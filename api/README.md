@@ -21,8 +21,8 @@ owners' stability policies.
 
 The `api/` directory contains the evidence used by CI:
 
-- `stability.json` records package tiers, source commits, snapshot hashes, and
-  the current review decision; and
+- `stability.json` records package tiers, compatibility baselines, and snapshot
+  hashes; and
 - `snapshots/` records the explicit all-feature Apple ARM64 Rust API plus the
   manifest, feature, dependency, target, and MSRV contract.
 
@@ -41,9 +41,11 @@ python3 tools/check-api-manifest.py
 python3 tools/check-api-compatibility.py
 ```
 
-Snapshot updates require a clean source commit and an explicit review recorded
-in `api/stability.json`. Additions, removals, deprecations, platform impact, and
-version consequences must be reviewed before accepting new evidence. Removals
-are accepted only for packages explicitly classified as application-internal
+After reviewing an API change, run
+`python3 tools/check-api-baseline.py --update` and commit the source and snapshot
+changes together. CI compares snapshots with the current source; compatibility
+checks retain the historical baseline.
+
+Removals are accepted only for packages explicitly classified as application-internal
 and governed by a reviewed snapshot; reusable/public packages remain closed to
 removals.

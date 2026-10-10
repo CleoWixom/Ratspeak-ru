@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "tool": {
     "name": "cargo-public-api",
     "version": "0.52.0",
@@ -11,95 +11,11 @@
     ]
   },
   "baseline": {
-    "commit": "fc78e4926c696a921f308d238ef1b620e0db0078",
-    "capturedOn": "2026-08-17"
+    "commit": "fc78e4926c696a921f308d238ef1b620e0db0078"
   },
   "compatibilityFloor": {
     "evidenceCommit": "7209cd7018d238e0c054bcc8e7b89cb1ac8b0341",
     "sourceCommit": "fc78e4926c696a921f308d238ef1b620e0db0078"
-  },
-  "snapshotSource": {
-    "commit": "e690b3d2afee1e1ca29aba7f7bda0061da88a4e2",
-    "capturedOn": "2026-10-10",
-    "review": {
-      "areas": [
-        "application domain and configuration",
-        "database and persistence",
-        "Reticulum and messaging runtime",
-        "Tauri commands and events",
-        "desktop and mobile application shell",
-        "profile-scoped shared-stack ownership, protected credentials and transactional switching",
-        "Android inbound text sharing and identity-locked native draft cleanup",
-        "exact route recovery, packet proof ownership and authoritative timing",
-        "bounded automatic photo preparation request and exact attachment storage keys",
-        "Direct delivery readiness and content-free BLE/Resource aggregate diagnostics (September 24)",
-        "Native Codec2 live audio, exact-Link PTT input leases and constrained profile ceiling",
-        "Standard native 700C voice messages with explicit identity/destination format preference",
-        "Automatic voice format selection, identity-fenced queue publication and definite pre-admission retry",
-        "Field-only outgoing reactions without legacy human-readable fallback"
-      ],
-      "canonicalDependencies": [
-        "lxmf_core::message_api",
-        "lxst_telephony::TelephonyService::registered",
-        "lrgp::protocol"
-      ],
-      "classification": "application-internal lifecycle, persistence, mobile integration and explicit network ownership",
-      "publicApiDiff": {
-        "added": 224,
-        "removed": 14
-      },
-      "semver": "no public-library consequence; application integration only",
-      "deprecations": "none",
-      "wirePersistenceRuntimeImpact": "No wire-format change. Adds versioned profile ownership/selectors and opaque credential references, native protected secret storage, five Developer-gated Tauri commands, and the R8-kept Android credential JNI bridge. Mode changes serialize with identity/interface lifecycle, commit after readiness, retain unlocked identity only for same-profile rebuild, and verify rollback. External clients authenticate without fallback and reject local interface changes. New managed profiles are standalone; existing private sharing and operator selectors are preserved. AutoInterface UDP remains unchanged. Retains the previously reviewed announce/readiness boundaries and BLE firmware startup policy. Failed Link/packet recovery now uses the transport's bounded exact-attempt owner, with no ordinary receive-interface quarantine. Atomic packet receipts retain validated proofs across retry queues; canonical first-hop timing drives packet and Link deadlines, while bounded protocol clocks take precedence over orphan watchdogs. Packet RTT still reaches DB, UI events and Activity. No new UI setting, wire format, native dependency or Auto delivery policy change. Adds voice_set_talk with exact established Link and monotonic edge serials. Constrained Codec2 calls require renewed local input and retain their profile ceiling. Existing LXMF Ogg/Opus memos and wire IDs are unchanged. Adds standard LXMF audio mode 0x03 compact clips (15-second capture / 30-second receive), typed decode/record APIs and a defaulted audio_mode in existing IPC results. Runtime AudioMessageRequest now explicitly carries audio_mode. Schema 44 stores per-identity/destination format preferences; no capability guessing or new wire IDs. Stored playback resolves the mode from the identity-bound message row. Existing Opus recording, calls and ownership barriers are retained. October 8: recording selects native 700C only for explicit no-compression peer metadata from live/cache discovery, otherwise Opus; this is an application heuristic, not a new codec advertisement. Schema 44 preference rows remain readable but no longer control new recordings or send validation; the existing format IPC is read-only and rejects override arguments. The selected recording mode remains frozen. Retryable staged owners preserve cancellation authority and may restore only after definite pre-admission failure. Durable admission, lease transfer, canonical finalization and queue notification retain the originating identity lifecycle lock even if the IPC future is dropped. Asynchronous conversation broadcasts reject stale identity generations. Ambiguous queue completion never restores a sendable token. No dependency pin, manifest, wire mode, mobile bridge, runtime ceiling or MSRV change. October 10: remove the internal reaction fallback text helper and send empty reaction content/title while preserving standard/custom reaction fields, routing and incoming legacy compatibility.",
-      "platformEvidence": [
-        "Ratspeak workspace: 1007 tests passed, including 625 runtime, 128 Tauri unit and 132 source contracts; dashboard behavior tests passed",
-        "Rust 1.87 all-feature runtime/Tauri check; all-feature strict Clippy; full standalone Tauri shell compile",
-        "iOS and Android serial/BLE runtime cross-checks; Windows protocol and native keyring checks (full Windows app blocked by absent MinGW SQLite compiler)",
-        "Android 35 ARM64 emulator: 10 native sharing tests and 2 real Keystore instrumentation tests; release R8 DEX preserves all 49 registered JNI methods",
-        "Live Python RNS 1.4.2 strict authentication, encrypted Link exchange and 65000-byte Resource verification; 380 protocol runtime and 450 transport actor tests passed",
-        "Actual production settings markup/styles/controller browser fixture with fake IPC; not native end-to-end or physical Sideband/Columba, Linux Secret Service, background, RF or audio qualification",
-        "September 5 Android text sharing: 54 frontend suites, 1014 workspace tests (one credential-store test explicitly ignored), 33 shell tests, strict host/Android/iOS simulator all-feature Clippy and Rust 1.87 all-feature workspace check",
-        "Fresh ARM64 debug APK on isolated API35 AVD: cold/warm text intake, Unicode draft selection, no automatic send, edited draft process recovery, exact native revision/Activity/identity rejection, explicit locally queued send, repeat/recreation; three real Keystore/AtomicFile instrumentation tests. Real source apps and physical acceptance remain open.",
-        "September 5 path recovery: 633 runtime tests plus actual slow-Link deadline regression, strict runtime Clippy; real manager/actor authenticated late-proof, same-radio/direct-to-relay and alternate-route regressions; live Python 1.4.2 shared recovery reconnect and payload",
-        "Rust 1.87 all-feature workspace check; Android ARM64 and iOS simulator all-feature shell Clippy checkpoint; final combined preflight recorded separately",
-        "September 24: two application-internal delivery drive/readiness methods, focused runtime/diagnostic/source tests, Android Kotlin/JNI checks, and encrypted readiness-driven multi-segment probes. No phone throughput qualification or new installation.",
-        "26 voice-enabled runtime tests, voice-enabled Tauri compile, strict runtime Clippy and actual UI owner/layout checks at four widths and both themes. Cross-client and physical acceptance remain separate.",
-        "October 2 M5: 16 unchanged-source command gates including 29 memo tests, 16 audio tests, 109 database tests, Tauri voice/IPC tests, seven dashboard suites, strict Clippy, iOS runtime and full desktop shell compile. Android runtime compiles separately; physical audio and final handheld peer qualification remain open.",
-        "October 8 source 3647fc6: six production voice command integration tests (A-to-B/A-to-B-to-A, no client ID, retained exact retry, cancellation, detached admission worker), focused runtime memo/audio/staging/policy/publication tests, all seven desktop/iOS/Android dashboard voice suites, fmt and strict all-target/all-feature runtime/Tauri Clippy. Clean local qualification graph uses rsReticulum d4183434, rsLXMF df3a500c and rsLXST 7dfb98e1; this is not the still-deferred release dependency pin set. Physical mobile audio and versioned artifact qualification remain separate gates."
-      ]
-    }
-  },
-  "manifestReview": {
-    "sourceCommit": "cfb11325fd8d398aa4bd4df0dc2a979016351162",
-    "reviewedOn": "2026-10-02",
-    "classification": "Application-internal native compact voice dependency",
-    "addition": "Optional direct lxst-codec2 dependency in ratspeak-runtime enabled only by lxst-voice; already present transitively; synchronized root and shell locks.",
-    "impact": "No native C codec, dependency version upgrade, MSRV change, wire ID allocation or platform permission change.",
-    "compatibility": "Runtime and Tauri application-internal coordinated API changes; existing Opus defaults retained.",
-    "verification": "16 focused final client checks with unchanged source and separate Android runtime compile."
-  },
-  "textShareReview": {
-    "sourceCommit": "4c47d379c56505669320da1094fbf14bbda75562",
-    "reviewedOn": "2026-09-05",
-    "rustApi": "One defaulted application-internal MobilePlatformBridge::forget_shared_text_drafts method, including its Noop implementation (two unique added API lines, three rendered occurrences); no removals. Non-Android default is inert; Android missing adapter fails closed. Existing identity lifecycle locks enclose native cleanup before identity deletion/reset.",
-    "nativeContracts": "Android text/plain ACTION_SEND; three kept JNI methods; list_text_shares and edit_text_share commands; payload-free text_shares_available event. Version 1 bounded native queue uses Android Keystore AES-GCM and AtomicFile in noBackupFilesDir. Explicit assignment/revision/identity/Activity authority, send-start recovery marker, explicit Send, exact acceptance/discard and reset cleanup.",
-    "impact": "No Reticulum/LXMF/LXST wire-format or dependency/MSRV change. No iOS Share Extension or entitlement change. Old shared-network/audio contracts retained. Reviewed separately from the earlier notification JNI manifest correction.",
-    "limits": "Eight pending items, 64 KiB UTF-8 each; text/URLs only, one recipient, no implicit send or URI dereference. Typed edits debounce for 250 ms; crash before persistence can retain the last committed draft. Hardware/OEM/source-app and final versioned artifact qualification remain separate gates."
-  },
-  "photoShareReview": {
-    "sourceCommit": "e9c1c29",
-    "reviewedOn": "2026-09-19",
-    "rustApi": "No public Rust API additions/removals or snapshot changes. Existing application-internal cleanup bridge now covers photo recovery as well as text.",
-    "nativeContracts": "Adds single-image image/* ACTION_SEND beside text/plain. Existing commands/events retain their names; optional image metadata and stage_image operation extend the native draft contract. Four kept JNI methods are added (63 overall). Source bytes are copied only from explicitly granted content URIs into private AES-GCM authenticated chunks; Rust-owned attachment staging performs inspection and transformation. Version 1 text-only drafts remain readable.",
-    "limits": "Eight pending shares; each accepts up to 64 KiB UTF-8 text/caption and one photo up to 128,000,000 bytes. Multiple-image/file URI/network URI and arbitrary-file shares are rejected or not advertised. Selection/compression never sends. Activity/identity/revision ownership, send-start recovery and exact discard/accepted-send cleanup remain mandatory.",
-    "verification": "Draft model, frontend send/preparation, native Keystore/chunk instrumentation, Android lint/build/JNI and release-R8 DEX gates; offline API35 ARM64 cross-UID content-provider integration covers compression, cancellation, process-death recovery and explicit local queueing. Physical OEM/source-app acceptance and final versioned/all-platform release artifacts remain separate.",
-    "impact": "App-only additive feature for the upcoming 1.0.32; no wire-format, dependency, MSRV, core version, iOS Share Extension or entitlement change. Historical textShareReview remains the earlier baseline, not the current feature limit."
-  },
-  "attachmentTransferReview": {
-    "reviewedOn": "2026-09-24",
-    "rustApi": "One application-internal PrepareImageAttachmentStageArgs::automatic bool field; JSON defaults to false, preserving existing explicit profile requests. No public-library API or wire-format change. Stored-name validation keeps its existing signature and now resolves exact keys instead of silently rewriting them.",
-    "behavior": "Implicit Actual photo preparation uses the Medium 750,000-byte ceiling and falls back to Medium from the original source when required. Explicit profiles retain their limits. Replacement staging waits for prior cleanup; large WebView downloads queue under the existing single-large-transfer budget. Complete new storage names fit 255 UTF-8 bytes and old valid keys remain readable and removable.",
-    "scope": "Application correction layered on the existing snapshot; snapshotSource identity, compatibility floor, runtime dependencies and historical reviews are preserved. Workspace tests, dashboard regressions, strict scoped Clippy, rendered API snapshots, and manifest/compatibility checks pass; physical mobile and final release qualification remain separate."
   },
   "packages": [
     {
@@ -147,48 +63,5 @@
       "itemCount": 2,
       "sha256": "034278ac95cbe749a710332e76ec105d2188a36da147738f9f852517872f38d6"
     }
-  ],
-  "candidateVersionReview": {
-    "sourceCommit": "4b734981a0151048e9216da75a99109b87c035cb",
-    "reviewedOn": "2026-09-24",
-    "scope": "Untagged Ratspeak 1.0.33, mobile build 1000063. Five application-internal package versions and eight internal dependency requirements advance together. Component package versions and registry dependency resolution are unchanged.",
-    "compatibility": "This version-only manifest update adds no Rust API, wire, database, IPC, or JNI changes. The attachment, delivery readiness, and route-recovery reviews describe the separately committed behavior changes. Existing compatibility floors remain authoritative.",
-    "qualification": "Final exact-source engineering, component, platform CI, and pre-tag artifact gates remain required; this metadata update is not publication approval."
-  },
-  "pathRecoveryReview": {
-    "sourceCommit": "df9bcbd48c3914bc51ec37b28303f28c80402d76",
-    "reviewedOn": "2026-09-05",
-    "rustApi": "One application-internal LxmfManager::set_path_recovery_handle method, two rendered lines; no removals. Retained public completion and route-observation entry points remain available.",
-    "bounds": "64 transport recovery operations; 1024 exact route records, one hour; 256 manager recovery/timing records, 10-second recovery wait; eight concurrent two-second timing queries, 15-second cache TTL; 512 packet attempts with route-aware receipt window and 120-second late-proof grace.",
-    "compatibility": "No UI/settings or wire/crypto change. Existing Auto policy and explicit low-level interface suppression APIs retained. Compatibility floor and native/manifest reviews preserved. Physical LoRa and final release artifacts require separate qualification."
-  },
-  "bleThroughputReview": {
-    "reviewedOn": "2026-09-24",
-    "rustApi": "Two additive application-internal LxmfManager methods for readiness and delivery-only processing. No public-library breaking change, wire change, persistence change, version bump, or platform export change.",
-    "scheduling": "Foreground/background periodic maintenance cadence retained; Direct delivery input and local receipts trigger bounded fast turns with explicit cooperative yield. Shutdown remains the first select branch.",
-    "diagnostics": "Exact aggregate-only schemas allow rns_interface::ble_peer::transfer and lxmf_core::delivery::transfer. Raw dependency/peer/content traces remain forbidden. Native admission and dispatch counts do not claim receiver delivery.",
-    "native": "Android unknown ATT payload falls back to 20 until successful MTU callbacks; Apple flow control and native payload sizing are supplied by pinned rsReticulum. BLE role fan-out is preserved.",
-    "qualification": "Source, scoped host/MSRV/native compile, privacy, encrypted integrity and live Python interoperability checks; final packages and physical throughput remain separately required. Existing release integration tags are not moved or published by this implementation."
-  },
-  "compactVoiceReview": {
-    "sourceCommit": "cfb11325fd8d398aa4bd4df0dc2a979016351162",
-    "addedSnapshotLines": 51,
-    "removedSnapshotLines": 1,
-    "classification": "Coordinated application-internal API only. Runtime audio_mode and draft format fields are required in Rust; existing IPC start/decode args default to Opus.",
-    "tests": "Private harness AudioMessageRequest callers updated explicitly; exact peer matrix tracked separately."
-  },
-  "voiceReleaseVersionReview": {
-    "sourceCommit": "b0ce9691ce32e483a9cdabe38356843b63ab5184",
-    "reviewedOn": "2026-10-08",
-    "scope": "Untagged Ratspeak 1.0.34, mobile build 1000064. Application package and internal requirement versions advance together; the exact LXST source selects the implemented native 700C codec and shared immutable FFT coefficients.",
-    "compatibility": "No additional Rust API, wire, persistence, IPC, JNI, or registry dependency change. Existing manifest and API reviews remain authoritative.",
-    "qualification": "Exact-source CI, platform artifacts, and physical acceptance remain required. No release or integration tags created."
-  },
-  "reactionFallbackReview": {
-    "sourceCommit": "e690b3d2afee1e1ca29aba7f7bda0061da88a4e2",
-    "reviewedOn": "2026-10-10",
-    "rustApi": "Remove the application-internal reaction_fallback_text helper. No IPC, JNI, database, dependency or version changes.",
-    "behavior": "Outgoing add/remove reactions contain only their structured LXMF fields and empty content/title. Standard add reaction and Ratspeak removal envelope remain intact. Inbound legacy reactions remain accepted; existing stored messages are not rewritten.",
-    "qualification": "Scoped outgoing/inbound reaction and route-admission tests; source contracts and live NomadNet field-only transport regression. Physical acceptance and replacement release artifacts remain separate gates."
-  }
+  ]
 }

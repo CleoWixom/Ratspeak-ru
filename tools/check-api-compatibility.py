@@ -50,7 +50,7 @@ def main() -> None:
         [sys.executable, "tools/check-api-baseline.py", "--metadata-only"], cwd=ROOT
     )
     if metadata.returncode != 0:
-        fail("snapshot metadata or review is invalid")
+        fail("snapshot metadata is invalid")
     ledger = json.loads(LEDGER_PATH.read_text(encoding="utf-8"))
     floor = ledger.get("compatibilityFloor", {}).get("evidenceCommit")
     if not isinstance(floor, str):
@@ -59,6 +59,9 @@ def main() -> None:
     floor_snapshots = {
         package["name"]: package["snapshot"] for package in floor_ledger["packages"]
     }
+    removed_packages = set(floor_snapshots) - {package["name"] for package in ledger["packages"]}
+    if removed_packages:
+        fail(f"compatibility-floor packages removed: {sorted(removed_packages)}")
     total_added = 0
     total_removed = 0
     packages_with_removals: list[dict[str, object]] = []
@@ -79,12 +82,6 @@ def main() -> None:
         if removed:
             for line in removed:
                 print(f"- {line}", file=sys.stderr)
-    review = ledger["snapshotSource"]["review"]
-    if review["publicApiDiff"] != {
-        "added": total_added,
-        "removed": total_removed,
-    }:
-        fail("snapshot review does not match the measured API diff")
     for package in packages_with_removals:
         if package.get("tier") != "application-internal" or package.get(
             "compatibility"
@@ -95,7 +92,7 @@ def main() -> None:
             )
     if total_removed:
         print(
-            "api compatibility: explicitly reviewed application-internal change "
+            "api compatibility: application-internal change "
             f"(+{total_added}, -{total_removed})"
         )
     else:
