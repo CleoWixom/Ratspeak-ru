@@ -2964,7 +2964,7 @@ dependencies = [
 
 [[package]]
 name = "lxmf-core"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2989,14 +2989,14 @@ dependencies = [
 
 [[package]]
 name = "lxst-codec2"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libm",
 ]
 
 [[package]]
 name = "lxst-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "half",
  "opus-rs",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "lxst-rns"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "lxst-core",
@@ -3019,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "lxst-telephony"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "lxst-codec2",
