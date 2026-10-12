@@ -5,6 +5,17 @@ changes that materially affect how an artifact is reproduced.
 
 ## [Unreleased]
 
+### Fixed and improved
+
+- Fixed propagation pickup and purge when many messages are stored on a relay.
+- Preserved unknown interface locations and restored discovery announcements.
+- Bounded background announcements at flow-controlled radio writers.
+
+### Build and compatibility
+
+- Updated the coordinated source graph to rsReticulum 1.4.0 (`~1.4.0`), including
+  the nullable discovery coordinate API migration.
+
 ## [1.0.34] - 2026-10-10
 
 ### Added
