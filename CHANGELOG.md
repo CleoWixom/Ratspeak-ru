@@ -13,7 +13,7 @@ changes that materially affect how an artifact is reproduced.
 
 ### Build and compatibility
 
-- Updated the coordinated source graph to rsReticulum 1.4.0 (`~1.4.0`), including
+- Updated the coordinated source graph to rsReticulum 1.3.0 (`~1.3.0`), including
   the nullable discovery coordinate API migration.
 
 ## [1.0.34] - 2026-10-10
