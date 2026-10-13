@@ -2222,6 +2222,7 @@ struct InterfaceIfacSettings {
     network_name: Option<String>,
     passphrase: Option<String>,
     ifac_size: Option<usize>,
+    unresolved: bool,
 }
 
 impl InterfaceIfacSettings {
@@ -2267,14 +2268,28 @@ fn ifac_settings_from_entry(entry: &Value) -> InterfaceIfacSettings {
         passphrase: cfg_non_empty_str(entry, "passphrase")
             .or_else(|| cfg_non_empty_str(entry, "pass_phrase")),
         ifac_size: cfg_usize(entry, "ifac_size"),
+        unresolved: entry.get("ifac_error").is_some(),
     }
 }
 
 fn ifac_settings_from_args(
     fields: &InterfaceIfacCommandFields,
     existing: Option<&InterfaceIfacSettings>,
-) -> InterfaceIfacSettings {
-    match fields.ifac_enabled {
+) -> AppResult<InterfaceIfacSettings> {
+    if fields
+        .ifac_size
+        .is_some_and(|size| !(1..=64).contains(&size))
+    {
+        return Err(AppError::bad_request(
+            "IFAC size must be between 1 and 64 bytes",
+        ));
+    }
+    if fields.ifac_enabled != Some(false) && existing.is_some_and(|value| value.unresolved) {
+        return Err(AppError::bad_request(
+            "Resolve the interface's IFAC units before editing, or turn IFAC off.",
+        ));
+    }
+    Ok(match fields.ifac_enabled {
         Some(true) => InterfaceIfacSettings {
             network_name: fields
                 .ifac_network_name
@@ -2290,10 +2305,11 @@ fn ifac_settings_from_args(
                 .ifac_size
                 .filter(|size| (1..=64).contains(size))
                 .or_else(|| existing.and_then(|settings| settings.ifac_size)),
+            unresolved: false,
         },
         Some(false) => InterfaceIfacSettings::default(),
         None => existing.cloned().unwrap_or_default(),
-    }
+    })
 }
 
 fn cfg_rnode_mode(entry: &Value) -> String {
@@ -2865,6 +2881,9 @@ fn couple_android_ble_operation_to_rnode_lease(
 }
 
 fn resumable_config_from_entry(group: &str, entry: &Value) -> Option<ResumableInterfaceConfig> {
+    if entry.get("ifac_error").is_some() {
+        return None;
+    }
     match group {
         "rnode" => rnode_config_from_entry(entry).map(ResumableInterfaceConfig::Editable),
         "auto" => auto_runtime_config_from_entry(entry).map(ResumableInterfaceConfig::Auto),
@@ -3522,7 +3541,9 @@ mod android_ble_owner_policy_tests {
                       [[Duplicate]]\n\
                       type = AutoInterface\n\
                       enabled = true\n";
-        crate::rns_config::write_config(temp.path(), config);
+        // Simulate an externally edited invalid file. The app's authoritative
+        // writer now rejects duplicate sections before publishing them.
+        std::fs::write(temp.path().join("config"), config).unwrap();
 
         let error = set_exact_interface_enabled(temp.path(), "Duplicate", false)
             .expect_err("ambiguous name must fail closed");
@@ -6812,6 +6833,41 @@ pub async fn api_list_network_interfaces() -> AppResult<Value> {
 }
 
 #[derive(Deserialize)]
+pub struct IfacUnitMigrationArgs {
+    pub name: String,
+    pub source_units: String,
+    pub expected_source_hash: String,
+}
+
+#[tauri::command]
+pub async fn migrate_interface_ifac_units(
+    state: State<'_, Arc<AppState>>,
+    args: IfacUnitMigrationArgs,
+) -> AppResult<Value> {
+    ratspeak_runtime::network_ownership::require_local_interfaces(&state)
+        .map_err(AppError::bad_request)?;
+    let units = match args.source_units.as_str() {
+        "bytes" => rns_runtime::config::ifac::IfacSourceUnits::Bytes,
+        "bits" => rns_runtime::config::ifac::IfacSourceUnits::Bits,
+        _ => {
+            return Err(AppError::bad_request(
+                "Choose existing Ratspeak size or Python bit size",
+            ));
+        }
+    };
+    let mut expected = [0u8; 32];
+    hex::decode_to_slice(&args.expected_source_hash, &mut expected)
+        .map_err(|_| AppError::bad_request("Reload the interface before resolving its units"))?;
+    let config_dir = active_rns_config_dir(&state);
+    let changed = with_rns_config_lock(&state, || {
+        crate::rns_config::migrate_ifac_units(&config_dir, &args.name, units, &expected)
+    })
+    .map_err(|error| AppError::bad_request(error.to_string()))?;
+    emit_hub_interfaces(&state, crate::rns_config::get_all_interfaces(&config_dir));
+    Ok(json!({ "changed": changed }))
+}
+
+#[derive(Deserialize)]
 pub struct TcpConnectionArgs {
     pub host: String,
     pub port: i64,
@@ -6837,7 +6893,7 @@ pub async fn add_tcp_connection(
     let host = sanitize_text(&args.host, 256);
     let port = args.port;
     let name = sanitize_text(&args.name, 64);
-    let ifac = ifac_settings_from_args(&args.ifac, None);
+    let ifac = ifac_settings_from_args(&args.ifac, None)?;
 
     if host.is_empty() || !(1..=65535).contains(&port) {
         emit_op_status_broadcast(
@@ -7027,7 +7083,7 @@ pub async fn update_tcp_connection(
             let old_runtime = tcp_client_config_from_entry(&old_entry)
                 .ok_or_else(|| AppError::bad_request("Invalid TCP config"))?;
             let old_ifac = ifac_settings_from_entry(&old_entry);
-            let ifac = ifac_settings_from_args(&args.ifac, Some(&old_ifac));
+            let ifac = ifac_settings_from_args(&args.ifac, Some(&old_ifac))?;
             enforce_public_tcp_transport_connect_limit(
                 &state_arc,
                 &ifaces,
@@ -7193,7 +7249,7 @@ pub async fn add_tcp_server(
     let name = sanitize_text(&args.name, 64);
     let listen_ip = sanitize_text(&args.listen_ip, 64);
     let listen_port = args.listen_port;
-    let ifac = ifac_settings_from_args(&args.ifac, None);
+    let ifac = ifac_settings_from_args(&args.ifac, None)?;
 
     let config_dir = active_rns_config_dir(&state_arc);
     if !with_rns_config_lock(&state_arc, || {
@@ -7342,7 +7398,7 @@ pub async fn update_tcp_server(
             let old_runtime = tcp_server_config_from_entry(&old_entry)
                 .ok_or_else(|| AppError::bad_request("Invalid TCP server config"))?;
             let existing_ifac = ifac_settings_from_entry(&old_entry);
-            let ifac = ifac_settings_from_args(&args.ifac, Some(&existing_ifac));
+            let ifac = ifac_settings_from_args(&args.ifac, Some(&existing_ifac))?;
             let old_config_content =
                 crate::rns_config::read_config(&config_dir).unwrap_or_default();
             let config_written = crate::rns_config::update_tcp_server_with_ifac(
@@ -7503,7 +7559,7 @@ pub async fn add_backbone_connection(
     let host = sanitize_text(&args.host, 256);
     let port = args.port;
     let raw_name = sanitize_text(&args.name, 64);
-    let ifac = ifac_settings_from_args(&args.ifac, None);
+    let ifac = ifac_settings_from_args(&args.ifac, None)?;
 
     if host.is_empty() || !(1..=65535).contains(&port) {
         emit_op_status_broadcast(
@@ -7693,7 +7749,7 @@ pub async fn update_backbone_connection(
             let old_runtime = backbone_client_config_from_entry(&old_entry)
                 .ok_or_else(|| AppError::bad_request("Invalid Backbone config"))?;
             let old_ifac = ifac_settings_from_entry(&old_entry);
-            let ifac = ifac_settings_from_args(&args.ifac, Some(&old_ifac));
+            let ifac = ifac_settings_from_args(&args.ifac, Some(&old_ifac))?;
             let old_config_content =
                 crate::rns_config::read_config(&config_dir).unwrap_or_default();
             let config_written = crate::rns_config::update_backbone_client(
@@ -7863,7 +7919,7 @@ pub async fn add_backbone_server(
         .map(|s| sanitize_text(s, 64))
         .filter(|s| !s.is_empty());
 
-    let ifac = ifac_settings_from_args(&args.ifac, None);
+    let ifac = ifac_settings_from_args(&args.ifac, None)?;
     let config_dir = active_rns_config_dir(&state_arc);
     if !with_rns_config_lock(&state_arc, || {
         crate::rns_config::add_backbone_server_with_ifac(
@@ -8032,7 +8088,7 @@ pub async fn update_backbone_server(
             let old_runtime = backbone_server_config_from_entry(&old_entry)
                 .ok_or_else(|| AppError::bad_request("Invalid Backbone server config"))?;
             let existing_ifac = ifac_settings_from_entry(&old_entry);
-            let ifac = ifac_settings_from_args(&args.ifac, Some(&existing_ifac));
+            let ifac = ifac_settings_from_args(&args.ifac, Some(&existing_ifac))?;
             let old_config_content =
                 crate::rns_config::read_config(&config_dir).unwrap_or_default();
             let config_written = crate::rns_config::update_backbone_server_with_ifac(

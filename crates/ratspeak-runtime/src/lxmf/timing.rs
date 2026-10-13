@@ -116,9 +116,9 @@ impl LxmfManager {
                 if message.method == DeliveryMethod::Propagated {
                     self.router
                         .outbound_propagation_node
-                        .unwrap_or(message.destination_hash)
+                        .unwrap_or(message.destination_hash())
                 } else {
-                    message.destination_hash
+                    message.destination_hash()
                 }
             })
             .collect::<HashSet<_>>();
@@ -130,9 +130,9 @@ impl LxmfManager {
             let dest = if message.method == DeliveryMethod::Propagated {
                 self.router
                     .outbound_propagation_node
-                    .unwrap_or(message.destination_hash)
+                    .unwrap_or(message.destination_hash())
             } else {
-                message.destination_hash
+                message.destination_hash()
             };
             if waiting.contains(&dest) && message.next_delivery_attempt <= now {
                 message.next_delivery_attempt = now + 0.5;
@@ -229,11 +229,10 @@ mod tests {
         );
         let (tx, _rx) = mpsc::channel(64);
         mgr.router.set_transport(tx);
-        let mut message = mgr
-            .create_message(&hex::encode(dest), "slow Link", "", DeliveryMethod::Direct)
+        let message = mgr
+            .create_final_message(&hex::encode(dest), "slow Link", "", DeliveryMethod::Direct)
             .unwrap();
-        message.outbound_ticket = None;
-        let hash = message.hash.unwrap();
+        let hash = message.message_id();
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::DeliverDirect {
             message,
             dest_hash: dest,

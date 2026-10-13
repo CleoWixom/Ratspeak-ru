@@ -1969,7 +1969,8 @@ function _ifacReadValues(prefix) {
         ifac_network_name: useIfac && networkEl ? networkEl.value.trim() : '',
         ifac_passphrase: useIfac && passEl ? passEl.value.trim() : ''
     };
-    var size = sizeEl ? parseInt(sizeEl.value, 10) : NaN;
+    var sizeText = sizeEl ? sizeEl.value.trim() : '';
+    var size = /^\d+$/.test(sizeText) ? Number(sizeText) : NaN;
     if (useIfac && size >= 1 && size <= 64) values.ifac_size = size;
     return values;
 }
@@ -1986,6 +1987,11 @@ function _ifacApplyArgs(prefix, args) {
 // IFAC on with neither field filled is always a mistake; block the submit.
 function _ifacGuardEmpty(prefix) {
     var v = _ifacReadValues(prefix);
+    var sizeEl = document.getElementById(prefix + '-ifac-size');
+    if (v.ifac_enabled && sizeEl && sizeEl.value.trim() && v.ifac_size === undefined) {
+        showPreConditionToast('IFAC size must be a whole number from 1 to 64 bytes');
+        return false;
+    }
     if (v.ifac_enabled && !v.ifac_network_name && !v.ifac_passphrase) {
         showPreConditionToast('Enter an IFAC network name or passphrase');
         return false;
@@ -2420,7 +2426,40 @@ function submitBackboneHost() {
     });
 }
 
+// A legacy value has no reliable producer marker. Only an explicit choice may
+// convert it; opening settings never changes the file.
+function resolveInterfaceIfacUnits(ifaceType, ifaceName, iface) {
+    var migration = iface.ifac_migration;
+    if (!migration) {
+        showPreConditionToast(iface.ifac_error || 'Correct the IFAC settings before editing this interface');
+        return;
+    }
+    var choices = [{ label: 'Keep existing Ratspeak size (' + migration.bytes + ' bytes)', value: 'bytes' }];
+    if (migration.python_bytes !== null && migration.python_bytes !== undefined) {
+        choices.push({ label: 'Use Python bit size (' + migration.python_bytes + ' bytes)', value: 'bits' });
+    }
+    rsChoice({
+        title: 'Confirm IFAC size',
+        message: 'This saved interface does not say which units its IFAC size uses. Choose the size used by the other peer. A backup will be kept.',
+        choices: choices
+    }).then(function(units) {
+        if (units === null) return;
+        return RS.invoke('migrate_interface_ifac_units', { args: {
+            name: ifaceName, source_units: units, expected_source_hash: migration.source_hash
+        }}).then(function() {
+            loadHubInterfaces();
+            showToast('IFAC size saved. Use Resume to connect this interface.', 'toast-success');
+        }).catch(function(error) {
+            showToast((error && error.message) || 'Could not update IFAC settings', 'toast-error', 8000);
+        });
+    });
+}
+
 function openInterfaceEditModal(ifaceType, ifaceName, iface) {
+    if (iface && iface.ifac_error) {
+        resolveInterfaceIfacUnits(ifaceType, ifaceName, iface);
+        return;
+    }
     iface = iface || {};
     var context = { ifaceType: ifaceType, oldName: ifaceName, iface: iface };
     if (ifaceType === 'rnode') {

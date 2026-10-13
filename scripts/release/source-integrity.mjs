@@ -305,7 +305,9 @@ export function releaseNotesFromChangelog(changelog, displayVersion) {
 // Core minor releases may break APIs under the project version policy.
 // Do not let Cargo caret compatibility admit the next core minor implicitly.
 export function componentCargoRequirement(component) {
-  return component.id === "rsreticulum" ? `~${component.version}` : component.version;
+  return ["rsreticulum", "rslxmf"].includes(component.id)
+    ? `~${component.version}`
+    : component.version;
 }
 
 export function verifyProductSurfaces(set) {

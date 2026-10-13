@@ -71,6 +71,7 @@ function renderPropagationStatus(targetId) {
         html += renderDiscoveredList(mode, favorStatic, selectedNodeHash);
     }
 
+    if (mode !== 'off') html += renderDeferredDownloads();
     html += renderHostingSettings();
     html += renderStampSettings();
 
@@ -260,6 +261,29 @@ function renderDiscoveredList(mode, favorStatic, activeHash) {
     return html;
 }
 
+function renderDeferredDownloads() {
+    var suppressed = Math.max(0, Number(propagationStatus.suppressed_count) || 0);
+    var deferred = Math.max(0, Number(propagationStatus.deferred_count) || 0);
+    var paused = !!propagationStatus.admission_paused;
+    var rejected = Math.max(0, Number(propagationStatus.rejected_count) || 0);
+    var committed = Math.max(0, Number(propagationStatus.committed_count) || 0);
+    if (!suppressed && !deferred && !paused && !rejected) return '';
+    var html = '<div class="relay-card"><div class="relay-card-header"><strong>' +
+        (paused ? 'Inbox downloads paused' : 'Some messages are waiting') + '</strong></div>';
+    if (rejected) html += '<div class="settings-row-desc">Last check: ' + committed + ' new message' + (committed === 1 ? '' : 's') + ' saved; ' + rejected + ' could not be saved.</div>';
+    if (suppressed) html += '<div class="settings-row-desc">' + suppressed + ' message' + (suppressed === 1 ? '' : 's') + ' could not be accepted. They remain on the inbox node and will be checked again when your keys or settings change.</div>';
+    if (deferred) html += '<div class="settings-row-desc">' + deferred + ' message' + (deferred === 1 ? '' : 's') + ' will be retried after a temporary problem.</div>';
+    if (propagationStatus.suppression_full) html += '<div class="settings-row-desc">The retry list is full. New downloads will resume when entries expire or you retry them.</div>';
+    else if (paused) html += '<div class="settings-row-desc">Local storage is being checked. Messages stay on the inbox node until they can be saved safely.</div>';
+    var next = Number(propagationStatus.next_retry);
+    if (Number.isFinite(next) && next > 0) {
+        var date = new Date(next * 1000);
+        if (!isNaN(date.getTime())) html += '<div class="settings-row-desc">Next retry: ' + escapeHtml(date.toLocaleString()) + '</div>';
+    }
+    html += '<div class="relay-card-actions"><button class="nr-btn nr-btn-sm" id="prop-retry-deferred-btn">Retry waiting messages</button></div></div>';
+    return html;
+}
+
 function renderHostingSettings() {
     // Inbox hosting needs an always-available key; a hardware (PIV) identity can
     // be unplugged or its session can lock, so hosting isn't offered for it.
@@ -270,7 +294,10 @@ function renderHostingSettings() {
             '<div class="settings-row-desc">Not available for hardware-key identities — a hosted inbox would stop whenever the security key is removed or the session locks.</div>' +
         '</div>';
     }
-    var enabled = !!propagationStatus.hosting_enabled;
+    var enabled = !!propagationStatus.hosting_requested;
+    var effective = !!propagationStatus.hosting_enabled;
+    var host = propagationStatus.hosting_status || {};
+    var readiness = host.readiness || 'disabled';
     var nodeHash = propagationStatus.local_node_hash || '';
     var count = propagationStatus.local_node_message_count || 0;
     var cost = propagationStatus.local_node_stamp_cost;
@@ -294,7 +321,20 @@ function renderHostingSettings() {
             '</label>' +
         '</div>';
 
-    if (enabled) {
+    if (enabled && !effective) {
+        html += '<div class="relay-card"><div class="relay-card-header"><strong>Hosting unavailable</strong></div>' +
+            '<div class="settings-row-desc">' + escapeHtml(host.reason || (readiness === 'opening' || readiness === 'recovering' ? 'Preparing inbox storage…' : 'Inbox storage is not ready.')) + '</div>' +
+            '<div class="settings-row-desc">Identity: ' + escapeHtml(host.identity || 'Current identity') + '</div>';
+        if (readiness !== 'opening' && readiness !== 'recovering') {
+            html += '<div class="relay-card-actions"><button class="nr-btn nr-btn-sm" id="prop-host-retry-btn">Retry storage recovery</button></div>';
+        }
+        html += '</div>';
+    }
+    if (host.quarantined_files > 0) {
+        html += '<div class="inline-hint">' + Number(host.quarantined_files) + ' archived file' + (host.quarantined_files === 1 ? '' : 's') +
+            ' preserved (' + Number(host.quarantined_bytes || 0).toLocaleString() + ' bytes). These files are not shared because their original encrypted form could not be confirmed.</div>';
+    }
+    if (effective) {
         html += '<div class="relay-card relay-card-active">' +
             '<div class="relay-card-header"><strong>' + escapeHtml(nodeHash || 'Local inbox node') + '</strong></div>' +
             '<div class="relay-card-details">' +
@@ -304,6 +344,7 @@ function renderHostingSettings() {
             '<div class="relay-card-actions">' +
                 '<button class="nr-btn nr-btn-sm" id="prop-host-announce-btn">Announce</button>' +
                 '<button class="nr-btn nr-btn-sm nr-btn-muted" id="prop-host-cost-btn">Stamp Cost</button>' +
+                '<button class="nr-btn nr-btn-sm nr-btn-muted" id="prop-host-import-btn">Recover archived messages</button>' +
             '</div>' +
         '</div>';
     }
@@ -356,6 +397,17 @@ function wireUpHandlers(container, mode) {
 
     var syncBtn = document.getElementById('prop-sync-btn');
     if (syncBtn) syncBtn.addEventListener('click', syncPropagationMailbox);
+    var retryDeferredBtn = document.getElementById('prop-retry-deferred-btn');
+    if (retryDeferredBtn) retryDeferredBtn.addEventListener('click', async function() {
+        retryDeferredBtn.disabled = true;
+        try {
+            await RS.invoke('retry_deferred_propagation');
+            showToast('Waiting messages will be checked again.', 'toast-success', 3000);
+            await syncPropagationMailbox();
+        } catch (err) {
+            showToast('Could not retry messages: ' + ((err && err.message) || String(err)), 'toast-error', 4000);
+        } finally { retryDeferredBtn.disabled = false; }
+    });
 
     var clearBtn = document.getElementById('prop-clear-btn');
     if (clearBtn) clearBtn.addEventListener('click', clearPropagationNode);
@@ -379,6 +431,11 @@ function wireUpHandlers(container, mode) {
             setPropagationHosting(!!this.checked);
         });
     }
+
+    var hostRetryBtn = document.getElementById('prop-host-retry-btn');
+    if (hostRetryBtn) hostRetryBtn.addEventListener('click', function() { recoverHostedInbox(false); });
+    var hostImportBtn = document.getElementById('prop-host-import-btn');
+    if (hostImportBtn) hostImportBtn.addEventListener('click', function() { recoverHostedInbox(true); });
 
     var hostCostBtn = document.getElementById('prop-host-cost-btn');
     if (hostCostBtn) hostCostBtn.addEventListener('click', choosePropagationHostCost);
@@ -456,11 +513,42 @@ function setPropagationHosting(enabled, cost) {
     }
 }
 
+async function recoverHostedInbox(importManifest) {
+    if (typeof rsConfirm !== 'function') return;
+    var host = propagationStatus.hosting_status || {};
+    var identity = host.identity;
+    if (!identity) return;
+    var manifest = null;
+    var digest = null;
+    if (importManifest) {
+        if (typeof rsPrompt !== 'function') return;
+        manifest = await rsPrompt({ title: 'Recover archived messages', message: 'Enter the full local path to a trusted recovery manifest. It must identify the original encrypted messages; retrying storage alone never releases archived files.', placeholder: 'Recovery manifest path' });
+        if (!manifest) return;
+        digest = await rsPrompt({ title: 'Verify recovery manifest', message: 'Enter the SHA-256 digest approved when this manifest was independently verified.', placeholder: '64 hexadecimal characters' });
+        if (!digest) return;
+    }
+    var confirmed = await rsConfirm({
+        title: 'Recover hosted inbox storage',
+        message: 'Stop every other Ratspeak or LXMF relay using this storage and disable its automatic restart. This app will briefly restart messaging. Existing files are preserved; uncertain old messages remain archived. Confirm that the other writers will stay stopped.',
+        confirmText: 'Writers stopped — continue'
+    });
+    if (!confirmed) return;
+    try {
+        var report = await RS.invoke('recover_propagation_host', { args: {
+            identity: identity, supervisor_writers_stopped: true,
+            manifest_path: manifest, approved_manifest_sha256: digest
+        }});
+        showToast('Storage recovered. ' + report.quarantined_files + ' original files preserved; ' + report.imported + ' verified messages imported.', 'toast-success', 6000);
+    } catch (error) {
+        showToast('Storage recovery could not finish: ' + ((error && error.message) || String(error)), 'toast-error', 6000);
+    }
+}
+
 function choosePropagationHostCost() {
     var current = propagationStatus.local_node_stamp_cost || 16;
     stampCostChoice('Hosted Inbox Stamp Cost', current, false).then(function(cost) {
         if (cost === null || isNaN(cost)) return;
-        setPropagationHosting(!!propagationStatus.hosting_enabled, Math.max(0, Math.min(32, cost)));
+        setPropagationHosting(!!propagationStatus.hosting_requested, Math.max(0, Math.min(32, cost)));
     });
 }
 

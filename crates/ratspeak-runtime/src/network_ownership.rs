@@ -930,10 +930,7 @@ mod tests {
             assert_eq!(warning_names().len(), usize::from(enabled), "{flags}");
         }
         // Invalid/unreadable configuration must not pretend failures resolved.
-        assert!(crate::rns_config::write_config(
-            &config_dir,
-            "[[invalid]]\n"
-        ));
+        std::fs::write(config_dir.join("config"), "[[invalid]]\n").unwrap();
         assert_eq!(warning_names(), ["Failed A", "Failed B"]);
         std::fs::remove_file(config_dir.join("config")).unwrap();
         assert_eq!(warning_names(), ["Failed A", "Failed B"]);

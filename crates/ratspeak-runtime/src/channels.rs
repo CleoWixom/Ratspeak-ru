@@ -3876,7 +3876,7 @@ fn link_connect_error(error: LinkSessionError) -> ConnectAttemptError {
         LinkSessionError::PublicKeyUnavailable => {
             activity::ChannelSessionFailureReason::InvalidAnnounce
         }
-        LinkSessionError::TransportUnavailable | LinkSessionError::SessionClosed => {
+        LinkSessionError::RequestDispatch(_) | LinkSessionError::TransportUnavailable | LinkSessionError::SessionClosed => {
             activity::ChannelSessionFailureReason::TransportUnavailable
         }
         LinkSessionError::LinkCrypto
@@ -8511,6 +8511,7 @@ mod tests {
                 binding: rns_transport::messages::LinkEndpointBinding {
                     link_id: responder.link_id,
                     interface_id: 1,
+                    interface_owner: None,
                     role: rns_transport::messages::LinkEndpointRole::Initiator,
                 },
                 reason: rns_transport::messages::LinkEndpointTerminalReason::InterfaceClosed,
@@ -9953,6 +9954,10 @@ mod tests {
             let mut endpoint_lifecycle_senders = Vec::new();
             while let Some(message) = transport_rx.recv().await {
                 let observed = match message {
+                    TransportMessage::SendLinkRequest { request, result_tx } => {
+                        result_tx.send(Ok(())).expect("live Link request owner");
+                        TransportMessage::Outbound(request)
+                    }
                     TransportMessage::BindLinkEndpoint {
                         binding,
                         lifecycle_tx,
@@ -10046,8 +10051,13 @@ mod tests {
 
     async fn next_outbound(rx: &mut mpsc::Receiver<TransportMessage>) -> OutboundRequest {
         loop {
-            if let TransportMessage::Outbound(request) = timeout_transport(rx).await {
-                return request;
+            match timeout_transport(rx).await {
+                TransportMessage::Outbound(request) => return request,
+                TransportMessage::SendLinkRequest { request, result_tx } => {
+                    result_tx.send(Ok(())).expect("live Link request owner");
+                    return request;
+                }
+                _ => {}
             }
         }
     }
@@ -10305,6 +10315,7 @@ mod tests {
             .send(DestinationEvent::InboundPacket {
                 raw: Bytes::from(raw),
                 interface_id,
+                interface_owner: None,
                 metrics: Default::default(),
             })
             .await

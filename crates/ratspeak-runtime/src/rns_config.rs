@@ -1,16 +1,12 @@
 //! RNS config file (INI-flavoured) read/write.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use ratspeak_core::config::{
     LEGACY_RNS_INSTANCE_CONTROL_PORT, LEGACY_RNS_SHARED_INSTANCE_PORT,
     RATSPEAK_RNS_INSTANCE_CONTROL_PORT, RATSPEAK_RNS_SHARED_INSTANCE_PORT,
 };
 use serde_json::{Value, json};
-
-static CONFIG_WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Ratspeak's product default for newly added mobile radio interfaces.
 pub const RNODE_NEW_INTERFACE_DEFAULT_MODE: &str = "roaming";
@@ -24,56 +20,95 @@ pub fn read_config(config_dir: &Path) -> Option<String> {
     std::fs::read_to_string(&path).ok()
 }
 
+/// Validate before publication; preserve the prior file in a private, unique backup.
+/// The shared OS lock also serializes app writes with the offline CLI migrator.
 pub fn write_config_result(config_dir: &Path, content: &str) -> std::io::Result<()> {
+    let path = config_dir.join("config");
+    let previous = match std::fs::read_to_string(&path) {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    write_config_if_unchanged(config_dir, previous.as_deref(), content)
+}
+
+fn write_config_if_unchanged(
+    config_dir: &Path,
+    expected: Option<&str>,
+    content: &str,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(config_dir)?;
     let path = config_dir.join("config");
-    let tmp_path = unique_config_tmp_path(config_dir, "write");
-
-    let write_result = (|| {
-        let mut tmp = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
-        tmp.write_all(content.as_bytes())?;
-        tmp.sync_all()?;
-        drop(tmp);
-
-        if path.exists() {
-            std::fs::copy(&path, config_dir.join("config.backup"))?;
-        }
-
-        match std::fs::rename(&tmp_path, &path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                std::fs::copy(&tmp_path, &path)?;
-                std::fs::remove_file(&tmp_path).ok();
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    })();
-
-    if write_result.is_err() {
-        std::fs::remove_file(&tmp_path).ok();
+    let _lock = rns_runtime::config::ifac_lock::ConfigWriteLock::acquire(&path)?;
+    let previous = match std::fs::read_to_string(&path) {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if previous.as_deref() != expected {
+        return Err(std::io::Error::other(
+            "Settings changed; reload before saving.",
+        ));
     }
-    write_result
+    publish_config_locked(config_dir, previous.as_deref(), content)
+}
+
+fn publish_config_locked(
+    config_dir: &Path,
+    previous: Option<&str>,
+    content: &str,
+) -> std::io::Result<()> {
+    rns_runtime::config::ifac::validate_ifac_update(previous, content)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if previous == Some(content) {
+        return Ok(());
+    }
+    if let Some(previous) = previous {
+        let backup = config_dir.join("config.backup");
+        rns_identity::persistence::durable_write(&backup, previous.as_bytes())
+            .map_err(std::io::Error::other)?;
+    }
+    rns_identity::persistence::durable_write(&config_dir.join("config"), content.as_bytes())
+        .map_err(std::io::Error::other)?;
+    Ok(())
 }
 
 pub fn write_config(config_dir: &Path, content: &str) -> bool {
     write_config_result(config_dir, content).is_ok()
 }
 
-fn unique_config_tmp_path(config_dir: &Path, label: &str) -> PathBuf {
-    let unique = CONFIG_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    config_dir.join(format!(
-        ".config.{label}.{}.{}.{unique}.tmp",
-        std::process::id(),
-        nanos,
-    ))
+/// Apply an explicit unit decision only to the source the user inspected.
+pub fn migrate_ifac_units(
+    config_dir: &Path,
+    interface: &str,
+    units: rns_runtime::config::ifac::IfacSourceUnits,
+    expected_source_hash: &[u8; 32],
+) -> std::io::Result<bool> {
+    let path = config_dir.join("config");
+    let _lock = rns_runtime::config::ifac_lock::ConfigWriteLock::acquire(&path)?;
+    let source = std::fs::read_to_string(&path)?;
+    if rns_crypto::sha::sha256(source.as_bytes()) != *expected_source_hash {
+        return Err(std::io::Error::other(
+            "Settings changed. Reload the interface and choose again.",
+        ));
+    }
+    let plan =
+        rns_runtime::config::ifac::plan_ifac_unit_migration(&source, &[interface.into()], units)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if plan.is_unchanged() {
+        return Ok(false);
+    }
+    // Detect an editor that does not participate in our OS lock before replacing.
+    if std::fs::read(&path)? != source.as_bytes() {
+        return Err(std::io::Error::other(
+            "Settings changed. Reload the interface and choose again.",
+        ));
+    }
+    let backup = config_dir.join(format!("config.backup.ifac.{}", uuid::Uuid::new_v4()));
+    rns_identity::persistence::durable_write(&backup, source.as_bytes())
+        .map_err(std::io::Error::other)?;
+    publish_config_locked(config_dir, Some(&source), plan.proposed_config())?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +124,7 @@ pub fn ensure_app_private_shared_instance_ports(
     std::fs::create_dir_all(config_dir)?;
     let path = config_dir.join("config");
     if !path.exists() {
-        write_config_result(config_dir, &ratspeak_default_config(config_dir))?;
+        write_config_if_unchanged(config_dir, None, &ratspeak_default_config(config_dir))?;
         return Ok(RatspeakRnsPortConfigChange::Created);
     }
 
@@ -104,7 +139,7 @@ pub fn ensure_app_private_shared_instance_ports(
         return Ok(RatspeakRnsPortConfigChange::Unchanged);
     }
 
-    write_config_result(config_dir, &updated)?;
+    write_config_if_unchanged(config_dir, Some(&content), &updated)?;
     Ok(RatspeakRnsPortConfigChange::Updated)
 }
 
@@ -118,7 +153,7 @@ pub(crate) fn ensure_app_private_shared_instance(
     std::fs::create_dir_all(config_dir)?;
     let path = config_dir.join("config");
     if !path.exists() {
-        write_config_result(config_dir, &ratspeak_default_config(config_dir))?;
+        write_config_if_unchanged(config_dir, None, &ratspeak_default_config(config_dir))?;
         return Ok(RatspeakRnsPortConfigChange::Created);
     }
 
@@ -136,7 +171,7 @@ pub(crate) fn ensure_app_private_shared_instance(
         return Ok(RatspeakRnsPortConfigChange::Unchanged);
     }
 
-    write_config_result(config_dir, &updated)?;
+    write_config_if_unchanged(config_dir, Some(&content), &updated)?;
     Ok(RatspeakRnsPortConfigChange::Updated)
 }
 
@@ -231,10 +266,12 @@ pub fn strip_legacy_default_auto_interface(content: &str) -> String {
 }
 
 fn interface_block_name(line: &str) -> Option<&str> {
-    line.trim()
+    strip_inline_comment(line)
+        .trim()
         .strip_prefix("[[")
         .and_then(|s| s.strip_suffix("]]"))
         .map(str::trim)
+        .map(unquote_ini_scalar)
 }
 
 fn next_section_header(lines: &[&str], start: usize) -> usize {
@@ -553,7 +590,7 @@ fn parse_ini_key_value(line: &str) -> Option<(String, String)> {
         return None;
     }
     Some((
-        key.to_ascii_lowercase(),
+        unquote_ini_scalar(key).to_ascii_lowercase(),
         unquote_ini_scalar(strip_inline_comment(value).trim()).to_string(),
     ))
 }
@@ -652,114 +689,75 @@ pub fn enabled_rnode_names_with_port_prefix(config_dir: &Path, prefix: &str) -> 
 }
 
 pub fn get_all_interfaces(config_dir: &Path) -> Value {
-    let content = match read_config(config_dir) {
-        Some(c) => c,
-        None => {
-            return json!({
-                "rnode": [],
-                "auto": [],
-                "tcp_client": [],
-                "tcp_server": [],
-                "backbone_client": [],
-                "backbone_server": [],
-            });
-        }
+    use rns_runtime::config::ifac::{IfacConfigError, parse_ifac_size};
+    use rns_runtime::config::{Config, ConfigValue};
+    let mut result = json!({ "rnode": [], "auto": [], "tcp_client": [], "tcp_server": [],
+        "backbone_client": [], "backbone_server": [] });
+    let Some(content) = read_config(config_dir) else {
+        return result;
     };
-
-    let mut rnode = Vec::new();
-    let mut auto = Vec::new();
-    let mut tcp_client = Vec::new();
-    let mut tcp_server = Vec::new();
-    let mut backbone_client = Vec::new();
-    let mut backbone_server = Vec::new();
-
-    let mut current_section: Option<String> = None;
-    let mut current_iface: Option<(String, String, std::collections::HashMap<String, String>)> =
-        None;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+    let Ok(config) = Config::parse(&content) else {
+        result["config_error"] =
+            json!("Configuration syntax is invalid. Correct the file before editing interfaces.");
+        return result;
+    };
+    let source_hash = hex::encode(rns_crypto::sha::sha256(content.as_bytes()));
+    for (name, section) in config.subsections("interfaces") {
+        let kind = section
+            .get("type")
+            .or_else(|| section.get("interface_type"))
+            .unwrap_or("");
+        let group = match kind {
+            "RNodeInterface" => "rnode",
+            "AutoInterface" => "auto",
+            "TCPClientInterface" => "tcp_client",
+            "TCPServerInterface" => "tcp_server",
+            "BackboneInterface" if section.has("target_host") => "backbone_client",
+            "BackboneInterface" => "backbone_server",
+            _ => continue,
+        };
+        let props = section
+            .values
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    match value {
+                        ConfigValue::Scalar(value) => value.clone(),
+                        ConfigValue::List(values) => values.join(","),
+                    },
+                )
+            })
+            .collect();
+        let mut entry = build_interface_entry(name, kind, &props);
+        let object = entry.as_object_mut().expect("interface object");
+        for key in rns_runtime::config::ifac::SIZE_KEYS {
+            object.remove(*key);
         }
-
-        if trimmed.starts_with("[[") && trimmed.ends_with("]]") {
-            if let Some((name, itype, props)) = current_iface.take() {
-                let entry = build_interface_entry(&name, &itype, &props);
-                match itype.as_str() {
-                    "RNodeInterface" => rnode.push(entry),
-                    "AutoInterface" => auto.push(entry),
-                    "TCPClientInterface" => tcp_client.push(entry),
-                    "TCPServerInterface" => tcp_server.push(entry),
-                    "BackboneInterface" => {
-                        if props.contains_key("target_host") {
-                            backbone_client.push(entry);
-                        } else {
-                            backbone_server.push(entry);
-                        }
-                    }
-                    _ => {}
+        match parse_ifac_size(section) {
+            Ok(Some(bytes)) => {
+                object.insert("ifac_size".into(), json!(bytes.to_string()));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                object.insert("ifac_error".into(), json!(error.to_string()));
+                if error == IfacConfigError::IfacUnitsRequired {
+                    let raw = section
+                        .get_uint("ifac_size")
+                        .expect("validated ambiguous integer");
+                    object.insert(
+                        "ifac_migration".into(),
+                        json!({
+                            "source_hash": source_hash, "bytes": raw,
+                            "python_bytes": if raw % 8 == 0 { Some(raw / 8) } else { None },
+                        }),
+                    );
                 }
             }
-
-            let name = trimmed
-                .trim_start_matches("[[")
-                .trim_end_matches("]]")
-                .trim()
-                .to_string();
-            current_section = Some(name.clone());
-            current_iface = None;
-            continue;
         }
-
-        if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[") {
-            let _section = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
-            continue;
-        }
-
-        if let Some((section_name, (key, value))) =
-            current_section.as_ref().zip(parse_key_value(trimmed))
-        {
-            if key == "type" || key == "interface_type" {
-                current_iface = Some((
-                    section_name.clone(),
-                    value.clone(),
-                    std::collections::HashMap::new(),
-                ));
-            }
-            if let Some((_, _, ref mut props)) = current_iface {
-                props.insert(key, value);
-            }
-        }
+        result[group].as_array_mut().unwrap().push(entry);
     }
-
-    if let Some((name, itype, props)) = current_iface {
-        let entry = build_interface_entry(&name, &itype, &props);
-        match itype.as_str() {
-            "RNodeInterface" => rnode.push(entry),
-            "AutoInterface" => auto.push(entry),
-            "TCPClientInterface" => tcp_client.push(entry),
-            "TCPServerInterface" => tcp_server.push(entry),
-            "BackboneInterface" => {
-                if props.contains_key("target_host") {
-                    backbone_client.push(entry);
-                } else {
-                    backbone_server.push(entry);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    json!({
-        "rnode": rnode,
-        "auto": auto,
-        "tcp_client": tcp_client,
-        "tcp_server": tcp_server,
-        "backbone_client": backbone_client,
-        "backbone_server": backbone_server,
-    })
+    result
 }
 
 #[derive(Clone, Debug)]
@@ -1123,7 +1121,7 @@ pub fn remove_interface_checked(config_dir: &Path, name: &str) -> RemoveInterfac
         return RemoveInterfaceOutcome::NotFound;
     }
 
-    match write_config_result(config_dir, &result) {
+    match write_config_if_unchanged(config_dir, Some(&content), &result) {
         Ok(()) => RemoveInterfaceOutcome::Removed,
         Err(_) => RemoveInterfaceOutcome::WriteFailed,
     }
@@ -1140,7 +1138,7 @@ pub fn remove_interfaces(config_dir: &Path, names: &[String]) -> bool {
 
     let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
     let (result, _) = remove_interface_blocks_from_content(&content, &name_refs);
-    write_config(config_dir, &result)
+    write_config_if_unchanged(config_dir, Some(&content), &result).is_ok()
 }
 
 /// Opaque, exact snapshot of one interface block in one config file.
@@ -1255,7 +1253,7 @@ pub fn restore_interface_block_if_revision(
     }
 
     let restored = replace_interface_block_range(&content, &current, &previous.block);
-    match write_config_result(config_dir, &restored) {
+    match write_config_if_unchanged(config_dir, Some(&content), &restored) {
         Ok(()) => InterfaceBlockCasOutcome::Applied,
         Err(_) => InterfaceBlockCasOutcome::WriteFailed,
     }
@@ -1292,7 +1290,7 @@ pub fn remove_interface_block_if_revision(
     }
 
     let updated = replace_interface_block_range(&content, &current, "");
-    match write_config_result(config_dir, &updated) {
+    match write_config_if_unchanged(config_dir, Some(&content), &updated) {
         Ok(()) => InterfaceBlockCasOutcome::Applied,
         Err(_) => InterfaceBlockCasOutcome::WriteFailed,
     }
@@ -1331,7 +1329,7 @@ pub fn set_interface_enabled_if_revision(
         return InterfaceBlockCasOutcome::Applied;
     }
     let updated = replace_interface_block_range(&content, &current, &updated_block);
-    match write_config_result(config_dir, &updated) {
+    match write_config_if_unchanged(config_dir, Some(&content), &updated) {
         Ok(()) => InterfaceBlockCasOutcome::Applied,
         Err(_) => InterfaceBlockCasOutcome::WriteFailed,
     }
@@ -1376,7 +1374,7 @@ pub fn set_rnode_usb_selector_if_revision(
         serial_number,
     );
     let updated = replace_interface_block_range(&content, &current, &updated_block);
-    match write_config_result(config_dir, &updated) {
+    match write_config_if_unchanged(config_dir, Some(&content), &updated) {
         Ok(()) => InterfaceBlockCasOutcome::Applied,
         Err(_) => InterfaceBlockCasOutcome::WriteFailed,
     }
@@ -1392,6 +1390,7 @@ fn unique_interface_block_range(
     content: &str,
     name: &str,
 ) -> Result<Option<InterfaceBlockRange>, ()> {
+    rns_runtime::config::Config::parse(content).map_err(|_| ())?;
     let mut matching = interface_block_ranges(content)
         .into_iter()
         .filter(|(block_name, _)| block_name == name)
@@ -1405,44 +1404,20 @@ fn unique_interface_block_range(
 }
 
 fn interface_block_ranges(content: &str) -> Vec<(String, InterfaceBlockRange)> {
-    let mut ranges = Vec::new();
-    let mut in_interfaces = false;
-    let mut current: Option<(String, usize)> = None;
-    let mut offset = 0usize;
-
-    for segment in content.split_inclusive('\n') {
-        let line = segment
-            .strip_suffix('\n')
-            .unwrap_or(segment)
-            .strip_suffix('\r')
-            .unwrap_or_else(|| segment.strip_suffix('\n').unwrap_or(segment));
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if let Some((name, start)) = current.take() {
-                ranges.push((name, InterfaceBlockRange { start, end: offset }));
-            }
-
-            if trimmed.starts_with("[[") {
-                if in_interfaces && let Some(name) = interface_block_name(line) {
-                    current = Some((name.to_string(), offset));
-                }
-            } else {
-                in_interfaces = named_top_level_section(line, "interfaces");
-            }
-        }
-        offset += segment.len();
-    }
-
-    if let Some((name, start)) = current {
-        ranges.push((
-            name,
-            InterfaceBlockRange {
-                start,
-                end: content.len(),
-            },
-        ));
-    }
-    ranges
+    rns_runtime::config::ifac::section_spans(content)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|span| span.section == "interfaces" && span.path.len() == 1)
+        .map(|span| {
+            (
+                span.path[0].clone(),
+                InterfaceBlockRange {
+                    start: span.range.start,
+                    end: span.range.end,
+                },
+            )
+        })
+        .collect()
 }
 
 fn replace_interface_block_range(
@@ -1574,138 +1549,78 @@ fn inline_comment_start(value: &str) -> Option<usize> {
 }
 
 pub fn set_interface_enabled(config_dir: &Path, name: &str, enabled: bool) -> bool {
-    if !safe_interface_name(name) {
+    let Some(content) = read_config(config_dir) else {
         return false;
-    }
-    let content = match read_config(config_dir) {
-        Some(c) => c,
-        None => return false,
     };
-
-    let lines: Vec<&str> = content.lines().collect();
-    let mut result = Vec::with_capacity(lines.len() + 1);
-    let mut found = false;
-    let enabled_value = if enabled { "true" } else { "false" };
-    let mut i = 0;
-
-    while i < lines.len() {
-        if interface_block_name(lines[i]) == Some(name) {
-            found = true;
-            let end = next_section_header(&lines, i + 1);
-            let mut block = lines[i..end]
-                .iter()
-                .map(|line| (*line).to_string())
-                .collect::<Vec<_>>();
-            let mut saw_enabled_key = false;
-            let mut insert_idx = 1;
-
-            for (idx, line) in block.iter_mut().enumerate().skip(1) {
-                if let Some((key, _)) = parse_ini_key_value(line) {
-                    let key = key.to_string();
-                    if key == "type" || key == "interface_type" {
-                        insert_idx = idx + 1;
-                    }
-                    if key == "enabled" || key == "interface_enabled" {
-                        let indent = line
-                            .chars()
-                            .take_while(|ch| ch.is_whitespace())
-                            .collect::<String>();
-                        *line = format!("{indent}{key} = {enabled_value}");
-                        saw_enabled_key = true;
-                    }
-                }
-            }
-
-            if !saw_enabled_key {
-                block.insert(insert_idx, format!("    enabled = {enabled_value}"));
-            }
-
-            result.extend(block);
-            i = end;
-            continue;
-        }
-
-        result.push(lines[i].to_string());
-        i += 1;
-    }
-
-    if !found {
+    let Ok(sections) = rns_runtime::config::ifac::section_spans(&content) else {
         return false;
+    };
+    let Some(section) = sections
+        .iter()
+        .find(|span| span.section == "interfaces" && span.path == [name])
+    else {
+        return false;
+    };
+    let Ok(properties) = rns_runtime::config::ifac::property_spans(&content) else {
+        return false;
+    };
+    let insertion = properties
+        .iter()
+        .find(|span| {
+            span.section == "interfaces"
+                && span.path == [name]
+                && matches!(span.key.as_str(), "type" | "interface_type")
+        })
+        .map_or(section.header_end, |span| span.range.end);
+    let mut edits = properties
+        .into_iter()
+        .filter(|span| {
+            span.section == "interfaces"
+                && span.path == [name]
+                && matches!(span.key.as_str(), "enabled" | "interface_enabled")
+        })
+        .map(|span| (span.range, format!("    {} = {}\n", span.key, enabled)))
+        .collect::<Vec<_>>();
+    if edits.is_empty() {
+        edits.push((insertion..insertion, format!("    enabled = {}\n", enabled)));
     }
-
-    write_config(config_dir, &join_config_lines(result))
+    let mut updated = content.clone();
+    for (range, replacement) in edits.into_iter().rev() {
+        updated.replace_range(range, &replacement);
+    }
+    write_config_if_unchanged(config_dir, Some(&content), &updated).is_ok()
 }
 
 fn remove_interface_blocks_from_content(content: &str, names: &[&str]) -> (String, bool) {
-    let headers: std::collections::HashSet<String> = names
-        .iter()
-        .filter(|name| !name.trim().is_empty())
-        .map(|name| format!("[[{}]]", name.trim()))
-        .collect();
-    let mut result = String::new();
-    let mut skipping = false;
-    let mut removed = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if skipping && trimmed.starts_with('[') {
-            skipping = false;
-        }
-        if !skipping
-            && trimmed.starts_with("[[")
-            && trimmed.ends_with("]]")
-            && headers.contains(trimmed)
-        {
-            skipping = true;
-            removed = true;
-            continue;
-        }
-        if !skipping {
-            result.push_str(line);
-            result.push('\n');
-        }
+    let mut ranges = interface_block_ranges(content)
+        .into_iter()
+        .filter(|(name, _)| names.contains(&name.as_str()))
+        .map(|(_, range)| range)
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| range.start);
+    let removed = !ranges.is_empty();
+    let mut result = content.to_owned();
+    for range in ranges.into_iter().rev() {
+        result.replace_range(range.start..range.end, "");
     }
-
     (result, removed)
 }
 
-/// Insert `block` inside `[interfaces]`; create the section if missing.
+/// Insert under the authoritative interfaces section, never under a quoted fake header.
 fn insert_interface_block(content: &str, block: &str) -> String {
-    let mut result = String::new();
-    let mut in_interfaces = false;
-    let mut inserted = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        if trimmed == "[interfaces]" {
-            in_interfaces = true;
-            result.push_str(line);
-            result.push('\n');
-            continue;
-        }
-
-        if in_interfaces && trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            if !inserted {
-                result.push_str(block);
-                inserted = true;
-            }
-            in_interfaces = false;
-        }
-
-        result.push_str(line);
-        result.push('\n');
-    }
-
-    if in_interfaces && !inserted {
-        result.push_str(block);
-    }
-
-    if !inserted && !content.contains("[interfaces]") {
+    let Ok(spans) = rns_runtime::config::ifac::section_spans(content) else {
+        return content.to_owned();
+    };
+    let mut result = content.to_owned();
+    if let Some(section) = spans
+        .iter()
+        .find(|span| span.section == "interfaces" && span.path.is_empty())
+    {
+        result.insert_str(section.range.end, block);
+    } else {
         result.push_str("\n[interfaces]\n");
         result.push_str(block);
     }
-
     result
 }
 
@@ -1714,9 +1629,18 @@ fn upsert_interface_block(config_dir: &Path, remove_names: &[&str], block: &str)
         return false;
     }
     let content = read_config(config_dir).unwrap_or_default();
-    let (content, _) = remove_interface_blocks_from_content(&content, remove_names);
-    let new_content = insert_interface_block(&content, block);
-    write_config(config_dir, &new_content)
+    let (without_old, _) = remove_interface_blocks_from_content(&content, remove_names);
+    let new_content = insert_interface_block(&without_old, block);
+    write_config_if_unchanged(
+        config_dir,
+        if config_dir.join("config").exists() {
+            Some(&content)
+        } else {
+            None
+        },
+        &new_content,
+    )
+    .is_ok()
 }
 
 // Full key schema each block generator owns (emitted plus read-side aliases).
@@ -1729,6 +1653,8 @@ const IFAC_OWNED_KEYS: &[&str] = &[
     "passphrase",
     "pass_phrase",
     "ifac_size",
+    "ifac_size_unit",
+    "ifac_size_bytes",
 ];
 const RNODE_OWNED_KEYS: &[&str] = &[
     "port",
@@ -1771,21 +1697,21 @@ const BACKBONE_SERVER_OWNED_KEYS: &[&str] = &[
 
 /// Key lines in `name`'s block that no generator owns, in original order.
 fn unowned_block_lines(content: &str, name: &str, owned_keys: &[&[&str]]) -> Vec<String> {
-    let lines: Vec<&str> = content.lines().collect();
-    let Some(start) = lines
-        .iter()
-        .position(|line| interface_block_name(line) == Some(name))
-    else {
-        return Vec::new();
-    };
-    let end = next_section_header(&lines, start + 1);
-    lines[start + 1..end]
-        .iter()
-        .filter(|line| {
-            parse_ini_key_value(line)
-                .is_some_and(|(key, _)| !owned_keys.iter().any(|set| set.contains(&key.as_str())))
+    rns_runtime::config::ifac::property_spans(content)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|span| {
+            span.section == "interfaces"
+                && span.path == [name]
+                && !owned_keys
+                    .iter()
+                    .any(|keys| keys.contains(&span.key.as_str()))
         })
-        .map(|line| (*line).to_string())
+        .map(|span| {
+            content[span.range]
+                .trim_end_matches(['\r', '\n'])
+                .to_owned()
+        })
         .collect()
 }
 
@@ -1820,12 +1746,12 @@ fn replace_interface_block(
     } else {
         vec![old_name, new_name]
     };
-    let (content, removed_old) = remove_interface_blocks_from_content(&content, &remove_names);
+    let (without_old, removed_old) = remove_interface_blocks_from_content(&content, &remove_names);
     if !removed_old {
         return false;
     }
-    let new_content = insert_interface_block(&content, &block);
-    write_config(config_dir, &new_content)
+    let new_content = insert_interface_block(&without_old, &block);
+    write_config_if_unchanged(config_dir, Some(&content), &new_content).is_ok()
 }
 
 fn rnode_interface_block(args: RnodeInterfaceArgs<'_>) -> String {
@@ -1891,7 +1817,10 @@ fn append_ifac_fields(block: &mut String, ifac: InterfaceIfacArgs<'_>) {
         block.push_str(&format!("    passphrase = {passphrase}\n"));
     }
     if let Some(ifac_size) = ifac.ifac_size {
-        block.push_str(&format!("    ifac_size = {ifac_size}\n"));
+        block.push_str(&format!(
+            "    ifac_size = {}\n    ifac_size_unit = bits\n",
+            ifac_size * 8
+        ));
     }
 }
 
@@ -2330,8 +2259,16 @@ pub fn update_backbone_server_with_ifac(
 }
 
 pub fn set_transport_mode(config_dir: &Path, enable: bool) -> bool {
-    let content = read_config(config_dir).unwrap_or_else(|| ratspeak_default_config(config_dir));
-    write_config(config_dir, &transport_mode_update(&content, enable))
+    let previous = read_config(config_dir);
+    let content = previous
+        .clone()
+        .unwrap_or_else(|| ratspeak_default_config(config_dir));
+    write_config_if_unchanged(
+        config_dir,
+        previous.as_deref(),
+        &transport_mode_update(&content, enable),
+    )
+    .is_ok()
 }
 
 fn transport_mode_update(content: &str, enable: bool) -> String {
@@ -2825,7 +2762,7 @@ mod tests {
         assert_eq!(count_header(&content, "New TCP"), 1);
         assert!(content.contains("network_name = mesh"));
         assert!(content.contains("passphrase = changed"));
-        assert!(content.contains("ifac_size = 8"));
+        assert!(content.contains("ifac_size = 64\n    ifac_size_unit = bits"));
     }
 
     #[test]
@@ -3873,5 +3810,176 @@ mod tests {
             rnode_interface_mode_passthrough(Some(" internal ")),
             "internal"
         );
+    }
+    #[test]
+    fn ifac_listing_uses_authoritative_quoted_keys_before_type_and_never_migrates_on_read() {
+        let dir = temp_config_dir();
+        let original = "[interfaces]\n [[\"Private TCP\"]] # peer\n 'ifac_size' = 16\n network_name = mesh\n type = TCPClientInterface\n note = '''\n [[Fake]]\n ifac_size = 8\n '''\n";
+        std::fs::write(dir.join("config"), original).unwrap();
+        let listing = get_all_interfaces(&dir);
+        let rows = listing["tcp_client"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "Private TCP");
+        assert!(rows[0].get("ifac_size").is_none());
+        assert_eq!(rows[0]["ifac_migration"]["bytes"], 16);
+        assert_eq!(rows[0]["ifac_migration"]["python_bytes"], 2);
+        assert_eq!(read_config(&dir).unwrap(), original);
+    }
+
+    #[test]
+    fn ifac_explicit_migration_preserves_other_ambiguity_backup_and_detects_stale_choice() {
+        use rns_runtime::config::ifac::IfacSourceUnits;
+        let dir = temp_config_dir();
+        let original = "[interfaces]\r\n [[\"First\"]]\r\n ifac_size = 16 # keep\r\n type = TCPClientInterface\r\n [[Second]]\r\n type = TCPClientInterface\r\n ifac_size = 64\r\n";
+        std::fs::write(dir.join("config"), original).unwrap();
+        let hash = rns_crypto::sha::sha256(original.as_bytes());
+        assert!(migrate_ifac_units(&dir, "First", IfacSourceUnits::Bytes, &hash).unwrap());
+        let updated = read_config(&dir).unwrap();
+        assert!(updated.contains("ifac_size = 128 # keep\r\n"));
+        assert!(updated.ends_with(" ifac_size = 64\r\n"));
+        let immutable = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .find(|item| {
+                item.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.backup.ifac.")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read_to_string(&immutable).unwrap(), original);
+        assert!(migrate_ifac_units(&dir, "Second", IfacSourceUnits::Bits, &hash).is_err());
+        assert_eq!(read_config(&dir).unwrap(), updated);
+        let next_hash = rns_crypto::sha::sha256(updated.as_bytes());
+        assert!(!migrate_ifac_units(&dir, "First", IfacSourceUnits::Bytes, &next_hash).unwrap());
+        assert!(migrate_ifac_units(&dir, "Second", IfacSourceUnits::Bits, &next_hash).unwrap());
+        let listing = get_all_interfaces(&dir);
+        assert_eq!(listing["tcp_client"][0]["ifac_size"], "16");
+        assert_eq!(listing["tcp_client"][1]["ifac_size"], "8");
+        assert_eq!(std::fs::read_to_string(&immutable).unwrap(), original);
+    }
+
+    #[test]
+    fn ifac_semantic_errors_block_new_writes_and_enable_but_allow_pause_and_clear() {
+        let dir = temp_config_dir();
+        let original = "[interfaces]\n [[Peer]]\n type = TCPClientInterface\n target_host = peer\n target_port = 4242\n ifac_size = 16\n";
+        assert!(!write_config(&dir, original));
+        std::fs::write(dir.join("config"), original).unwrap();
+        assert!(set_interface_enabled(&dir, "Peer", false));
+        let paused = read_config(&dir).unwrap();
+        assert!(!set_interface_enabled(&dir, "Peer", true));
+        assert_eq!(read_config(&dir).unwrap(), paused);
+        assert!(update_tcp_client_with_ifac(
+            &dir,
+            "Peer",
+            "Peer",
+            "peer",
+            4242,
+            InterfaceIfacArgs::default()
+        ));
+        assert!(!read_config(&dir).unwrap().contains("ifac_size"));
+    }
+
+    #[test]
+    fn ifac_all_editor_families_preserve_bytes_then_clear_quoted_escape_keys() {
+        for kind in [
+            "TCPClientInterface",
+            "TCPServerInterface",
+            "BackboneInterface",
+        ] {
+            for server in [false, true] {
+                if kind != "BackboneInterface" && server {
+                    continue;
+                }
+                for bytes in [8, 16] {
+                    let dir = temp_config_dir();
+                    let original = format!(
+                        "[interfaces]\n [['Old Peer']]\n 'ifac_size_bytes' = {bytes}\n network_name = mesh\n type = {kind}\n custom_note = '''\n [[Not a section]]\n 'ifac_size_unit' = not a declaration\n '''\n"
+                    );
+                    std::fs::write(dir.join("config"), original).unwrap();
+                    for (old, new, size) in [
+                        ("Old Peer", "New Peer", Some(bytes)),
+                        ("New Peer", "New Peer", Some(bytes)),
+                        ("New Peer", "New Peer", None),
+                    ] {
+                        let ifac = InterfaceIfacArgs {
+                            network_name: size.map(|_| "mesh"),
+                            passphrase: None,
+                            ifac_size: size,
+                        };
+                        let ok = match (kind, server) {
+                            ("TCPClientInterface", _) => {
+                                update_tcp_client_with_ifac(&dir, old, new, "peer", 4242, ifac)
+                            }
+                            ("TCPServerInterface", _) => {
+                                update_tcp_server_with_ifac(&dir, old, new, 4242, "0.0.0.0", ifac)
+                            }
+                            (_, true) => update_backbone_server_with_ifac(
+                                &dir, old, new, 4242, "0.0.0.0", false, None, ifac,
+                            ),
+                            _ => update_backbone_client(
+                                &dir,
+                                old,
+                                BackboneClientArgs {
+                                    name: new,
+                                    host: "peer",
+                                    port: 4242,
+                                    prefer_ipv6: false,
+                                    connect_timeout: None,
+                                    max_reconnect_tries: None,
+                                    i2p_tunneled: false,
+                                    ifac,
+                                },
+                            ),
+                        };
+                        assert!(ok, "{kind} server={server} size={size:?}");
+                        let content = read_config(&dir).unwrap();
+                        assert!(content.contains("custom_note = '''\n [[Not a section]]\n 'ifac_size_unit' = not a declaration\n '''"));
+                        let parsed = rns_runtime::config::Config::parse(&content).unwrap();
+                        let section = parsed.subsection("interfaces", new).unwrap();
+                        assert_eq!(
+                            rns_runtime::config::ifac::parse_ifac_size(section).unwrap(),
+                            size
+                        );
+                        assert!(!section.has("ifac_size_bytes"));
+                        assert_eq!(section.has("ifac_size_unit"), size.is_some());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ifac_migration_lock_and_snapshot_prevent_competing_publication() {
+        let dir = temp_config_dir();
+        let source = "[interfaces]\n [[Peer]]\n type = TCPClientInterface\n ifac_size = 16\n";
+        std::fs::write(dir.join("config"), source).unwrap();
+        let lock =
+            rns_runtime::config::ifac_lock::ConfigWriteLock::acquire(&dir.join("config")).unwrap();
+        assert!(
+            migrate_ifac_units(
+                &dir,
+                "Peer",
+                rns_runtime::config::ifac::IfacSourceUnits::Bytes,
+                &rns_crypto::sha::sha256(source.as_bytes())
+            )
+            .is_err()
+        );
+        assert_eq!(read_config(&dir).unwrap(), source);
+        drop(lock);
+        std::fs::write(dir.join("config"), format!("{source}# changed\n")).unwrap();
+        assert!(write_config_if_unchanged(&dir, Some(source), "[interfaces]\n").is_err());
+    }
+
+    #[test]
+    fn ifac_duplicate_syntax_is_not_a_last_wins_interface_list() {
+        let dir = temp_config_dir();
+        let content = "[interfaces]\n [[Peer]]\n type = TCPClientInterface\n ifac_size = 128\n 'ifac_size' = 64\n";
+        std::fs::write(dir.join("config"), content).unwrap();
+        let listing = get_all_interfaces(&dir);
+        assert!(listing.get("config_error").is_some());
+        assert_eq!(listing["tcp_client"].as_array().unwrap().len(), 0);
+        assert!(!set_interface_enabled(&dir, "Peer", true));
+        assert_eq!(read_config(&dir).unwrap(), content);
     }
 }

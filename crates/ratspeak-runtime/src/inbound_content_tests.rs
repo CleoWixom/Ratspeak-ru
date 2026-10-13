@@ -58,20 +58,19 @@ async fn service_only_envelopes_and_replays_have_no_chat_side_effects() {
             let (state, emitter, notifier) = content_pipeline_state();
             let identity = local_identity(&state);
             let signing = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-            let src = [0xd1; 16];
-            register_source_identity(&state, src, &signing);
+            let src = register_source_identity(&state, &signing);
             db::hide_conversation(&state.db, &hex::encode(src), &identity);
-            let mut msg = lxmf_core::message_api::LxMessage::new(
+            let mut msg = lxmf_core::message::LxMessageDraft::new(
                 local_dest(&state),
                 src,
                 "\t ",
                 " \n\t",
                 lxmf_core::message_api::DeliveryMethod::Direct,
-            );
+            ).unwrap();
             if let Some(field) = field {
-                msg.set_field(field, vec![0xc0]);
+                msg.set_field(field, vec![0xc0]).unwrap();
             }
-            msg.sign(&signing).unwrap();
+            let msg = msg.sign(&signing).unwrap().finalize(None).unwrap();
             let wire = msg.pack().unwrap();
             for _ in 0..2 {
                 handle_decrypted_lxmf(&state, wire.clone(), content_source(method)).await;
@@ -102,10 +101,9 @@ async fn telemetry_never_hides_text_titles_or_declared_media() {
             "broken_audio",
         ] {
             let (state, emitter, notifier) = content_pipeline_state();
-            let src = [0xd2; 16];
             let signing = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-            register_source_identity(&state, src, &signing);
-            let mut msg = lxmf_core::message_api::LxMessage::new(
+            let src = register_source_identity(&state, &signing);
+            let mut msg = lxmf_core::message::LxMessageDraft::new(
                 local_dest(&state),
                 src,
                 if kind == "title" {
@@ -119,8 +117,8 @@ async fn telemetry_never_hides_text_titles_or_declared_media() {
                     ""
                 },
                 lxmf_core::message_api::DeliveryMethod::Direct,
-            );
-            msg.set_field(FIELD_TELEMETRY, vec![0x81, 1, 1]);
+            ).unwrap();
+            msg.set_field(FIELD_TELEMETRY, vec![0x81, 1, 1]).unwrap();
             match kind {
                 "file" => {
                     msg.set_file_attachment_field("fixture.txt", b"fixture")
@@ -133,17 +131,17 @@ async fn telemetry_never_hides_text_titles_or_declared_media() {
                     msg.set_audio_field(0xfe, b"future codec").unwrap();
                 }
                 "broken_file" => {
-                    msg.set_field(FIELD_FILE_ATTACHMENTS, vec![0xc0]);
+                    msg.set_field(FIELD_FILE_ATTACHMENTS, vec![0xc0]).unwrap();
                 }
                 "broken_image" => {
-                    msg.set_field(FIELD_IMAGE, vec![0xc0]);
+                    msg.set_field(FIELD_IMAGE, vec![0xc0]).unwrap();
                 }
                 "broken_audio" => {
-                    msg.set_field(FIELD_AUDIO, vec![0xc0]);
+                    msg.set_field(FIELD_AUDIO, vec![0xc0]).unwrap();
                 }
                 _ => {}
             }
-            msg.sign(&signing).unwrap();
+            let msg = msg.sign(&signing).unwrap().finalize(None).unwrap();
             let wire = msg.pack().unwrap();
             handle_decrypted_lxmf(&state, wire.clone(), content_source(method)).await;
             handle_decrypted_lxmf(&state, wire, content_source(method)).await;
@@ -200,9 +198,8 @@ async fn telemetry_never_hides_text_titles_or_declared_media() {
 async fn service_only_signed_ticket_still_learns_and_opportunistic_retries_get_proofs() {
     use rns_transport::messages::{TransportMessage, TransportQueryResponse};
     let (state, emitter, notifier) = content_pipeline_state();
-    let src = [0xd3; 16];
     let signing = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-    register_source_identity(&state, src, &signing);
+    let src = register_source_identity(&state, &signing);
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     set_blackhole_transport(&state, Some(tx));
     let proofs = Arc::new(AtomicU64::new(0));
@@ -222,13 +219,13 @@ async fn service_only_signed_ticket_still_learns_and_opportunistic_retries_get_p
             }
         }
     });
-    let mut msg = lxmf_core::message_api::LxMessage::new(
+    let mut msg = lxmf_core::message::LxMessageDraft::new(
         local_dest(&state),
         src,
         "",
         "",
         lxmf_core::message_api::DeliveryMethod::Opportunistic,
-    );
+    ).unwrap();
     let expiry = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -242,7 +239,7 @@ async fn service_only_signed_ticket_still_learns_and_opportunistic_retries_get_p
     .unwrap();
     msg.set_msgpack_field(lxmf_core::constants::FIELD_TICKET, ticket)
         .unwrap();
-    msg.sign(&signing).unwrap();
+    let msg = msg.sign(&signing).unwrap().finalize(None).unwrap();
     let wire = msg.pack().unwrap();
     let raw = rns_wire::header::PacketHeader {
         flags: rns_wire::flags::PacketFlags {
@@ -292,20 +289,20 @@ async fn content_classification_does_not_bypass_admission_gates_or_rewrite_old_h
     for method in 0..3 {
         for gate in ["signature", "stamp", "blocked"] {
             let (state, emitter, notifier) = content_pipeline_state();
-            let src = [0xd4; 16];
             let signer = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-            register_source_identity(&state, src, &signer);
-            let mut msg = lxmf_core::message_api::LxMessage::new(
+            let src = register_source_identity(&state, &signer);
+            let mut msg = lxmf_core::message::LxMessageDraft::new(
                 local_dest(&state),
                 src,
                 "Title",
                 "",
                 lxmf_core::message_api::DeliveryMethod::Direct,
-            );
-            msg.set_field(lxmf_core::constants::FIELD_TELEMETRY, vec![0xc0]);
-            msg.sign(&signer).unwrap();
+            ).unwrap();
+            msg.set_field(lxmf_core::constants::FIELD_TELEMETRY, vec![0xc0]).unwrap();
+            let msg = msg.sign(&signer).unwrap().finalize(None).unwrap();
+            let mut wire = msg.pack().unwrap();
             match gate {
-                "signature" => msg.signature.as_mut().unwrap()[0] ^= 1,
+                "signature" => wire[32] ^= 1,
                 "stamp" => {
                     state.enforce_stamps.store(true, Ordering::Relaxed);
                     state.required_stamp_cost.store(8, Ordering::Relaxed);
@@ -317,7 +314,7 @@ async fn content_classification_does_not_bypass_admission_gates_or_rewrite_old_h
                     &local_identity(&state),
                 ),
             }
-            handle_decrypted_lxmf(&state, msg.pack().unwrap(), content_source(method)).await;
+            handle_decrypted_lxmf(&state, wire, content_source(method)).await;
             assert_eq!(message_rows(&state), 0, "{method}/{gate}");
             assert_eq!(emitter.count("lxmf_message"), 0);
             assert!(notifier.0.lock().unwrap().is_empty());

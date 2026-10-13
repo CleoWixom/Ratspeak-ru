@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use serde_json::{Value, json};
 
+use lxmf_core::admission::{AdmissionEpochs, DownloadedPropagationMessage, SuppressionLedger};
 use lxmf_core::constants::{
     DELIVERY_RETRY_WAIT, MAX_DELIVERY_ATTEMPTS, MAX_PATHLESS_TRIES, PATH_REQUEST_WAIT,
     STRUCT_OVERHEAD, TIMESTAMP_SIZE,
@@ -23,7 +24,11 @@ use lxmf_core::link_delivery::{
     DeliveryState, DirectLinkStartKind, LxmfDeliveryEvent, LxmfDeliveryEventKind,
     LxmfDeliveryEventMethod, is_retryable_link_delivery_failure,
 };
+use lxmf_core::message::{LxMessageDraft, MessageError, MessageMetadata, SignedLxMessage};
 use lxmf_core::message_api::{DeliveryMethod, DeliveryRepresentation, LxMessage};
+use lxmf_core::propagation_send::{
+    AdvertisedNodePolicy, PropagationEnvelope, propagation_readiness,
+};
 use lxmf_core::router::{
     DirectDeliveryPlan, DirectDeliveryPlanInput, DirectReusableLinkState, DirectRouteSnapshot,
     LxmRouter, OutboundAction, RouterConfig, RouterStateSnapshot, plan_direct_delivery,
@@ -215,36 +220,10 @@ fn chat_map_entry(key: &str, value: rmpv::Value) -> (rmpv::Value, rmpv::Value) {
     (rmpv::Value::String(key.into()), value)
 }
 
-fn chat_string_value(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<String> {
-    map.iter().find_map(|(k, v)| {
-        if k.as_str() == Some(key) {
-            v.as_str().map(ToOwned::to_owned)
-        } else {
-            None
-        }
-    })
-}
-
-// v2 hash extractor: expects rmpv::Value::Binary of exactly 32 bytes and
-// returns a hex string (so the rest of the codebase keeps treating ids
-// as strings). Returns None on any shape mismatch — callers will then
-// drop the message rather than thread it against a garbage target.
-fn chat_hash_value(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<String> {
-    map.iter().find_map(|(k, v)| {
-        if k.as_str() != Some(key) {
-            return None;
-        }
-        match v {
-            rmpv::Value::Binary(bytes) if bytes.len() == 32 => Some(hex::encode(bytes)),
-            _ => None,
-        }
-    })
-}
-
 fn chat_custom_type(msg: &LxMessage) -> Option<&[u8]> {
-    msg.fields
-        .get(&lxmf_core::constants::FIELD_CUSTOM_TYPE)
-        .map(Vec::as_slice)
+    msg.fields()
+        .get(lxmf_core::constants::FIELD_CUSTOM_TYPE)?
+        .as_binary()
 }
 
 // Try to interpret an id string as a 64-char hex-encoded 32-byte hash. Used
@@ -431,7 +410,7 @@ pub fn ratspeak_chat_custom_fields(ext: &RatspeakChatExtension) -> Option<Vec<(u
     if EMIT_LEGACY_REPLY_REACTION_ENVELOPE {
         // Envelope prefers v2 (~32 B saved per hash reference). Fall back to
         // v1 when the ids in `ext` aren't 32-byte hashes — covers the
-        // UUID-id'd-outbound edge case where msg.hash was None at send time.
+        // Historical outbound rows sometimes used UUIDs before receiving a message hash.
         if let Some(payload) = encode_chat_extension_data_v2(ext) {
             fields.push((
                 lxmf_core::constants::FIELD_CUSTOM_TYPE,
@@ -466,113 +445,196 @@ fn standard_hash_hex(bytes: &[u8]) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-// Inbound standard LXMF 1.0.1 fields. Reactions carry no action key — the
-// standard field only expresses adds (removals arrive envelope-only).
-fn decode_standard_chat_fields(msg: &LxMessage) -> Option<RatspeakChatExtension> {
-    if let Some(data) = msg.fields.get(&lxmf_core::constants::FIELD_REACTION) {
-        let value = rmpv::decode::read_value(&mut &data[..]).ok()?;
-        let map = value.as_map()?;
-        let entry = |key: u8| {
-            map.iter()
-                .find_map(|(k, v)| (k.as_u64() == Some(key as u64)).then_some(v))
-        };
-        let target = standard_hash_hex(entry(lxmf_core::constants::REACTION_TO)?.as_slice()?)?;
-        let emoji = msgpack_text_value(entry(lxmf_core::constants::REACTION_CONTENT)?)?;
-        if emoji.is_empty() {
-            return None;
-        }
-        return Some(RatspeakChatExtension::Reaction {
-            target,
-            emoji,
-            action: "add".to_string(),
-        });
-    }
-    let target = standard_hash_hex(msg.fields.get(&lxmf_core::constants::FIELD_REPLY_TO)?)?;
-    let preview = msg
-        .fields
-        .get(&lxmf_core::constants::FIELD_REPLY_QUOTE)
-        .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
-        .unwrap_or_default();
-    Some(RatspeakChatExtension::Reply {
-        target,
-        preview,
-        target_sender: None,
-    })
+// Selected schema fields are borrowed until their final UI projection. Unknown
+// values are structurally scanned, never expanded into an owned MessagePack tree.
+fn chat_field_text(value: lxmf_core::message::FieldValueRef<'_>) -> Option<&str> {
+    value
+        .as_text()
+        .or_else(|| std::str::from_utf8(value.as_binary()?).ok())
 }
 
-pub fn decode_ratspeak_chat_extension(msg: &LxMessage) -> Option<RatspeakChatExtension> {
-    // Standard fields win when both are present (our own dual-emit carries
-    // the same data) and are the only shape standard-only peers send.
-    if let Some(ext) = decode_standard_chat_fields(msg) {
-        return Some(ext);
-    }
-    let custom_type = chat_custom_type(msg)?;
-    if custom_type == LEGACY_RATSPEAK_REACTION_TYPE {
-        let data: serde_json::Value = serde_json::from_str(&msg.content).ok()?;
-        let target = data
-            .get("message_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let emoji = data
-            .get("emoji")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let action = data
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("add")
-            .to_string();
-        if target.is_empty() || emoji.is_empty() {
-            return None;
+fn decode_legacy_reaction_json(bytes: &[u8]) -> Result<RatspeakChatExtension, serde_json::Error> {
+    // Stream this old flat schema. Unknown values are ignored without owned
+    // trees; the small key count and input caps bound duplicate-key bookkeeping.
+    struct LegacyReaction;
+    impl<'de> serde::de::Visitor<'de> for LegacyReaction {
+        type Value = RatspeakChatExtension;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a bounded reaction object with unique keys")
         }
-        return Some(RatspeakChatExtension::Reaction {
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut keys = Vec::<String>::with_capacity(64);
+            let (mut target, mut emoji, mut action) = (None, None, None);
+            while let Some(key) = map.next_key::<String>()? {
+                if keys.len() == 64 || keys.contains(&key) {
+                    return Err(serde::de::Error::custom(
+                        "duplicate or excessive reaction keys",
+                    ));
+                }
+                match key.as_str() {
+                    "message_id" => target = Some(map.next_value::<String>()?),
+                    "emoji" => emoji = Some(map.next_value::<String>()?),
+                    "action" => action = Some(map.next_value::<String>()?),
+                    _ => {
+                        let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                keys.push(key);
+            }
+            Ok(RatspeakChatExtension::Reaction {
+                target: target
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| serde::de::Error::custom("missing reaction target"))?,
+                emoji: emoji
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| serde::de::Error::custom("missing reaction emoji"))?,
+                action: action.unwrap_or_else(|| "add".into()),
+            })
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let reaction = serde::Deserializer::deserialize_map(&mut decoder, LegacyReaction)?;
+    decoder.end()?;
+    Ok(reaction)
+}
+
+/// Validates recognized chat schemas before durable propagation admission. The
+/// compatibility wrapper below still presents malformed extensions as absent
+/// to existing direct-message consumers, which do not grant remote purge rights.
+pub(crate) fn decode_ratspeak_chat_extension_checked(
+    msg: &LxMessage,
+) -> Result<Option<RatspeakChatExtension>, lxmf_core::admission::SuppressionReason> {
+    use lxmf_core::admission::SuppressionReason::{Malformed, TooLarge};
+    use lxmf_core::message::{FieldMapKey, FieldValueRef};
+    if let Some(data) = msg.get_field(lxmf_core::constants::FIELD_REACTION) {
+        let map = data.unique_map().map_err(|_| Malformed)?;
+        let target = map
+            .get(FieldMapKey::Integer(
+                lxmf_core::constants::REACTION_TO.into(),
+            ))
+            .ok_or(Malformed)?;
+        let target = standard_hash_hex(
+            target
+                .as_binary()
+                .or_else(|| target.as_text().map(str::as_bytes))
+                .ok_or(Malformed)?,
+        )
+        .ok_or(Malformed)?;
+        let emoji = chat_field_text(
+            map.get(FieldMapKey::Integer(
+                lxmf_core::constants::REACTION_CONTENT.into(),
+            ))
+            .ok_or(Malformed)?,
+        )
+        .filter(|text| !text.is_empty())
+        .ok_or(Malformed)?
+        .to_owned();
+        return Ok(Some(RatspeakChatExtension::Reaction {
             target,
             emoji,
-            action,
-        });
+            action: "add".into(),
+        }));
     }
-
-    let read_target = if custom_type == RATSPEAK_CHAT_CUSTOM_TYPE_V2 {
-        chat_hash_value
-    } else if custom_type == RATSPEAK_CHAT_CUSTOM_TYPE_V1 {
-        chat_string_value
-    } else {
-        return None;
+    if let Some(target) = msg.get_field(lxmf_core::constants::FIELD_REPLY_TO) {
+        let target = standard_hash_hex(target.as_binary().ok_or(Malformed)?).ok_or(Malformed)?;
+        let preview = match msg.get_field(lxmf_core::constants::FIELD_REPLY_QUOTE) {
+            Some(value) => std::str::from_utf8(value.as_binary().ok_or(Malformed)?)
+                .map_err(|_| Malformed)?
+                .to_owned(),
+            None => String::new(),
+        };
+        return Ok(Some(RatspeakChatExtension::Reply {
+            target,
+            preview,
+            target_sender: None,
+        }));
+    }
+    let Some(custom_type) = chat_custom_type(msg) else {
+        return Ok(None);
     };
-
-    let data = msg.fields.get(&lxmf_core::constants::FIELD_CUSTOM_DATA)?;
-    let value = rmpv::decode::read_value(&mut &data[..]).ok()?;
-    let map = value.as_map()?;
-    let kind = chat_string_value(map, "kind")?;
-    match kind.as_str() {
+    if custom_type == LEGACY_RATSPEAK_REACTION_TYPE {
+        // This historical JSON shape only contains short reaction metadata.
+        // Its separate input and key-count caps bound the streaming decoder.
+        const MAX_LEGACY_REACTION_JSON_BYTES: usize = 4096;
+        if msg.content_bytes().len() > MAX_LEGACY_REACTION_JSON_BYTES {
+            return Err(TooLarge);
+        }
+        return decode_legacy_reaction_json(msg.content_bytes())
+            .map(Some)
+            .map_err(|_| Malformed);
+    }
+    let v2 = custom_type == RATSPEAK_CHAT_CUSTOM_TYPE_V2;
+    if !v2 && custom_type != RATSPEAK_CHAT_CUSTOM_TYPE_V1 {
+        return Ok(None);
+    }
+    let data = msg
+        .get_field(lxmf_core::constants::FIELD_CUSTOM_DATA)
+        .and_then(|value| value.as_binary())
+        .ok_or(Malformed)?;
+    let map = FieldValueRef::from_encoded(data)
+        .and_then(|value| value.unique_map())
+        .map_err(|_| Malformed)?;
+    let text = |key| {
+        map.get(FieldMapKey::Text(key))
+            .and_then(|value| value.as_text())
+    };
+    let target = |key| {
+        let value = map.get(FieldMapKey::Text(key)).ok_or(Malformed)?;
+        if v2 {
+            value
+                .as_binary()
+                .filter(|bytes| bytes.len() == 32)
+                .map(hex::encode)
+                .ok_or(Malformed)
+        } else {
+            value
+                .as_text()
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .ok_or(Malformed)
+        }
+    };
+    let optional_text = |key| match map.get(FieldMapKey::Text(key)) {
+        Some(value) => value.as_text().map(str::to_owned).ok_or(Malformed),
+        None => Ok(String::new()),
+    };
+    match text("kind").ok_or(Malformed)? {
         "reaction" => {
-            let target = read_target(map, "target")?;
-            let emoji = chat_string_value(map, "emoji")?;
-            let action = chat_string_value(map, "action").unwrap_or_else(|| "add".to_string());
-            if target.is_empty() || emoji.is_empty() {
-                return None;
-            }
-            Some(RatspeakChatExtension::Reaction {
+            let target = target("target")?;
+            let emoji = text("emoji")
+                .filter(|text| !text.is_empty())
+                .ok_or(Malformed)?
+                .to_owned();
+            let action = match map.get(FieldMapKey::Text("action")) {
+                Some(value) => value.as_text().ok_or(Malformed)?.to_owned(),
+                None => "add".into(),
+            };
+            Ok(Some(RatspeakChatExtension::Reaction {
                 target,
                 emoji,
                 action,
-            })
+            }))
         }
         "reply" => {
-            let target = read_target(map, "target")?;
-            if target.is_empty() {
-                return None;
-            }
-            Some(RatspeakChatExtension::Reply {
-                target,
-                preview: chat_string_value(map, "preview").unwrap_or_default(),
-                target_sender: read_target(map, "target_sender"),
-            })
+            let target_sender = map
+                .get(FieldMapKey::Text("target_sender"))
+                .map(|_| target("target_sender"))
+                .transpose()?;
+            Ok(Some(RatspeakChatExtension::Reply {
+                target: target("target")?,
+                preview: optional_text("preview")?,
+                target_sender,
+            }))
         }
-        _ => None,
+        _ => Ok(None),
     }
+}
+
+pub fn decode_ratspeak_chat_extension(msg: &LxMessage) -> Option<RatspeakChatExtension> {
+    decode_ratspeak_chat_extension_checked(msg).ok().flatten()
 }
 
 fn direct_link_start_step(kind: DirectLinkStartKind) -> &'static str {
@@ -703,12 +765,43 @@ pub fn delivery_method_name(method: DeliveryMethod) -> &'static str {
     }
 }
 
-fn message_within_resource_limit(msg: &LxMessage) -> bool {
-    match msg.pack() {
-        Ok(packed) if packed.len() <= MAX_LXMF_RESOURCE_BYTES => true,
+trait OutboundMessageView: std::ops::DerefMut<Target = MessageMetadata> {
+    fn destination_hash(&self) -> [u8; 16];
+    fn message_id(&self) -> [u8; 32];
+    fn packed_len(&self) -> Result<usize, MessageError>;
+}
+impl OutboundMessageView for LxMessage {
+    fn destination_hash(&self) -> [u8; 16] {
+        self.destination_hash()
+    }
+    fn message_id(&self) -> [u8; 32] {
+        self.message_id()
+    }
+    fn packed_len(&self) -> Result<usize, MessageError> {
+        self.packed_len()
+    }
+}
+impl OutboundMessageView for SignedLxMessage {
+    fn destination_hash(&self) -> [u8; 16] {
+        self.destination_hash()
+    }
+    fn message_id(&self) -> [u8; 32] {
+        self.message_id()
+    }
+    fn packed_len(&self) -> Result<usize, MessageError> {
+        self.packed_len().and_then(|n| {
+            n.checked_add(MAX_DEFERRED_STAMP_WIRE_BYTES)
+                .ok_or_else(|| MessageError::PackFailed("wire size overflow".into()))
+        })
+    }
+}
+
+fn message_within_resource_limit(msg: &impl OutboundMessageView) -> bool {
+    match msg.packed_len() {
+        Ok(packed) if packed <= MAX_LXMF_RESOURCE_BYTES => true,
         Ok(packed) => {
             tracing::warn!(
-                packed_len = packed.len(),
+                packed_len = packed,
                 max_len = MAX_LXMF_RESOURCE_BYTES,
                 "LXMF message exceeds RNS resource limit"
             );
@@ -770,13 +863,11 @@ fn validate_audio_message_size(actual_bytes: usize) -> Result<(), LxmfSubmission
     Ok(())
 }
 
-fn normalize_protocol_delivery_method(msg: &mut LxMessage) {
+fn normalize_protocol_delivery_method(msg: &mut impl OutboundMessageView) {
     if msg.method == DeliveryMethod::Opportunistic
-        && let Ok(packed) = msg.pack_payload()
+        && let Ok(packed_len) = msg.packed_len()
     {
-        let content_size = packed
-            .len()
-            .saturating_sub(TIMESTAMP_SIZE + STRUCT_OVERHEAD);
+        let content_size = packed_len.saturating_sub(96 + TIMESTAMP_SIZE + STRUCT_OVERHEAD);
         if content_size > OPPORTUNISTIC_MAX_CONTENT_BYTES {
             msg.method = DeliveryMethod::Direct;
         }
@@ -1048,6 +1139,74 @@ pub(crate) enum BackchannelLinkEvent {
     },
 }
 
+/// Captured briefly under manager ownership; decrypt in the bounded blocking
+/// admission worker. Secret snapshots are zeroized when the owner exits.
+pub struct PropagationDecryptContext {
+    identity: Identity,
+    destination: [u8; 16],
+    ratchets: zeroize::Zeroizing<Vec<[u8; 32]>>,
+}
+impl PropagationDecryptContext {
+    pub fn decrypt(&self, data: &[u8]) -> Option<Vec<u8>> {
+        if data.len() < 17 || data[..16] != self.destination {
+            return None;
+        }
+        let refs = self.ratchets.iter().collect::<Vec<_>>();
+        let plaintext = self
+            .identity
+            .decrypt(
+                &data[16..],
+                (!refs.is_empty()).then_some(refs.as_slice()),
+                false,
+            )
+            .ok()?;
+        let mut full = Vec::with_capacity(16 + plaintext.len());
+        full.extend_from_slice(&self.destination);
+        full.extend_from_slice(&plaintext);
+        Some(full)
+    }
+}
+
+#[derive(Clone)]
+pub struct DownloadSuppressionSnapshot {
+    pub identity: [u8; 16],
+    pub node: [u8; 16],
+    pub ledger: SuppressionLedger,
+    pub epochs: AdmissionEpochs,
+    revision: u64,
+    client_revision: u64,
+}
+struct InstalledDownloadState {
+    node: [u8; 16],
+    ledger: SuppressionLedger,
+    epochs: AdmissionEpochs,
+    haves: Vec<lxmf_core::admission::DurableHave>,
+}
+
+enum PreparedPropagation {
+    Pending,
+    Ready(Vec<u8>),
+    Failed(MessageError),
+}
+struct PendingPropagationEnvelope {
+    binding: [u8; 32],
+    cost: u8,
+    result: oneshot::Receiver<Result<PropagationEnvelope, MessageError>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for PendingPropagationEnvelope {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+fn propagation_preparation_slots() -> Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+        .clone()
+}
+
 pub struct LxmfManager {
     pub identity: Identity,
     /// True when `identity` is backed by a hardware token (PIV). Gates features
@@ -1116,6 +1275,10 @@ pub struct LxmfManager {
     pub client_propagation_enabled: bool,
     pub configured_propagation_node: Option<[u8; 16]>,
     propagation_transfer_limits_kb: HashMap<[u8; 16], u64>,
+    propagation_node_policies: HashMap<[u8; 16], AdvertisedNodePolicy>,
+    propagation_envelopes: HashMap<[u8; 32], PropagationEnvelope>,
+    pending_propagation_envelopes: HashMap<[u8; 32], PendingPropagationEnvelope>,
+    propagation_preparation_tasks: Vec<tokio::task::JoinHandle<()>>,
     last_ratchet_clean: f64,
     last_router_cull: f64,
     pub received_ratchets_dir: PathBuf,
@@ -1130,7 +1293,10 @@ pub struct LxmfManager {
     failed_propagation_deposits: Vec<([u8; 16], String)>,
     completed_propagation_syncs: Vec<[u8; 16]>,
     failed_propagation_syncs: Vec<([u8; 16], String)>,
-    downloaded_propagation_messages: Vec<Vec<u8>>,
+    downloaded_propagation_messages: Vec<DownloadedPropagationMessage>,
+    download_state: Option<InstalledDownloadState>,
+    download_suppression_revision: u64,
+    last_propagation_admission: lxmf_core::propagation_client::PropagationAdmissionCounts,
     delivery_progress_updates: Vec<LxmfDeliveryProgressUpdate>,
     delivery_failure_updates: Vec<LxmfDeliveryFailureUpdate>,
     ephemeral_outbound: HashSet<[u8; 32]>,
@@ -1153,7 +1319,7 @@ pub struct KnownIdentitiesSnapshot {
 
 impl KnownIdentitiesSnapshot {
     pub fn persist(&self) -> std::io::Result<()> {
-        rns_identity::persistence::atomic_write(&self.path, &self.bytes)
+        lxmf_core::persist::write_file_atomic(&self.path, &self.bytes)
     }
 }
 
@@ -1164,12 +1330,14 @@ pub struct LxmfCheckpointSnapshot {
     known_identities: KnownIdentitiesSnapshot,
     router_state: RouterStateSnapshot,
     router_state_dir: PathBuf,
+    node_policies: HashMap<[u8; 16], AdvertisedNodePolicy>,
 }
 
 impl LxmfCheckpointSnapshot {
     pub fn persist(&self) -> std::io::Result<()> {
         self.known_identities.persist()?;
-        self.router_state.save_state(&self.router_state_dir)
+        self.router_state.save_state(&self.router_state_dir)?;
+        lxmf_core::persist::save_node_policies(&self.router_state_dir, &self.node_policies)
     }
 
     pub fn known_identities_count(&self) -> usize {
@@ -1185,6 +1353,7 @@ pub struct LxmfPersistenceDelta {
     known_identities: Option<KnownIdentitiesSnapshot>,
     received_ratchets: Vec<(String, PathBuf, ReceivedRatchet)>,
     router_state: Option<(PathBuf, RouterStateSnapshot)>,
+    node_policies: Option<(PathBuf, HashMap<[u8; 16], AdvertisedNodePolicy>)>,
 }
 
 impl LxmfPersistenceDelta {
@@ -1192,17 +1361,21 @@ impl LxmfPersistenceDelta {
         self.known_identities.is_none()
             && self.received_ratchets.is_empty()
             && self.router_state.is_none()
+            && self.node_policies.is_none()
     }
 
     pub fn persist(&self) -> std::io::Result<()> {
         for (_, path, ratchet) in &self.received_ratchets {
-            ratchet.save(path)?;
+            ratchet.save_durable(path)?;
         }
         if let Some(snapshot) = self.known_identities.as_ref() {
             snapshot.persist()?;
         }
         if let Some((path, snapshot)) = self.router_state.as_ref() {
             snapshot.save_state(path)?;
+        }
+        if let Some((path, policies)) = &self.node_policies {
+            lxmf_core::persist::save_node_policies(path, policies)?;
         }
         Ok(())
     }
@@ -1211,6 +1384,7 @@ impl LxmfPersistenceDelta {
         usize::from(self.known_identities.is_some())
             + self.received_ratchets.len()
             + usize::from(self.router_state.is_some())
+            + usize::from(self.node_policies.is_some())
     }
 
     fn persisted_ratchets(&self) -> impl Iterator<Item = (&str, ReceivedRatchet)> {
@@ -1266,21 +1440,32 @@ fn load_hwid_identity(
     )
 }
 
+fn bounded_plain_identity_from_file(
+    path: &Path,
+) -> Result<Identity, Box<dyn std::error::Error + Send + Sync>> {
+    let key = crate::vault::read_plain_identity_key(path)?;
+    Ok(Identity::from_private_key(key.as_ref())?)
+}
+
 /// Load a passcode-protected software identity from its `identity.enc` vault.
 /// `passcode` is the user's passcode (None when still locked).
 fn load_encrypted_identity(
     enc_file: &Path,
     hash: &str,
     passcode: Option<&str>,
+    job: Option<&crate::vault::VaultJob>,
 ) -> Result<Identity, Box<dyn std::error::Error + Send + Sync>> {
     let vault = crate::vault::read_vault(enc_file)
         .map_err(|e| format!("invalid identity.enc for {hash}: {e}"))?;
     let passcode =
         passcode.ok_or_else(|| "identity is locked (no passcode provided)".to_string())?;
-    let key = crate::vault::decrypt_key(passcode, &vault)
-        .map_err(|e| format!("passcode unlock failed: {e}"))?;
+    let unlocked = match job {
+        Some(job) => job.decrypt_identity(passcode, &vault),
+        None => crate::vault::decrypt_identity(passcode, &vault),
+    }
+    .map_err(|e| format!("passcode unlock failed: {e}"))?;
     tracing::info!(identity = %crate::short_id(hash), "loading passcode-protected identity");
-    Ok(Identity::from_private_key(key.as_ref())?)
+    Ok(Identity::from_private_key(unlocked.key())?)
 }
 
 fn received_ratchet_hash_from_path(path: &Path) -> Option<&str> {
@@ -1336,7 +1521,7 @@ fn hwid_contact_card_public_key(_data_dir: &Path, _hash_hex: &str) -> Option<[u8
 }
 
 fn apply_lrgp_fields_to_message(
-    message: &mut LxMessage,
+    message: &mut LxMessageDraft,
     fields: &std::collections::HashMap<u8, rmpv::Value>,
 ) -> Result<(), String> {
     for (&field_id, value) in fields {
@@ -1362,6 +1547,15 @@ impl LxmfManager {
         preferred_identity_hash: Option<&str>,
         hw_pin: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::load_or_create_with_vault_job(data_dir, preferred_identity_hash, hw_pin, None)
+    }
+
+    pub(crate) fn load_or_create_with_vault_job(
+        data_dir: &Path,
+        preferred_identity_hash: Option<&str>,
+        hw_pin: Option<String>,
+        job: Option<&crate::vault::VaultJob>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if preferred_identity_hash
             .filter(|hash| !hash.is_empty())
             .is_some_and(|hash| !crate::helpers::is_protocol_hash_16(hash))
@@ -1385,12 +1579,12 @@ impl LxmfManager {
                 load_hwid_identity(&hwid_file, hash, hw_pin.as_deref())?
             } else if enc_file.exists() {
                 // Passcode-protected software identity; `hw_pin` carries the passcode.
-                load_encrypted_identity(&enc_file, hash, hw_pin.as_deref())?
+                load_encrypted_identity(&enc_file, hash, hw_pin.as_deref(), job)?
             } else if id_file.exists() {
                 tracing::info!(identity = %crate::short_id(hash), "Loading active identity from profile");
-                Identity::from_file(&id_file)?
+                bounded_plain_identity_from_file(&id_file)?
             } else if legacy_path.exists() {
-                let id = Identity::from_file(&legacy_path)?;
+                let id = bounded_plain_identity_from_file(&legacy_path)?;
                 let legacy_hash = hex::encode(id.hash);
                 if legacy_hash == hash {
                     let id_dir = identities_dir.join(hash);
@@ -1405,7 +1599,7 @@ impl LxmfManager {
             }
         } else if legacy_path.exists() {
             tracing::info!("Loading identity from legacy profile");
-            Identity::from_file(&legacy_path)?
+            bounded_plain_identity_from_file(&legacy_path)?
         } else {
             let mut found = None;
             if identities_dir.is_dir()
@@ -1414,7 +1608,7 @@ impl LxmfManager {
                 for entry in entries.flatten() {
                     let id_file = entry.path().join("identity");
                     if id_file.exists() {
-                        found = Some(Identity::from_file(&id_file)?);
+                        found = Some(bounded_plain_identity_from_file(&id_file)?);
                         break;
                     }
                 }
@@ -1552,6 +1746,12 @@ impl LxmfManager {
             "Crypto state loaded"
         );
 
+        let propagation_node_policies =
+            lxmf_core::persist::load_node_policies(&lxmf_storage).unwrap_or_default();
+        let propagation_transfer_limits_kb = propagation_node_policies
+            .iter()
+            .map(|(node, p)| (*node, p.transfer_limit_kb as u64))
+            .collect();
         let (backchannel_abandon_tx, backchannel_abandon_rx) = mpsc::channel(256);
         Ok(Self {
             identity,
@@ -1611,7 +1811,11 @@ impl LxmfManager {
             last_router_cull: 0.0,
             client_propagation_enabled: false,
             configured_propagation_node: None,
-            propagation_transfer_limits_kb: HashMap::new(),
+            propagation_transfer_limits_kb,
+            propagation_node_policies,
+            propagation_envelopes: HashMap::new(),
+            pending_propagation_envelopes: HashMap::new(),
+            propagation_preparation_tasks: Vec::new(),
             last_ratchet_clean: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1624,6 +1828,9 @@ impl LxmfManager {
             completed_propagation_syncs: Vec::new(),
             failed_propagation_syncs: Vec::new(),
             downloaded_propagation_messages: Vec::new(),
+            download_state: None,
+            download_suppression_revision: 0,
+            last_propagation_admission: Default::default(),
             delivery_progress_updates: Vec::new(),
             delivery_failure_updates: Vec::new(),
             ephemeral_outbound: HashSet::new(),
@@ -1897,7 +2104,7 @@ impl LxmfManager {
 
     fn apply_peer_lxmf_compression_support(
         &self,
-        msg: &mut LxMessage,
+        msg: &mut MessageMetadata,
         db_pool: Option<&DbPool>,
         dest_hash_hex: &str,
     ) {
@@ -1936,7 +2143,7 @@ impl LxmfManager {
         content: &str,
         title: &str,
         delivery_method: DeliveryMethod,
-    ) -> Option<LxMessage> {
+    ) -> Option<SignedLxMessage> {
         self.create_message_with_custom_fields(dest_hash_hex, content, title, delivery_method, &[])
     }
 
@@ -1947,7 +2154,7 @@ impl LxmfManager {
         title: &str,
         delivery_method: DeliveryMethod,
         custom_fields: &[(u8, Vec<u8>)],
-    ) -> Option<LxMessage> {
+    ) -> Option<SignedLxMessage> {
         let dest_bytes = hex::decode(dest_hash_hex).ok()?;
         if dest_bytes.len() != 16 {
             return None;
@@ -1955,7 +2162,8 @@ impl LxmfManager {
         let mut dest = [0u8; 16];
         dest.copy_from_slice(&dest_bytes);
 
-        let mut msg = LxMessage::new(dest, self.lxmf_dest_hash, title, content, delivery_method);
+        let mut msg =
+            LxMessageDraft::new(dest, self.lxmf_dest_hash, title, content, delivery_method).ok()?;
         self.apply_peer_lxmf_compression_support(&mut msg, None, dest_hash_hex);
 
         msg.include_ticket = true;
@@ -1966,23 +2174,15 @@ impl LxmfManager {
             if *field_id == lxmf_core::constants::FIELD_REACTION {
                 msg.set_msgpack_field(*field_id, bytes.clone()).ok()?;
             } else {
-                msg.set_field(*field_id, bytes.clone());
+                msg.set_field(*field_id, bytes.clone()).ok()?;
             }
         }
 
-        self.router.prepare_outbound(&mut msg).ok()?;
-
-        // Sign with Ed25519 seed (second half of identity private key).
-        if let Some(prv_key) = self.identity.get_private_key() {
-            let mut ed_seed = [0u8; 32];
-            ed_seed.copy_from_slice(&prv_key[32..64]);
-            let signing_key = rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&ed_seed);
-            msg.sign(&signing_key).ok()?;
-        }
-
-        msg.compute_hash().ok()?;
-
-        Some(msg)
+        let intent = self.router.prepare_outbound(&mut msg).ok()?;
+        intent.persist(&self.lxmf_storage_dir, &mut msg).ok()?;
+        let identity = self.identity.clone();
+        msg.sign_with(|bytes| identity.sign(bytes).ok_or("identity signing unavailable"))
+            .ok()
     }
 
     pub fn send_message(
@@ -2136,21 +2336,18 @@ impl LxmfManager {
             return None;
         }
 
-        let msg_id = msg
-            .hash
-            .map(hex::encode)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let msg_id = hex::encode(msg.message_id());
         let display_timestamp = db::next_conversation_observed_timestamp(
             db_pool,
             dest_hash_hex,
             identity_id,
-            msg.timestamp,
+            msg.timestamp(),
         );
 
         self.preempt_opportunistic_path(&mut msg);
         let auto_fallback = Self::auto_live_fallback_hash(&msg, preference);
         let method = msg.method;
-        self.router.try_send(msg).ok()?;
+        self.router.submit_signed(msg).ok()?;
         self.auto_live_fallback.extend(auto_fallback);
         if preference == DeliveryPreference::Auto && profile == DeliveryProfile::Message {
             self.live_preparation.auto_messages.extend(auto_fallback);
@@ -2200,11 +2397,9 @@ impl LxmfManager {
         if msg.method != DeliveryMethod::Opportunistic || !message_within_resource_limit(&msg) {
             return false;
         }
-        if let Some(hash) = msg.hash {
-            self.ephemeral_outbound.insert(hash);
-        }
+        self.ephemeral_outbound.insert(msg.message_id());
         self.preempt_opportunistic_path(&mut msg);
-        self.router.try_send(msg).is_ok()
+        self.router.submit_signed(msg).is_ok()
     }
 
     /// FIELD_FILE_ATTACHMENTS 0x05 = msgpack `[[filename, bytes]]`.
@@ -2266,7 +2461,8 @@ impl LxmfManager {
             preference,
             DeliveryProfile::Attachment,
         );
-        let mut msg = LxMessage::new(dest, self.lxmf_dest_hash, title, content, method);
+        let mut msg = LxMessageDraft::new(dest, self.lxmf_dest_hash, title, content, method)
+            .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         self.apply_peer_lxmf_compression_support(&mut msg, Some(db_pool), dest_hash_hex);
 
         if is_image {
@@ -2283,20 +2479,24 @@ impl LxmfManager {
         }
 
         msg.include_ticket = true;
-        self.router
+        let intent = self
+            .router
             .prepare_outbound(&mut msg)
             .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
-        if let Some(prv_key) = self.identity.get_private_key() {
-            let mut ed_seed = [0u8; 32];
-            ed_seed.copy_from_slice(&prv_key[32..64]);
-            let signing_key = rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&ed_seed);
-            msg.sign(&signing_key)
-                .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
-        }
+        intent
+            .persist(&self.lxmf_storage_dir, &mut msg)
+            .map_err(|_| LxmfSubmissionFailure::StorageFailed)?;
+        let identity = self.identity.clone();
+        let mut msg = msg
+            .sign_with(|bytes| identity.sign(bytes).ok_or("identity signing unavailable"))
+            .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         normalize_protocol_delivery_method(&mut msg);
         let packed_len = msg
             .packed_len()
             .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
+        let packed_len = packed_len
+            .checked_add(MAX_DEFERRED_STAMP_WIRE_BYTES)
+            .ok_or(LxmfSubmissionFailure::PreparationFailed)?;
         if let Err(error) = validate_attachment_envelope_size(packed_len) {
             tracing::warn!(
                 packed_len,
@@ -2306,15 +2506,12 @@ impl LxmfManager {
             return Err(error);
         }
 
-        let msg_id = msg
-            .hash
-            .map(hex::encode)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let msg_id = hex::encode(msg.message_id());
         let display_timestamp = db::next_conversation_observed_timestamp(
             db_pool,
             dest_hash_hex,
             identity_id,
-            msg.timestamp,
+            msg.timestamp(),
         );
 
         self.preempt_opportunistic_path(&mut msg);
@@ -2360,7 +2557,7 @@ impl LxmfManager {
             return Err(LxmfSubmissionFailure::StorageFailed);
         }
 
-        if self.router.try_send(msg).is_err() {
+        if self.router.submit_signed(msg).is_err() {
             let _ = db::delete_message_for_identity(db_pool, &msg_id, identity_id);
             let _ = std::fs::remove_file(self.files_dir().join(&stored_name));
             return Err(LxmfSubmissionFailure::PreparationFailed);
@@ -2420,26 +2617,28 @@ impl LxmfManager {
             preference,
             DeliveryProfile::Attachment,
         );
-        let mut msg = LxMessage::new(dest, self.lxmf_dest_hash, title, content, method);
+        let mut msg = LxMessageDraft::new(dest, self.lxmf_dest_hash, title, content, method)
+            .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         self.apply_peer_lxmf_compression_support(&mut msg, Some(db_pool), dest_hash_hex);
         msg.set_audio_field(audio_mode, audio_bytes)
             .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         debug_assert!(
-            !msg.fields
-                .contains_key(&lxmf_core::constants::FIELD_FILE_ATTACHMENTS)
+            msg.get_field(lxmf_core::constants::FIELD_FILE_ATTACHMENTS)
+                .is_none()
         );
 
         msg.include_ticket = true;
-        self.router
+        let intent = self
+            .router
             .prepare_outbound(&mut msg)
             .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
-        if let Some(prv_key) = self.identity.get_private_key() {
-            let mut ed_seed = [0u8; 32];
-            ed_seed.copy_from_slice(&prv_key[32..64]);
-            let signing_key = rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&ed_seed);
-            msg.sign(&signing_key)
-                .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
-        }
+        intent
+            .persist(&self.lxmf_storage_dir, &mut msg)
+            .map_err(|_| LxmfSubmissionFailure::StorageFailed)?;
+        let identity = self.identity.clone();
+        let mut msg = msg
+            .sign_with(|bytes| identity.sign(bytes).ok_or("identity signing unavailable"))
+            .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         normalize_protocol_delivery_method(&mut msg);
         let packed_len = msg
             .packed_len()
@@ -2455,15 +2654,12 @@ impl LxmfManager {
             });
         }
 
-        let msg_id = msg
-            .hash
-            .map(hex::encode)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let msg_id = hex::encode(msg.message_id());
         let display_timestamp = db::next_conversation_observed_timestamp(
             db_pool,
             dest_hash_hex,
             identity_id,
-            msg.timestamp,
+            msg.timestamp(),
         );
 
         self.preempt_opportunistic_path(&mut msg);
@@ -2507,7 +2703,7 @@ impl LxmfManager {
             return Err(LxmfSubmissionFailure::StorageFailed);
         }
 
-        if self.router.try_send(msg).is_err() {
+        if self.router.submit_signed(msg).is_err() {
             let _ = db::delete_message_for_identity(db_pool, &msg_id, identity_id);
             let _ = std::fs::remove_file(self.files_dir().join(&stored_name));
             return Err(LxmfSubmissionFailure::PreparationFailed);
@@ -2586,7 +2782,8 @@ impl LxmfManager {
 
         let method =
             self.pick_delivery_method(db_pool, dest_hash_hex, preference, DeliveryProfile::Lrgp);
-        let mut msg = LxMessage::new(dest, self.lxmf_dest_hash, "", fallback_text, method);
+        let mut msg =
+            LxMessageDraft::new(dest, self.lxmf_dest_hash, "", fallback_text, method).ok()?;
         self.apply_peer_lxmf_compression_support(&mut msg, Some(db_pool), dest_hash_hex);
 
         if let Err(error) = apply_lrgp_fields_to_message(&mut msg, lrgp_fields) {
@@ -2600,46 +2797,31 @@ impl LxmfManager {
         }
 
         msg.include_ticket = true;
-        self.router.prepare_outbound(&mut msg).ok()?;
-        if let Some(prv_key) = self.identity.get_private_key() {
-            let mut ed_seed = [0u8; 32];
-            ed_seed.copy_from_slice(&prv_key[32..64]);
-            let signing_key = rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&ed_seed);
-            if msg.sign(&signing_key).is_err() {
-                tracing::warn!(
-                    target: "ttt_trace",
-                    step = "lxmf_send.sign_fail",
-                    dest = %dest_short,
-                    reason = "sign_failed",
-                    "message signing failed"
-                );
-                return None;
-            }
-        }
+        let intent = self.router.prepare_outbound(&mut msg).ok()?;
+        intent.persist(&self.lxmf_storage_dir, &mut msg).ok()?;
+        let identity = self.identity.clone();
+        let mut msg = msg
+            .sign_with(|bytes| identity.sign(bytes).ok_or("identity signing unavailable"))
+            .ok()?;
         normalize_protocol_delivery_method(&mut msg);
         if !message_within_resource_limit(&msg) {
             return None;
         }
 
-        let msg_hash_some = msg.hash.is_some();
-        let msg_id = msg
-            .hash
-            .map(hex::encode)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let msg_id = hex::encode(msg.message_id());
 
         // LRGP payloads not persisted to messages; game session is the surface.
         let _ = (db_pool, identity_id, fallback_text);
 
         self.preempt_opportunistic_path(&mut msg);
         let auto_fallback = Self::auto_live_fallback_hash(&msg, preference);
-        self.router.try_send(msg).ok()?;
+        self.router.submit_signed(msg).ok()?;
         self.auto_live_fallback.extend(auto_fallback);
         let msg_id_short: String = msg_id.chars().take(8).collect();
         tracing::info!(
             target: "ttt_trace",
             step = "lxmf_send.exit",
             dest = %dest_short,
-            msg_hash_some = msg_hash_some,
             msg_id = %msg_id_short,
             "send_message_with_lrgp_fields exit"
         );
@@ -2697,10 +2879,23 @@ impl LxmfManager {
                         | lxmf_core::propagation_client::PropagationClientState::GetRequested
                         | lxmf_core::propagation_client::PropagationClientState::Receiving
                         | lxmf_core::propagation_client::PropagationClientState::PurgeRequested
+                        | lxmf_core::propagation_client::PropagationClientState::AwaitingAdmission
+                        | lxmf_core::propagation_client::PropagationClientState::Partial
                         | lxmf_core::propagation_client::PropagationClientState::Complete
                 )
             })
             .unwrap_or(false);
+        let admission = self
+            .propagation_client
+            .as_ref()
+            .map(|client| client.admission_status())
+            .unwrap_or_default();
+        let counts = transfer_status
+            .filter(|status| {
+                status.state != lxmf_core::propagation_client::PropagationClientState::Idle
+            })
+            .map(|status| status.admission)
+            .unwrap_or(self.last_propagation_admission);
         json!({
             "enabled": self.client_propagation_enabled,
             "node_hash": node_hash,
@@ -2711,7 +2906,21 @@ impl LxmfManager {
             "transfer_progress": transfer_status.map(|status| status.progress),
             "transfer_size": transfer_status.and_then(|status| status.data_size),
             "transfer_result": transfer_status.and_then(|status| status.result),
+            "downloaded_count": counts.downloaded,
+            "committed_count": counts.committed,
+            "duplicate_count": counts.duplicate,
+            "policy_discarded_count": counts.policy_discarded,
+            "user_deleted_count": counts.user_deleted,
+            "rejected_count": counts.rejected,
+            "retryable_count": counts.retryable,
             "message_count": self.router.propagation_store.len(),
+            "suppressed_count": admission.suppressed_count,
+            "deferred_count": admission.deferred_count,
+            "next_retry": admission.next_retry,
+            "suppression_records": admission.node_records,
+            "suppression_capacity": admission.node_capacity,
+            "suppression_full": admission.ledger_full,
+            "admission_paused": admission.admission_paused || !self.download_state_installed(),
         })
     }
 
@@ -2838,19 +3047,30 @@ impl LxmfManager {
         db::hide_conversation(db_pool, dest_hash, identity_id);
     }
 
-    pub fn delete_conversation(&self, dest_hash: &str, db_pool: &DbPool, identity_id: &str) {
-        let file_refs = db::delete_conversation(db_pool, dest_hash, identity_id);
-        let files_dir = self.files_dir();
-        for file_ref in file_refs {
-            let Some(sanitized) = sanitize_stored_file_name(&file_ref) else {
-                tracing::warn!(
-                    reason = "unsafe_stored_name",
-                    "skipping unsafe stored attachment path"
-                );
-                continue;
-            };
-            std::fs::remove_file(files_dir.join(sanitized)).ok();
-        }
+    pub fn delete_conversation(
+        &mut self,
+        dest_hash: &str,
+        db_pool: &DbPool,
+        identity_id: &str,
+    ) -> Result<(), db::admission::AdmissionDbError> {
+        self.invalidate_download_state();
+        let store = db::admission::DurableInboundStore::from_pool(db_pool)?;
+        let guard = db::admission::try_reserve_admission()?;
+        let artifacts = store.delete_messages_guarded(
+            &guard,
+            identity_id,
+            Some(dest_hash),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )?;
+        crate::inbound_admission::cleanup_deleted_artifacts(
+            &self.data_dir,
+            &store,
+            &guard,
+            &artifacts,
+        )
     }
 
     pub fn set_propagation_node(
@@ -2953,12 +3173,213 @@ impl LxmfManager {
             );
             client.set_propagation_node(dest);
             client.set_delivery_limit(self.delivery_limit_kb);
+            if let Some(state) = self.download_state.as_ref().filter(|s| s.node == dest) {
+                client.set_suppression_ledger(state.ledger.clone(), state.epochs);
+                client.replace_durable_haves(state.haves.iter().copied());
+            } else {
+                client.suppression_persistence_failed();
+            }
             self.propagation_client = Some(client);
             tracing::info!(
                 node = %crate::short_id(&hex::encode(dest)),
                 "propagation client created for message download"
             );
         }
+    }
+
+    /// Install only a durably persisted, identity-scoped snapshot. The selected
+    /// node is captured here so future relay switches cannot inherit its haves.
+    pub fn install_download_state(
+        &mut self,
+        ledger: SuppressionLedger,
+        epochs: AdmissionEpochs,
+        haves: Vec<lxmf_core::admission::DurableHave>,
+    ) {
+        let Some(node) = self.configured_propagation_node else {
+            return;
+        };
+        if let Some(client) = self.propagation_client.as_mut() {
+            client.set_suppression_ledger(ledger.clone(), epochs);
+            client.replace_durable_haves(haves.iter().copied());
+        }
+        self.download_state = Some(InstalledDownloadState {
+            node,
+            ledger,
+            epochs,
+            haves,
+        });
+        self.download_suppression_revision = self.download_suppression_revision.wrapping_add(1);
+    }
+    /// Refresh proven haves after a durable message commit without replacing
+    /// newer, still-unpersisted suppression decisions from this client.
+    pub fn install_download_haves(
+        &mut self,
+        identity: [u8; 16],
+        node: [u8; 16],
+        haves: Vec<lxmf_core::admission::DurableHave>,
+    ) -> bool {
+        if identity != self.identity.hash || Some(node) != self.configured_propagation_node {
+            return false;
+        }
+        let Some(state) = self.download_state.as_mut().filter(|s| s.node == node) else {
+            return false;
+        };
+        if let Some(client) = self.propagation_client.as_mut() {
+            client.replace_durable_haves(haves.iter().copied());
+        }
+        state.haves = haves;
+        true
+    }
+    /// Retain a newly durable disposition for a future client generation. The
+    /// adapter calls this only after its commit and current-generation check;
+    /// the active client still consumes the exact single-use admission token.
+    pub fn remember_committed_download(
+        &mut self,
+        receipt: &lxmf_core::admission::DurableAdmissionReceipt,
+    ) -> bool {
+        let scope = receipt.record().scope;
+        if scope.identity != self.identity.hash
+            || Some(scope.node) != self.configured_propagation_node
+        {
+            return false;
+        }
+        let Some(state) = self
+            .download_state
+            .as_mut()
+            .filter(|state| state.node == scope.node)
+        else {
+            return false;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        state
+            .haves
+            .retain(|have| have.active(now) && have.transient_id != scope.transient_id);
+        let have = lxmf_core::admission::DurableHave::from_record(receipt.record());
+        if have.active(now) {
+            state.haves.push(have);
+        }
+        true
+    }
+    pub fn update_download_epochs(&mut self, identity: [u8; 16], epochs: AdmissionEpochs) -> bool {
+        if identity != self.identity.hash {
+            return false;
+        }
+        let Some(state) = self.download_state.as_mut() else {
+            return false;
+        };
+        if state.epochs == epochs {
+            return true;
+        }
+        state.epochs = epochs;
+        state.ledger.prune(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            epochs,
+        );
+        if let Some(client) = self.propagation_client.as_mut() {
+            client.update_admission_epochs(epochs);
+        }
+        self.download_suppression_revision = self.download_suppression_revision.wrapping_add(1);
+        true
+    }
+    pub fn download_suppression_snapshot(&mut self) -> Option<DownloadSuppressionSnapshot> {
+        let client = self.propagation_client.as_mut()?;
+        if !client.take_suppression_updates().is_empty() {
+            self.download_suppression_revision = self.download_suppression_revision.wrapping_add(1);
+        }
+        if !client.suppression_persistence_pending() {
+            return None;
+        }
+        let state = self.download_state.as_ref()?;
+        Some(DownloadSuppressionSnapshot {
+            identity: self.identity.hash,
+            node: state.node,
+            ledger: client.suppression_ledger().clone(),
+            epochs: state.epochs,
+            revision: self.download_suppression_revision,
+            client_revision: client.suppression_revision(),
+        })
+    }
+    pub fn acknowledge_download_suppression(
+        &mut self,
+        snapshot: &DownloadSuppressionSnapshot,
+    ) -> bool {
+        if snapshot.identity != self.identity.hash
+            || Some(snapshot.node) != self.configured_propagation_node
+            || snapshot.revision != self.download_suppression_revision
+        {
+            return false;
+        }
+        if let Some(client) = self.propagation_client.as_mut() {
+            if !client.take_suppression_updates().is_empty() {
+                self.download_suppression_revision =
+                    self.download_suppression_revision.wrapping_add(1);
+                return false;
+            }
+            if !client.acknowledge_suppression_persistence(snapshot.client_revision) {
+                return false;
+            }
+        }
+        if let Some(state) = self.download_state.as_mut() {
+            state.ledger = snapshot.ledger.clone();
+            state.epochs = snapshot.epochs;
+        }
+        true
+    }
+    /// Fence delayed hydration against same-identity deletion/recovery changes.
+    pub fn download_state_revision(&self) -> u64 {
+        self.download_suppression_revision
+    }
+    pub fn download_state_installed(&self) -> bool {
+        self.download_state
+            .as_ref()
+            .is_some_and(|state| Some(state.node) == self.configured_propagation_node)
+    }
+    /// Deletion/recovery revokes the current transfer before changing effects.
+    /// Only a fresh durable adapter hydration can resume selection afterward.
+    pub fn invalidate_download_state(&mut self) {
+        if let Some(client) = self.propagation_client.as_mut() {
+            client.cancel_download();
+            client.replace_durable_haves(std::iter::empty());
+            client.suppression_persistence_failed();
+        }
+        self.download_state = None;
+        self.download_suppression_revision = self.download_suppression_revision.wrapping_add(1);
+    }
+    pub fn pause_download_admission(&mut self) {
+        if let Some(client) = self.propagation_client.as_mut() {
+            client.suppression_persistence_failed();
+        }
+    }
+    pub fn download_key_epoch(&self) -> [u8; 32] {
+        let mut keys = self
+            .known_identities
+            .iter()
+            .map(|(dest, key)| (dest.clone(), *key))
+            .collect::<Vec<_>>();
+        keys.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut bytes = b"LXMF download keys v1".to_vec();
+        for (dest, key) in keys {
+            bytes.extend_from_slice(dest.as_bytes());
+            bytes.extend_from_slice(&key);
+        }
+        let mut ratchets = self
+            .delivery_ratchets
+            .ring()
+            .private_keys()
+            .iter()
+            .map(rns_identity::ratchet::ratchet_public_bytes)
+            .collect::<Vec<_>>();
+        ratchets.sort_unstable();
+        for key in ratchets {
+            bytes.extend_from_slice(&key);
+        }
+        rns_crypto::sha::full_hash(&bytes)
     }
 
     pub fn set_delivery_limit_kb(&mut self, limit_kb: usize) {
@@ -3040,7 +3461,7 @@ impl LxmfManager {
 
         self.preempt_opportunistic_path(&mut msg);
         let auto_fallback = Self::auto_live_fallback_hash(&msg, request.preference);
-        if self.router.try_send(msg).is_err() {
+        if self.router.submit_signed(msg).is_err() {
             return false;
         }
         self.auto_live_fallback.extend(auto_fallback);
@@ -3318,6 +3739,7 @@ impl LxmfManager {
             known_identities: self.known_identities_snapshot(),
             router_state: self.router.state_snapshot(),
             router_state_dir: self.lxmf_storage_dir.clone(),
+            node_policies: self.propagation_node_policies.clone(),
         }
     }
 
@@ -3352,6 +3774,12 @@ impl LxmfManager {
             received_ratchets,
             router_state: router_changed
                 .then(|| (self.lxmf_storage_dir.clone(), self.router.state_snapshot())),
+            node_policies: router_changed.then(|| {
+                (
+                    self.lxmf_storage_dir.clone(),
+                    self.propagation_node_policies.clone(),
+                )
+            }),
         }
     }
 
@@ -3375,6 +3803,7 @@ impl LxmfManager {
             known_identities: None,
             received_ratchets,
             router_state: None,
+            node_policies: None,
         }
     }
 
@@ -3452,35 +3881,24 @@ impl LxmfManager {
         }
     }
 
-    pub fn save_crypto_state(&self) {
-        let ratchet_dir = self.ratchets_dir();
-        std::fs::create_dir_all(&ratchet_dir).ok();
-
-        self.delivery_ratchets.save(&self.identity);
-
-        let received_dir = ratchet_dir.join("received");
-        std::fs::create_dir_all(&received_dir).ok();
-        for (hash_hex, rr) in &self.received_ratchets {
+    pub fn save_crypto_state(&self) -> std::io::Result<()> {
+        self.delivery_ratchets.save_durable(&self.identity)?;
+        let received_dir = self.ratchets_dir().join("received");
+        for (hash_hex, ratchet) in &self.received_ratchets {
             if !crate::helpers::is_protocol_hash_16(hash_hex) {
-                tracing::warn!(
-                    reason = "invalid_identifier",
-                    "skipping received ratchet with invalid destination identifier"
-                );
-                continue;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid received ratchet destination",
+                ));
             }
-            let path = received_dir.join(format!("{hash_hex}.ratchet"));
-            if rr.save(&path).is_err() {
-                tracing::warn!(identity = %crate::short_id(hash_hex), reason = "save_failed", "Failed to save received ratchet");
-            }
+            ratchet.save_durable(&received_dir.join(format!("{hash_hex}.ratchet")))?;
         }
-
-        let ki_path = ratchet_dir.join("known_identities");
-        if rns_identity::persistence::atomic_write(&ki_path, &self.known_identities_blob()).is_err()
-        {
-            tracing::warn!(reason = "save_failed", "Failed to save known identities");
-        }
-
-        self.save_router_state();
+        self.known_identities_snapshot().persist()?;
+        self.router.save_state(&self.lxmf_storage_dir)?;
+        lxmf_core::persist::save_node_policies(
+            &self.lxmf_storage_dir,
+            &self.propagation_node_policies,
+        )
     }
 
     /// Returns `(identity_changed, ratchet_changed)`. No-op updates are
@@ -3736,7 +4154,7 @@ impl LxmfManager {
     }
 
     fn auto_live_fallback_hash(
-        msg: &LxMessage,
+        msg: &impl OutboundMessageView,
         preference: DeliveryPreference,
     ) -> Option<[u8; 32]> {
         (preference == DeliveryPreference::Auto
@@ -3744,8 +4162,7 @@ impl LxmfManager {
                 msg.method,
                 DeliveryMethod::Direct | DeliveryMethod::Opportunistic
             ))
-        .then_some(msg.hash)
-        .flatten()
+        .then_some(msg.message_id())
     }
 
     fn clear_auto_live_fallback(&mut self, hash: &[u8; 32]) {
@@ -3774,7 +4191,7 @@ impl LxmfManager {
         reason: &str,
         results: &mut Vec<(String, &'static str)>,
     ) -> bool {
-        let Some(hash) = message.hash else {
+        let Some(hash) = Some(message.message_id()) else {
             return false;
         };
         if !self.auto_live_fallback.contains(&hash) {
@@ -3899,7 +4316,7 @@ impl LxmfManager {
     /// Opportunistic messages and defers the first attempt by
     /// `PATH_REQUEST_WAIT` (LXMRouter.py:1675-1679). No-op when a path is
     /// already known or the method is not Opportunistic.
-    fn preempt_opportunistic_path(&mut self, msg: &mut LxMessage) {
+    fn preempt_opportunistic_path(&mut self, msg: &mut impl OutboundMessageView) {
         if msg.method != DeliveryMethod::Opportunistic {
             return;
         }
@@ -3907,10 +4324,13 @@ impl LxmfManager {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        if self.direct_route_entry(msg.destination_hash, now).is_some() {
+        if self
+            .direct_route_entry(msg.destination_hash(), now)
+            .is_some()
+        {
             return;
         }
-        self.request_path_recovery(msg.destination_hash, None);
+        self.request_path_recovery(msg.destination_hash(), None);
         msg.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
     }
 
@@ -3968,14 +4388,14 @@ impl LxmfManager {
         reason: &str,
         failed_link: Option<[u8; 16]>,
     ) -> bool {
-        let Some(hash) = message.hash else {
+        let Some(hash) = Some(message.message_id()) else {
             return self.requeue_direct_after_link_failure(message, dest_hash, reason, failed_link);
         };
         let router_owned = self
             .router
             .pending_outbound
             .iter()
-            .any(|pending| pending.hash == Some(hash));
+            .any(|pending| Some(pending.message_id()) == Some(hash));
         if !router_owned {
             return self.requeue_direct_after_link_failure(message, dest_hash, reason, failed_link);
         }
@@ -4043,13 +4463,22 @@ impl LxmfManager {
 
         if name_hash == rns_identity::name_hash::name_hash(LXMF_PROPAGATION_APP_NAME) {
             if let Some(pn) = lxmf_core::handlers::parse_pn_announce_data(app_data) {
-                let mut changed = self.router.get_stamp_cost(&dest_hash) != Some(pn.stamp_cost);
                 self.router.set_stamp_cost(dest_hash, pn.stamp_cost);
-                changed |= self
-                    .propagation_transfer_limits_kb
-                    .insert(dest_hash, pn.transfer_limit)
-                    != Some(pn.transfer_limit);
-                return changed;
+                self.propagation_transfer_limits_kb
+                    .insert(dest_hash, pn.transfer_limit);
+                self.propagation_node_policies.insert(
+                    dest_hash,
+                    AdvertisedNodePolicy {
+                        stamp_cost: pn.stamp_cost,
+                        transfer_limit_kb: pn.transfer_limit as f64,
+                        recorded_at: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64(),
+                    },
+                );
+                // A refreshed observation must be persisted even when its values match.
+                return true;
             }
         } else if name_hash == rns_identity::name_hash::name_hash(LXMF_APP_NAME) {
             let mut changed = false;
@@ -4113,16 +4542,6 @@ impl LxmfManager {
         result.ok()
     }
 
-    fn decode_propagated_download(&self, data: &[u8]) -> Option<Vec<u8>> {
-        if data.len() < 16 || data[..16] != self.lxmf_dest_hash {
-            return None;
-        }
-        let plaintext = self.decrypt_inbound(&data[16..])?;
-        let mut full = self.lxmf_dest_hash.to_vec();
-        full.extend_from_slice(&plaintext);
-        Some(full)
-    }
-
     pub fn is_destination_known(&self, dest_hash_hex: &str) -> bool {
         self.known_identities.contains_key(dest_hash_hex)
     }
@@ -4136,17 +4555,36 @@ impl LxmfManager {
     }
 
     pub fn propagation_node_ready_for_send(&self, prop_hash: &[u8; 16]) -> bool {
-        self.known_identities.contains_key(&hex::encode(prop_hash))
-            && self.router.get_stamp_cost(prop_hash).is_some()
-            && self.propagation_transfer_limits_kb.contains_key(prop_hash)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        propagation_readiness(
+            *prop_hash,
+            self.known_identities.contains_key(&hex::encode(prop_hash)),
+            self.direct_route_entry(*prop_hash, now).is_some(),
+            self.propagation_node_policies.get(prop_hash).copied(),
+            true,
+            now,
+        )
+        .is_ok()
     }
 
+    pub fn inbound_source_public_key(&self, source: &[u8; 16]) -> Option<[u8; 64]> {
+        self.known_identities.get(&hex::encode(source)).copied()
+    }
     pub fn verify_inbound_signature(&self, msg: &mut LxMessage) -> Option<bool> {
-        let pk = self.known_identities.get(&hex::encode(msg.source_hash))?;
-        let mut ed = [0u8; 32];
-        ed.copy_from_slice(&pk[32..64]);
-        let ed_pub = rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&ed).ok()?;
-        Some(msg.verify(&ed_pub))
+        let key = self.inbound_source_public_key(&msg.source_hash())?;
+        Some(msg.verify(&key).is_ok())
+    }
+    pub fn propagation_decrypt_context(&self) -> PropagationDecryptContext {
+        PropagationDecryptContext {
+            identity: self.identity.clone(),
+            destination: self.lxmf_dest_hash,
+            ratchets: zeroize::Zeroizing::new(
+                self.delivery_ratchets.ring().private_keys().to_vec(),
+            ),
+        }
     }
 
     /// Ed25519-sign full packet hash; address to truncated hash for
@@ -4316,7 +4754,7 @@ impl LxmfManager {
             .pending_outbound
             .iter()
             .filter(|message| message.method == DeliveryMethod::Direct)
-            .map(|message| message.destination_hash)
+            .map(|message| message.destination_hash())
             .collect::<HashSet<_>>();
         let reusable_links = direct_destinations
             .iter()
@@ -4324,7 +4762,7 @@ impl LxmfManager {
             .map(|dest| (dest, self.direct_reusable_link_state_for_router(dest)))
             .collect::<HashMap<_, _>>();
         let actions = self.router.process_outbound_with_direct(|message, now| {
-            let dest = message.destination_hash;
+            let dest = message.destination_hash();
             let route = route_entries
                 .get(&dest)
                 .filter(|entry| entry.expires > now)
@@ -4366,6 +4804,7 @@ impl LxmfManager {
             let terminal_state = if matches!(
                 transfer_status.state,
                 lxmf_core::propagation_client::PropagationClientState::Complete
+                    | lxmf_core::propagation_client::PropagationClientState::Partial
                     | lxmf_core::propagation_client::PropagationClientState::Failed
             ) {
                 Some(transfer_status.state)
@@ -4377,6 +4816,10 @@ impl LxmfManager {
                     Some(lxmf_core::propagation_client::PropagationClientState::Complete) => {
                         self.completed_propagation_syncs.push(node);
                     }
+                    Some(lxmf_core::propagation_client::PropagationClientState::Partial) => {
+                        self.failed_propagation_syncs
+                            .push((node, "sync_partial".to_string()));
+                    }
                     Some(lxmf_core::propagation_client::PropagationClientState::Failed) => {
                         self.failed_propagation_syncs
                             .push((node, "sync_failed".to_string()));
@@ -4384,8 +4827,9 @@ impl LxmfManager {
                     _ => {}
                 }
             }
-            downloaded = client.take_received_messages();
+            downloaded = client.take_downloaded_messages();
             if terminal_state.is_some() {
+                self.last_propagation_admission = transfer_status.admission;
                 client.acknowledge_transfer();
             }
 
@@ -4405,20 +4849,7 @@ impl LxmfManager {
                 tracing::debug!("auto-triggered propagation download check");
             }
         }
-        for msg_data in downloaded {
-            if let Some(full_lxmf) = self.decode_propagated_download(&msg_data) {
-                tracing::info!(
-                    len = full_lxmf.len(),
-                    "propagation client: downloaded and decrypted message"
-                );
-                self.downloaded_propagation_messages.push(full_lxmf);
-            } else {
-                tracing::warn!(
-                    len = msg_data.len(),
-                    "propagation client: failed to decrypt downloaded message"
-                );
-            }
-        }
+        self.downloaded_propagation_messages.extend(downloaded);
 
         self.filter_repeated_steps(results)
     }
@@ -4450,6 +4881,13 @@ impl LxmfManager {
             }
 
             if terminal_delivery_step(step) {
+                if let Some(id) = hex::decode(&msg_id)
+                    .ok()
+                    .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                {
+                    self.propagation_envelopes.remove(&id);
+                    self.pending_propagation_envelopes.remove(&id);
+                }
                 self.last_reported_steps.remove(&msg_id);
             } else {
                 if self.last_reported_steps.len() >= MAX_REPORTED_STEPS
@@ -4498,7 +4936,7 @@ impl LxmfManager {
         tracing::info!("propagation sync disabled");
     }
 
-    pub fn take_downloaded_propagation_messages(&mut self) -> Vec<Vec<u8>> {
+    pub fn take_downloaded_propagation_messages(&mut self) -> Vec<DownloadedPropagationMessage> {
         std::mem::take(&mut self.downloaded_propagation_messages)
     }
 
@@ -4547,7 +4985,7 @@ impl LxmfManager {
             self.router
                 .pending_outbound
                 .iter()
-                .any(|message| message.destination_hash == *dest)
+                .any(|message| message.destination_hash() == *dest)
         });
         true
     }
@@ -4593,6 +5031,8 @@ impl LxmfManager {
         self.clear_auto_live_fallback(&hash);
         cancelled |= self.ephemeral_outbound.remove(&hash);
         cancelled |= self.in_flight_propagation.remove(&hash).is_some();
+        self.propagation_envelopes.remove(&hash);
+        self.pending_propagation_envelopes.remove(&hash);
         cancelled |= self.opportunistic_in_flight.remove(&hash).is_some();
         cancelled |= self.opportunistic_proofs.remove(&hash).is_some();
 
@@ -4612,7 +5052,7 @@ impl LxmfManager {
             self.router
                 .pending_outbound
                 .iter()
-                .any(|message| message.destination_hash == *dest)
+                .any(|message| message.destination_hash() == *dest)
         });
 
         cancelled
@@ -4626,6 +5066,8 @@ impl LxmfManager {
         match result {
             DeliveryResult::Complete { msg_hash, .. } => {
                 if let Some(hash) = msg_hash {
+                    self.propagation_envelopes.remove(&hash);
+                    self.pending_propagation_envelopes.remove(&hash);
                     self.opportunistic_proofs.remove(&hash);
                     self.opportunistic_in_flight.remove(&hash);
                     self.clear_auto_live_fallback(&hash);
@@ -4832,73 +5274,125 @@ impl LxmfManager {
         })
     }
 
-    /// Hand `message` back when it is ready to send (stamped or no stamp
-    /// required); `None` when stamp PoW was deferred to a worker — the
-    /// message re-enters `pending_outbound` with the stamp attached, so the
-    /// caller must skip this delivery attempt. Never grinds PoW inline: the
-    /// tick holds the manager lock, and a synchronous search blocked it for
-    /// 53 s in live testing (announces and all manager work stalled).
-    fn ensure_message_stamp_or_defer(&mut self, mut message: LxMessage) -> Option<LxMessage> {
-        if message.stamp.is_some() {
-            return Some(message);
-        }
-        let Some(cost) = self
-            .router
-            .get_stamp_cost(&message.destination_hash)
-            .filter(|cost| *cost > 0)
-        else {
-            return Some(message);
-        };
-        message.stamp_cost = Some(cost);
-        let dest = hex::encode(message.destination_hash);
-        match self.router.defer_stamp(message) {
-            None => {
-                tracing::info!(
-                    dest = %crate::short_id(&dest),
-                    cost,
-                    "stamp required; deferred to worker — delivery resumes when ready"
-                );
-                None
-            }
-            Some(mut message) => {
-                // No id to key the deferred job on; keep prior inline
-                // behavior as the last resort.
-                tracing::warn!(dest = %crate::short_id(&dest), cost, "stamp needed but message has no id; generating inline");
-                message.get_stamp();
-                Some(message)
-            }
-        }
+    /// Revoke envelope preparation and return its actual blocking owners. The
+    /// lifecycle caller must await these handles outside the manager lock before
+    /// dropping the identity or considering shutdown complete.
+    pub fn cancel_and_take_propagation_workers(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.pending_propagation_envelopes.clear();
+        self.propagation_envelopes.clear();
+        std::mem::take(&mut self.propagation_preparation_tasks)
     }
 
     fn pack_message_for_propagation(
-        &self,
-        message: &mut LxMessage,
-        prop_hash: [u8; 16],
-    ) -> Option<Vec<u8>> {
-        let dest_hex = hex::encode(message.destination_hash);
-        let target_cost = self.router.get_stamp_cost(&prop_hash).unwrap_or(0);
-        let (packed, _tid, stamp_value) = message
-            .pack_propagated_encrypted_with_stamp(
-                |plaintext| {
-                    self.encrypt_for_destination(&dest_hex, plaintext)
-                        .ok_or_else(|| {
-                            lxmf_core::message_api::MessageError::PackFailed(format!(
-                                "no identity key for destination {dest_hex}"
-                            ))
-                        })
-                },
-                target_cost,
-            )
-            .ok()?;
-        tracing::debug!(
-            dest = %crate::short_id(&dest_hex),
-            prop = %crate::short_id(&hex::encode(prop_hash)),
-            target_cost,
-            stamp_value,
-            packed_len = packed.len(),
-            "prepared propagation wrapper"
+        &mut self,
+        message: &LxMessage,
+        prepared: lxmf_core::propagation_send::PreparedNode,
+        now: f64,
+    ) -> PreparedPropagation {
+        let id = message.message_id();
+        let dest = hex::encode(message.destination_hash());
+        let Some(key) = self.known_identities.get(&dest).copied() else {
+            return PreparedPropagation::Failed(MessageError::PackFailed(
+                "recipient key missing".into(),
+            ));
+        };
+        let ratchet = self
+            .received_ratchets
+            .get(&dest)
+            .filter(|r| !r.is_expired())
+            .map(|r| r.ratchet_pub);
+        let mut binding_data = key.to_vec();
+        if let Some(ratchet) = ratchet {
+            binding_data.extend_from_slice(&ratchet);
+        }
+        let binding = rns_crypto::sha::full_hash(&binding_data);
+        if let Some(job) = self.pending_propagation_envelopes.get_mut(&id) {
+            // Dropping a receiver revokes this generation only; the worker owns
+            // its permit and message until it really exits.
+            if job.binding != binding || job.cost != prepared.policy.stamp_cost {
+                self.pending_propagation_envelopes.remove(&id);
+            } else {
+                match job.result.try_recv() {
+                    Ok(Ok(envelope)) => {
+                        self.pending_propagation_envelopes.remove(&id);
+                        self.propagation_envelopes.insert(id, envelope);
+                    }
+                    Ok(Err(error)) => {
+                        self.pending_propagation_envelopes.remove(&id);
+                        return PreparedPropagation::Failed(error);
+                    }
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        return PreparedPropagation::Pending;
+                    }
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        self.pending_propagation_envelopes.remove(&id);
+                        return PreparedPropagation::Failed(MessageError::PackFailed(
+                            "propagation worker unavailable".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(envelope) = self.propagation_envelopes.get_mut(&id)
+            && envelope.matches(message, &binding)
+            && envelope.stamp_value() >= u32::from(prepared.policy.stamp_cost)
+        {
+            return match envelope.pack_for(prepared, now) {
+                Ok(bytes) => PreparedPropagation::Ready(bytes),
+                Err(e) => PreparedPropagation::Failed(e),
+            };
+        }
+        let Ok(permit) = propagation_preparation_slots().try_acquire_owned() else {
+            return PreparedPropagation::Pending;
+        };
+        let previous = self
+            .propagation_envelopes
+            .remove(&id)
+            .filter(|e| e.matches(message, &binding));
+        let message = message.clone();
+        let cost = prepared.policy.stamp_cost;
+        let (tx, result) = oneshot::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        self.propagation_preparation_tasks
+            .retain(|task| !task.is_finished());
+        self.propagation_preparation_tasks
+            .push(tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let outcome = (|| {
+                    let mut envelope = match previous {
+                        Some(envelope) => envelope,
+                        None => PropagationEnvelope::new_cancellable(
+                            message,
+                            binding,
+                            cost,
+                            |plaintext| {
+                                let remote = Identity::from_public_key(&key)
+                                    .map_err(|e| MessageError::PackFailed(e.to_string()))?;
+                                remote
+                                    .encrypt(plaintext, ratchet.as_ref())
+                                    .map_err(|e| MessageError::PackFailed(e.to_string()))
+                            },
+                            &worker_cancel,
+                        )?,
+                    };
+                    // This is the only potentially expensive path; policy is checked
+                    // again on the manager before dispatch.
+                    envelope.pack_for_cancellable(prepared, now, &worker_cancel)?;
+                    Ok(envelope)
+                })();
+                let _ = tx.send(outcome);
+            }));
+        self.pending_propagation_envelopes.insert(
+            id,
+            PendingPropagationEnvelope {
+                binding,
+                cost,
+                result,
+                cancel,
+            },
         );
-        Some(packed)
+        PreparedPropagation::Pending
     }
 
     fn start_propagation_delivery(
@@ -4916,93 +5410,58 @@ impl LxmfManager {
             self.queue_router_message(message, "propagation timing observation");
             return;
         }
-        let msg_hash = message.hash;
-        let dest_hex = hex::encode(message.destination_hash);
+        let msg_hash = Some(message.message_id());
+        let dest_hex = hex::encode(message.destination_hash());
         let prop_hex = hex::encode(prop_hash);
 
-        if !self.known_identities.contains_key(&prop_hex) {
-            tracing::warn!(
-                prop = %crate::short_id(&prop_hex),
-                attempts = message.delivery_attempts,
-                "cannot propagate LXMF before propagation node identity is known; requesting path"
-            );
-            self.defer_propagation_delivery(message, prop_hash);
-            return;
-        }
-
-        if self.router.get_stamp_cost(&prop_hash).is_none() {
-            tracing::warn!(
-                prop = %crate::short_id(&prop_hex),
-                attempts = message.delivery_attempts,
-                "cannot propagate LXMF before propagation node stamp cost is known; requesting path"
-            );
-            self.defer_propagation_delivery(message, prop_hash);
-            return;
-        }
-
-        if !self.propagation_transfer_limits_kb.contains_key(&prop_hash) {
-            tracing::warn!(
-                prop = %crate::short_id(&prop_hex),
-                attempts = message.delivery_attempts,
-                "cannot propagate LXMF before propagation node transfer limit is known; requesting path"
-            );
-            self.defer_propagation_delivery(message, prop_hash);
-            return;
-        }
-
-        if !self.known_identities.contains_key(&dest_hex) {
-            tracing::warn!(
-                dest = %crate::short_id(&dest_hex),
-                attempts = message.delivery_attempts,
-                "cannot propagate LXMF before recipient identity key is known; requesting path"
-            );
-            let destination_hash = message.destination_hash;
-            self.defer_propagation_delivery(message, destination_hash);
-            return;
-        }
-
-        let Some(mut message) = self.ensure_message_stamp_or_defer(message) else {
-            return;
-        };
-        let Some(packed) = self.pack_message_for_propagation(&mut message, prop_hash) else {
-            tracing::warn!(
-                dest = %crate::short_id(&dest_hex),
-                prop = %crate::short_id(&hex::encode(prop_hash)),
-                "failed to pack propagation wrapper"
-            );
-            if let Some(hash) = msg_hash {
-                results.push((hex::encode(hash), "failed"));
-            }
-            return;
-        };
-
-        if let Some(limit_kb) = self.propagation_transfer_limits_kb.get(&prop_hash).copied() {
-            let limit_bytes = usize::try_from(limit_kb)
-                .unwrap_or(usize::MAX)
-                .saturating_mul(lxmf_core::constants::BYTES_PER_KILOBYTE);
-            if packed.len() > limit_bytes {
-                tracing::warn!(
-                    dest = %crate::short_id(&dest_hex),
-                    prop = %crate::short_id(&prop_hex),
-                    actual_bytes = packed.len(),
-                    limit_bytes,
-                    reason = "propagation_limit_exceeded",
-                    "propagation node cannot accept packed LXMF message"
-                );
-                if let Some(hash) = msg_hash {
-                    let msg_id = hex::encode(hash);
-                    self.delivery_failure_updates
-                        .push(LxmfDeliveryFailureUpdate {
-                            msg_id: msg_id.clone(),
-                            code: "propagation_limit_exceeded",
-                            actual_bytes: packed.len(),
-                            limit_bytes,
-                        });
-                    results.push((msg_id, "failed"));
-                }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let prepared = match propagation_readiness(
+            prop_hash,
+            self.known_identities.contains_key(&prop_hex),
+            self.direct_route_entry(prop_hash, now).is_some(),
+            self.propagation_node_policies.get(&prop_hash).copied(),
+            self.known_identities.contains_key(&dest_hex),
+            now,
+        ) {
+            Ok(prepared) => prepared,
+            Err(lxmf_core::propagation_send::MissingPropagationInput::RecipientIdentity) => {
+                let destination = message.destination_hash();
+                self.defer_propagation_delivery(message, destination);
                 return;
             }
-        }
+            Err(_) => {
+                self.defer_propagation_delivery(message, prop_hash);
+                return;
+            }
+        };
+        let packed = match self.pack_message_for_propagation(&message, prepared, now) {
+            PreparedPropagation::Ready(packed) => packed,
+            PreparedPropagation::Pending => {
+                message.next_delivery_attempt = now + 0.5;
+                // Preparation is not a transmitted payload attempt.
+                message.delivery_attempts = message.delivery_attempts.saturating_sub(1);
+                self.queue_router_message(message, "propagation envelope preparation");
+                return;
+            }
+            PreparedPropagation::Failed(error) => {
+                tracing::warn!(%error,"propagation envelope preparation failed");
+                if let MessageError::TooLarge { size, limit } = &error {
+                    self.delivery_failure_updates
+                        .push(LxmfDeliveryFailureUpdate {
+                            msg_id: hex::encode(message.message_id()),
+                            code: "propagation_limit_exceeded",
+                            actual_bytes: *size,
+                            limit_bytes: *limit,
+                        });
+                }
+                self.propagation_envelopes.remove(&message.message_id());
+                results.push((hex::encode(message.message_id()), "failed"));
+                return;
+            }
+        };
 
         let _ = self.ensure_link_delivery_manager();
 
@@ -5334,7 +5793,7 @@ impl LxmfManager {
                 }
                 OutboundAction::DeliverPropagated { message, prop_hash } => {
                     tracing::info!(
-                        dest = %crate::short_id(&hex::encode(message.destination_hash)),
+                        dest = %crate::short_id(&hex::encode(message.destination_hash())),
                         prop = %crate::short_id(&hex::encode(prop_hash)),
                         "routing message via propagation node"
                     );
@@ -5342,8 +5801,8 @@ impl LxmfManager {
                     continue;
                 }
                 OutboundAction::Failed(message) => {
-                    let msg_hash = message.hash;
-                    let dest_hash = message.destination_hash;
+                    let msg_hash = Some(message.message_id());
+                    let dest_hash = message.destination_hash();
                     if !self.try_auto_propagation_fallback(
                         message,
                         dest_hash,
@@ -5358,15 +5817,14 @@ impl LxmfManager {
                     // An expired message is no longer timely enough to deposit
                     // for later pickup. Do not reinterpret expiry as an
                     // Offline Inbox retry.
-                    self.push_failed_outbound_state(message.hash, &mut results);
+                    self.push_failed_outbound_state(Some(message.message_id()), &mut results);
                     continue;
                 }
             };
-            let Some(mut message) = self.ensure_message_stamp_or_defer(message) else {
-                continue;
-            };
+            // Router output is already finalized after any deferred recipient stamp.
+            let mut message = message;
 
-            let msg_hash = message.hash;
+            let msg_hash = Some(message.message_id());
             let is_ephemeral = msg_hash
                 .as_ref()
                 .is_some_and(|hash| self.ephemeral_outbound.contains(hash));
@@ -6092,6 +6550,33 @@ mod tests {
         pool
     }
 
+    impl LxmfManager {
+        pub(super) fn create_final_message(
+            &mut self,
+            dest: &str,
+            content: &str,
+            title: &str,
+            method: DeliveryMethod,
+        ) -> Option<LxMessage> {
+            let signed = self.create_message(dest, content, title, method)?;
+            let stamp = signed.generate_recipient_stamp().ok()?;
+            signed.finalize(stamp).ok()
+        }
+        pub(super) fn create_final_message_with_custom_fields(
+            &mut self,
+            dest: &str,
+            content: &str,
+            title: &str,
+            method: DeliveryMethod,
+            fields: &[(u8, Vec<u8>)],
+        ) -> Option<LxMessage> {
+            let signed =
+                self.create_message_with_custom_fields(dest, content, title, method, fields)?;
+            let stamp = signed.generate_recipient_stamp().ok()?;
+            signed.finalize(stamp).ok()
+        }
+    }
+
     pub(super) fn test_manager() -> LxmfManager {
         let unique = TEMP_LXMF_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!(
@@ -6105,6 +6590,56 @@ mod tests {
         LxmfManager::load_or_create(&tmp, None, None).unwrap()
     }
 
+    fn ready_relay_policy(mgr: &mut LxmfManager, node: [u8; 16], cost: u8, limit: usize) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let announce = lxmf_core::handlers::PropagationNodeAnnounceData::new(
+            true,
+            limit as u64,
+            limit as u64,
+            cost,
+            0,
+            0,
+        );
+        assert!(mgr.update_lxmf_announce_app_data(
+            node,
+            rns_identity::name_hash::name_hash("lxmf.propagation"),
+            Some(&lxmf_core::handlers::get_propagation_node_app_data(
+                &announce
+            ))
+        ));
+        mgr.replace_route_hops_from_path_table(&[PathTableRpcEntry {
+            hash: node,
+            timestamp: now,
+            via: None,
+            hops: 1,
+            expires: now + 600.,
+            interface: "relay fixture".into(),
+            interface_id: 1,
+            interface_mode: rns_transport::constants::InterfaceMode::Full,
+            interface_role: rns_transport::messages::InterfaceRole::Normal,
+        }]);
+    }
+    async fn finish_pending_propagation(
+        mgr: &mut LxmfManager,
+        mut states: Vec<(String, &'static str)>,
+    ) -> Vec<(String, &'static str)> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while states.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                for msg in &mut mgr.router.pending_outbound {
+                    msg.next_delivery_attempt = 0.;
+                }
+                states.extend(mgr.tick());
+            }
+            states
+        })
+        .await
+        .expect("bounded envelope worker should settle")
+    }
+
     fn ready_auto_propagation_fallback(
         mgr: &mut LxmfManager,
         dest: [u8; 16],
@@ -6116,6 +6651,7 @@ mod tests {
             .insert(hex::encode(dest), remote.get_public_key());
         mgr.known_identities
             .insert(hex::encode(node), relay.get_public_key());
+        ready_relay_policy(mgr, node, 0, 256);
         mgr.router.set_stamp_cost(node, 0);
         mgr.propagation_transfer_limits_kb.insert(node, 256);
         mgr.router.set_outbound_propagation_node(Some(node));
@@ -6138,25 +6674,24 @@ mod tests {
         )
         .unwrap();
         let fields = lrgp::protocol::pack_lxmf_fields(&envelope).unwrap();
-        let mut message = LxMessage::new(
+        let mut message = lxmf_core::message::LxMessageDraft::new(
             [0x11; 16],
             [0x22; 16],
             "",
             "[LRGP TTT] Sent a challenge!",
             DeliveryMethod::Opportunistic,
-        );
+        )
+        .unwrap();
 
         apply_lrgp_fields_to_message(&mut message, &fields).unwrap();
-        assert!(
-            message
-                .msgpack_field_ids
-                .contains(&lrgp::protocol::FIELD_CUSTOM_TYPE)
-        );
-        assert!(
-            message
-                .msgpack_field_ids
-                .contains(&lrgp::protocol::FIELD_CUSTOM_META)
-        );
+        assert!(matches!(
+            message.get_field(lrgp::protocol::FIELD_CUSTOM_TYPE),
+            Some(lxmf_core::message::FieldValue::MessagePack(_))
+        ));
+        assert!(matches!(
+            message.get_field(lrgp::protocol::FIELD_CUSTOM_META),
+            Some(lxmf_core::message::FieldValue::MessagePack(_))
+        ));
 
         // Decode the complete LXMF payload exactly as a Python client would:
         // the allocated LRGP fields must be a native string and map, never
@@ -6203,8 +6738,13 @@ mod tests {
 
     fn next_outbound(rx: &mut mpsc::Receiver<TransportMessage>) -> Vec<u8> {
         while let Ok(message) = rx.try_recv() {
-            if let TransportMessage::Outbound(request) = message {
-                return request.raw.to_vec();
+            match message {
+                TransportMessage::Outbound(request) => return request.raw.to_vec(),
+                TransportMessage::SendLinkRequest { request, result_tx } => {
+                    result_tx.send(Ok(())).unwrap();
+                    return request.raw.to_vec();
+                }
+                _ => {}
             }
         }
         panic!("expected outbound transport message");
@@ -6639,6 +7179,115 @@ mod tests {
     }
 
     #[test]
+    fn checked_chat_schema_rejects_duplicates_without_falling_back_to_chat() {
+        use lxmf_core::admission::SuppressionReason;
+        let mut manager = test_manager();
+        let destination = hex::encode([0x22; 16]);
+        // The same normalized integer key uses two legal MessagePack encodings.
+        let mut reaction = vec![0x83, 0x00, 0xc4, 0x20];
+        reaction.extend_from_slice(&[0x11; 32]);
+        reaction.extend_from_slice(&[0xcc, 0x00, 0xc4, 0x20]);
+        reaction.extend_from_slice(&[0x22; 32]);
+        reaction.extend_from_slice(&[0x01, 0xa1, b'x']);
+        let message = manager
+            .create_final_message_with_custom_fields(
+                &destination,
+                "fallback",
+                "",
+                DeliveryMethod::Propagated,
+                &[(lxmf_core::constants::FIELD_REACTION, reaction)],
+            )
+            .unwrap();
+        assert_eq!(
+            decode_ratspeak_chat_extension_checked(&message),
+            Err(SuppressionReason::Malformed)
+        );
+        assert_eq!(decode_ratspeak_chat_extension(&message), None);
+
+        let payload = encode_msgpack_value(&rmpv::Value::Map(vec![
+            ("kind".into(), "reply".into()),
+            ("kind".into(), "reaction".into()),
+            ("target".into(), "old-id".into()),
+            ("emoji".into(), "x".into()),
+        ]));
+        let message = manager
+            .create_final_message_with_custom_fields(
+                &destination,
+                "fallback",
+                "",
+                DeliveryMethod::Propagated,
+                &[
+                    (
+                        lxmf_core::constants::FIELD_CUSTOM_TYPE,
+                        RATSPEAK_CHAT_CUSTOM_TYPE_V1.to_vec(),
+                    ),
+                    (lxmf_core::constants::FIELD_CUSTOM_DATA, payload),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            decode_ratspeak_chat_extension_checked(&message),
+            Err(SuppressionReason::Malformed)
+        );
+    }
+
+    #[test]
+    fn checked_chat_schema_skips_unknown_trees_and_bounds_legacy_json() {
+        use lxmf_core::admission::SuppressionReason;
+        let mut manager = test_manager();
+        let destination = hex::encode([0x22; 16]);
+        let mut reaction = vec![0x83, 0x00, 0xc4, 0x20];
+        reaction.extend_from_slice(&[0x11; 32]);
+        reaction.extend_from_slice(&[0x01, 0xa1, b'x', 0x02, 0xdc, 0xff, 0xff]);
+        reaction.extend(std::iter::repeat_n(0xc0, 65535));
+        let message = manager
+            .create_final_message_with_custom_fields(
+                &destination,
+                "",
+                "",
+                DeliveryMethod::Propagated,
+                &[(lxmf_core::constants::FIELD_REACTION, reaction)],
+            )
+            .unwrap();
+        assert!(
+            matches!(decode_ratspeak_chat_extension_checked(&message), Ok(Some(RatspeakChatExtension::Reaction { emoji, .. })) if emoji == "x")
+        );
+
+        let message = manager
+            .create_final_message_with_custom_fields(
+                &destination,
+                &" ".repeat(4097),
+                "",
+                DeliveryMethod::Propagated,
+                &[(
+                    lxmf_core::constants::FIELD_CUSTOM_TYPE,
+                    LEGACY_RATSPEAK_REACTION_TYPE.to_vec(),
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            decode_ratspeak_chat_extension_checked(&message),
+            Err(SuppressionReason::TooLarge)
+        );
+        let message = manager
+            .create_final_message_with_custom_fields(
+                &destination,
+                r#"{"message_id":"one","message_id":"two","emoji":"x"}"#,
+                "",
+                DeliveryMethod::Propagated,
+                &[(
+                    lxmf_core::constants::FIELD_CUSTOM_TYPE,
+                    LEGACY_RATSPEAK_REACTION_TYPE.to_vec(),
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            decode_ratspeak_chat_extension_checked(&message),
+            Err(SuppressionReason::Malformed)
+        );
+    }
+
+    #[test]
     fn ratspeak_chat_extension_round_trips_reaction_and_reply_fields() {
         let mut mgr = test_manager();
         let dest_hex = hex::encode([0x22; 16]);
@@ -6659,7 +7308,7 @@ mod tests {
             .map(|(_, v)| v.as_slice());
         assert_eq!(tag, Some(RATSPEAK_CHAT_CUSTOM_TYPE_V2));
         let reaction_msg = mgr
-            .create_message_with_custom_fields(
+            .create_final_message_with_custom_fields(
                 &dest_hex,
                 "",
                 "",
@@ -6683,7 +7332,7 @@ mod tests {
         })
         .expect("reply fields");
         let reply_msg = mgr
-            .create_message_with_custom_fields(
+            .create_final_message_with_custom_fields(
                 &dest_hex,
                 "reply text",
                 "",
@@ -6803,7 +7452,7 @@ mod tests {
             ),
         ];
         let reply_msg = mgr
-            .create_message_with_custom_fields(
+            .create_final_message_with_custom_fields(
                 &dest_hex,
                 "reply text",
                 "",
@@ -6825,7 +7474,7 @@ mod tests {
             encode_standard_reaction_field(&target_hash, "👍"),
         )];
         let reaction_msg = mgr
-            .create_message_with_custom_fields(
+            .create_final_message_with_custom_fields(
                 &dest_hex,
                 "Reacted to your message with 👍.",
                 "",
@@ -6866,7 +7515,7 @@ mod tests {
             ),
         ];
         let msg = mgr
-            .create_message_with_custom_fields(
+            .create_final_message_with_custom_fields(
                 &dest_hex,
                 "reply text",
                 "",
@@ -6916,7 +7565,7 @@ mod tests {
             .expect("v2 payload"),
         ));
         let msg = mgr
-            .create_message_with_custom_fields(
+            .create_final_message_with_custom_fields(
                 &dest_hex,
                 "reply text",
                 "",
@@ -6947,7 +7596,7 @@ mod tests {
             target_hash_hex.to_uppercase().into_bytes(),
         )];
         let msg = mgr
-            .create_message_with_custom_fields(
+            .create_final_message_with_custom_fields(
                 &dest_hex,
                 "reply text",
                 "",
@@ -7018,7 +7667,7 @@ mod tests {
             (lxmf_core::constants::FIELD_CUSTOM_DATA, payload),
         ];
         let msg = mgr
-            .create_message_with_custom_fields(
+            .create_final_message_with_custom_fields(
                 &dest_hex,
                 "fallback",
                 "",
@@ -7057,7 +7706,7 @@ mod tests {
             (lxmf_core::constants::FIELD_CUSTOM_DATA, payload),
         ];
         let msg = mgr
-            .create_message_with_custom_fields(
+            .create_final_message_with_custom_fields(
                 &dest_hex,
                 "fallback",
                 "",
@@ -7109,7 +7758,7 @@ mod tests {
             (lxmf_core::constants::FIELD_CUSTOM_DATA, legacy_payload),
         ];
         let msg = mgr
-            .create_message_with_custom_fields(
+            .create_final_message_with_custom_fields(
                 &dest_hex,
                 "fallback",
                 "",
@@ -7262,7 +7911,7 @@ mod tests {
         let announce =
             rns_identity::announce::AnnounceData::unpack(&raw[offset..], header.flags.context_flag)
                 .unwrap();
-        restarted.save_crypto_state();
+        assert!(restarted.save_crypto_state().is_err());
 
         assert!(!header.flags.context_flag);
         assert_eq!(announce.ratchet, None);
@@ -7503,15 +8152,20 @@ mod tests {
             .unwrap()
             .register_backchannel(dest, link_id);
 
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Backchannel",
             "reply over inbound link",
             DeliveryMethod::Direct,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let msg_hash = msg.message_id();
 
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::DeliverDirect {
             message: msg,
@@ -7576,10 +8230,10 @@ mod tests {
             .register_backchannel(dest, link_id);
 
         let msg = mgr
-            .create_message(&dest_hex, "direct no bz2", "", DeliveryMethod::Direct)
+            .create_final_message(&dest_hex, "direct no bz2", "", DeliveryMethod::Direct)
             .unwrap();
         assert!(!msg.auto_compress);
-        let msg_hash = msg.hash.unwrap();
+        let msg_hash = msg.message_id();
 
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::DeliverDirect {
             message: msg,
@@ -7666,15 +8320,20 @@ mod tests {
         let link_id = [0x44; 16];
         mgr.note_pending_direct_backchannel(dest, link_id);
 
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Pending identify",
             "reply should wait for LINKIDENTIFY",
             DeliveryMethod::Direct,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let msg_hash = msg.message_id();
 
         let waiting = mgr.execute_encrypted_actions(vec![OutboundAction::DeliverDirect {
             message: msg,
@@ -7773,15 +8432,20 @@ mod tests {
             .unwrap()
             .register_backchannel(dest, link_id);
 
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Backchannel",
             "stale backchannel",
             DeliveryMethod::Direct,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let msg_hash = msg.message_id();
 
         let initial = mgr.execute_encrypted_actions(vec![OutboundAction::DeliverDirect {
             message: msg,
@@ -7823,7 +8487,7 @@ mod tests {
             .router
             .pending_outbound
             .iter()
-            .find(|message| message.hash == Some(msg_hash))
+            .find(|message| message.message_id() == msg_hash)
             .expect("message should remain pending after stale backchannel");
         assert_eq!(requeued.method, DeliveryMethod::Direct);
         assert!(requeued.next_delivery_attempt > 0.0);
@@ -7844,15 +8508,20 @@ mod tests {
         let dest = [0x55; 16];
         let link_id = [0x66; 16];
         let packet_hash = [0x77; 32];
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Proof",
             "proof event",
             DeliveryMethod::Direct,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let msg_hash = msg.message_id();
         mgr.auto_live_fallback.insert(msg_hash);
         assert!(mgr.ensure_link_delivery_manager());
         mgr.link_delivery
@@ -7937,15 +8606,20 @@ mod tests {
         let dest = [0x81; 16];
         let link_id = [0x82; 16];
         let resource_hash = [0x83; 32];
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Resource rejection",
             "rejected by receiver",
             DeliveryMethod::Direct,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let msg_hash = msg.message_id();
         assert!(mgr.ensure_link_delivery_manager());
         mgr.link_delivery
             .as_mut()
@@ -8013,15 +8687,20 @@ mod tests {
         let dest = [0x91; 16];
         let link_id = [0x92; 16];
         let resource_hash = [0x93; 32];
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Resource cancel",
             "cancel exact transfer",
             DeliveryMethod::Direct,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let msg_hash = msg.message_id();
         assert!(mgr.ensure_link_delivery_manager());
         mgr.link_delivery
             .as_mut()
@@ -8092,17 +8771,20 @@ mod tests {
         let mut mgr = test_manager();
         let recipient = [0x71; 16];
         let relay = [0x72; 16];
-        let mut message = LxMessage::new(
+        let message = lxmf_core::message::LxMessageDraft::new(
             recipient,
             mgr.lxmf_dest_hash,
             "Relay",
             "reject",
             DeliveryMethod::Propagated,
-        );
-        message
+        )
+        .unwrap();
+        let message = message
             .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
             .unwrap();
-        let hash = message.hash.unwrap();
+        let hash = message.message_id();
         mgr.in_flight_propagation.insert(hash, relay);
         mgr.auto_live_fallback.insert(hash);
 
@@ -8151,15 +8833,20 @@ mod tests {
         mgr.known_identities
             .insert(dest_hex, Identity::new().get_public_key());
 
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "No Path",
             "hello",
             DeliveryMethod::Direct,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let msg_hash = msg.message_id();
 
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::DeliverDirect {
             message: msg,
@@ -8200,15 +8887,21 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportMessage>(8);
         mgr.router.set_transport(tx);
 
-        let mut msg = LxMessage::new(
+        let mut msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Retry",
             "hello",
             DeliveryMethod::Direct,
-        );
+        )
+        .unwrap();
         msg.delivery_attempts = 1;
         msg.last_delivery_attempt = 1.0;
+        let msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
 
         assert!(mgr.requeue_direct_after_link_failure(
             msg,
@@ -8262,15 +8955,21 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportMessage>(8);
         mgr.router.set_transport(tx);
 
-        let mut msg = LxMessage::new(
+        let mut msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Retry",
             "hello",
             DeliveryMethod::Direct,
-        );
+        )
+        .unwrap();
         msg.delivery_attempts = 1;
         msg.last_delivery_attempt = 1.0;
+        let msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
 
         assert!(mgr.requeue_direct_after_link_failure(
             msg,
@@ -8319,14 +9018,19 @@ mod tests {
             interface_role: rns_transport::messages::InterfaceRole::Normal,
         }]);
 
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Boundary",
             "hello",
             DeliveryMethod::Direct,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
+        )
+        .unwrap();
+        let mut msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
         msg.delivery_attempts = MAX_DELIVERY_ATTEMPTS - 1;
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::DeliverDirect {
             message: msg,
@@ -8379,15 +9083,20 @@ mod tests {
             interface_role: rns_transport::messages::InterfaceRole::Normal,
         }]);
 
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Direct",
             "hello over link",
             DeliveryMethod::Direct,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let msg_hash = msg.message_id();
 
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::DeliverDirect {
             message: msg,
@@ -8418,7 +9127,8 @@ mod tests {
         }
 
         match rx.try_recv().unwrap() {
-            TransportMessage::Outbound(request) => {
+            TransportMessage::SendLinkRequest { request, result_tx } => {
+                result_tx.send(Ok(())).unwrap();
                 assert_eq!(request.destination_hash, dest);
                 let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw)
                     .expect("link request header");
@@ -8460,9 +9170,9 @@ mod tests {
         }]);
 
         let msg = mgr
-            .create_message(&dest_hex, "router-owned direct", "", DeliveryMethod::Direct)
+            .create_final_message(&dest_hex, "router-owned direct", "", DeliveryMethod::Direct)
             .expect("message created");
-        let msg_hash = msg.hash.expect("message hash");
+        let msg_hash = msg.message_id();
         mgr.router.try_send(msg).unwrap();
 
         assert_eq!(
@@ -8470,10 +9180,15 @@ mod tests {
             vec![(hex::encode(msg_hash), "link_establishing")]
         );
         assert_eq!(mgr.router.pending_outbound.len(), 1);
-        assert_eq!(mgr.router.pending_outbound[0].hash, Some(msg_hash));
+        assert_eq!(mgr.router.pending_outbound[0].message_id(), msg_hash);
 
         rx.try_recv().expect("destination registration");
-        rx.try_recv().expect("initial LinkRequest");
+        let TransportMessage::SendLinkRequest { result_tx, .. } =
+            rx.try_recv().expect("initial LinkRequest")
+        else {
+            panic!("typed Link request expected");
+        };
+        result_tx.send(Ok(())).unwrap();
 
         assert_eq!(
             mgr.tick(),
@@ -8523,17 +9238,20 @@ mod tests {
             interface_role: rns_transport::messages::InterfaceRole::Normal,
         }]);
 
-        let mut first = LxMessage::new(
+        let first = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Direct one",
             "opens link",
             DeliveryMethod::Direct,
-        );
-        first
+        )
+        .unwrap();
+        let first = first
             .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
             .unwrap();
-        let first_hash = first.hash.unwrap();
+        let first_hash = first.message_id();
         assert_eq!(
             mgr.execute_encrypted_actions(vec![OutboundAction::DeliverDirect {
                 message: first,
@@ -8543,19 +9261,27 @@ mod tests {
         );
 
         rx.try_recv().expect("destination registration");
-        rx.try_recv().expect("initial LinkRequest");
+        let TransportMessage::SendLinkRequest { result_tx, .. } =
+            rx.try_recv().expect("initial LinkRequest")
+        else {
+            panic!("typed Link request expected");
+        };
+        result_tx.send(Ok(())).unwrap();
 
-        let mut second = LxMessage::new(
+        let second = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Direct two",
             "waits on pending link",
             DeliveryMethod::Direct,
-        );
-        second
+        )
+        .unwrap();
+        let second = second
             .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
             .unwrap();
-        let second_hash = second.hash.unwrap();
+        let second_hash = second.message_id();
 
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::DeliverDirect {
             message: second,
@@ -8587,13 +9313,13 @@ mod tests {
             mgr.router
                 .pending_outbound
                 .iter()
-                .any(|message| message.hash == Some(second_hash))
+                .any(|message| message.message_id() == second_hash)
         );
         assert!(mgr.auto_live_fallback.contains(&second_hash));
     }
 
-    #[test]
-    fn auto_direct_terminal_failure_escalates_to_propagation_when_ready() {
+    #[tokio::test]
+    async fn auto_direct_terminal_failure_escalates_to_propagation_when_ready() {
         let mut mgr = test_manager();
         let dest = [0x49; 16];
         let node = [0x4A; 16];
@@ -8607,6 +9333,7 @@ mod tests {
             .insert(dest_hex.clone(), remote.get_public_key());
         mgr.known_identities
             .insert(node_hex, relay.get_public_key());
+        ready_relay_policy(&mut mgr, node, 0, 256);
         mgr.router.set_stamp_cost(node, 0);
         mgr.propagation_transfer_limits_kb.insert(node, 256);
         mgr.router.set_outbound_propagation_node(Some(node));
@@ -8614,18 +9341,19 @@ mod tests {
         mgr.client_propagation_enabled = true;
 
         let msg = mgr
-            .create_message(
+            .create_final_message(
                 &dest_hex,
                 "fallback to propagation",
                 "",
                 DeliveryMethod::Direct,
             )
             .expect("message created");
-        let hash = msg.hash.expect("message hash");
+        let hash = msg.message_id();
         mgr.auto_live_fallback.insert(hash);
 
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::Failed(msg)]);
 
+        let results = finish_pending_propagation(&mut mgr, results).await;
         assert_eq!(results, vec![(hex::encode(hash), "propagating")]);
         assert_eq!(mgr.in_flight_propagation.get(&hash), Some(&node));
         assert!(!mgr.auto_live_fallback.contains(&hash));
@@ -8669,14 +9397,14 @@ mod tests {
         }]);
 
         let msg = mgr
-            .create_message(
+            .create_final_message(
                 &dest_hex,
                 "fallback from stuck link",
                 "",
                 DeliveryMethod::Direct,
             )
             .expect("message created");
-        let hash = msg.hash.expect("message hash");
+        let hash = msg.message_id();
         mgr.router.try_send(msg).unwrap();
         mgr.auto_live_fallback.insert(hash);
 
@@ -8703,7 +9431,7 @@ mod tests {
             mgr.router
                 .pending_outbound
                 .iter()
-                .any(|message| message.hash == Some(hash))
+                .any(|message| message.message_id() == hash)
         );
         assert_eq!(mgr.in_flight_propagation.get(&hash), None);
         assert!(mgr.auto_live_fallback.contains(&hash));
@@ -8745,16 +9473,16 @@ mod tests {
             interface_role: rns_transport::messages::InterfaceRole::Normal,
         }]);
 
-        let mut msg = mgr
-            .create_message(
+        let msg = mgr
+            .create_final_message(
                 &dest_hex,
                 &"image-like payload".repeat(rns_protocol::resource::MAX_EFFICIENT_SIZE / 18),
                 "",
                 DeliveryMethod::Direct,
             )
             .expect("message created");
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let hash = msg.hash.expect("message hash");
+
+        let hash = msg.message_id();
         assert!(msg.pack().unwrap().len() > rns_protocol::resource::MAX_EFFICIENT_SIZE);
         mgr.router.try_send(msg).unwrap();
 
@@ -8803,7 +9531,7 @@ mod tests {
         mgr.router
             .pending_outbound
             .iter_mut()
-            .find(|message| message.hash == Some(hash))
+            .find(|message| message.message_id() == hash)
             .expect("pending Resource message")
             .delivery_attempts = MAX_DELIVERY_ATTEMPTS;
         let results = mgr.tick();
@@ -8825,7 +9553,7 @@ mod tests {
             mgr.router
                 .pending_outbound
                 .iter()
-                .any(|m| m.hash == Some(hash))
+                .any(|m| m.message_id() == hash)
         );
         assert_eq!(mgr.in_flight_propagation.get(&hash), None);
         assert!(mgr.auto_live_fallback.contains(&hash));
@@ -8867,16 +9595,16 @@ mod tests {
             interface_role: rns_transport::messages::InterfaceRole::Normal,
         }]);
 
-        let mut msg = mgr
-            .create_message(
+        let msg = mgr
+            .create_final_message(
                 &dest_hex,
                 &"image-like payload".repeat(rns_protocol::resource::MAX_EFFICIENT_SIZE / 18),
                 "",
                 DeliveryMethod::Direct,
             )
             .expect("message created");
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let hash = msg.hash.expect("message hash");
+
+        let hash = msg.message_id();
         mgr.router.try_send(msg).unwrap();
 
         assert_eq!(mgr.tick(), vec![(hex::encode(hash), "link_establishing")]);
@@ -8942,7 +9670,7 @@ mod tests {
             !mgr.router
                 .pending_outbound
                 .iter()
-                .any(|m| m.hash == Some(hash))
+                .any(|m| m.message_id() == hash)
         );
         assert_eq!(mgr.in_flight_propagation.get(&hash), None);
         assert!(!mgr.auto_live_fallback.contains(&hash));
@@ -8965,14 +9693,14 @@ mod tests {
             .insert(dest_hex.clone(), remote.get_public_key());
 
         let msg = mgr
-            .create_message(
+            .create_final_message(
                 &dest_hex,
                 "fallback unavailable",
                 "",
                 DeliveryMethod::Direct,
             )
             .expect("message created");
-        let hash = msg.hash.expect("message hash");
+        let hash = msg.message_id();
         mgr.auto_live_fallback.insert(hash);
 
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::Failed(msg)]);
@@ -8981,26 +9709,27 @@ mod tests {
         assert!(!mgr.auto_live_fallback.contains(&hash));
     }
 
-    #[test]
-    fn auto_opportunistic_terminal_failure_escalates_to_propagation() {
+    #[tokio::test]
+    async fn auto_opportunistic_terminal_failure_escalates_to_propagation() {
         let mut mgr = test_manager();
         let dest = [0x7A; 16];
         let node = [0x7B; 16];
         let dest_hex = hex::encode(dest);
         let _transport_rx = ready_auto_propagation_fallback(&mut mgr, dest, node);
         let message = mgr
-            .create_message(
+            .create_final_message(
                 &dest_hex,
                 "opportunistic fallback",
                 "",
                 DeliveryMethod::Opportunistic,
             )
             .expect("message created");
-        let hash = message.hash.expect("message hash");
+        let hash = message.message_id();
         mgr.auto_live_fallback.insert(hash);
 
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::Failed(message)]);
 
+        let results = finish_pending_propagation(&mut mgr, results).await;
         assert_eq!(results, vec![(hex::encode(hash), "propagating")]);
         assert_eq!(mgr.in_flight_propagation.get(&hash), Some(&node));
         assert!(!mgr.auto_live_fallback.contains(&hash));
@@ -9014,14 +9743,14 @@ mod tests {
         let dest_hex = hex::encode(dest);
         let _transport_rx = ready_auto_propagation_fallback(&mut mgr, dest, node);
         let message = mgr
-            .create_message(
+            .create_final_message(
                 &dest_hex,
                 "manual opportunistic",
                 "",
                 DeliveryMethod::Opportunistic,
             )
             .expect("message created");
-        let hash = message.hash.expect("message hash");
+        let hash = message.message_id();
 
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::Failed(message)]);
 
@@ -9037,9 +9766,9 @@ mod tests {
         let dest_hex = hex::encode(dest);
         let _transport_rx = ready_auto_propagation_fallback(&mut mgr, dest, node);
         let message = mgr
-            .create_message(&dest_hex, "rejected live send", "", DeliveryMethod::Direct)
+            .create_final_message(&dest_hex, "rejected live send", "", DeliveryMethod::Direct)
             .expect("message created");
-        let hash = message.hash.expect("message hash");
+        let hash = message.message_id();
         mgr.auto_live_fallback.insert(hash);
 
         let mut results = Vec::new();
@@ -9068,17 +9797,23 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportMessage>(8);
         mgr.router.set_transport(tx);
 
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Opp",
             "hi",
             DeliveryMethod::Opportunistic,
-        );
+        )
+        .unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
+        let mut msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
         mgr.preempt_opportunistic_path(&mut msg);
 
         assert!(
@@ -9095,8 +9830,19 @@ mod tests {
         }
 
         // Non-opportunistic is a no-op.
-        let mut direct =
-            LxMessage::new(dest, mgr.lxmf_dest_hash, "D", "hi", DeliveryMethod::Direct);
+        let direct = lxmf_core::message::LxMessageDraft::new(
+            dest,
+            mgr.lxmf_dest_hash,
+            "D",
+            "hi",
+            DeliveryMethod::Direct,
+        )
+        .unwrap();
+        let mut direct = direct
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
         mgr.preempt_opportunistic_path(&mut direct);
         assert_eq!(direct.next_delivery_attempt, 0.0);
     }
@@ -9115,15 +9861,20 @@ mod tests {
         mgr.known_identities
             .insert(dest_hex, Identity::new().get_public_key());
 
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Opp",
             "hi",
             DeliveryMethod::Opportunistic,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let mut msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let msg_hash = msg.message_id();
         msg.delivery_attempts = MAX_PATHLESS_TRIES;
 
         let now = SystemTime::now()
@@ -9190,15 +9941,20 @@ mod tests {
             interface_role: rns_transport::messages::InterfaceRole::Normal,
         }]);
 
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "Opp",
             "hi",
             DeliveryMethod::Opportunistic,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let mut msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let msg_hash = msg.message_id();
         msg.delivery_attempts = MAX_PATHLESS_TRIES + 1;
 
         let results = mgr.execute_encrypted_actions(vec![OutboundAction::DeliverOpportunistic {
@@ -9395,13 +10151,14 @@ mod tests {
             db::LXMF_COMPRESSION_SUPPORT_UNSUPPORTED
         ));
 
-        let mut msg = LxMessage::new(
+        let mut msg = lxmf_core::message::LxMessageDraft::new(
             dest_bytes,
             mgr.lxmf_dest_hash,
             "",
             "manual direct",
             DeliveryMethod::Direct,
-        );
+        )
+        .unwrap();
         assert!(msg.auto_compress);
         mgr.apply_peer_lxmf_compression_support(&mut msg, Some(&pool), dest);
         assert!(!msg.auto_compress);
@@ -9568,7 +10325,13 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<TransportMessage>(16);
         mgr.router.set_transport(tx);
         mgr.client_propagation_enabled = true;
+        mgr.configured_propagation_node = Some(node);
         mgr.activate_client_propagation_node(node);
+        mgr.install_download_state(
+            SuppressionLedger::default(),
+            AdmissionEpochs::default(),
+            Vec::new(),
+        );
         mgr.known_identities
             .insert(node_hex, Identity::new().get_public_key());
         mgr.last_propagation_check = SystemTime::now()
@@ -9616,7 +10379,7 @@ mod tests {
         let dest = "cccccccccccccccccccccccccccccccc";
         let content = "x".repeat(OPPORTUNISTIC_MAX_CONTENT_BYTES + 512);
         let mut msg = mgr
-            .create_message(dest, &content, "", DeliveryMethod::Opportunistic)
+            .create_final_message(dest, &content, "", DeliveryMethod::Opportunistic)
             .unwrap();
 
         normalize_protocol_delivery_method(&mut msg);
@@ -9668,8 +10431,8 @@ mod tests {
                 preference: DeliveryPreference::Auto,
             }));
             let msg = &mgr.router.pending_outbound[index];
-            assert!(msg.content.is_empty());
-            assert!(msg.title.is_empty());
+            assert!(msg.content_bytes().is_empty());
+            assert!(msg.title_bytes().is_empty());
             assert_eq!(
                 decode_ratspeak_chat_extension(msg),
                 Some(RatspeakChatExtension::Reaction {
@@ -9860,19 +10623,23 @@ mod tests {
 
     #[test]
     fn deferred_stamp_reserve_matches_actual_packed_lxm_at_efficient_boundary() {
-        fn message_with_audio_len(audio_len: usize) -> LxMessage {
-            let mut message = LxMessage::new(
+        fn message_with_audio_len(audio_len: usize) -> SignedLxMessage {
+            let mut message = lxmf_core::message::LxMessageDraft::new(
                 [0x11; 16],
                 [0x22; 16],
                 "",
                 "Voice message",
                 DeliveryMethod::Direct,
-            );
+            )
+            .unwrap();
             message
                 .set_audio_field(lxmf_core::constants::AM_OPUS_OGG, &vec![0; audio_len])
                 .unwrap();
-            message.signature = Some([0x33; 64]);
             message
+                .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                    &[7; 32],
+                ))
+                .unwrap()
         }
 
         let limit = rns_protocol::resource::MAX_EFFICIENT_SIZE;
@@ -9890,8 +10657,11 @@ mod tests {
         let unstamped_len = unstamped.packed_len().unwrap();
         assert_eq!(unstamped_len + MAX_DEFERRED_STAMP_WIRE_BYTES, limit);
 
-        let mut stamped = unstamped.clone();
-        stamped.stamp = Some(vec![0x44; lxmf_core::constants::STAMP_SIZE]);
+        let stamped = unstamped
+            .finalize(Some(lxmf_core::message::RecipientStamp::ProofOfWork(
+                [0x44; 32],
+            )))
+            .unwrap();
         assert_eq!(stamped.packed_len().unwrap(), limit);
         assert_eq!(
             validate_audio_message_size(unstamped_len + MAX_DEFERRED_STAMP_WIRE_BYTES),
@@ -9901,9 +10671,13 @@ mod tests {
             })
         );
 
-        let mut below = message_with_audio_len(audio_len - 1);
+        let below = message_with_audio_len(audio_len - 1);
         let below_unstamped_len = below.packed_len().unwrap();
-        below.stamp = Some(vec![0x55; lxmf_core::constants::STAMP_SIZE]);
+        let below = below
+            .finalize(Some(lxmf_core::message::RecipientStamp::ProofOfWork(
+                [0x55; 32],
+            )))
+            .unwrap();
         assert_eq!(below.packed_len().unwrap(), limit - 1);
         assert_eq!(
             validate_audio_message_size(below_unstamped_len + MAX_DEFERRED_STAMP_WIRE_BYTES),
@@ -9946,13 +10720,12 @@ mod tests {
         let (proof_tx, mut proof_rx) = tokio::sync::mpsc::unbounded_channel();
         mgr.set_opportunistic_proof_sender(proof_tx);
 
-        let mut message = mgr
+        let message = mgr
             .create_message(&dest_hex, "needs stamp", "", DeliveryMethod::Opportunistic)
             .expect("message created");
-        message.outbound_ticket = None;
         mgr.router.ticket_store.replace_legacy(Vec::new());
-        let msg_id = message.hash.map(hex::encode).expect("message hash");
-        mgr.router.try_send(message).unwrap();
+        let msg_id = hex::encode(message.message_id());
+        mgr.router.submit_signed(message).unwrap();
 
         assert_eq!(mgr.router.pending_deferred_stamps.len(), 1);
 
@@ -10052,7 +10825,8 @@ mod tests {
             mgr.propagation_transfer_limits_kb.get(&propagation_dest),
             Some(&1024)
         );
-        assert!(!mgr.update_lxmf_announce_app_data(
+        // Even unchanged cost/limit renew the durable policy's announce time.
+        assert!(mgr.update_lxmf_announce_app_data(
             propagation_dest,
             rns_identity::name_hash::name_hash("lxmf.propagation"),
             Some(&pn_app_data),
@@ -10080,8 +10854,8 @@ mod tests {
         assert_eq!(mgr.router.get_stamp_cost(&unrelated_dest), None);
     }
 
-    #[test]
-    fn propagated_send_fails_locally_above_announced_decimal_limit() {
+    #[tokio::test]
+    async fn propagated_send_fails_locally_above_announced_decimal_limit() {
         let mut mgr = test_manager();
         let destination = Identity::new();
         let relay = Identity::new();
@@ -10092,6 +10866,9 @@ mod tests {
         mgr.known_identities
             .insert(hex::encode(relay_hash), relay.get_public_key());
 
+        let (tx, _rx) = mpsc::channel(16);
+        mgr.router.set_transport(tx);
+        ready_relay_policy(&mut mgr, relay_hash, 0, 0);
         let announce = lxmf_core::handlers::PropagationNodeAnnounceData::new(true, 0, 0, 0, 0, 0);
         assert!(mgr.update_lxmf_announce_app_data(
             relay_hash,
@@ -10102,17 +10879,19 @@ mod tests {
         ));
 
         let message = mgr
-            .create_message(
+            .create_final_message(
                 &hex::encode(destination_hash),
                 "cannot fit in a zero-byte relay transfer",
                 "",
                 DeliveryMethod::Propagated,
             )
             .unwrap();
-        let message_id = hex::encode(message.hash.unwrap());
+        mgr.router.set_outbound_propagation_node(Some(relay_hash));
+        let message_id = hex::encode(message.message_id());
         let mut results = Vec::new();
         mgr.start_propagation_delivery(message, relay_hash, &mut results);
 
+        let results = finish_pending_propagation(&mut mgr, results).await;
         assert_eq!(results, vec![(message_id.clone(), "failed")]);
         let failures = mgr.take_delivery_failure_updates();
         assert_eq!(failures.len(), 1);
@@ -10184,7 +10963,7 @@ mod tests {
             .insert(hex::encode(propagation_node), remote.get_public_key());
         mgr.propagation_transfer_limits_kb
             .insert(propagation_node, 256);
-        mgr.save_crypto_state();
+        mgr.save_crypto_state().unwrap();
         drop(mgr);
 
         let mut restored = LxmfManager::load_or_create(&tmp, Some(&identity_hash), None).unwrap();
@@ -10202,6 +10981,11 @@ mod tests {
                 &announce,
             )),
         ));
+        assert!(
+            !restored.propagation_node_ready_for_send(&propagation_node),
+            "announce alone does not establish a usable node path"
+        );
+        ready_relay_policy(&mut restored, propagation_node, 19, 256);
         assert!(restored.propagation_node_ready_for_send(&propagation_node));
     }
 
@@ -10226,14 +11010,14 @@ mod tests {
         mgr.router.set_transport(tx);
 
         let message = mgr
-            .create_message(
+            .create_final_message(
                 &recipient_hex,
                 "relay once cost is known",
                 "",
                 DeliveryMethod::Propagated,
             )
             .expect("message created");
-        let message_id = message.hash.expect("message hash");
+        let message_id = message.message_id();
         mgr.router.try_send(message).unwrap();
 
         let states = mgr.tick();
@@ -10249,14 +11033,14 @@ mod tests {
             mgr.router
                 .pending_outbound
                 .iter()
-                .any(|msg| msg.hash == Some(message_id)),
+                .any(|msg| msg.message_id() == message_id),
             "message should be requeued until propagation-node stamp cost is learned"
         );
         let queued = mgr
             .router
             .pending_outbound
             .iter()
-            .find(|msg| msg.hash == Some(message_id))
+            .find(|msg| msg.message_id() == message_id)
             .expect("message requeued");
         assert_eq!(
             queued.delivery_attempts, 0,
@@ -10279,6 +11063,7 @@ mod tests {
 
         mgr.known_identities
             .insert(prop_hex, prop_identity.get_public_key());
+        ready_relay_policy(&mut mgr, propagation_node, 19, 256);
         mgr.router.set_stamp_cost(propagation_node, 19);
         mgr.propagation_transfer_limits_kb
             .insert(propagation_node, 256);
@@ -10289,14 +11074,14 @@ mod tests {
         mgr.router.set_transport(tx);
 
         let message = mgr
-            .create_message(
+            .create_final_message(
                 &recipient_hex,
                 "wait until recipient identity is known",
                 "",
                 DeliveryMethod::Propagated,
             )
             .expect("message created");
-        let message_id = message.hash.expect("message hash");
+        let message_id = message.message_id();
         mgr.router.try_send(message).unwrap();
 
         let states = mgr.tick();
@@ -10312,14 +11097,14 @@ mod tests {
             mgr.router
                 .pending_outbound
                 .iter()
-                .any(|msg| msg.hash == Some(message_id)),
+                .any(|msg| msg.message_id() == message_id),
             "message should be requeued until recipient identity key is learned"
         );
         let queued = mgr
             .router
             .pending_outbound
             .iter()
-            .find(|msg| msg.hash == Some(message_id))
+            .find(|msg| msg.message_id() == message_id)
             .expect("message requeued");
         assert_eq!(
             queued.delivery_attempts, 0,
@@ -10340,14 +11125,14 @@ mod tests {
         let mut mgr = test_manager();
         let dest_hex = hex::encode([0x88; 16]);
         let mut message = mgr
-            .create_message(
+            .create_final_message(
                 &dest_hex,
                 "delivery attempts exhausted",
                 "",
                 DeliveryMethod::Direct,
             )
             .expect("message created");
-        let message_id = message.hash.expect("message hash");
+        let message_id = message.message_id();
         message.delivery_attempts = u32::MAX;
         mgr.router.try_send(message).unwrap();
 
@@ -10365,13 +11150,22 @@ mod tests {
         let mut mgr = test_manager();
         let dest = [0x89; 16];
         let node = [0x8A; 16];
-        let dest_hex = hex::encode(dest);
         let _transport_rx = ready_auto_propagation_fallback(&mut mgr, dest, node);
-        let mut message = mgr
-            .create_message(&dest_hex, "expired Auto send", "", DeliveryMethod::Direct)
-            .expect("message created");
-        let message_id = message.hash.expect("message hash");
-        message.timestamp = 0.0;
+        let mut draft = LxMessageDraft::new(
+            dest,
+            mgr.lxmf_dest_hash,
+            "",
+            "expired Auto send",
+            DeliveryMethod::Direct,
+        )
+        .unwrap();
+        draft.set_timestamp(0.0).unwrap();
+        let message = draft
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let message_id = message.message_id();
         mgr.router.try_send(message).unwrap();
         mgr.auto_live_fallback.insert(message_id);
 
@@ -10411,10 +11205,9 @@ mod tests {
             .first()
             .expect("direct attachment should be pending outbound");
         let field = message
-            .fields
-            .get(&lxmf_core::constants::FIELD_FILE_ATTACHMENTS)
+            .get_field(lxmf_core::constants::FIELD_FILE_ATTACHMENTS)
             .expect("attachment field");
-        let value = rmpv::decode::read_value(&mut std::io::Cursor::new(field)).unwrap();
+        let value = rmpv::decode::read_value(&mut std::io::Cursor::new(field.encoded())).unwrap();
         let attachment = value.as_array().unwrap()[0].as_array().unwrap();
 
         assert_eq!(attachment[0].as_str(), Some("note.txt"));
@@ -10450,8 +11243,8 @@ mod tests {
         assert_eq!(audio.bytes, audio_bytes);
         assert!(
             !message
-                .fields
-                .contains_key(&lxmf_core::constants::FIELD_FILE_ATTACHMENTS)
+                .fields()
+                .contains(lxmf_core::constants::FIELD_FILE_ATTACHMENTS)
         );
 
         let conversation = db::get_conversation(&pool, &dest, "me", 10);

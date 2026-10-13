@@ -15,8 +15,10 @@ pub mod channels;
 #[cfg(feature = "hardware")]
 pub mod hardware;
 pub mod helpers;
+mod hosted_propagation;
 pub mod identity_prune;
 pub mod image_attachment;
+mod inbound_admission;
 mod link_accounting;
 pub mod lxmf;
 pub mod lxmf_persistence;
@@ -26,6 +28,7 @@ pub mod network_ownership;
 mod network_secrets;
 mod path_response;
 pub mod propagation;
+pub mod propagation_recovery;
 mod rnode_activity;
 pub mod rns;
 pub mod rns_config;
@@ -512,9 +515,7 @@ pub fn apply_lxmf_settings_from_state(state: &AppState, mgr: &mut lxmf::LxmfMana
     mgr.announce_ratspeak_usage = state.announce_ratspeak_usage_enabled();
     mgr.set_delivery_limit_kb(state.lxmf_delivery_limit_kb());
 
-    let hosting = state
-        .propagation_node_hosting_enabled
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let hosting = state.effective_propagation_hosting();
     let pn_cost = state
         .propagation_node_stamp_cost
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -544,6 +545,9 @@ fn install_propagation_announce_metadata(
                     return None;
                 }
                 let state = state.upgrade()?;
+                if !state.effective_propagation_hosting() {
+                    return None;
+                }
                 let owner = state.lxmf.lock().ok()?;
                 let owner = owner
                     .as_ref()
@@ -558,6 +562,7 @@ fn install_propagation_announce_metadata(
 /// strips this stamp when serving a client, including after a process restart.
 /// `None` rejects invalid proof data; `Some(false)` is a valid but unaccepted
 /// deposit (for example a duplicate or a storage limit).
+#[cfg(test)]
 fn accept_hosted_propagation_deposit(
     node: &mut lxmf_core::propagation_node::PropagationNode,
     entry: &[u8],
@@ -1036,6 +1041,23 @@ pub(crate) async fn shutdown_rns_lxmf_inner(
     if let Ok(sig) = state.session_shutdown.read() {
         sig.trigger();
     }
+    let outbound_workers = state
+        .lxmf
+        .lock()
+        .ok()
+        .and_then(|mut manager| {
+            let manager = manager.as_mut()?;
+            manager.pause_download_admission();
+            Some(manager.cancel_and_take_propagation_workers())
+        })
+        .unwrap_or_default();
+    for worker in outbound_workers {
+        if let Err(error) = worker.await {
+            tracing::warn!(%error, "outbound preparation worker stopped");
+        }
+    }
+    let _download_jobs = inbound_admission::quiesce().await;
+    let _hosted_jobs = hosted_propagation::quiesce().await;
     #[cfg(all(feature = "ble", target_os = "android"))]
     let _ = state
         .mobile_platform_bridge()
@@ -1315,6 +1337,21 @@ pub async fn start_channel_hub_service(state: &Arc<AppState>) -> bool {
 }
 
 pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
+    // Keep the large startup state machine out of every caller's future and
+    // debug poll frame. Tokio's normal worker stack should remain sufficient.
+    Box::pin(init_rns_lxmf_inner(state, data_dir)).await;
+}
+
+#[cfg(test)]
+#[test]
+fn startup_future_keeps_callers_stack_small() {
+    fn future_size<A, B, F>(_: fn(A, B) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+    assert!(future_size(init_rns_lxmf) <= 128);
+}
+
+async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf) {
     state
         .network_session
         .write()
@@ -1399,14 +1436,38 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
         return;
     }
 
-    let loaded = match retained_identity {
-        Some((identity, hardware)) => {
-            lxmf::LxmfManager::from_loaded_identity(&data_dir, identity, hardware)
+    let generation = state.current_identity_session_generation();
+    let vault_job = if lock_kind == Some("passcode") && retained_identity.is_none() {
+        match vault::try_acquire_job() {
+            Ok(job) => Some(job),
+            Err(error) => {
+                state.set_hw_last_error(Some(error.to_string()));
+                state.set_hw_locked(preferred_identity_hash.clone());
+                state.set_startup_stage("hw_locked");
+                return;
+            }
         }
-        None => {
-            lxmf::LxmfManager::load_or_create(&data_dir, preferred_identity_hash.as_deref(), hw_pin)
-        }
+    } else {
+        None
     };
+    let load_dir = data_dir.clone();
+    let load_hash = preferred_identity_hash.clone();
+    let loaded = tokio::task::spawn_blocking(move || match retained_identity {
+        Some((identity, hardware)) => {
+            lxmf::LxmfManager::from_loaded_identity(&load_dir, identity, hardware)
+        }
+        None => lxmf::LxmfManager::load_or_create_with_vault_job(
+            &load_dir,
+            load_hash.as_deref(),
+            hw_pin,
+            vault_job.as_ref(),
+        ),
+    })
+    .await
+    .unwrap_or_else(|_| Err("identity loading task panicked".into()));
+    if state.current_identity_session_generation() != generation {
+        return;
+    }
     match loaded {
         Ok(mut mgr) => {
             state.set_hw_locked(None);
@@ -1763,8 +1824,8 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                 (None, None)
             };
 
-            // Register propagation destination and start inbound propagation LinkManager
-            {
+            // Open durable storage before exposing the propagation service.
+            'propagation_host: {
                 let prop_info = state.lxmf.lock().ok().and_then(|l| {
                     let mgr = l.as_ref()?;
                     let signing_key = mgr.identity.get_signing_key()?;
@@ -1775,6 +1836,86 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                 });
 
                 if let Some((prop_dest_hash, identity, signing_key)) = prop_info {
+                    let prop_storage = {
+                        let lxmf = state.lxmf.lock().ok();
+                        lxmf.and_then(|l| {
+                            let mgr = l.as_ref()?;
+                            let storage_dir = mgr
+                                .data_dir
+                                .join("identities")
+                                .join(&mgr.identity_hash)
+                                .join("propagation");
+                            Some((storage_dir, prop_dest_hash))
+                        })
+                    };
+
+                    let prop_node_config = lxmf_core::propagation_node::PropagationNodeConfig {
+                        min_stamp_cost: state
+                            .propagation_node_stamp_cost
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        ..lxmf_core::propagation_node::PropagationNodeConfig::default()
+                    };
+
+                    let generation = state.current_identity_session_generation();
+                    let identity_id = hex::encode(identity.hash);
+                    state.set_propagation_host_readiness(
+                        identity_id.clone(),
+                        generation,
+                        state::PropagationHostReadiness::Opening,
+                        None,
+                    );
+                    let Some((storage_dir, dest_hash)) = prop_storage else {
+                        state.set_propagation_host_readiness(
+                            identity_id,
+                            generation,
+                            state::PropagationHostReadiness::Unavailable,
+                            Some("Storage path unavailable".into()),
+                        );
+                        break 'propagation_host;
+                    };
+                    let result = tokio::task::spawn_blocking(move || {
+                        let node = lxmf_core::propagation_node::PropagationNode::with_storage(
+                            prop_node_config,
+                            dest_hash,
+                            storage_dir.clone(),
+                        );
+                        let summary =
+                            lxmf_core::propagation_store_v2::quarantine_summary(&storage_dir).ok();
+                        (node, summary)
+                    })
+                    .await;
+                    if let Ok((_, summary)) = &result {
+                        state.set_propagation_quarantine_summary(generation, summary.clone());
+                    }
+                    let prop_node = match result {
+                        Ok((Ok(node), _)) => node,
+                        error => {
+                            let migration = matches!(&error, Ok((Err(error), _)) if lxmf_core::propagation_store_v2::is_migration_required(error));
+                            let readiness = if migration {
+                                state::PropagationHostReadiness::MigrationRequired
+                            } else {
+                                state::PropagationHostReadiness::Unavailable
+                            };
+                            state.set_propagation_host_readiness(
+                                identity_id,
+                                generation,
+                                readiness,
+                                Some(
+                                    if migration {
+                                        "Relay storage requires an offline migration"
+                                    } else {
+                                        "Relay storage could not be opened or verified"
+                                    }
+                                    .into(),
+                                ),
+                            );
+                            tracing::warn!(
+                                migration,
+                                "propagation hosting unavailable; ordinary messaging remains active"
+                            );
+                            break 'propagation_host;
+                        }
+                    };
                     let (prop_tx, prop_rx) = tokio::sync::mpsc::channel(CHANNEL_BUFFER_SIZE);
                     match rns_mgr
                         .handle
@@ -1799,62 +1940,15 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                                 reason = "registration_failed",
                                 "failed to register propagation destination"
                             );
+                            state.set_propagation_host_readiness(
+                                identity_id,
+                                generation,
+                                state::PropagationHostReadiness::Unavailable,
+                                Some("Transport unavailable".into()),
+                            );
+                            break 'propagation_host;
                         }
                     }
-
-                    let prop_storage = {
-                        let lxmf = state.lxmf.lock().ok();
-                        lxmf.and_then(|l| {
-                            let mgr = l.as_ref()?;
-                            let storage_dir = mgr
-                                .data_dir
-                                .join("identities")
-                                .join(&mgr.identity_hash)
-                                .join("propagation");
-                            Some((storage_dir, prop_dest_hash))
-                        })
-                    };
-
-                    let prop_node_config = lxmf_core::propagation_node::PropagationNodeConfig {
-                        min_stamp_cost: state
-                            .propagation_node_stamp_cost
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        ..lxmf_core::propagation_node::PropagationNodeConfig::default()
-                    };
-                    // Captured before the config moves into the node: bounds
-                    // the wrapper decode in the deposit loop below.
-                    let max_transfer_bytes = prop_node_config.max_storage;
-
-                    let prop_node = if let Some((storage_dir, dest_hash)) = prop_storage {
-                        match lxmf_core::propagation_node::PropagationNode::with_storage(
-                            prop_node_config.clone(),
-                            dest_hash,
-                            storage_dir,
-                        ) {
-                            Ok(node) => {
-                                tracing::info!(
-                                    messages = node.message_count(),
-                                    "propagation node loaded"
-                                );
-                                node
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    reason = "storage_unavailable",
-                                    "failed to create propagation node with storage, using in-memory"
-                                );
-                                lxmf_core::propagation_node::PropagationNode::new(
-                                    prop_node_config.clone(),
-                                    dest_hash,
-                                )
-                            }
-                        }
-                    } else {
-                        lxmf_core::propagation_node::PropagationNode::new(
-                            prop_node_config,
-                            prop_dest_hash,
-                        )
-                    };
 
                     let prop_node = std::sync::Arc::new(std::sync::Mutex::new(prop_node));
                     if let Ok(mut pn) = state.propagation_node.lock() {
@@ -1872,7 +1966,6 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                     install_propagation_announce_metadata(&mut link_mgr, &state, prop_dest_hash);
 
                     let offer_node = prop_node.clone();
-                    let get_node = prop_node.clone();
                     let link_identities = link_mgr.link_identities_handle();
                     let prop_hosting_state = state.clone();
 
@@ -1885,20 +1978,10 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                         ph.copy_from_slice(&h[..16]);
                         ph
                     };
-                    let get_path_hash = {
-                        let h = rns_crypto::sha::sha256(
-                            lxmf_core::constants::MESSAGE_GET_PATH.as_bytes(),
-                        );
-                        let mut ph = [0u8; 16];
-                        ph.copy_from_slice(&h[..16]);
-                        ph
-                    };
+
 
                     link_mgr.set_request_handler(move |link_id, path_hash, data| {
-                        if !prop_hosting_state
-                            .propagation_node_hosting_enabled
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                        {
+                        if !prop_hosting_state.effective_propagation_hosting() {
                             return None;
                         }
                         if path_hash == offer_path_hash {
@@ -1923,43 +2006,55 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                             } else {
                                 None
                             }
-                        } else if path_hash == get_path_hash {
-                            let remote_identity_hash = link_identities
-                                .lock()
-                                .ok()
-                                .and_then(|ids| ids.get(&link_id).copied());
-                            let client_dest_hash = remote_identity_hash
-                                .map(|identity_hash| {
-                                    rns_identity::destination::Destination::hash_from_name_and_identity(
-                                        LXMF_DELIVERY_APP_NAME,
-                                        Some(&identity_hash),
-                                    )
-                                })
-                                .unwrap_or([0u8; 16]);
-                            let action = if let Ok(mut node) = get_node.lock() {
-                                node.handle_get_request(&data, &client_dest_hash)
-                            } else {
-                                return None;
-                            };
-                            // Phase-2 file reads happen here, after the node lock drops.
-                            Some(action.into_response())
                         } else {
                             None
                         }
                     });
 
-                    let (pkt_tx, mut pkt_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, [u8; 16])>();
-                    link_mgr.set_link_packet_channel(pkt_tx);
-                    let (res_tx, mut res_rx) =
-                        tokio::sync::mpsc::channel::<(Vec<u8>, [u8; 16])>(CHANNEL_BUFFER_SIZE);
-                    link_mgr.set_resource_completed_channel(res_tx);
+                    link_mgr.set_link_endpoint_dispatch_handle(
+                        rns_mgr.handle.link_endpoint_dispatch_handle(),
+                    );
+                    let get_limit = state.lxmf.lock().ok().and_then(|owner| {
+                        let kb = owner.as_ref()?.router.config.propagation_limit_kb;
+                        Some(kb.saturating_mul(lxmf_core::constants::BYTES_PER_KILOBYTE).min(64 * 1024 * 1024))
+                    }).unwrap_or(0);
+                    if !hosted_propagation::install_get_handler(&mut link_mgr, &state, prop_node.clone(), get_limit) {
+                        state.set_propagation_host_readiness(identity_id, generation, state::PropagationHostReadiness::Unavailable, Some("Propagation transfer budget is invalid".into()));
+                        break 'propagation_host;
+                    }
 
+                    let (pkt_tx, pkt_rx) = tokio::sync::mpsc::channel(256);
+                    link_mgr
+                        .set_inbound_link_packet_channel(pkt_tx)
+                        .expect("new hosted manager uses a typed packet channel");
+                    link_mgr
+                        .set_ordinary_packet_proof_strategy(
+                            rns_identity::destination::ProofStrategy::ProveApp,
+                        )
+                        .expect("hosted manager has exact dispatch and a typed packet channel");
+                    let (accounting_tx, accounting_rx) = tokio::sync::mpsc::unbounded_channel();
+                    link_mgr.set_accounting_event_channel(accounting_tx);
+                    let resource_owners =
+                        hosted_propagation::install_resource_admission(&mut link_mgr, &state);
+                    if !state.set_propagation_host_readiness(
+                        identity_id,
+                        generation,
+                        state::PropagationHostReadiness::Ready,
+                        None,
+                    ) {
+                        break 'propagation_host;
+                    }
+                    if let Ok(mut manager) = state.lxmf.lock()
+                        && let Some(manager) = manager.as_mut()
+                    {
+                        apply_lxmf_settings_from_state(&state, manager);
+                    }
                     let prop_shutdown = state
                         .session_shutdown
                         .read()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
+                    let store_shutdown = prop_shutdown.clone();
                     tokio::spawn(async move {
                         tokio::select! {
                             biased;
@@ -1967,59 +2062,14 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                             _ = link_mgr.run() => {}
                         }
                     });
-
-                    // Completed resources on this link = propagation deposits.
-                    let store_node = prop_node.clone();
-                    let store_state = state.clone();
-                    let store_shutdown = state
-                        .session_shutdown
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    tokio::spawn(async move {
-                        loop {
-                            let item = tokio::select! {
-                                biased;
-                                _ = store_shutdown.wait() => break,
-                                item = pkt_rx.recv() => item,
-                                item = res_rx.recv() => item,
-                            };
-                            let Some((data, _link_id)) = item else {
-                                break;
-                            };
-                            let Ok((_timebase, entries)) =
-                                lxmf_core::message_api::LxMessage::unpack_propagation_wrapper_bounded(
-                                    &data,
-                                    max_transfer_bytes,
-                                )
-                            else {
-                                tracing::warn!("failed to unpack inbound propagation wrapper");
-                                continue;
-                            };
-                            if !store_state
-                                .propagation_node_hosting_enabled
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                            {
-                                continue;
-                            }
-                            if let Ok(mut node) = store_node.lock() {
-                                let mut accepted = 0usize;
-                                let mut rejected = 0usize;
-                                for entry in entries {
-                                    match accept_hosted_propagation_deposit(&mut node, &entry) {
-                                        Some(true) => accepted += 1,
-                                        Some(false) => {}
-                                        None => rejected += 1,
-                                    }
-                                }
-                                tracing::debug!(
-                                    accepted,
-                                    rejected,
-                                    "processed inbound propagation transfer"
-                                );
-                            }
-                        }
-                    });
+                    tokio::spawn(hosted_propagation::run(
+                        state.clone(),
+                        prop_node,
+                        pkt_rx,
+                        accounting_rx,
+                        resource_owners,
+                        store_shutdown,
+                    ));
                 }
             }
 
@@ -2109,7 +2159,14 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                         tokio::sync::mpsc::channel::<([u8; 16], [u8; 16])>(CHANNEL_BUFFER_SIZE);
                     let (backchannel_event_tx, backchannel_event_rx) =
                         tokio::sync::mpsc::unbounded_channel::<lxmf::BackchannelLinkEvent>();
-                    lxmf_link_mgr.set_link_packet_channel(link_pkt_tx.clone());
+                    lxmf_link_mgr
+                        .set_ordinary_packet_proof_strategy(
+                            rns_identity::destination::ProofStrategy::ProveAll,
+                        )
+                        .expect("Direct proofs do not require deferred admission");
+                    lxmf_link_mgr
+                        .set_link_packet_channel(link_pkt_tx.clone())
+                        .expect("Direct channel uses automatic proofs");
                     // Use the single-owner accounting stream instead of also
                     // installing the legacy completion channel. Installing
                     // both would clone every completed Resource Vec.
@@ -2346,6 +2403,7 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                 let mut save_counter: u64 = 0;
                 let mut timeout_check_counter: u64 = 0;
                 let mut next_auto_inbox_ready_check_at = 0.0;
+                let mut download_coordinator = inbound_admission::DownloadCoordinator::default();
                 #[cfg(feature = "mobile-throttle")]
                 let mut was_foreground = true;
                 loop {
@@ -2388,6 +2446,9 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                             }
                             was_foreground = is_fg;
                         }
+                    }
+                    if !delivery_only {
+                        download_coordinator.synchronize(&tick_state).await;
                     }
                     let network_available =
                         crate::any_interface_online_cached(&tick_state).unwrap_or(false);
@@ -2846,13 +2907,8 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                     }
 
                     for data in downloaded_propagation_messages {
-                        handle_decrypted_lxmf_from_origin(
-                            &tick_state,
-                            data,
-                            InboundLxmfSource::Propagated,
-                            tick_activity_origin,
-                        )
-                        .await;
+                        inbound_admission::admit_download(&tick_state, data, tick_activity_origin)
+                            .await;
                     }
 
                     if delivery_only {
@@ -3694,10 +3750,7 @@ fn try_build_presence_announce_packets(
     let mut delivery_coalesced = false;
     let mut delivery_failed = false;
     if let Some(mgr) = lxmf.as_mut() {
-        let propagation_packet = if state
-            .propagation_node_hosting_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        let propagation_packet = if state.effective_propagation_hosting() {
             match mgr.create_propagation_announce_packet() {
                 Ok(raw) => Some((mgr.propagation_dest_hash, raw, false)),
                 Err(error) => {
@@ -4114,8 +4167,8 @@ fn extract_and_save_attachment(
     // A declared but malformed field is user media, not service traffic.
     // Keep a non-playable/unavailable representation instead of a blank bubble.
     use lxmf_core::constants::{FIELD_FILE_ATTACHMENTS, FIELD_IMAGE};
-    if msg.fields.contains_key(&FIELD_IMAGE) || msg.fields.contains_key(&FIELD_FILE_ATTACHMENTS) {
-        let is_image = msg.fields.contains_key(&FIELD_IMAGE);
+    if msg.fields().contains(FIELD_IMAGE) || msg.fields().contains(FIELD_FILE_ATTACHMENTS) {
+        let is_image = msg.fields().contains(FIELD_IMAGE);
         return Some(ExtractedAttachment {
             file_name: if is_image { "Image" } else { "Attachment" }.into(),
             stored_name: db::ATTACHMENT_UNAVAILABLE_STORED_NAME.into(),
@@ -4595,11 +4648,11 @@ async fn handle_inbound_lxmf(
             dest = %short_id(&hex::encode(dest_hash)),
             "attempting LXMF decrypt"
         );
-        let decrypted = state
-            .lxmf
-            .lock()
-            .ok()
-            .and_then(|l| l.as_ref().and_then(|mgr| mgr.decrypt_inbound(lxmf_payload)));
+        let decrypted = state.lxmf.lock().ok().and_then(|l| {
+            l.as_ref()
+                .filter(|mgr| mgr.lxmf_dest_hash == dest_hash)
+                .and_then(|mgr| mgr.decrypt_inbound(lxmf_payload))
+        });
         tracing::info!(
             decrypted = decrypted.is_some(),
             decrypted_len = decrypted.as_ref().map(|d| d.len()),
@@ -4608,9 +4661,11 @@ async fn handle_inbound_lxmf(
 
         // Opportunistic LXMF omits dest_hash from the body (it's in the
         // RNS header). unpack() needs [dest_hash:16][src_hash:16][sig:64][msgpack];
-        // re-prepend it here. Falls back to the plaintext-broadcast layout
-        // when decryption didn't apply.
-        let body: &[u8] = decrypted.as_deref().unwrap_or(lxmf_payload);
+        // re-prepend it only after authenticated decryption succeeds.
+        let Some(body) = decrypted.as_deref() else {
+            tracing::warn!(reason = "decrypt_failed", "encrypted LXMF input rejected");
+            continue;
+        };
         let mut lxmf_data = Vec::with_capacity(16 + body.len());
         lxmf_data.extend_from_slice(&dest_hash);
         lxmf_data.extend_from_slice(body);
@@ -4720,7 +4775,10 @@ fn inbound_stamp_allowed(state: &AppState, msg: &lxmf_core::message_api::LxMessa
     if required_cost == 0 {
         return true;
     }
-    let stamp_ok = match (msg.stamp.as_deref(), msg.message_id.or(msg.hash)) {
+    let stamp_ok = match (
+        msg.recipient_stamp().map(|stamp| stamp.as_bytes()),
+        Some(msg.message_id()),
+    ) {
         (Some(stamp), Some(message_id)) => state
             .lxmf
             .lock()
@@ -4731,7 +4789,7 @@ fn inbound_stamp_allowed(state: &AppState, msg: &lxmf_core::message_api::LxMessa
                         &message_id,
                         stamp,
                         required_cost,
-                        &msg.source_hash,
+                        &msg.source_hash(),
                     )
                 })
             })
@@ -4740,9 +4798,9 @@ fn inbound_stamp_allowed(state: &AppState, msg: &lxmf_core::message_api::LxMessa
     };
     if !stamp_ok {
         tracing::warn!(
-            from = %short_id(&hex::encode(msg.source_hash)),
+            from = %short_id(&hex::encode(msg.source_hash())),
             required_cost,
-            has_stamp = msg.stamp.is_some(),
+            has_stamp = msg.recipient_stamp().is_some(),
             "inbound message REJECTED: stamp missing or PoW invalid (enforce_stamps=true)"
         );
     }
@@ -4855,11 +4913,11 @@ fn inbound_has_chat_content(
     extension: Option<&lxmf::RatspeakChatExtension>,
 ) -> bool {
     use lxmf_core::constants::{FIELD_AUDIO, FIELD_FILE_ATTACHMENTS, FIELD_IMAGE};
-    !msg.content.trim().is_empty()
-        || !msg.title.trim().is_empty()
+    !msg.content_text().trim().is_empty()
+        || !msg.title_text().trim().is_empty()
         || [FIELD_FILE_ATTACHMENTS, FIELD_IMAGE, FIELD_AUDIO]
             .iter()
-            .any(|field| msg.fields.contains_key(field))
+            .any(|field| msg.fields().contains(*field))
         || matches!(extension, Some(lxmf::RatspeakChatExtension::Reply { .. }))
 }
 
@@ -4870,18 +4928,18 @@ fn inbound_has_chat_content(
 /// made every retry look new).
 async fn process_inbound_lxmf(
     state: &Arc<AppState>,
-    mut msg: lxmf_core::message_api::LxMessage,
+    msg: lxmf_core::message_api::LxMessage,
     fallback_id_material: &[u8],
     source: InboundLxmfSource,
     activity_origin: ActivityRequestFence,
 ) {
-    let source_hash = hex::encode(msg.source_hash);
-    let dest_hash = hex::encode(msg.destination_hash);
+    let source_hash = hex::encode(msg.source_hash());
+    let dest_hash = hex::encode(msg.destination_hash());
     let inbound_method = source.activity_method();
 
     tracing::info!(
         from = %short_id(&source_hash),
-        len = msg.content.len(),
+        len = msg.content_bytes().len(),
         source = source.label(),
         "inbound LXMF message received"
     );
@@ -4892,7 +4950,7 @@ async fn process_inbound_lxmf(
         .and_then(|l| {
             l.as_ref().map(|mgr| {
                 (
-                    mgr.recall_identity_hash(&msg.source_hash),
+                    mgr.recall_identity_hash(&msg.source_hash()),
                     mgr.router.transport_tx.clone(),
                 )
             })
@@ -4903,10 +4961,13 @@ async fn process_inbound_lxmf(
         return;
     }
 
-    let sig_valid = state.lxmf.lock().ok().and_then(|mut l| {
-        l.as_mut()
-            .and_then(|mgr| mgr.verify_inbound_signature(&mut msg))
+    let source_key = state.lxmf.lock().ok().and_then(|manager| {
+        manager
+            .as_ref()
+            .and_then(|manager| manager.inbound_source_public_key(&msg.source_hash()))
     });
+    let verification = source_key.as_ref().map(|key| msg.verify(key));
+    let sig_valid = verification.as_ref().map(Result::is_ok);
     match sig_valid {
         Some(true) => tracing::debug!("inbound signature validated"),
         Some(false) => {
@@ -4920,13 +4981,13 @@ async fn process_inbound_lxmf(
         return;
     }
 
-    if sig_valid == Some(true)
+    if let Some(Ok(verified)) = verification.as_ref()
         && let Ok(mut lxmf) = state.lxmf.lock()
         && let Some(mgr) = lxmf.as_mut()
-        && mgr.router.learn_ticket_from_inbound(&msg)
+        && mgr.router.learn_ticket_from_inbound(verified)
     {
         tracing::debug!(
-            from = %short_id(&hex::encode(msg.source_hash)),
+            from = %short_id(&hex::encode(msg.source_hash())),
             "stored signed inbound ticket for future stamp bypass"
         );
     }
@@ -4973,10 +5034,7 @@ async fn process_inbound_lxmf(
         return;
     }
 
-    let msg_id = msg
-        .hash
-        .map(hex::encode)
-        .unwrap_or_else(|| hex::encode(rns_crypto::sha::sha256(fallback_id_material)));
+    let msg_id = hex::encode(msg.message_id());
 
     // Senders retry on missing proofs; duplicates are scoped to the local
     // identity so two Ratspeak identities can hold the same LXMF hash.
@@ -5014,12 +5072,12 @@ async fn process_inbound_lxmf(
         let local_destination_matches = hex::decode(&lxmf_id)
             .ok()
             .and_then(|bytes| bytes.try_into().ok())
-            .is_some_and(|local_dest: [u8; 16]| local_dest == msg.destination_hash);
+            .is_some_and(|local_dest: [u8; 16]| local_dest == msg.destination_hash());
         if local_destination_matches {
             if let Ok(mut lxmf) = state.lxmf.lock()
                 && let Some(mgr) = lxmf.as_mut()
             {
-                mgr.note_pending_direct_backchannel(msg.source_hash, link_id);
+                mgr.note_pending_direct_backchannel(msg.source_hash(), link_id);
             }
             tracing::debug!(
                 from = %short_id(&source_hash),
@@ -5046,7 +5104,8 @@ async fn process_inbound_lxmf(
     }
 
     // LRGP tunnels over LXMF; don't surface in conversation UI.
-    let lrgp_sender_authenticated = lrgp_sender_authenticated(&source, &msg.source_hash, sig_valid);
+    let lrgp_sender_authenticated =
+        lrgp_sender_authenticated(&source, &msg.source_hash(), sig_valid);
     if !matches!(
         chat_extension,
         Some(lxmf::RatspeakChatExtension::Reply { .. })
@@ -5084,8 +5143,8 @@ async fn process_inbound_lxmf(
         let msg_id_for_save = msg_id.clone();
         let source_hash_for_save = source_hash.clone();
         let dest_hash_for_save = dest_hash.clone();
-        let content_for_save = msg.content.clone();
-        let title_for_save = msg.title.clone();
+        let content_for_save = msg.content_text().into_owned();
+        let title_for_save = msg.title_text().into_owned();
         let timestamp_for_save = received_at;
         let identity_id_for_save = identity_id.clone();
         let reply_to_id_for_save = reply_to_id.clone();
@@ -5161,7 +5220,7 @@ async fn process_inbound_lxmf(
     record_activity_if_current(state, activity_origin, || {
         Ok(producer::lxmf_inbound_accepted(
             producer::LxmfInboundAccepted {
-                source: producer::DestinationHash::new(msg.source_hash),
+                source: producer::DestinationHash::new(msg.source_hash()),
                 method: inbound_method,
                 encoded_bytes: fallback_id_material.len().min(u32::MAX as usize) as u32,
             },
@@ -5171,7 +5230,7 @@ async fn process_inbound_lxmf(
         state,
         &source_hash,
         &identity_id,
-        &messaging::message_display_text(&msg.title, &msg.content),
+        &messaging::message_display_text(&msg.title_text(), &msg.content_text()),
         attachment_file.is_some() || audio_file.is_some(),
     )
     .await;
@@ -5184,8 +5243,8 @@ async fn process_inbound_lxmf(
         "source": source_hash,
         "source_display_name": source_display_name,
         "destination": dest_hash,
-        "content": msg.content,
-        "title": msg.title,
+        "content": msg.content_text(),
+        "title": msg.title_text(),
         "timestamp": received_at,
         "state": "received",
         "direction": "inbound",
@@ -6508,6 +6567,7 @@ fn bounded_protocol_waits(state: &AppState, ids: &[String]) -> std::collections:
 }
 
 async fn sweep_stale_game_deliveries(state: &AppState) {
+    let _game_transaction = Arc::new(state.lrgp_transaction.clone().lock_owned().await);
     let pending = state
         .lrgp_msg_to_session
         .lock()
@@ -6617,24 +6677,28 @@ async fn sweep_stale_game_deliveries(state: &AppState) {
         return;
     }
 
-    let changed_identities = db::spawn_db(state.db.clone(), move |pool| {
-        let mut changed = std::collections::HashSet::new();
-        for session in expired {
-            let already_expired =
-                db::get_game_session(&pool, &session.session_id, &session.identity_id)
-                    .and_then(|row| {
-                        row.get("status")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .is_some_and(|status| status == lrgp::constants::STATUS_EXPIRED);
-            if !already_expired {
-                changed.insert(session.identity_id.clone());
-                db::save_game_session(&pool, &session);
+    let changed_identities = db::spawn_db_with_lease(
+        state.db.clone(),
+        Arc::clone(&_game_transaction),
+        move |pool| {
+            let mut changed = std::collections::HashSet::new();
+            for session in expired {
+                let already_expired =
+                    db::get_game_session(&pool, &session.session_id, &session.identity_id)
+                        .and_then(|row| {
+                            row.get("status")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .is_some_and(|status| status == lrgp::constants::STATUS_EXPIRED);
+                if !already_expired {
+                    changed.insert(session.identity_id.clone());
+                    db::save_game_session(&pool, &session);
+                }
             }
-        }
-        changed
-    })
+            changed
+        },
+    )
     .await
     .unwrap_or_default();
 
@@ -6646,9 +6710,11 @@ async fn sweep_stale_game_deliveries(state: &AppState) {
     if let Some(identity_id) =
         active_identity.filter(|identity_id| changed_identities.contains(identity_id))
     {
-        let all = db::spawn_db(state.db.clone(), move |pool| {
-            db::list_game_sessions(&pool, &identity_id, None, None)
-        })
+        let all = db::spawn_db_with_lease(
+            state.db.clone(),
+            Arc::clone(&_game_transaction),
+            move |pool| db::list_game_sessions(&pool, &identity_id, None, None),
+        )
         .await
         .unwrap_or_default();
         state.emit_to_all("all_game_sessions", all.into());
@@ -6809,55 +6875,15 @@ async fn try_handle_inbound_lrgp(
     identity_id: &str,
     sender_authenticated: bool,
 ) -> bool {
-    let mut rmpv_fields: std::collections::HashMap<u8, rmpv::Value> =
-        std::collections::HashMap::new();
-    for (&key, bytes) in &msg.fields {
-        let mut cursor = std::io::Cursor::new(bytes);
-        if let Some(value) = rmpv::decode::read_value(&mut cursor)
-            .ok()
-            .filter(|_| cursor.position() as usize == bytes.len())
-        {
-            rmpv_fields.insert(key, value);
-        } else if let Ok(s) = std::str::from_utf8(bytes) {
-            rmpv_fields.insert(key, rmpv::Value::String(s.into()));
-        } else {
-            rmpv_fields.insert(key, rmpv::Value::Binary(bytes.clone()));
-        }
-    }
-
-    let has_lrgp_marker = matches!(
-        rmpv_fields.get(&lrgp::protocol::FIELD_CUSTOM_TYPE),
-        Some(rmpv::Value::String(value))
-            if value.as_str() == Some(lrgp::protocol::PROTOCOL_TYPE)
-    );
-    if !has_lrgp_marker {
-        return false;
-    }
-    if !sender_authenticated {
-        // LRGP binds a session to the sender identity supplied by its
-        // transport; it cannot authenticate that string itself. Never let an
-        // unsigned/unknown LRGP marker fall through into ordinary chat.
-        tracing::warn!(
-            from = %short_id(sender_hash),
-            "Dropping LRGP envelope without an authenticated LXMF sender"
-        );
-        return true;
-    }
-
-    let envelope = match lrgp::protocol::unpack_envelope(&rmpv_fields) {
-        Ok(Some(env)) => env,
+    let envelope = match inbound_admission::decode_game(msg, sender_authenticated) {
+        Ok(Some(envelope)) => envelope,
         Ok(None) => return false,
-        Err(_) => {
-            // A message explicitly marked as LRGP must never leak into the
-            // ordinary chat transcript merely because its envelope is bad.
-            tracing::warn!(
-                from = %short_id(sender_hash),
-                reason = "invalid_envelope",
-                "Dropping malformed LRGP envelope"
-            );
+        Err(reason) => {
+            tracing::warn!(?reason, from = %short_id(sender_hash), "Dropping invalid LRGP envelope");
             return true;
         }
     };
+    let _game_transaction = Arc::new(state.lrgp_transaction.clone().lock_owned().await);
 
     tracing::info!(from = %short_id(sender_hash), "Inbound LRGP game message received");
 
@@ -6902,9 +6928,11 @@ async fn try_handle_inbound_lrgp(
     let sid = session_id.clone();
     let iid = identity_id.to_string();
     let nonce_for_db = durable_nonce;
-    let replayed_after_restart = db::spawn_db(state.db.clone(), move |pool| {
-        db::has_game_nonce(&pool, &sid, &iid, &nonce_for_db)
-    })
+    let replayed_after_restart = db::spawn_db_with_lease(
+        state.db.clone(),
+        Arc::clone(&_game_transaction),
+        move |pool| db::has_game_nonce(&pool, &sid, &iid, &nonce_for_db),
+    )
     .await
     .unwrap_or(false);
     if replayed_after_restart {
@@ -6945,20 +6973,24 @@ async fn try_handle_inbound_lrgp(
                 let sender = sender_hash.to_string();
                 let packed = envelope_mp.clone();
                 let payload = serde_json::to_string(&error_payload).unwrap_or_else(|_| "{}".into());
-                let message_timestamp = msg.timestamp;
-                db::spawn_db(state.db.clone(), move |pool| {
-                    db::persist_inbound_game_action(
-                        &pool,
-                        &sid,
-                        &iid,
-                        lrgp::protocol::CMD_ERROR,
-                        &payload,
-                        &sender,
-                        message_timestamp,
-                        &packed,
-                        None,
-                    )
-                })
+                let message_timestamp = msg.timestamp();
+                db::spawn_db_with_lease(
+                    state.db.clone(),
+                    Arc::clone(&_game_transaction),
+                    move |pool| {
+                        db::persist_inbound_game_action(
+                            &pool,
+                            &sid,
+                            &iid,
+                            lrgp::protocol::CMD_ERROR,
+                            &payload,
+                            &sender,
+                            message_timestamp,
+                            &packed,
+                            None,
+                        )
+                    },
+                )
                 .await
                 .ok()
                 .flatten()
@@ -6994,9 +7026,11 @@ async fn try_handle_inbound_lrgp(
                 return true;
             } else {
                 let iid = identity_id.to_string();
-                let all = db::spawn_db(state.db.clone(), move |pool| {
-                    db::list_game_sessions(&pool, &iid, None, None)
-                })
+                let all = db::spawn_db_with_lease(
+                    state.db.clone(),
+                    Arc::clone(&_game_transaction),
+                    move |pool| db::list_game_sessions(&pool, &iid, None, None),
+                )
                 .await
                 .unwrap_or_default();
                 state.emit_to_all("all_game_sessions", all.into());
@@ -7055,9 +7089,13 @@ async fn try_handle_inbound_lrgp(
                     app.get_session_record(&session_id, identity_id)
                 })
             {
-                let _ = db::spawn_db(state.db.clone(), move |pool| {
-                    db::save_game_session(&pool, &expired);
-                })
+                let _ = db::spawn_db_with_lease(
+                    state.db.clone(),
+                    Arc::clone(&_game_transaction),
+                    move |pool| {
+                        db::save_game_session(&pool, &expired);
+                    },
+                )
                 .await;
             }
             send_lrgp_error_best_effort(
@@ -7166,10 +7204,10 @@ async fn try_handle_inbound_lrgp(
         let sender_hash = sender_hash.to_string();
         let command = command.clone();
         let envelope_mp = envelope_mp.clone();
-        let timestamp = msg.timestamp;
+        let timestamp = msg.timestamp();
         let payload_json = serde_json::to_string(&payload_json).unwrap_or_else(|_| "{}".into());
         let session = persisted_session.clone();
-        db::spawn_db(state.db.clone(), move |p| {
+        db::spawn_db_with_lease(state.db.clone(), Arc::clone(&_game_transaction), move |p| {
             let had_session = db::persist_inbound_game_action(
                 &p,
                 &session_id,
@@ -7618,11 +7656,12 @@ mod inbound_pipeline_tests {
         let worker = tokio::spawn(manager.run());
         let mut first_response = None;
 
-        for (index, (hosting, static_only, cost, limit)) in [
-            (true, false, 13, 256),
-            (false, false, 17, 512),
-            (true, true, 21, 1024),
-            (true, false, 23, 2048),
+        for (index, (hosting, ready, static_only, cost, limit)) in [
+            (true, true, false, 13, 256),
+            (false, true, false, 17, 512),
+            (true, true, true, 21, 1024),
+            (true, true, false, 23, 2048),
+            (true, false, false, 23, 2048),
         ]
         .into_iter()
         .enumerate()
@@ -7633,6 +7672,24 @@ mod inbound_pipeline_tests {
             state
                 .propagation_node_stamp_cost
                 .store(cost, Ordering::Relaxed);
+            let identity = state
+                .lxmf
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .identity_hash
+                .clone();
+            assert!(state.set_propagation_host_readiness(
+                identity,
+                state.current_identity_session_generation(),
+                if ready {
+                    crate::state::PropagationHostReadiness::Ready
+                } else {
+                    crate::state::PropagationHostReadiness::Unavailable
+                },
+                None
+            ));
             let ordinary = {
                 let mut owner = state.lxmf.lock().unwrap();
                 let owner = owner.as_mut().unwrap();
@@ -7670,8 +7727,27 @@ mod inbound_pipeline_tests {
                 rns_wire::context::PacketContext::PathResponse
             );
             let broadcast = metadata(&ordinary, &destination);
+            if !hosting || !ready {
+                let (header, offset) =
+                    rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+                let announce = rns_identity::announce::AnnounceData::unpack(
+                    &request.raw[offset..],
+                    header.flags.context_flag,
+                )
+                .unwrap();
+                announce.validate(&destination).unwrap();
+                assert!(
+                    announce
+                        .app_data
+                        .as_deref()
+                        .is_none_or(|data| data.is_empty()),
+                    "unavailable hosting must not advertise active node policy"
+                );
+                assert!(!broadcast.node_state);
+                continue;
+            }
             let response = metadata(&request.raw, &destination);
-            assert_eq!(response.node_state, hosting && !static_only);
+            assert_eq!(response.node_state, hosting && ready && !static_only);
             assert_eq!(response.stamp_cost, cost);
             assert_eq!(response.transfer_limit, limit as u64);
             assert_eq!(response.sync_limit, (limit * 2) as u64);
@@ -7744,9 +7820,12 @@ mod inbound_pipeline_tests {
             min_stamp_cost: 1,
             ..Default::default()
         };
-        let mut node =
-            PropagationNode::with_storage(config.clone(), [0xA1; 16], storage.path().to_path_buf())
-                .unwrap();
+        let mut node = PropagationNode::with_storage(
+            config.clone(),
+            [0xA1; 16],
+            storage.path().join("messages"),
+        )
+        .unwrap();
         assert_eq!(
             accept_hosted_propagation_deposit(&mut node, &entry),
             Some(true)
@@ -7757,9 +7836,13 @@ mod inbound_pipeline_tests {
         );
         assert_eq!(accept_hosted_propagation_deposit(&mut node, &[0; 16]), None);
         assert_eq!(node.message_count(), 1);
-        let files = std::fs::read_dir(storage.path())
+        let files = std::fs::read_dir(storage.path().join("messages.v2").join("objects"))
             .unwrap()
             .map(|file| file.unwrap().path())
+            .filter(|path| {
+                !path.to_string_lossy().ends_with(".entry")
+                    && !path.to_string_lossy().ends_with(".active")
+            })
             .collect::<Vec<_>>();
         assert_eq!(files.len(), 1);
         assert_eq!(
@@ -7780,7 +7863,7 @@ mod inbound_pipeline_tests {
                 node = PropagationNode::with_storage(
                     config.clone(),
                     [0xA1; 16],
-                    storage.path().to_path_buf(),
+                    storage.path().join("messages"),
                 )
                 .unwrap();
             }
@@ -7806,14 +7889,16 @@ mod inbound_pipeline_tests {
         assert!(stamp_value < 255);
         node.set_min_stamp_cost(stamp_value as u8 + 1);
         assert_eq!(accept_hosted_propagation_deposit(&mut node, &entry), None);
-        let mut limited = PropagationNode::new(
+        let mut limited = PropagationNode::with_storage(
             PropagationNodeConfig {
                 max_message_size: blob.len(),
                 min_stamp_cost: 1,
                 ..Default::default()
             },
             [0xA2; 16],
-        );
+            storage.path().join("limited"),
+        )
+        .unwrap();
         assert_eq!(
             accept_hosted_propagation_deposit(&mut limited, &entry),
             Some(false),
@@ -7841,6 +7926,23 @@ mod inbound_pipeline_tests {
                 owner.propagation_dest_hash,
             )
         };
+        state
+            .propagation_node_hosting_enabled
+            .store(true, Ordering::Relaxed);
+        let identity = state
+            .lxmf
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .identity_hash
+            .clone();
+        assert!(state.set_propagation_host_readiness(
+            identity,
+            state.current_identity_session_generation(),
+            crate::state::PropagationHostReadiness::Ready,
+            None
+        ));
         let owners = Arc::strong_count(&state);
         install_propagation_announce_metadata(&mut manager, &state, destination);
         assert_eq!(
@@ -7879,16 +7981,23 @@ mod inbound_pipeline_tests {
     }
 
     pub(super) fn packed_inbound(dest: [u8; 16], src: [u8; 16], content: &str) -> Vec<u8> {
-        let mut msg = lxmf_core::message_api::LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             src,
             "",
             content,
             lxmf_core::message_api::DeliveryMethod::Direct,
-        );
-        // Unsigned-by-unknown-sender: verify returns None and the message is
+        )
+        .unwrap();
+        // Signed by an unknown sender: verify returns None and the message is
         // still delivered, so tests don't need real peer keys.
-        msg.signature = Some([0u8; 64]);
+        let msg = msg
+            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                &[7; 32],
+            ))
+            .unwrap()
+            .finalize(None)
+            .unwrap();
         msg.pack().unwrap()
     }
 
@@ -7898,15 +8007,22 @@ mod inbound_pipeline_tests {
         mode: u8,
         audio_bytes: &[u8],
     ) -> Vec<u8> {
-        let mut msg = lxmf_core::message_api::LxMessage::new(
+        let mut msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             src,
             "",
             "Voice message",
             lxmf_core::message_api::DeliveryMethod::Direct,
-        );
+        )
+        .unwrap();
         msg.set_audio_field(mode, audio_bytes).unwrap();
-        msg.signature = Some([0u8; 64]);
+        let msg = msg
+            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                &[7; 32],
+            ))
+            .unwrap()
+            .finalize(None)
+            .unwrap();
         msg.pack().unwrap()
     }
 
@@ -8111,19 +8227,26 @@ mod inbound_pipeline_tests {
     #[tokio::test]
     async fn malformed_audio_does_not_reject_or_hide_the_enclosing_message() {
         let (state, emitter) = pipeline_state();
-        let mut msg = lxmf_core::message_api::LxMessage::new(
+        let mut msg = lxmf_core::message::LxMessageDraft::new(
             local_dest(&state),
             [0xEC; 16],
             "",
             "text survives malformed media",
             lxmf_core::message_api::DeliveryMethod::Direct,
-        );
+        )
+        .unwrap();
         msg.set_msgpack_field(
             lxmf_core::constants::FIELD_AUDIO,
             vec![0x93, lxmf_core::constants::AM_OPUS_OGG, 0xc4, 0x00, 0xc0],
         )
         .unwrap();
-        msg.signature = Some([0u8; 64]);
+        let msg = msg
+            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                &[7; 32],
+            ))
+            .unwrap()
+            .finalize(None)
+            .unwrap();
         let data = msg.pack().unwrap();
 
         handle_decrypted_lxmf(&state, data, InboundLxmfSource::Propagated).await;
@@ -8219,15 +8342,24 @@ mod inbound_pipeline_tests {
             .transport_tx = tx;
     }
 
-    /// Register `src` as a known identity so the gate's recall resolves and
-    /// signatures verify (x25519 half is irrelevant to both).
+    /// Register a complete identity and derive its LXMF source address. The
+    /// verified capability binds both public-key halves to this exact source.
     fn register_source_identity(
         state: &AppState,
-        src: [u8; 16],
         signing: &rns_crypto::ed25519::Ed25519PrivateKey,
-    ) {
+    ) -> [u8; 16] {
         let mut pub_key = [0u8; 64];
+        pub_key[..32].copy_from_slice(
+            &rns_crypto::x25519::X25519PrivateKey::from_bytes(&[9; 32])
+                .public_key()
+                .to_bytes(),
+        );
         pub_key[32..].copy_from_slice(&signing.public_key().to_bytes());
+        let identity = rns_crypto::sha::truncated_hash(&pub_key);
+        let src = rns_identity::destination::Destination::hash_from_name_and_identity(
+            "lxmf.delivery",
+            Some(&identity),
+        );
         state
             .lxmf
             .lock()
@@ -8236,6 +8368,7 @@ mod inbound_pipeline_tests {
             .unwrap()
             .known_identities
             .insert(hex::encode(src), pub_key);
+        src
     }
 
     fn packed_signed_inbound(
@@ -8244,14 +8377,15 @@ mod inbound_pipeline_tests {
         content: &str,
         signing: &rns_crypto::ed25519::Ed25519PrivateKey,
     ) -> Vec<u8> {
-        let mut msg = lxmf_core::message_api::LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             dest,
             src,
             "",
             content,
             lxmf_core::message_api::DeliveryMethod::Direct,
-        );
-        msg.sign(signing).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(signing).unwrap().finalize(None).unwrap();
         msg.pack().unwrap()
     }
 
@@ -8262,8 +8396,7 @@ mod inbound_pipeline_tests {
     async fn blackholed_source_is_dropped() {
         let (state, emitter) = pipeline_state();
         let signing = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let src = [0xBB; 16];
-        register_source_identity(&state, src, &signing);
+        let src = register_source_identity(&state, &signing);
 
         set_blackhole_transport(&state, Some(spawn_blackhole_transport(true)));
         let data = packed_signed_inbound(local_dest(&state), src, "should vanish", &signing);
@@ -8312,8 +8445,7 @@ mod inbound_pipeline_tests {
     async fn blackhole_query_failure_fails_open() {
         let (state, _emitter) = pipeline_state();
         let signing = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let src = [0xBB; 16];
-        register_source_identity(&state, src, &signing);
+        let src = register_source_identity(&state, &signing);
 
         // Transport channel closed.
         let (dead_tx, dead_rx) =
@@ -8433,13 +8565,14 @@ mod inbound_pipeline_tests {
         let (state, emitter) = pipeline_state();
         let target_id = hex::encode([0xAB; 32]);
 
-        let mut msg = lxmf_core::message_api::LxMessage::new(
+        let mut msg = lxmf_core::message::LxMessageDraft::new(
             local_dest(&state),
             [0xEE; 16],
             "",
             "",
             lxmf_core::message_api::DeliveryMethod::Direct,
-        );
+        )
+        .unwrap();
         for (field_id, bytes) in
             lxmf::ratspeak_chat_custom_fields(&lxmf::RatspeakChatExtension::Reaction {
                 target: target_id.clone(),
@@ -8448,9 +8581,19 @@ mod inbound_pipeline_tests {
             })
             .unwrap()
         {
-            msg.fields.insert(field_id, bytes);
+            if field_id == lxmf_core::constants::FIELD_REACTION {
+                msg.set_msgpack_field(field_id, bytes).unwrap();
+            } else {
+                msg.set_field(field_id, bytes).unwrap();
+            }
         }
-        msg.signature = Some([0u8; 64]);
+        let msg = msg
+            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                &[7; 32],
+            ))
+            .unwrap()
+            .finalize(None)
+            .unwrap();
         let data = msg.pack().unwrap();
 
         handle_decrypted_lxmf(&state, data, InboundLxmfSource::Propagated).await;
@@ -8468,13 +8611,14 @@ mod inbound_pipeline_tests {
         let (state, emitter) = pipeline_state();
         let target_hash = [0xAB; 32];
 
-        let mut msg = lxmf_core::message_api::LxMessage::new(
+        let mut msg = lxmf_core::message::LxMessageDraft::new(
             local_dest(&state),
             [0xEE; 16],
             "",
             "Reacted to your message with \u{1F44D}.",
             lxmf_core::message_api::DeliveryMethod::Direct,
-        );
+        )
+        .unwrap();
         let dict_value = rmpv::Value::Map(vec![
             (
                 rmpv::Value::from(lxmf_core::constants::REACTION_TO as u64),
@@ -8489,7 +8633,13 @@ mod inbound_pipeline_tests {
         rmpv::encode::write_value(&mut dict, &dict_value).unwrap();
         msg.set_msgpack_field(lxmf_core::constants::FIELD_REACTION, dict)
             .unwrap();
-        msg.signature = Some([0u8; 64]);
+        let msg = msg
+            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                &[7; 32],
+            ))
+            .unwrap()
+            .finalize(None)
+            .unwrap();
         let data = msg.pack().unwrap();
 
         handle_decrypted_lxmf(&state, data, InboundLxmfSource::Propagated).await;
@@ -8513,16 +8663,25 @@ mod inbound_pipeline_tests {
         let (state, emitter) = pipeline_state();
         let target_hash = [0xCD; 32];
 
-        let mut msg = lxmf_core::message_api::LxMessage::new(
+        let mut msg = lxmf_core::message::LxMessageDraft::new(
             local_dest(&state),
             [0xEE; 16],
             "",
             "standard reply",
             lxmf_core::message_api::DeliveryMethod::Direct,
-        );
-        msg.set_field(lxmf_core::constants::FIELD_REPLY_TO, target_hash.to_vec());
-        msg.set_field(lxmf_core::constants::FIELD_REPLY_QUOTE, b"quoted".to_vec());
-        msg.signature = Some([0u8; 64]);
+        )
+        .unwrap();
+        msg.set_field(lxmf_core::constants::FIELD_REPLY_TO, target_hash.to_vec())
+            .unwrap();
+        msg.set_field(lxmf_core::constants::FIELD_REPLY_QUOTE, b"quoted".to_vec())
+            .unwrap();
+        let msg = msg
+            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                &[7; 32],
+            ))
+            .unwrap()
+            .finalize(None)
+            .unwrap();
         let data = msg.pack().unwrap();
 
         handle_decrypted_lxmf(

@@ -52,13 +52,13 @@ impl LxmfManager {
             .pending_outbound
             .iter()
             .filter_map(|message| {
-                message.hash.map(|hash| {
+                Some(message.message_id()).map(|hash| {
                     (
                         hash,
-                        message.destination_hash,
+                        message.destination_hash(),
                         message.method,
                         message.delivery_attempts,
-                        message.timestamp,
+                        message.timestamp(),
                     )
                 })
             })
@@ -98,7 +98,7 @@ impl LxmfManager {
                         .router
                         .pending_outbound
                         .iter_mut()
-                        .find(|m| m.hash == Some(hash))
+                        .find(|m| m.message_id() == hash)
                 {
                     message.method = DeliveryMethod::Direct;
                     if was_waiting {
@@ -141,7 +141,7 @@ impl LxmfManager {
                     .router
                     .pending_outbound
                     .iter_mut()
-                    .find(|m| m.hash == Some(hash))
+                    .find(|m| m.message_id() == hash)
                 {
                     // Poll/admission/throttle waits are not payload attempts.
                     message.next_delivery_attempt = now + 0.5;
@@ -159,7 +159,7 @@ impl LxmfManager {
                 .router
                 .pending_outbound
                 .iter_mut()
-                .find(|m| m.hash == Some(hash))
+                .find(|m| m.message_id() == hash)
             {
                 if unsupported {
                     message.auto_compress = false;
@@ -175,7 +175,7 @@ impl LxmfManager {
         }
         let mut failures = Vec::new();
         self.router.pending_outbound.retain(|message| {
-            if message.hash.is_some_and(|hash| expired.contains(&hash)) {
+            if Some(message.message_id()).is_some_and(|hash| expired.contains(&hash)) {
                 let mut message = message.clone();
                 message.mark_failed();
                 failures.push(message);
@@ -188,8 +188,8 @@ impl LxmfManager {
             .discovery
             .retain(|hash, _| !expired.contains(hash));
         for message in failures {
-            let hash = message.hash;
-            let dest = message.destination_hash;
+            let hash = Some(message.message_id());
+            let dest = message.destination_hash();
             if !self.try_auto_propagation_fallback(
                 message,
                 dest,
@@ -209,12 +209,20 @@ mod tests {
     use crate::lxmf::tests::test_manager;
 
     fn queued(mgr: &mut LxmfManager, method: DeliveryMethod, auto: bool, bytes: usize) -> [u8; 32] {
-        let mut message =
-            LxMessage::new([9; 16], mgr.lxmf_dest_hash, "", &"x".repeat(bytes), method);
-        message
+        let message = lxmf_core::message::LxMessageDraft::new(
+            [9; 16],
+            mgr.lxmf_dest_hash,
+            "",
+            &"x".repeat(bytes),
+            method,
+        )
+        .unwrap();
+        let message = message
             .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
             .unwrap();
-        let hash = message.hash.unwrap();
+        let hash = message.message_id();
         if auto {
             mgr.live_preparation.auto_messages.insert(hash);
             mgr.auto_live_fallback.insert(hash);

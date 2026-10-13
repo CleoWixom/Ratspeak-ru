@@ -515,7 +515,7 @@
 
         var detailSpan = document.createElement('span');
         detailSpan.className = 'hub-iface-detail';
-        detailSpan.textContent = typeof getIfaceDetailText === 'function' ? getIfaceDetailText(iface, ifaceType) : '';
+        detailSpan.textContent = iface.ifac_error ? (iface.ifac_migration ? 'IFAC size needs confirmation' : iface.ifac_error) : (typeof getIfaceDetailText === 'function' ? getIfaceDetailText(iface, ifaceType) : '');
 
         row.appendChild(statusDot);
         row.appendChild(nameSpan);
@@ -524,6 +524,14 @@
         if (opts.actions !== false) {
             var actions = document.createElement('span');
             actions.className = 'hub-iface-actions';
+            if (iface.ifac_error && typeof resolveInterfaceIfacUnits === 'function') {
+                var unitsBtn = document.createElement('button');
+                unitsBtn.className = 'nr-btn-sm nr-btn-muted';
+                unitsBtn.textContent = iface.ifac_migration ? 'Confirm size' : 'IFAC settings';
+                unitsBtn.addEventListener('click', function() { resolveInterfaceIfacUnits(ifaceType, iface.name, iface); });
+                actions.appendChild(unitsBtn);
+            }
+
 
             if (opts.editable && typeof isEditableInterfaceType === 'function' && isEditableInterfaceType(ifaceType)) {
                 var editBtn = document.createElement('button');

@@ -370,7 +370,7 @@ impl LxmfManager {
         for message in &mut self.router.pending_outbound {
             if self
                 .pending_path_recoveries
-                .contains_key(&message.destination_hash)
+                .contains_key(&message.destination_hash())
                 && message.next_delivery_attempt <= now
             {
                 message.next_delivery_attempt = now + 0.5;
@@ -868,15 +868,21 @@ mod tests {
         let mut mgr = test_manager();
         mgr.set_path_recovery_handle(handle);
         let dest = [0xDD; 16];
-        let mut message = LxMessage::new(
+        let mut message = lxmf_core::message::LxMessageDraft::new(
             dest,
             mgr.lxmf_dest_hash,
             "",
             "probe",
             DeliveryMethod::Direct,
-        );
+        )
+        .unwrap();
         message.delivery_attempts = 1;
         message.next_delivery_attempt = 0.0;
+        let message = message
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
         mgr.router.pending_outbound.push(message);
         mgr.request_path_recovery(dest, Some([0x11; 16]));
         for now in [10.0, 20.0, 30.0] {

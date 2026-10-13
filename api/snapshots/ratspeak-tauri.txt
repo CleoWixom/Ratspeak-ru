@@ -380,6 +380,10 @@ pub ratspeak_tauri::commands::interfaces::BackboneServerArgs::listen_ip: alloc::
 pub ratspeak_tauri::commands::interfaces::BackboneServerArgs::listen_port: u16
 pub ratspeak_tauri::commands::interfaces::BackboneServerArgs::name: alloc::string::String
 pub ratspeak_tauri::commands::interfaces::BackboneServerArgs::prefer_ipv6: bool
+pub struct ratspeak_tauri::commands::interfaces::IfacUnitMigrationArgs
+pub ratspeak_tauri::commands::interfaces::IfacUnitMigrationArgs::expected_source_hash: alloc::string::String
+pub ratspeak_tauri::commands::interfaces::IfacUnitMigrationArgs::name: alloc::string::String
+pub ratspeak_tauri::commands::interfaces::IfacUnitMigrationArgs::source_units: alloc::string::String
 pub struct ratspeak_tauri::commands::interfaces::InterfaceLifecycleArgs
 pub ratspeak_tauri::commands::interfaces::InterfaceLifecycleArgs::iface_type: core::option::Option<alloc::string::String>
 pub ratspeak_tauri::commands::interfaces::InterfaceLifecycleArgs::name: alloc::string::String
@@ -463,6 +467,7 @@ pub async fn ratspeak_tauri::commands::interfaces::apply_network_type_change(all
 pub async fn ratspeak_tauri::commands::interfaces::apply_network_type_change_transition(alloc::sync::Arc<ratspeak_runtime::state::AppState>, alloc::string::String, u64) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::disable_auto_interface(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, core::option::Option<alloc::string::String>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::enable_auto_interface(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, core::option::Option<alloc::string::String>, core::option::Option<ratspeak_runtime::rns_config::AutoInterfaceOptions>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
+pub async fn ratspeak_tauri::commands::interfaces::migrate_interface_ifac_units(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::interfaces::IfacUnitMigrationArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::network_type_changed(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::interfaces::NetworkTypeArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::pause_interface(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::interfaces::InterfaceLifecycleArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::remove_backbone_connection(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
@@ -590,6 +595,11 @@ pub ratspeak_tauri::commands::network::NetworkLogArgs::level: core::option::Opti
 pub struct ratspeak_tauri::commands::network::PropagationHostingArgs
 pub ratspeak_tauri::commands::network::PropagationHostingArgs::enabled: bool
 pub ratspeak_tauri::commands::network::PropagationHostingArgs::stamp_cost: core::option::Option<u8>
+pub struct ratspeak_tauri::commands::network::PropagationRecoveryArgs
+pub ratspeak_tauri::commands::network::PropagationRecoveryArgs::approved_manifest_sha256: core::option::Option<alloc::string::String>
+pub ratspeak_tauri::commands::network::PropagationRecoveryArgs::identity: alloc::string::String
+pub ratspeak_tauri::commands::network::PropagationRecoveryArgs::manifest_path: core::option::Option<alloc::string::String>
+pub ratspeak_tauri::commands::network::PropagationRecoveryArgs::supervisor_writers_stopped: bool
 pub struct ratspeak_tauri::commands::network::StampSettingsArgs
 pub ratspeak_tauri::commands::network::StampSettingsArgs::enforce: bool
 pub ratspeak_tauri::commands::network::StampSettingsArgs::required_cost: core::option::Option<u8>
@@ -603,9 +613,11 @@ pub async fn ratspeak_tauri::commands::network::api_propagation_nodes(tauri::sta
 pub async fn ratspeak_tauri::commands::network::enable_network_log(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::network::NetworkLogArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::network::enable_propagation(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, bool) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::network::get_propagation_status(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
+pub async fn ratspeak_tauri::commands::network::recover_propagation_host(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::network::PropagationRecoveryArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::network::refresh_propagation_nodes(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::network::request_all_paths(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::network::request_path(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
+pub async fn ratspeak_tauri::commands::network::retry_deferred_propagation(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::network::set_network_log_level(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::network::set_propagation_hosting(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::network::PropagationHostingArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::network::set_propagation_mode(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String, core::option::Option<bool>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>

@@ -113,6 +113,7 @@ pub async fn send_game_action(
     args: SendGameActionArgs,
 ) -> AppResult<Value> {
     let state_arc: Arc<AppState> = Arc::clone(&state);
+    let _game_transaction = Arc::new(state_arc.lrgp_transaction.clone().lock_owned().await);
     let activity_origin = state_arc.activity_request_fence();
     let mut dest_hash = sanitize_text(&args.dest_hash, 128);
     let app_id = sanitize_text(&args.app_id, 64);
@@ -160,9 +161,11 @@ pub async fn send_game_action(
     if !session_id.is_empty() {
         let sid = session_id.clone();
         let id_c = identity_id.clone();
-        let existing = db::spawn_db(state_arc.db.clone(), move |p| {
-            db::get_game_session(&p, &sid, &id_c)
-        })
+        let existing = db::spawn_db_with_lease(
+            state_arc.db.clone(),
+            Arc::clone(&_game_transaction),
+            move |p| db::get_game_session(&p, &sid, &id_c),
+        )
         .await
         .unwrap_or(None);
         if let Some(existing) = existing {
@@ -232,9 +235,13 @@ pub async fn send_game_action(
                     app.get_session_record(&session_id, &identity_id)
                 })
             {
-                let _ = db::spawn_db(state_arc.db.clone(), move |pool| {
-                    db::save_game_session(&pool, &expired);
-                })
+                let _ = db::spawn_db_with_lease(
+                    state_arc.db.clone(),
+                    Arc::clone(&_game_transaction),
+                    move |pool| {
+                        db::save_game_session(&pool, &expired);
+                    },
+                )
                 .await;
                 emit_game_sessions(&state_arc, &identity_id, Some(&dest_hash)).await;
             }
@@ -334,17 +341,21 @@ pub async fn send_game_action(
     let command_for_outbox = command.clone();
     let sender_for_outbox = identity_id.clone();
     let envelope_for_outbox = envelope_mp.clone();
-    let action_num = db::spawn_db(state_arc.db.clone(), move |pool| {
-        db::persist_outbound_game_action(
-            &pool,
-            &session_for_outbox,
-            &command_for_outbox,
-            &payload_for_history,
-            &sender_for_outbox,
-            action_timestamp,
-            &envelope_for_outbox,
-        )
-    })
+    let action_num = db::spawn_db_with_lease(
+        state_arc.db.clone(),
+        Arc::clone(&_game_transaction),
+        move |pool| {
+            db::persist_outbound_game_action(
+                &pool,
+                &session_for_outbox,
+                &command_for_outbox,
+                &payload_for_history,
+                &sender_for_outbox,
+                action_timestamp,
+                &envelope_for_outbox,
+            )
+        },
+    )
     .await
     .ok()
     .flatten();
@@ -372,25 +383,29 @@ pub async fn send_game_action(
     let ft = fallback_text.clone();
     let fields = lrgp_fields.clone();
     let id_c = identity_id.clone();
-    let (msg_id, sender_hash) = tokio::task::spawn_blocking(move || {
-        if let Ok(mut lxmf) = st.lxmf.lock() {
-            let sender = lxmf
-                .as_ref()
-                .map(|m| m.lxmf_hash.clone())
-                .unwrap_or_default();
-            let id = lxmf.as_mut().and_then(|mgr| {
-                mgr.send_message_with_lrgp_fields_preference(
-                    &dh,
-                    &ft,
-                    &fields,
-                    &st.db,
-                    &id_c,
-                    delivery_pref,
-                )
-            });
-            (id, sender)
-        } else {
-            (None, String::new())
+    let (msg_id, sender_hash) = tokio::task::spawn_blocking({
+        let game_transaction = Arc::clone(&_game_transaction);
+        move || {
+            let _game_transaction = game_transaction;
+            if let Ok(mut lxmf) = st.lxmf.lock() {
+                let sender = lxmf
+                    .as_ref()
+                    .map(|m| m.lxmf_hash.clone())
+                    .unwrap_or_default();
+                let id = lxmf.as_mut().and_then(|mgr| {
+                    mgr.send_message_with_lrgp_fields_preference(
+                        &dh,
+                        &ft,
+                        &fields,
+                        &st.db,
+                        &id_c,
+                        delivery_pref,
+                    )
+                });
+                (id, sender)
+            } else {
+                (None, String::new())
+            }
         }
     })
     .await
@@ -434,6 +449,7 @@ pub async fn send_game_action(
             }) {
                 crate::commands::shared::save_session_from_state(
                     &state_arc,
+                    Arc::clone(&_game_transaction),
                     SessionStateSave {
                         session_id: &session_id,
                         identity_id: &identity_id,
@@ -487,15 +503,19 @@ pub async fn send_game_action(
             let sid_for_rollback = session_id.clone();
             let identity_for_rollback = identity_id.clone();
             let snapshot_for_db = snapshot.clone();
-            let db_rolled_back = db::spawn_db(state_arc.db.clone(), move |pool| {
-                db::rollback_outbound_game_action(
-                    &pool,
-                    &sid_for_rollback,
-                    &identity_for_rollback,
-                    action_num,
-                    snapshot_for_db.as_ref(),
-                )
-            })
+            let db_rolled_back = db::spawn_db_with_lease(
+                state_arc.db.clone(),
+                Arc::clone(&_game_transaction),
+                move |pool| {
+                    db::rollback_outbound_game_action(
+                        &pool,
+                        &sid_for_rollback,
+                        &identity_for_rollback,
+                        action_num,
+                        snapshot_for_db.as_ref(),
+                    )
+                },
+            )
             .await
             .unwrap_or(false);
 
@@ -534,6 +554,7 @@ pub async fn send_game_action(
                 {
                     crate::commands::shared::save_session_from_state(
                         &state_arc,
+                        Arc::clone(&_game_transaction),
                         SessionStateSave {
                             session_id: &session_id,
                             identity_id: &identity_id,
@@ -605,6 +626,11 @@ pub async fn delete_game_session(
     session_id: String,
 ) -> AppResult<Value> {
     let state_arc: Arc<AppState> = Arc::clone(&state);
+    let deletion = Arc::new(
+        ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state_arc))
+            .await,
+    );
+    let _game_transaction = Arc::new(state_arc.lrgp_transaction.clone().lock_owned().await);
     let session_id = sanitize_text(&session_id, 128);
     if session_id.is_empty() {
         return Err(AppError::bad_request("session_id required"));
@@ -612,24 +638,40 @@ pub async fn delete_game_session(
     let identity_id = active_lxmf_hash(&state_arc);
     let sid = session_id.clone();
     let id_c = identity_id.clone();
-    let (outcome, app_id) = db::spawn_db(state_arc.db.clone(), move |p| {
-        let Some(session) = db::get_game_session(&p, &sid, &id_c) else {
-            return ("not_found", None);
-        };
-        let status = session.get("status").and_then(Value::as_str).unwrap_or("");
-        if !matches!(status, "completed" | "declined" | "expired") {
-            return ("active", None);
-        }
-        let app_id = session
-            .get("app_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if db::delete_game_session(&p, &sid, &id_c) {
-            ("deleted", app_id)
-        } else {
-            ("failed", None)
-        }
-    })
+    let (outcome, app_id) = db::spawn_db_with_lease(
+        state_arc.db.clone(),
+        (Arc::clone(&_game_transaction), Arc::clone(&deletion)),
+        move |p| {
+            let Some(session) = db::get_game_session(&p, &sid, &id_c) else {
+                return ("not_found", None);
+            };
+            let status = session.get("status").and_then(Value::as_str).unwrap_or("");
+            if !matches!(status, "completed" | "declined" | "expired") {
+                return ("active", None);
+            }
+            let app_id = session
+                .get("app_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if db::admission::DurableInboundStore::from_pool(&p)
+                .and_then(|store| {
+                    store.delete_game_session(
+                        &id_c,
+                        &sid,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    )
+                })
+                .unwrap_or(false)
+            {
+                ("deleted", app_id)
+            } else {
+                ("failed", None)
+            }
+        },
+    )
     .await
     .map_err(|_| AppError::internal("delete_game_session db task panicked"))?;
     match outcome {
@@ -702,6 +744,7 @@ pub async fn resend_last_game_action(
     args: ResendLastGameActionArgs,
 ) -> AppResult<Value> {
     let state_arc: Arc<AppState> = Arc::clone(&state);
+    let _game_transaction = Arc::new(state_arc.lrgp_transaction.clone().lock_owned().await);
     let activity_origin = state_arc.activity_request_fence();
     let session_id = sanitize_text(&args.session_id, 128);
     let delivery_pref =
@@ -714,11 +757,15 @@ pub async fn resend_last_game_action(
 
     let sid = session_id.clone();
     let iid = identity_id.clone();
-    let (session, envelope_mp) = db::spawn_db(state_arc.db.clone(), move |p| {
-        let session = db::get_game_session(&p, &sid, &iid);
-        let env = db::get_last_outbound_envelope_for_session(&p, &sid, &iid);
-        (session, env)
-    })
+    let (session, envelope_mp) = db::spawn_db_with_lease(
+        state_arc.db.clone(),
+        Arc::clone(&_game_transaction),
+        move |p| {
+            let session = db::get_game_session(&p, &sid, &iid);
+            let env = db::get_last_outbound_envelope_for_session(&p, &sid, &iid);
+            (session, env)
+        },
+    )
     .await
     .map_err(|_| AppError::internal("resend_last_game_action db task panicked"))?;
 
@@ -770,20 +817,24 @@ pub async fn resend_last_game_action(
     let st: Arc<AppState> = Arc::clone(&state_arc);
     let dh = dest_hash.clone();
     let iid_for_send = identity_id.clone();
-    let msg_id: Option<String> = tokio::task::spawn_blocking(move || {
-        if let Ok(mut lxmf) = st.lxmf.lock() {
-            lxmf.as_mut().and_then(|mgr| {
-                mgr.send_message_with_lrgp_fields_preference(
-                    &dh,
-                    &fallback_text,
-                    &lrgp_fields,
-                    &st.db,
-                    &iid_for_send,
-                    delivery_pref,
-                )
-            })
-        } else {
-            None
+    let msg_id: Option<String> = tokio::task::spawn_blocking({
+        let game_transaction = Arc::clone(&_game_transaction);
+        move || {
+            let _game_transaction = game_transaction;
+            if let Ok(mut lxmf) = st.lxmf.lock() {
+                lxmf.as_mut().and_then(|mgr| {
+                    mgr.send_message_with_lrgp_fields_preference(
+                        &dh,
+                        &fallback_text,
+                        &lrgp_fields,
+                        &st.db,
+                        &iid_for_send,
+                        delivery_pref,
+                    )
+                })
+            } else {
+                None
+            }
         }
     })
     .await
@@ -817,6 +868,7 @@ pub async fn resend_last_game_action(
             }) {
                 crate::commands::shared::save_session_from_state(
                     &state_arc,
+                    Arc::clone(&_game_transaction),
                     SessionStateSave {
                         session_id: &session_id,
                         identity_id: &identity_id,

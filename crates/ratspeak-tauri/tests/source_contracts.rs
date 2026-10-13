@@ -2828,7 +2828,11 @@ fn games_transport_uses_native_lxmf_fields_and_a_durable_outbox() {
     assert!(games.contains("db::rollback_outbound_game_action("));
     assert!(games.contains("reason = \"resend_required\";"));
     assert!(games.contains("lrgp::protocol::pack_lxmf_fields"));
-    assert!(runtime.contains("lrgp::protocol::unpack_envelope"));
+    assert!(runtime.contains("inbound_admission::decode_game(msg, sender_authenticated)"));
+    let admission_game=read_source(root.join("crates/ratspeak-runtime/src/inbound_admission/game.rs")).expect("shared LRGP admission");
+    assert!(admission_game.contains("protocol::unpack_envelope(&fields)"));
+    assert!(admission_game.contains("meta.unique_map()"));
+    assert!(admission_game.contains("if !authenticated"));
     assert!(db.contains("lrgp::protocol::validate_envelope"));
     assert!(db.contains("pub fn persist_outbound_game_action("));
     assert!(db.contains("pub fn rollback_outbound_game_action("));
@@ -4357,7 +4361,8 @@ fn ifac_is_available_ungated_on_client_and_server_sheets() {
     assert!(rns_config.contains("pub struct InterfaceIfacArgs"));
     assert!(rns_config.contains("network_name = {network_name}"));
     assert!(rns_config.contains("passphrase = {passphrase}"));
-    assert!(rns_config.contains("ifac_size = {ifac_size}"));
+    assert!(rns_config.contains("ifac_size = {}\\n    ifac_size_unit = bits\\n"));
+    assert!(rns_config.contains("ifac_size * 8"));
     assert!(rns_config.contains("add_tcp_client_with_ifac"));
     assert!(rns_config.contains("update_tcp_client_with_ifac"));
     assert!(rns_config.contains("add_tcp_server_with_ifac"));
@@ -8618,7 +8623,7 @@ fn path_resolution_diagnostics_are_not_duplicate_or_stale() {
 
     let lxmf = read_source(root.join("crates/ratspeak-runtime/src/lxmf.rs")).expect("lxmf");
     assert!(!lxmf.contains("pub async fn resolve_destination"));
-    assert!(lxmf.contains("self.router.try_send(msg).ok()?;"));
+    assert!(lxmf.contains("self.router.submit_signed(msg).ok()?;"));
 
     let messaging = read_source(root.join("crates/ratspeak-tauri/src/commands/messaging.rs"))
         .expect("messaging commands");

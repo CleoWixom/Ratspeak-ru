@@ -1458,9 +1458,8 @@ pub fn get_status_payload(state: &AppState) -> serde_json::Value {
             .unwrap_or_else(fallback);
         (hash, count, cost)
     };
-    let hosting_enabled = state
-        .propagation_node_hosting_enabled
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let hosting_requested = state.propagation_node_hosting_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let hosting_enabled = state.effective_propagation_hosting();
     let enforce_stamps = state
         .enforce_stamps
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1484,6 +1483,8 @@ pub fn get_status_payload(state: &AppState) -> serde_json::Value {
         obj.insert("static_nodes_known".to_string(), json!(static_nodes_known));
         obj.insert("pn_parse_failures".to_string(), json!(pn_parse_failures));
         obj.insert("hosting_enabled".to_string(), json!(hosting_enabled));
+        obj.insert("hosting_requested".to_string(), json!(hosting_requested));
+        obj.insert("hosting_status".to_string(), state.propagation_host_status.lock().ok().and_then(|status| serde_json::to_value(&*status).ok()).unwrap_or(json!(null)));
         obj.insert("local_node_hash".to_string(), json!(local_node_hash));
         obj.insert(
             "local_node_message_count".to_string(),
@@ -1751,13 +1752,13 @@ mod tests {
             let mgr = lxmf.as_mut().unwrap();
             mgr.router
                 .pending_outbound
-                .push(lxmf_core::message_api::LxMessage::new(
+                .push(lxmf_core::message::LxMessageDraft::new(
                     [0x33; 16],
                     mgr.lxmf_dest_hash,
                     "pending",
                     "pending",
                     lxmf_core::message_api::DeliveryMethod::Propagated,
-                ));
+                ).unwrap().sign(&mgr.identity.get_signing_key().unwrap()).unwrap().finalize(None).unwrap());
         }
 
         maybe_reselect_on_announce(&state).await;
@@ -2061,6 +2062,21 @@ mod tests {
                 &announce,
             )),
         ));
+        assert!(!mgr.propagation_node_ready_for_send(&node));
+        mgr.update_route_hop(node, 1);
+        assert!(!mgr.propagation_node_ready_for_send(&node));
+        let now = now_f64();
+        mgr.replace_route_hops_from_path_table(&[rns_transport::messages::PathTableRpcEntry {
+            hash: node,
+            timestamp: now,
+            via: None,
+            hops: 1,
+            expires: now + 600.,
+            interface: "relay fixture".into(),
+            interface_id: 1,
+            interface_mode: rns_transport::constants::InterfaceMode::Full,
+            interface_role: rns_transport::messages::InterfaceRole::Normal,
+        }]);
         assert!(mgr.propagation_node_ready_for_send(&node));
 
         *state.lxmf.lock().unwrap() = Some(mgr);

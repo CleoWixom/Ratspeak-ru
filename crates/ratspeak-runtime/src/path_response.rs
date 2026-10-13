@@ -465,11 +465,13 @@ mod tests {
         let mut packet = vec![0, 0]; // Header1, SINGLE DATA, zero hops
         packet.extend_from_slice(&destination);
         packet.push(0); // context NONE
-        packet.extend_from_slice(&packed[16..]);
+        let ciphertext=f.state.lxmf.lock().unwrap().as_ref().unwrap().identity.encrypt(&packed[16..],None).unwrap();
+        packet.extend_from_slice(&ciphertext);
         events
             .send(DestinationEvent::InboundPacket {
                 raw: packet.into(),
                 interface_id: 7,
+                interface_owner: None,
                 metrics: Default::default(),
             })
             .await

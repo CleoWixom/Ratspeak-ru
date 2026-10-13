@@ -78,6 +78,11 @@ pub async fn set_propagation_hosting(
     .await
     .map_err(|_| AppError::internal("set_propagation_hosting db task panicked"))?;
 
+    if args.enabled && !state.propagation_host_ready() {
+        ratspeak_runtime::restart_rns_lxmf(Arc::clone(&state)).await
+            .map_err(|_| AppError::internal("propagation hosting could not restart safely"))?;
+    }
+
     if let Ok(mut lxmf) = state.lxmf.lock()
         && let Some(mgr) = lxmf.as_mut()
     {
@@ -99,6 +104,38 @@ pub async fn set_propagation_hosting(
     .await;
     crate::propagation::emit_propagation_update(&state);
     Ok(crate::propagation::get_status_payload(&state))
+}
+
+#[derive(Deserialize)]
+pub struct PropagationRecoveryArgs {
+    pub identity: String,
+    pub supervisor_writers_stopped: bool,
+    pub manifest_path: Option<String>,
+    pub approved_manifest_sha256: Option<String>,
+}
+
+#[tauri::command]
+pub async fn recover_propagation_host(state: State<'_,Arc<AppState>>,args:PropagationRecoveryArgs)->AppResult<Value> {
+    if !validate_hex(&args.identity,32,32) { return Err(AppError::bad_request("Invalid identity")); }
+    let recovery=match (args.manifest_path,args.approved_manifest_sha256) {
+        (None,None)=>None,
+        (Some(path),Some(digest))=> {
+            if !validate_hex(&digest,64,64) { return Err(AppError::bad_request("Invalid manifest digest")); }
+            if path.len()>4096 || !std::path::Path::new(&path).is_absolute() {
+                return Err(AppError::bad_request("Recovery manifest needs an absolute local path"));
+            }
+            let digest: [u8;32]=hex::decode(digest).map_err(|_|AppError::bad_request("Invalid manifest digest"))?.try_into().map_err(|_|AppError::bad_request("Invalid manifest digest"))?;
+            Some((std::path::PathBuf::from(path),digest))
+        },
+        _=>return Err(AppError::bad_request("Trusted recovery requires both its manifest and approved SHA-256 digest")),
+    };
+    ratspeak_runtime::propagation_recovery::recover_host(Arc::clone(&state),args.identity,args.supervisor_writers_stopped,recovery).await.map_err(AppError::bad_request)
+}
+
+#[tauri::command]
+pub async fn retry_deferred_propagation(state:State<'_,Arc<AppState>>)->AppResult<Value> {
+    ratspeak_runtime::propagation_recovery::retry_deferred_downloads(Arc::clone(&state)).await.map_err(AppError::bad_request)?;
+    Ok(json!({"ok":true}))
 }
 
 #[derive(Deserialize)]
@@ -1021,17 +1058,16 @@ pub async fn sync_propagation(state: State<'_, Arc<AppState>>) -> AppResult<Valu
                     client.state(),
                     PropagationClientState::Idle
                         | PropagationClientState::Complete
+                        | PropagationClientState::Partial
                         | PropagationClientState::Failed
                 ) {
-                    if relay_ready {
-                        client.start_download();
-                    }
+                    let started = relay_ready && client.start_download();
                     json!({
                         "ok": true,
                         "success": true,
-                        "started": relay_ready,
+                        "started": started,
                         "downloaded": 0,
-                        "message": if relay_ready { "Offline Inbox check started" } else { "Offline Inbox path requested" },
+                        "message": if started { "Offline Inbox check started" } else if relay_ready { "Local storage is being checked; waiting messages remain on the inbox node" } else { "Offline Inbox path requested" },
                     })
                 } else {
                     json!({

@@ -8,7 +8,7 @@ use tokio::task::JoinError;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 
-const SCHEMA_VERSION: i64 = 44;
+pub(crate) const SCHEMA_VERSION: i64 = 45;
 
 const VOICE_FORMAT_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS conversation_voice_formats (
@@ -55,6 +55,21 @@ where
     R: Send + 'static,
 {
     tokio::task::spawn_blocking(move || f(pool)).await
+}
+
+/// Keep a lifecycle/transaction lease in the actual worker across cancellation
+/// of the async caller. The lease is dropped only after the closure completes.
+pub async fn spawn_db_with_lease<F, R, L>(pool: DbPool, lease: L, f: F) -> Result<R, JoinError>
+where
+    F: FnOnce(DbPool) -> R + Send + 'static,
+    R: Send + 'static,
+    L: Send + 'static,
+{
+    spawn_db(pool, move |pool| {
+        let _lease = lease;
+        f(pool)
+    })
+    .await
 }
 
 fn now_ts() -> f64 {
@@ -114,6 +129,7 @@ pub fn init_schema(pool: &DbPool) -> Result<(), Box<dyn std::error::Error + Send
     }
 
     conn.execute_batch(SCHEMA_SQL)?;
+    conn.execute_batch(crate::admission::SCHEMA_SQL)?;
     conn.execute_batch(VOICE_FORMAT_SCHEMA_SQL)?;
     conn.execute_batch(CHANNEL_HISTORY_SCHEMA_SQL)?;
     conn.execute_batch(CHANNEL_ROOM_STATE_SCHEMA_SQL)?;
@@ -1847,6 +1863,14 @@ fn run_migrations(conn: &Connection, from_version: i64) -> Result<(), rusqlite::
         })?;
     }
 
+    if from_version < 45 {
+        migration_step(conn, 45, |conn| {
+            conn.execute_batch(crate::admission::SCHEMA_SQL)?;
+            conn.execute_batch("UPDATE schema_version SET version = 45;")?;
+            Ok(())
+        })?;
+    }
+
     Ok(())
 }
 
@@ -2021,6 +2045,13 @@ pub fn update_identity_status(pool: &DbPool, hash_hex: &str, status: &str) -> Re
 /// Inventory-checked in tests: a new user-data table must be added here (or
 /// explicitly exempted in the test) before it can ship.
 pub const RESET_TABLES: &[&str] = &[
+    "lxmf_inbound_receipts",
+    "lxmf_inbound_effects",
+    "lxmf_user_deleted",
+    "lxmf_deleted_artifacts",
+    "lxmf_download_suppression",
+    "lxmf_admission_epochs",
+    "lxmf_admission_barrier",
     "conversation_voice_formats",
     "messages",
     "contacts",
@@ -2051,6 +2082,30 @@ pub const RESET_TABLES: &[&str] = &[
 /// interpolation), children before parents. Inventory-checked in tests
 /// against every table carrying an `identity_id` column.
 const IDENTITY_CASCADE: &[(&str, &str)] = &[
+    (
+        "lxmf_inbound_receipts",
+        "DELETE FROM lxmf_inbound_receipts WHERE identity_id = ?1",
+    ),
+    (
+        "lxmf_inbound_effects",
+        "DELETE FROM lxmf_inbound_effects WHERE identity_id = ?1",
+    ),
+    (
+        "lxmf_user_deleted",
+        "DELETE FROM lxmf_user_deleted WHERE identity_id = ?1",
+    ),
+    (
+        "lxmf_deleted_artifacts",
+        "DELETE FROM lxmf_deleted_artifacts WHERE identity_id = ?1",
+    ),
+    (
+        "lxmf_download_suppression",
+        "DELETE FROM lxmf_download_suppression WHERE identity_id = ?1",
+    ),
+    (
+        "lxmf_admission_epochs",
+        "DELETE FROM lxmf_admission_epochs WHERE identity_id = ?1",
+    ),
     (
         "app_actions",
         "DELETE FROM app_actions WHERE identity_id = ?1",
@@ -2790,6 +2845,52 @@ pub fn try_save_message_with_audio(
     audio_stored_name: &str,
 ) -> Result<(), String> {
     let conn = pool.get().map_err(|error| error.to_string())?;
+    try_save_message_with_audio_conn(
+        &conn,
+        msg_id,
+        source,
+        destination,
+        content,
+        title,
+        timestamp,
+        state,
+        direction,
+        identity_id,
+        attachment_name,
+        attachment_stored_name,
+        image_name,
+        image_stored_name,
+        reply_to_id,
+        reply_to_preview,
+        delivery_method,
+        audio_mode,
+        audio_stored_name,
+    )
+}
+
+/// Apply on the caller's transaction, including propagation admission.
+#[allow(clippy::too_many_arguments)]
+pub fn try_save_message_with_audio_conn(
+    conn: &Connection,
+    msg_id: &str,
+    source: &str,
+    destination: &str,
+    content: &str,
+    title: &str,
+    timestamp: f64,
+    state: &str,
+    direction: &str,
+    identity_id: &str,
+    attachment_name: &str,
+    attachment_stored_name: &str,
+    image_name: &str,
+    image_stored_name: &str,
+    reply_to_id: &str,
+    reply_to_preview: &str,
+    delivery_method: Option<&str>,
+    audio_mode: Option<u8>,
+    audio_stored_name: &str,
+) -> Result<(), String> {
     let exists: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE id = ?1 AND identity_id = ?2",
@@ -8751,6 +8852,39 @@ pub fn persist_inbound_game_action(
     envelope_mp: &[u8],
     session: Option<&lrgp::session::Session>,
 ) -> Option<bool> {
+    let mut conn = pool.get().ok()?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .ok()?;
+    let result = persist_inbound_game_action_conn(
+        &tx,
+        session_id,
+        identity_id,
+        command,
+        payload_json,
+        sender,
+        timestamp,
+        envelope_mp,
+        session,
+    )?;
+    tx.commit().ok()?;
+    Some(result)
+}
+
+/// Connection form shares the established game-action argument contract so a
+/// durable admission can include the effect and its receipt in one transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn persist_inbound_game_action_conn(
+    tx: &Connection,
+    session_id: &str,
+    identity_id: &str,
+    command: &str,
+    payload_json: &str,
+    sender: &str,
+    timestamp: f64,
+    envelope_mp: &[u8],
+    session: Option<&lrgp::session::Session>,
+) -> Option<bool> {
     let envelope = lrgp::protocol::unpack_from_bytes(envelope_mp).ok()?;
     let validated = lrgp::protocol::validate_envelope(&envelope).ok()?;
     if validated.session_id != session_id || validated.command != command {
@@ -8766,10 +8900,6 @@ pub fn persist_inbound_game_action(
         return None;
     }
     let incoming_nonce = validated.nonce;
-    let mut conn = pool.get().ok()?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .ok()?;
     let existing: Option<(i64, String, String, u32, String)> = tx
         .query_row(
             "SELECT unread, contact_hash, app_id, app_version, initiator FROM app_sessions
@@ -8918,7 +9048,6 @@ pub fn persist_inbound_game_action(
         .ok()?;
     }
 
-    tx.commit().ok()?;
     Some(existing.is_some())
 }
 

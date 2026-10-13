@@ -27,6 +27,40 @@ pub use ratspeak_core::types::{
 };
 pub use ratspeak_db::DbPool;
 
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PropagationHostReadiness {
+    Disabled,
+    Opening,
+    MigrationRequired,
+    Recovering,
+    Ready,
+    Unavailable,
+}
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PropagationHostStatus {
+    pub identity: String,
+    pub generation: u64,
+    pub readiness: PropagationHostReadiness,
+    pub reason: Option<String>,
+    pub quarantined_files: usize,
+    pub quarantined_bytes: u64,
+    pub quarantine_reason: Option<String>,
+}
+impl Default for PropagationHostStatus {
+    fn default() -> Self {
+        Self {
+            identity: String::new(),
+            generation: 0,
+            readiness: PropagationHostReadiness::Disabled,
+            reason: None,
+            quarantined_files: 0,
+            quarantined_bytes: 0,
+            quarantine_reason: None,
+        }
+    }
+}
+
 const INTERFACE_REANNOUNCE_SUPPRESSION_TTL: Duration = Duration::from_secs(120);
 // The WebView abandons native connects at 180s. Keep a cleanup margin so its
 // typed timeout callback can still consume the token under scheduler delay.
@@ -431,15 +465,15 @@ impl ActivityRequestFence {
 /// allowing Activity commands to distinguish a request born during a
 /// transition from one that was merely queued before a point-in-time reset.
 pub struct IdentitySwitchLock {
-    inner: tokio::sync::Mutex<()>,
-    epoch: AtomicU64,
+    inner: Arc<tokio::sync::Mutex<()>>,
+    epoch: Arc<AtomicU64>,
 }
 
 impl IdentitySwitchLock {
     pub fn new() -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(()),
-            epoch: AtomicU64::new(0),
+            inner: Arc::new(tokio::sync::Mutex::new(())),
+            epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -455,6 +489,22 @@ impl IdentitySwitchLock {
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
+    /// Publish a result for the current identity without announcing a new
+    /// identity/privacy transition. The same mutex still excludes real changes.
+    pub(crate) async fn lock_publication(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.lock().await
+    }
+
+    /// Retain a short identity publication transition inside its actual blocking
+    /// closure, even when the awaiting command is cancelled.
+    pub async fn lock_owned(&self) -> OwnedIdentitySwitchGuard {
+        let guard = self.inner.clone().lock_owned().await;
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        OwnedIdentitySwitchGuard {
+            _guard: guard,
+            epoch: self.epoch.clone(),
+        }
+    }
 }
 
 impl Default for IdentitySwitchLock {
@@ -469,6 +519,17 @@ pub struct IdentitySwitchGuard<'a> {
 }
 
 impl Drop for IdentitySwitchGuard<'_> {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+pub struct OwnedIdentitySwitchGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    epoch: Arc<AtomicU64>,
+}
+
+impl Drop for OwnedIdentitySwitchGuard {
     fn drop(&mut self) {
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
@@ -605,6 +666,8 @@ pub struct AppState {
     /// `known_path_hashes`; prevents restored paths from flooding Activity.
     pub path_activity_baselined: AtomicBool,
     pub lrgp_router: lrgp::router::LrgpRouter,
+    /// Serializes game plans, database commits and publication to the live router.
+    pub lrgp_transaction: Arc<tokio::sync::Mutex<()>>,
     pub message_send_times: Mutex<HashMap<String, f64>>,
     pub seen_announce_hashes: Mutex<std::collections::HashSet<String>>,
     /// False until the first non-empty announce snapshot has seeded
@@ -650,6 +713,7 @@ pub struct AppState {
     /// Edge-trigger wake for long-sleeping background loops.
     pub foreground_changed: Arc<tokio::sync::Notify>,
     pub propagation_node: Mutex<Option<Arc<Mutex<lxmf_core::propagation_node::PropagationNode>>>>,
+    pub propagation_host_status: Mutex<PropagationHostStatus>,
     pub last_stats: RwLock<Option<serde_json::Value>>,
     /// Product readiness for exact runtime-owned RNodes, keyed by the
     /// runtime-local interface ID. Generic transport `online` is only an
@@ -886,6 +950,7 @@ impl AppState {
             known_path_hashes: Mutex::new(std::collections::HashSet::new()),
             path_activity_baselined: AtomicBool::new(false),
             lrgp_router,
+            lrgp_transaction: Arc::new(tokio::sync::Mutex::new(())),
             message_send_times: Mutex::new(HashMap::new()),
             seen_announce_hashes: Mutex::new(std::collections::HashSet::new()),
             announce_activity_baselined: AtomicBool::new(false),
@@ -907,6 +972,7 @@ impl AppState {
             network_transition_lock: tokio::sync::Mutex::new(()),
             foreground_changed: Arc::new(tokio::sync::Notify::new()),
             propagation_node: Mutex::new(None),
+            propagation_host_status: Mutex::new(PropagationHostStatus::default()),
             last_stats: RwLock::new(None),
             rnode_product_readiness: RwLock::new(HashMap::new()),
             last_hub_interfaces: RwLock::new(None),
@@ -1110,8 +1176,78 @@ impl AppState {
             + 1
     }
 
+    pub fn set_propagation_host_readiness(
+        &self,
+        identity: String,
+        generation: u64,
+        readiness: PropagationHostReadiness,
+        reason: Option<String>,
+    ) -> bool {
+        if self.current_identity_session_generation() != generation {
+            return false;
+        }
+        let Ok(mut status) = self.propagation_host_status.lock() else {
+            return false;
+        };
+        if status.identity != identity || status.generation != generation {
+            *status = PropagationHostStatus::default();
+        }
+        status.identity = identity;
+        status.generation = generation;
+        status.readiness = readiness;
+        status.reason = reason;
+        true
+    }
+    pub fn set_propagation_quarantine_summary(
+        &self,
+        generation: u64,
+        summary: Option<lxmf_core::propagation_store_v2::QuarantineSummary>,
+    ) {
+        if let Ok(mut status) = self.propagation_host_status.lock() {
+            if status.generation != generation
+                || generation != self.current_identity_session_generation()
+            {
+                return;
+            }
+            status.quarantined_files = summary.as_ref().map_or(0, |s| s.files);
+            status.quarantined_bytes = summary.as_ref().map_or(0, |s| s.bytes);
+            status.quarantine_reason = summary.map(|s| s.reason.to_string());
+        }
+    }
+    pub fn propagation_host_ready(&self) -> bool {
+        self.propagation_host_status.lock().is_ok_and(|status| {
+            status.generation == self.current_identity_session_generation()
+                && status.readiness == PropagationHostReadiness::Ready
+        })
+    }
+    pub fn effective_propagation_hosting(&self) -> bool {
+        self.propagation_node_hosting_enabled
+            .load(Ordering::Relaxed)
+            && self.propagation_host_ready()
+    }
+
     pub fn current_identity_session_generation(&self) -> u64 {
         self.identity_session_generation.load(Ordering::SeqCst)
+    }
+
+    /// Install a validated software unlock only while the caller owns the identity
+    /// transition lock. Startup consumes this instead of deriving the key twice.
+    pub fn retain_unlocked_identity(
+        &self,
+        identity: rns_identity::identity::Identity,
+        expected_hash: &str,
+        generation: u64,
+    ) -> bool {
+        if self.current_identity_session_generation() != generation
+            || hex::encode(identity.hash) != expected_hash
+        {
+            return false;
+        }
+        self.network_session
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retained_identity = Some((identity, false));
+        true
     }
 
     pub fn announce_semantic_revision(&self) -> AnnounceSemanticRevision {
@@ -2606,6 +2742,9 @@ impl AppState {
         if let Ok(mut pn) = self.propagation_node.lock() {
             *pn = None;
         }
+        if let Ok(mut status) = self.propagation_host_status.lock() {
+            *status = PropagationHostStatus::default();
+        }
         if let Ok(mut stats) = self.last_stats.write() {
             *stats = None;
         }
@@ -4033,6 +4172,64 @@ mod tests {
             !state.is_current_activity_request_fence_after_identity_lock(born_during_transition)
         );
         drop(command);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_identity_command_retains_actual_worker_ownership() {
+        let state = Arc::new(make_state());
+        let worker_state = state.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let command = tokio::spawn(async move {
+            let guard = worker_state.identity_switch_lock.lock_owned().await;
+            tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        started_rx.await.unwrap();
+        let epoch = state.identity_switch_lock.epoch();
+        assert_eq!(epoch % 2, 1);
+        command.abort();
+        assert!(command.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                state.identity_switch_lock.lock_owned()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(state.identity_switch_lock.epoch(), epoch);
+        release_tx.send(()).unwrap();
+        let next = tokio::time::timeout(
+            Duration::from_secs(2),
+            state.identity_switch_lock.lock_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.identity_switch_lock.epoch(), epoch + 2);
+        drop(next);
+    }
+    #[tokio::test]
+    async fn result_publication_excludes_switches_without_invalidating_activity() {
+        let state = make_state();
+        let fence = state.activity_request_fence();
+        let publication = state.identity_switch_lock.lock_publication().await;
+        assert!(state.is_current_activity_origin_fence(fence));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), state.identity_switch_lock.lock())
+                .await
+                .is_err()
+        );
+        drop(publication);
+        assert!(state.is_current_activity_origin_fence(fence));
+        let transition = state.identity_switch_lock.lock().await;
+        drop(transition);
+        assert!(!state.is_current_activity_origin_fence(fence));
     }
 
     #[tokio::test]

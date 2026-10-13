@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 use tauri::State;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-use crate::commands::shared::remove_stored_file_refs;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::helpers::{active_identity_id, sanitize_text, validate_hex};
@@ -2434,36 +2433,30 @@ pub async fn delete_conversation(
     if !validate_hex(&dest_hash, 16, 64) {
         return Err(AppError::bad_request("Invalid identity hash"));
     }
+    let deletion =
+        ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await;
+    let generation = state.current_identity_session_generation();
     let identity_id = active_identity_id(&state);
 
     // One blocking task so the lxmf MutexGuard never crosses an .await.
     let st: Arc<AppState> = Arc::clone(&state);
     let dh = dest_hash.clone();
     let id_c = identity_id.clone();
-    let total = tokio::task::spawn_blocking(move || {
-        let mut file_refs = Vec::new();
-        if let Ok(lxmf) = st.lxmf.lock() {
-            if let Some(mgr) = lxmf.as_ref() {
-                mgr.delete_conversation(&dh, &st.db, &id_c);
-            } else {
-                file_refs = db::delete_conversation(&st.db, &dh, &id_c);
-            }
-        } else {
-            file_refs = db::delete_conversation(&st.db, &dh, &id_c);
-        }
-        if !file_refs.is_empty() {
-            remove_stored_file_refs(&st.config.files_dir(), file_refs);
-        }
-        if let Ok(conn) = st.db.get() {
-            let counts = db::get_all_unread_counts_conn(&conn, &id_c);
-            counts.values().sum::<i64>()
-        } else {
-            0i64
-        }
-    })
-    .await
-    .unwrap_or(0);
+    let total =
+        tokio::task::spawn_blocking(move || -> Result<i64, db::admission::AdmissionDbError> {
+            let _deletion = deletion;
+            ratspeak_runtime::propagation_recovery::delete_messages(&st, &id_c, Some(&dh))?;
+            let counts = db::get_all_unread_counts(&st.db, &id_c);
+            Ok(counts.values().sum())
+        })
+        .await
+        .map_err(|_| AppError::internal("message deletion worker failed"))?
+        .map_err(|error| AppError::database_unavailable(error.to_string()))?;
 
+    let _lifecycle = state.identity_switch_lock.lock().await;
+    if generation != state.current_identity_session_generation() {
+        return Ok(json!({"hash":dest_hash}));
+    }
     state.emit_to_all(
         "conversation_deleted",
         json!({ "ok": true, "hash": dest_hash }),

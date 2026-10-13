@@ -43,7 +43,8 @@ test("published notes reject flat lists and drift from the documented section or
 test("core compatibility is restricted to the reviewed patch line", () => {
   assert.equal(componentCargoRequirement({ id: "rsreticulum", version: "1.3.0" }), "~1.3.0");
   assert.equal(componentCargoRequirement({ id: "rsreticulum", version: "1.4.0" }), "~1.4.0");
-  assert.equal(componentCargoRequirement({ id: "rslxmf", version: "1.2.0" }), "1.2.0");
+  assert.equal(componentCargoRequirement({ id: "rslxmf", version: "1.4.0" }), "~1.4.0");
+  assert.equal(componentCargoRequirement({ id: "rslxst", version: "0.3.0" }), "0.3.0");
 });
 
 test("dependency-set schema rejects source and platform identity drift", () => {

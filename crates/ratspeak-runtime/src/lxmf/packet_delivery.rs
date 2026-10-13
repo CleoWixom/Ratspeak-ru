@@ -48,7 +48,7 @@ impl LxmfManager {
                         .router
                         .pending_outbound
                         .iter()
-                        .any(|message| message.hash == Some(hash))
+                        .any(|message| Some(message.message_id()) == Some(hash))
             })
         {
             return true;
@@ -81,7 +81,7 @@ impl LxmfManager {
         let Some(tx) = self.router.transport_tx.as_ref() else {
             return Err("transport_unavailable");
         };
-        let Some(hash) = message.hash else {
+        let Some(hash) = Some(message.message_id()) else {
             return Err("missing_message_hash");
         };
         if self
@@ -94,7 +94,7 @@ impl LxmfManager {
             return Err("proof_capacity");
         }
         let lifetime = self
-            .packet_retry_window(message.destination_hash)
+            .packet_retry_window(message.destination_hash())
             .saturating_add(LATE_PROOF_GRACE);
         let (full_hash, truncated_hash) =
             rns_wire::hash::packet_hash_pair(&raw, rns_wire::flags::HeaderType::Header1);
@@ -103,13 +103,13 @@ impl LxmfManager {
         tx.try_send(TransportMessage::SendPacket {
             request: rns_transport::messages::OutboundRequest {
                 raw: Bytes::from(raw),
-                destination_hash: message.destination_hash,
+                destination_hash: message.destination_hash(),
             },
             attached_interface: None,
             receipt: Some(TrackedReceiptRegistration {
                 truncated_hash,
                 full_hash,
-                destination_hash: message.destination_hash,
+                destination_hash: message.destination_hash(),
                 destination_public_key: public_key,
                 timeout: Some(lifetime),
                 status_tx,
@@ -258,15 +258,20 @@ mod tests {
     #[test]
     fn destination_discovery_watchdog_exemption_is_finite_and_cancelled_with_message() {
         let mut mgr = test_manager();
-        let mut msg = LxMessage::new(
+        let msg = lxmf_core::message::LxMessageDraft::new(
             [9; 16],
             mgr.lxmf_dest_hash,
             "",
             "cold",
             DeliveryMethod::Direct,
-        );
-        msg.sign(&mgr.identity.get_signing_key().unwrap()).unwrap();
-        let hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg
+            .sign(&mgr.identity.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+        let hash = msg.message_id();
         let id = hex::encode(hash);
         mgr.router.pending_outbound.push(msg);
         let at = Instant::now();
@@ -295,14 +300,14 @@ mod tests {
         let resource = [0xC7; 32];
         delivery.register_backchannel(dest, link);
         let message = mgr
-            .create_message(
+            .create_final_message(
                 &hex::encode(dest),
                 "slow resource",
                 "",
                 DeliveryMethod::Direct,
             )
             .unwrap();
-        let hash = message.hash.unwrap();
+        let hash = message.message_id();
         delivery.start_backchannel_delivery(message, dest).unwrap();
         requests
             .try_recv()
@@ -401,9 +406,9 @@ mod tests {
         let packet = [0xC8; 32];
         delivery.register_backchannel(dest, link);
         let message = mgr
-            .create_message(&hex::encode(dest), "packet", "", DeliveryMethod::Direct)
+            .create_final_message(&hex::encode(dest), "packet", "", DeliveryMethod::Direct)
             .unwrap();
-        let hash = message.hash.unwrap();
+        let hash = message.message_id();
         delivery.start_backchannel_delivery(message, dest).unwrap();
         requests
             .try_recv()
@@ -442,16 +447,15 @@ mod tests {
         mgr.router.set_stamp_cost(dest, 0);
         let (tx, rx) = mpsc::channel(64);
         mgr.router.set_transport(tx);
-        let mut message = mgr
-            .create_message(
+        let message = mgr
+            .create_final_message(
                 &hex::encode(dest),
                 "probe",
                 "",
                 DeliveryMethod::Opportunistic,
             )
             .unwrap();
-        message.outbound_ticket = None;
-        let hash = message.hash.unwrap();
+        let hash = message.message_id();
         mgr.router.try_send(message).unwrap();
         mgr.tick();
         (mgr, hash, rx)
@@ -508,7 +512,7 @@ mod tests {
         message.next_delivery_attempt = 0.0;
         message.delivery_attempts = 0;
         mgr.execute_encrypted_actions(vec![OutboundAction::DeliverOpportunistic {
-            dest_hash: message.destination_hash,
+            dest_hash: message.destination_hash(),
             message,
         }]);
         let new_proof = accept(&mut rx);

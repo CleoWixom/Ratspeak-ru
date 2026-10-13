@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tauri::State;
 
-use crate::commands::shared::{active_rns_config_dir, remove_stored_file_refs};
+use crate::commands::shared::active_rns_config_dir;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::helpers::{active_identity_id, sanitize_announced_display_name};
@@ -518,17 +518,18 @@ pub async fn api_clear_announces(state: State<'_, Arc<AppState>>) -> AppResult<V
 
 #[tauri::command]
 pub async fn api_clear_messages(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    let deletion = Arc::new(
+        ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await,
+    );
     let identity_id = active_identity_id(&state);
     let id_for_db = identity_id.clone();
-    let file_refs = db::spawn_db(state.db.clone(), move |p| {
-        db::clear_all_messages(&p, &id_for_db)
+    let worker_state = Arc::clone(&state);
+    db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
+        ratspeak_runtime::propagation_recovery::delete_messages(&worker_state, &id_for_db, None)
     })
     .await
-    .unwrap_or_else(|_| {
-        tracing::error!(reason = "task_panicked", "clear_messages db task panicked");
-        Default::default()
-    });
-    remove_stored_file_refs(&state.config.files_dir(), file_refs);
+    .map_err(|_| AppError::internal("message deletion worker failed"))?
+    .map_err(|error| AppError::database_unavailable(error.to_string()))?;
     Ok(json!(null))
 }
 
@@ -555,45 +556,49 @@ pub async fn api_clear_contacts(state: State<'_, Arc<AppState>>) -> AppResult<Va
 #[tauri::command]
 #[tracing::instrument(level = "debug", name = "command.api_reset_database", skip_all)]
 pub async fn api_reset_database(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    let deletion = Arc::new(
+        ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await,
+    );
     let identity_id = active_identity_id(&state);
     let id1 = identity_id.clone();
-    let file_refs = db::spawn_db(state.db.clone(), move |p| db::clear_all_messages(&p, &id1))
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(
-                reason = "task_panicked",
-                "reset_database clear_messages panicked"
-            );
-            Default::default()
-        });
-    remove_stored_file_refs(&state.config.files_dir(), file_refs);
+    let worker_state = Arc::clone(&state);
+    db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
+        ratspeak_runtime::propagation_recovery::delete_messages(&worker_state, &id1, None)
+    })
+    .await
+    .map_err(|_| AppError::internal("message deletion worker failed"))?
+    .map_err(|error| AppError::database_unavailable(error.to_string()))?;
     let id2 = identity_id.clone();
-    db::spawn_db(state.db.clone(), move |p| db::clear_all_contacts(&p, &id2))
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(
-                reason = "task_panicked",
-                "reset_database clear_contacts panicked"
-            );
-            Default::default()
-        });
+    db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |p| {
+        db::clear_all_contacts(&p, &id2)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        tracing::error!(
+            reason = "task_panicked",
+            "reset_database clear_contacts panicked"
+        );
+        Default::default()
+    });
     let id3 = identity_id;
-    db::spawn_db(state.db.clone(), move |p| db::clear_all_blocked(&p, &id3))
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(
-                reason = "task_panicked",
-                "reset_database clear_blocked panicked"
-            );
-            Default::default()
-        });
+    db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |p| {
+        db::clear_all_blocked(&p, &id3)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        tracing::error!(
+            reason = "task_panicked",
+            "reset_database clear_blocked panicked"
+        );
+        Default::default()
+    });
     Ok(json!(null))
 }
 
 #[tauri::command]
 #[tracing::instrument(level = "debug", name = "command.api_identity_reset", skip_all)]
 pub async fn api_identity_reset(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let identity_lifecycle = Arc::new(state.identity_switch_lock.lock_owned().await);
     let identity_id = active_identity_id(&state);
     if !identity_id.is_empty() {
         super::shared::forget_shared_text_drafts(&state, Some(identity_id.clone())).await?;
@@ -610,30 +615,37 @@ pub async fn api_identity_reset(state: State<'_, Arc<AppState>>) -> AppResult<Va
 
     if !identity_id.is_empty() {
         let id1 = identity_id.clone();
-        let file_refs = db::spawn_db(state.db.clone(), move |p| db::clear_all_messages(&p, &id1))
-            .await
-            .unwrap_or_else(|_| {
-                tracing::error!(
-                    reason = "task_panicked",
-                    "identity_reset clear_messages panicked"
-                );
-                Default::default()
-            });
-        remove_stored_file_refs(&state.config.files_dir(), file_refs);
+        let worker_state = Arc::clone(&state);
+        db::spawn_db_with_lease(
+            state.db.clone(),
+            Arc::clone(&identity_lifecycle),
+            move |_p| {
+                ratspeak_runtime::propagation_recovery::delete_messages(&worker_state, &id1, None)
+            },
+        )
+        .await
+        .map_err(|_| AppError::internal("message deletion worker failed"))?
+        .map_err(|error| AppError::database_unavailable(error.to_string()))?;
         let id2 = identity_id.clone();
-        db::spawn_db(state.db.clone(), move |p| db::clear_all_contacts(&p, &id2))
-            .await
-            .unwrap_or_else(|_| {
-                tracing::error!(
-                    reason = "task_panicked",
-                    "identity_reset clear_contacts panicked"
-                );
-                Default::default()
-            });
+        db::spawn_db_with_lease(
+            state.db.clone(),
+            Arc::clone(&identity_lifecycle),
+            move |p| db::clear_all_contacts(&p, &id2),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            tracing::error!(
+                reason = "task_panicked",
+                "identity_reset clear_contacts panicked"
+            );
+            Default::default()
+        });
         let id3 = identity_id.clone();
-        let del_res = db::spawn_db(state.db.clone(), move |p| {
-            db::delete_identity(&p, &id3, true)
-        })
+        let del_res = db::spawn_db_with_lease(
+            state.db.clone(),
+            Arc::clone(&identity_lifecycle),
+            move |p| db::delete_identity(&p, &id3, true),
+        )
         .await
         .unwrap_or_else(|_| {
             tracing::error!(reason = "task_panicked", "identity_reset delete panicked");
@@ -648,7 +660,9 @@ pub async fn api_identity_reset(state: State<'_, Arc<AppState>>) -> AppResult<Va
     }
 
     if let Some(data_dir) = reset_data_dir {
+        let lifecycle = Arc::clone(&identity_lifecycle);
         let _ = tokio::task::spawn_blocking(move || {
+            let _lifecycle = lifecycle;
             std::fs::remove_dir_all(data_dir.join("identities")).ok();
             std::fs::remove_dir_all(data_dir.join("ratchets")).ok();
             std::fs::remove_file(data_dir.join("identity")).ok();
@@ -685,7 +699,7 @@ pub async fn dismiss_alert(state: State<'_, Arc<AppState>>, index: i64) -> AppRe
 #[tauri::command]
 #[tracing::instrument(level = "debug", name = "command.api_factory_reset", skip_all)]
 pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let identity_lifecycle = Arc::new(state.identity_switch_lock.lock_owned().await);
     super::shared::forget_shared_text_drafts(&state, None).await?;
     // Capture config_dir before shutdown wipes RNS.
     let rns_config_dir = active_rns_config_dir(&state);
@@ -699,7 +713,7 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
         .await
         .map_err(|_| AppError::internal("factory reset lifecycle boundary unavailable"))?;
 
-    db::spawn_db(state.db.clone(), |pool| {
+    db::spawn_db_with_lease(state.db.clone(), Arc::clone(&identity_lifecycle), |pool| {
         db::note_identity_tables_changed();
         if let Ok(conn) = pool.get() {
             for table in db::RESET_TABLES {
@@ -720,7 +734,9 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
 
     // Bulk fs wipe; keep off the runtime.
     let data_dir = state.config.data_dir.clone();
+    let lifecycle = Arc::clone(&identity_lifecycle);
     let _ = tokio::task::spawn_blocking(move || {
+        let _lifecycle = lifecycle;
         let identities_dir = data_dir.join("identities");
         if identities_dir.exists() && std::fs::remove_dir_all(&identities_dir).is_err() {
             tracing::warn!(

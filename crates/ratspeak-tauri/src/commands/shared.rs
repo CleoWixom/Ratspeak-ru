@@ -546,7 +546,11 @@ pub(crate) struct SessionStateSave<'a> {
     pub(crate) delivery_state: Option<&'a str>,
 }
 
-pub(crate) async fn save_session_from_state(state: &AppState, save: SessionStateSave<'_>) {
+pub(crate) async fn save_session_from_state(
+    state: &AppState,
+    game_transaction: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
+    save: SessionStateSave<'_>,
+) {
     let SessionStateSave {
         session_id,
         identity_id,
@@ -609,7 +613,7 @@ pub(crate) async fn save_session_from_state(state: &AppState, save: SessionState
         updated_at: now,
         last_action_at: now,
     };
-    let _ = db::spawn_db(state.db.clone(), move |p| {
+    let _ = db::spawn_db_with_lease(state.db.clone(), game_transaction, move |p| {
         db::save_game_session(&p, &session);
     })
     .await;

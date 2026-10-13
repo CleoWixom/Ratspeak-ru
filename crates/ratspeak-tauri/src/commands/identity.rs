@@ -23,6 +23,7 @@ use crate::state::AppState;
 
 use ratspeak_core::LXMF_DELIVERY_APP_NAME as LXMF_APP_NAME;
 use ratspeak_runtime::activity::ActivityRecorderError;
+use ratspeak_runtime::vault::{self, VaultJob};
 
 const IDENTITY_BACKUP_FORMAT: &str = "ratspeak.identity.v2";
 const LEGACY_IDENTITY_BACKUP_FORMAT: &str = "ratspeak.identity.v1";
@@ -153,10 +154,17 @@ fn base32_encode_padded(bytes: &[u8]) -> String {
     out
 }
 
-fn parse_private_identity_bytes(
+fn parse_private_identity_bytes_with_job(
     bytes: &[u8],
     passcode: Option<&str>,
+    job: &VaultJob,
 ) -> Result<ParsedIdentityImport, String> {
+    if bytes.len() > vault::MAX_IDENTITY_IMPORT_BYTES {
+        return Err("Identity import exceeds the 1 MiB limit".into());
+    }
+    if let Some(passcode) = passcode {
+        vault::validate_passcode(passcode).map_err(|e| e.to_string())?;
+    }
     if bytes.len() == 64 {
         return Ok(ParsedIdentityImport {
             key_bytes: bytes.to_vec(),
@@ -173,8 +181,8 @@ fn parse_private_identity_bytes(
     }
 
     if text.starts_with('{') {
-        let value = serde_json::from_str::<Value>(text)
-            .map_err(|_| "Identity backup JSON is invalid".to_string())?;
+        let value = vault::parse_unique_json(text.as_bytes(), vault::MAX_IDENTITY_IMPORT_BYTES)
+            .map_err(|e| e.to_string())?;
         let format = value.get("format").and_then(|v| v.as_str()).unwrap_or("");
         if format == IDENTITY_BACKUP_FORMAT {
             let backup = serde_json::from_value::<EncryptedIdentityBackupV2>(value)
@@ -186,12 +194,16 @@ fn parse_private_identity_bytes(
                 .map(str::trim)
                 .filter(|p| !p.is_empty())
                 .ok_or_else(|| "Backup PIN required".to_string())?;
-            let key = ratspeak_runtime::vault::decrypt_key(passcode, &backup.vault)
-                .map_err(|_| "Incorrect backup PIN or corrupt identity backup".to_string())?;
-            let mnemonic = ratspeak_runtime::vault::decrypt_mnemonic(passcode, &backup.vault)
-                .map_err(|_| "Incorrect backup PIN or corrupt identity backup".to_string())?
-                .map(|m| m.as_str().to_string());
-            let key_bytes = key.as_ref().to_vec();
+            let unlocked = job
+                .decrypt_identity(passcode, &backup.vault)
+                .map_err(|e| match e {
+                    vault::VaultError::Auth => {
+                        "Incorrect backup PIN or corrupt identity backup".to_string()
+                    }
+                    _ => e.to_string(),
+                })?;
+            let mnemonic = unlocked.mnemonic().map(str::to_string);
+            let key_bytes = unlocked.key().to_vec();
             let identity = Identity::from_private_key(&key_bytes)
                 .map_err(|e| format!("Invalid identity backup key: {e}"))?;
             let hash_hex = hex::encode(identity.hash);
@@ -233,9 +245,10 @@ fn parse_private_identity_bytes(
         return Err("Unsupported identity backup format".into());
     }
 
-    if let Some(key_bytes) = hex::decode(text)
-        .ok()
-        .filter(|key_bytes| key_bytes.len() == 64)
+    if text.len() <= 128
+        && let Some(key_bytes) = hex::decode(text)
+            .ok()
+            .filter(|key_bytes| key_bytes.len() == 64)
     {
         return Ok(ParsedIdentityImport {
             key_bytes,
@@ -244,10 +257,11 @@ fn parse_private_identity_bytes(
         });
     }
 
-    if let Some(key_bytes) = B64
-        .decode(text)
-        .ok()
-        .filter(|key_bytes| key_bytes.len() == 64)
+    if text.len() <= 88
+        && let Some(key_bytes) = B64
+            .decode(text)
+            .ok()
+            .filter(|key_bytes| key_bytes.len() == 64)
     {
         return Ok(ParsedIdentityImport {
             key_bytes,
@@ -256,9 +270,10 @@ fn parse_private_identity_bytes(
         });
     }
 
-    if let Some(key_bytes) = base32_decode_text(text)
-        .ok()
-        .filter(|key_bytes| key_bytes.len() == 64)
+    if text.len() <= 4096 + 104
+        && let Some(key_bytes) = base32_decode_text(text)
+            .ok()
+            .filter(|key_bytes| key_bytes.len() == 64)
     {
         return Ok(ParsedIdentityImport {
             key_bytes,
@@ -268,6 +283,57 @@ fn parse_private_identity_bytes(
     }
 
     Err("Identity import must contain a private identity, not a public-only identity".into())
+}
+
+#[cfg(test)]
+fn parse_private_identity_bytes(
+    bytes: &[u8],
+    passcode: Option<&str>,
+) -> Result<ParsedIdentityImport, String> {
+    let job = vault::try_acquire_job().map_err(|e| e.to_string())?;
+    parse_private_identity_bytes_with_job(bytes, passcode, &job)
+}
+
+fn bounded_encoded_input(text: &str, encoded_limit: usize) -> AppResult<&str> {
+    if text.len() > encoded_limit + vault::MAX_OUTER_WHITESPACE_BYTES {
+        return Err(AppError::bad_request("Identity import exceeds size limit"));
+    }
+    let text = text.trim();
+    if text.len() > encoded_limit {
+        return Err(AppError::bad_request("Identity import exceeds size limit"));
+    }
+    Ok(text)
+}
+fn decode_identity_base64(text: &str) -> AppResult<Vec<u8>> {
+    let bytes = B64
+        .decode(bounded_encoded_input(text, vault::MAX_BASE64_IMPORT_BYTES)?)
+        .map_err(|_| AppError::bad_request("Invalid base64 identity data"))?;
+    if bytes.len() > vault::MAX_IDENTITY_IMPORT_BYTES {
+        return Err(AppError::bad_request(
+            "Identity import exceeds the 1 MiB limit",
+        ));
+    }
+    Ok(bytes)
+}
+async fn parse_identity_import_async(
+    bytes: Vec<u8>,
+    passcode: Option<String>,
+) -> AppResult<ParsedIdentityImport> {
+    if bytes.len() > vault::MAX_IDENTITY_IMPORT_BYTES {
+        return Err(AppError::bad_request(
+            "Identity import exceeds the 1 MiB limit",
+        ));
+    }
+    if let Some(p) = &passcode {
+        vault::validate_passcode(p).map_err(|e| AppError::bad_request(e.to_string()))?;
+    }
+    let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        parse_private_identity_bytes_with_job(&bytes, passcode.as_deref(), &job)
+    })
+    .await
+    .map_err(|_| AppError::internal("identity parsing task panicked"))?
+    .map_err(AppError::bad_request)
 }
 
 fn identity_material_exists(id_dir: &std::path::Path) -> bool {
@@ -422,8 +488,11 @@ pub async fn api_import_identity(
     state: State<'_, Arc<AppState>>,
     args: ImportIdentityArgs,
 ) -> AppResult<Value> {
-    let key_bytes =
-        hex::decode(args.key.trim()).map_err(|_| AppError::bad_request("Invalid hex key data"))?;
+    let key_bytes = hex::decode(bounded_encoded_input(
+        &args.key,
+        vault::MAX_HEX_IMPORT_BYTES,
+    )?)
+    .map_err(|_| AppError::bad_request("Invalid hex key data"))?;
     import_identity_shared(state, key_bytes, args.nickname).await
 }
 
@@ -432,9 +501,7 @@ pub async fn api_import_identity_base64(
     state: State<'_, Arc<AppState>>,
     args: ImportIdentityArgs,
 ) -> AppResult<Value> {
-    let key_bytes = B64
-        .decode(args.key.trim())
-        .map_err(|_| AppError::bad_request("Invalid base64 key data"))?;
+    let key_bytes = decode_identity_base64(&args.key)?;
     import_identity_shared_with_passcode(state, key_bytes, args.nickname, args.passcode).await
 }
 
@@ -493,19 +560,34 @@ pub async fn set_identity_passcode(
     if !validate_hex(&args.hash, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
-    if args.passcode.len() < 6 || args.passcode.len() > 128 {
+    if args.passcode.len() < 6 || args.passcode.len() > vault::MAX_PASSCODE_BYTES {
         return Err(AppError::bad_request("PIN must be at least 6 characters"));
     }
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let generation = state.current_identity_session_generation();
     let id_dir = state.config.data_dir.join("identities").join(&args.hash);
     let (passcode, current) = (args.passcode, args.current);
-    tokio::task::spawn_blocking(move || {
-        ratspeak_runtime::vault::protect_identity(&id_dir, &passcode, current.as_deref())
+    let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
+    let (job, prepared) = tokio::task::spawn_blocking(move || {
+        job.prepare_protection(&id_dir, &passcode, current.as_deref())
+            .map(|prepared| (job, prepared))
             .map_err(|e| e.to_string())
     })
     .await
     .map_err(|_| AppError::internal("set_passcode task panicked"))?
     .map_err(AppError::bad_request)?;
+    let identity_lifecycle = state.identity_switch_lock.lock_owned().await;
+    if generation != state.current_identity_session_generation() {
+        return Err(AppError::conflict(
+            "Identity changed while preparing protection; retry",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        let _identity_lifecycle = identity_lifecycle;
+        job.commit_protection(prepared)
+    })
+    .await
+    .map_err(|_| AppError::internal("vault commit task panicked"))?
+    .map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -524,15 +606,31 @@ pub async fn remove_identity_passcode(
     if !validate_hex(&args.hash, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let generation = state.current_identity_session_generation();
     let id_dir = state.config.data_dir.join("identities").join(&args.hash);
     let passcode = args.passcode;
-    tokio::task::spawn_blocking(move || {
-        ratspeak_runtime::vault::unprotect_identity(&id_dir, &passcode).map_err(|e| e.to_string())
+    let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
+    let (job, prepared) = tokio::task::spawn_blocking(move || {
+        job.prepare_unprotection(&id_dir, &passcode)
+            .map(|prepared| (job, prepared))
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|_| AppError::internal("remove_passcode task panicked"))?
     .map_err(AppError::bad_request)?;
+    let identity_lifecycle = state.identity_switch_lock.lock_owned().await;
+    if generation != state.current_identity_session_generation() {
+        return Err(AppError::conflict(
+            "Identity changed while preparing unprotection; retry",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        let _identity_lifecycle = identity_lifecycle;
+        job.commit_unprotection(prepared)
+    })
+    .await
+    .map_err(|_| AppError::internal("vault commit task panicked"))?
+    .map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -557,8 +655,9 @@ pub async fn reveal_identity_mnemonic(
     }
     let id_dir = state.config.data_dir.join("identities").join(&args.hash);
     let passcode = args.passcode;
+    let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     let phrase = tokio::task::spawn_blocking(move || {
-        ratspeak_runtime::vault::reveal_mnemonic(&id_dir, passcode.as_deref())
+        job.reveal_mnemonic(&id_dir, passcode.as_deref())
             .map(|z| z.as_str().to_string())
             .map_err(|e| e.to_string())
     })
@@ -586,8 +685,8 @@ fn check_unlock_secret(kind: Option<&str>, secret: &str) -> AppResult<()> {
     if kind == Some("hardware") && secret.len() > 8 {
         return Err(AppError::bad_request("PIN must be 6-8 characters"));
     }
-    if kind != Some("hardware") && secret.len() > 128 {
-        return Err(AppError::bad_request("PIN must be at most 128 characters"));
+    if kind != Some("hardware") && secret.len() > vault::MAX_PASSCODE_BYTES {
+        return Err(AppError::bad_request("Passcode exceeds 1024 UTF-8 bytes"));
     }
     Ok(())
 }
@@ -610,19 +709,81 @@ pub(crate) async fn unlock_protected_identity(
     state: Arc<AppState>,
     secret: String,
 ) -> AppResult<Value> {
-    let _guard = state.identity_switch_lock.lock().await;
+    let generation = state.current_identity_session_generation();
     let expected_hash = state.hw_locked_hash();
     let kind = expected_hash
         .as_deref()
         .and_then(|hash| protected_identity_kind(&state, hash));
     check_unlock_secret(kind, &secret)?;
 
+    // Validate the candidate before stopping a usable runtime. The job permit
+    // lives in the actual worker if this awaiting command is cancelled.
+    let unlocked = if kind == Some("passcode") {
+        let hash = expected_hash
+            .clone()
+            .ok_or_else(|| AppError::bad_request("No locked identity"))?;
+        let path = state
+            .config
+            .data_dir
+            .join("identities")
+            .join(&hash)
+            .join("identity.enc");
+        let passcode = secret.clone();
+        let job =
+            vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
+        let unlocked = tokio::task::spawn_blocking(move || {
+            let decoded = job.decrypt_identity(&passcode, &vault::read_vault(&path)?)?;
+            let identity = Identity::from_private_key(decoded.key())
+                .map_err(|_| vault::VaultError::InvalidFormat("private identity".into()))?;
+            if hex::encode(identity.hash) != hash {
+                return Err(vault::VaultError::InvalidFormat(
+                    "vault identity does not match selected profile".into(),
+                ));
+            }
+            Ok::<_, vault::VaultError>(identity)
+        })
+        .await
+        .map_err(|_| AppError::internal("identity unlock task panicked"))?;
+        match unlocked {
+            Ok(identity) => Some(identity),
+            Err(vault::VaultError::Auth) => {
+                return Ok(
+                    json!({"ok":false,"kind":"passcode","error":"Incorrect PIN or corrupt identity vault","locked":false,"remaining":null}),
+                );
+            }
+            Err(error) => return Err(AppError::bad_request(error.to_string())),
+        }
+    } else {
+        None
+    };
+    let _guard = state.identity_switch_lock.lock().await;
+    if generation != state.current_identity_session_generation()
+        || expected_hash != state.hw_locked_hash()
+    {
+        return Err(AppError::conflict(
+            "Selected identity changed during unlock; retry",
+        ));
+    }
+
     crate::shutdown_rns_lxmf(&state)
         .await
         .map_err(identity_activity_reset_error)?;
     state.clear_identity_scoped_runtime_state();
     state.set_hw_last_error(None);
-    state.set_pending_hw_pin(Some(secret));
+    if let Some(identity) = unlocked {
+        if !state.retain_unlocked_identity(
+            identity,
+            expected_hash.as_deref().unwrap_or(""),
+            generation,
+        ) {
+            return Err(AppError::conflict(
+                "Selected identity changed during unlock",
+            ));
+        }
+        state.set_pending_hw_pin(None);
+    } else {
+        state.set_pending_hw_pin(Some(secret));
+    }
     if let Ok(mut sig) = state.session_shutdown.write() {
         *sig = rns_runtime::lifecycle::ShutdownSignal::new();
     }
@@ -689,8 +850,7 @@ async fn import_identity_shared_with_passcode(
 ) -> AppResult<Value> {
     let nickname = sanitize_announced_display_name(nickname.as_deref().unwrap_or(""))
         .map_err(AppError::bad_request)?;
-    let parsed = parse_private_identity_bytes(&key_bytes, passcode.as_deref())
-        .map_err(AppError::bad_request)?;
+    let parsed = parse_identity_import_async(key_bytes, passcode).await?;
     let format = parsed.format;
     let mnemonic = parsed.mnemonic.clone();
     let parsed_identity = Identity::from_private_key(&parsed.key_bytes)
@@ -773,11 +933,8 @@ async fn import_identity_shared_with_passcode(
 
 #[tauri::command]
 pub async fn api_preview_identity_import_base64(args: ImportIdentityArgs) -> AppResult<Value> {
-    let bytes = B64
-        .decode(args.key.trim())
-        .map_err(|_| AppError::bad_request("Invalid base64 identity data"))?;
-    let parsed = parse_private_identity_bytes(&bytes, args.passcode.as_deref())
-        .map_err(AppError::bad_request)?;
+    let bytes = decode_identity_base64(&args.key)?;
+    let parsed = parse_identity_import_async(bytes, args.passcode).await?;
     identity_preview_payload(&parsed.key_bytes, parsed.format).map_err(AppError::bad_request)
 }
 
@@ -938,7 +1095,7 @@ pub async fn api_export_identity_backup_base64(
     passcode: String,
 ) -> AppResult<Value> {
     let passcode = passcode.trim().to_string();
-    if passcode.len() < 6 || passcode.len() > 128 {
+    if passcode.len() < 6 || passcode.len() > vault::MAX_PASSCODE_BYTES {
         return Err(AppError::bad_request(
             "Backup PIN must be at least 6 characters",
         ));
@@ -974,15 +1131,13 @@ pub async fn api_export_identity_backup_base64(
     // Argon2id KDF — off the async worker like the other vault paths.
     let identity_dir = state.config.data_dir.join("identities").join(&hash_hex);
     let passcode_for_kdf = passcode.clone();
+    let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     let vault = tokio::task::spawn_blocking(move || {
-        let mnemonic = ratspeak_runtime::vault::reveal_mnemonic(&identity_dir, None)
+        let mnemonic = job
+            .reveal_mnemonic(&identity_dir, None)
             .ok()
             .map(|m| m.as_str().to_string());
-        ratspeak_runtime::vault::encrypt_identity(
-            &passcode_for_kdf,
-            &key_array,
-            mnemonic.as_deref(),
-        )
+        job.encrypt_identity(&passcode_for_kdf, &key_array, mnemonic.as_deref())
     })
     .await
     .map_err(|_| AppError::internal("identity backup task panicked"))?
@@ -999,8 +1154,11 @@ pub async fn api_export_identity_backup_base64(
         nickname,
         exported_at: now_ts(),
     };
-    let bytes = serde_json::to_vec_pretty(&backup)
-        .map_err(|_| AppError::internal("failed to encode identity backup"))?;
+    let bytes = db::admission::bounded_json(&backup, vault::MAX_IDENTITY_IMPORT_BYTES)
+        .map_err(|_| {
+            AppError::bad_request("Identity backup metadata exceeds the 1 MiB export limit")
+        })?
+        .into_bytes();
 
     Ok(json!({
         "backup_base64": B64.encode(&bytes),
@@ -1069,7 +1227,7 @@ pub async fn api_delete_identity(
     if !validate_hex(&hash_hex, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let identity_lifecycle = Arc::new(state.identity_switch_lock.lock_owned().await);
     let active = active_identity_id(&state);
     let runtime_identity = state
         .lxmf
@@ -1082,9 +1240,11 @@ pub async fn api_delete_identity(
     super::shared::forget_shared_text_drafts(&state, Some(hash_hex.clone())).await?;
     let file_refs = if cascade.unwrap_or(false) {
         let hash_for_refs = hash_hex.clone();
-        db::spawn_db(state.db.clone(), move |p| {
-            db::get_identity_file_refs(&p, &hash_for_refs)
-        })
+        db::spawn_db_with_lease(
+            state.db.clone(),
+            Arc::clone(&identity_lifecycle),
+            move |p| db::get_identity_file_refs(&p, &hash_for_refs),
+        )
         .await
         .map_err(|_| AppError::internal("identity file refs db task panicked"))?
     } else {
@@ -1092,9 +1252,11 @@ pub async fn api_delete_identity(
     };
     let hash_for_db = hash_hex.clone();
     let cascade = cascade.unwrap_or(false);
-    let result = db::spawn_db(state.db.clone(), move |p| {
-        db::delete_identity(&p, &hash_for_db, cascade)
-    })
+    let result = db::spawn_db_with_lease(
+        state.db.clone(),
+        Arc::clone(&identity_lifecycle),
+        move |p| db::delete_identity(&p, &hash_for_db, cascade),
+    )
     .await
     .map_err(|_| AppError::internal("delete_identity db task panicked"))?;
     result.map_err(|e| AppError::internal(format!("Failed to delete: {e}")))?;
@@ -1435,6 +1597,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    static VAULT_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     static TEMP_IDENTITY_COMMAND_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn private_key_bytes() -> Vec<u8> {
@@ -1462,6 +1626,7 @@ mod tests {
 
     #[test]
     fn parse_private_identity_accepts_raw_key() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap();
         let key = private_key_bytes();
         let parsed = parse_private_identity_bytes(&key, None).unwrap();
         assert_eq!(parsed.format, "raw-private-key");
@@ -1470,6 +1635,7 @@ mod tests {
 
     #[test]
     fn parse_private_identity_accepts_encrypted_backup_envelope() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap();
         let key = private_key_bytes();
         let preview = identity_preview_payload(&key, "test").unwrap();
         let key_array: [u8; 64] = key.as_slice().try_into().unwrap();
@@ -1504,6 +1670,7 @@ mod tests {
 
     #[test]
     fn parse_private_identity_rejects_encrypted_backup_without_pin() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap();
         let key = private_key_bytes();
         let preview = identity_preview_payload(&key, "test").unwrap();
         let key_array: [u8; 64] = key.as_slice().try_into().unwrap();
@@ -1535,6 +1702,7 @@ mod tests {
 
     #[test]
     fn parse_private_identity_accepts_legacy_backup_envelope() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap();
         let key = private_key_bytes();
         let preview = identity_preview_payload(&key, "test").unwrap();
         let backup = LegacyIdentityBackupV1 {
@@ -1575,6 +1743,7 @@ mod tests {
 
     #[test]
     fn base32_identity_text_roundtrips_with_spacing() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap();
         let key = private_key_bytes();
         let encoded = base32_encode_padded(&key).to_lowercase();
         let wrapped = encoded
@@ -1591,6 +1760,7 @@ mod tests {
 
     #[test]
     fn parse_private_identity_rejects_public_backup() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap();
         let key = private_key_bytes();
         let backup = LegacyIdentityBackupV1 {
             format: LEGACY_IDENTITY_BACKUP_FORMAT.to_string(),
@@ -1611,6 +1781,7 @@ mod tests {
 
     #[test]
     fn parse_private_identity_rejects_hash_mismatch() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap();
         let key = private_key_bytes();
         let backup = LegacyIdentityBackupV1 {
             format: LEGACY_IDENTITY_BACKUP_FORMAT.to_string(),
