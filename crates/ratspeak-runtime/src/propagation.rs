@@ -1458,7 +1458,9 @@ pub fn get_status_payload(state: &AppState) -> serde_json::Value {
             .unwrap_or_else(fallback);
         (hash, count, cost)
     };
-    let hosting_requested = state.propagation_node_hosting_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let hosting_requested = state
+        .propagation_node_hosting_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
     let hosting_enabled = state.effective_propagation_hosting();
     let enforce_stamps = state
         .enforce_stamps
@@ -1484,7 +1486,15 @@ pub fn get_status_payload(state: &AppState) -> serde_json::Value {
         obj.insert("pn_parse_failures".to_string(), json!(pn_parse_failures));
         obj.insert("hosting_enabled".to_string(), json!(hosting_enabled));
         obj.insert("hosting_requested".to_string(), json!(hosting_requested));
-        obj.insert("hosting_status".to_string(), state.propagation_host_status.lock().ok().and_then(|status| serde_json::to_value(&*status).ok()).unwrap_or(json!(null)));
+        obj.insert(
+            "hosting_status".to_string(),
+            state
+                .propagation_host_status
+                .lock()
+                .ok()
+                .and_then(|status| serde_json::to_value(&*status).ok())
+                .unwrap_or(json!(null)),
+        );
         obj.insert("local_node_hash".to_string(), json!(local_node_hash));
         obj.insert(
             "local_node_message_count".to_string(),
@@ -1750,15 +1760,20 @@ mod tests {
         {
             let mut lxmf = state.lxmf.lock().unwrap();
             let mgr = lxmf.as_mut().unwrap();
-            mgr.router
-                .pending_outbound
-                .push(lxmf_core::message::LxMessageDraft::new(
+            mgr.router.pending_outbound.push(
+                lxmf_core::message::LxMessageDraft::new(
                     [0x33; 16],
                     mgr.lxmf_dest_hash,
                     "pending",
                     "pending",
                     lxmf_core::message_api::DeliveryMethod::Propagated,
-                ).unwrap().sign(&mgr.identity.get_signing_key().unwrap()).unwrap().finalize(None).unwrap());
+                )
+                .unwrap()
+                .sign(&mgr.identity.get_signing_key().unwrap())
+                .unwrap()
+                .finalize(None)
+                .unwrap(),
+            );
         }
 
         maybe_reselect_on_announce(&state).await;

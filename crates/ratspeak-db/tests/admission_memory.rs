@@ -101,13 +101,14 @@ fn maximal_admission_plans_fit_qualified_sqlite_headroom() {
     warm.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
     // Leave room for fixed receipt/lookups and every other binding occurrence.
-    let available = admission::MAX_PROJECTION_BINDINGS - 4096 - "archive".len() - 64 - 32 - 8 - 5 - 8 - 7;
+    let available =
+        admission::MAX_PROJECTION_BINDINGS - 4096 - "archive".len() - 64 - 32 - 8 - 5 - 8 - 7;
     let unique = (0..)
         .map(|i| format!("unique{i:09} "))
         .take(available / 16 + 1)
         .collect::<String>();
     let mut lossy = String::from_utf8_lossy(&vec![0xff; available / 3]).into_owned();
-    lossy.push_str(&"x".repeat(available-lossy.len()));
+    lossy.push_str(&"x".repeat(available - lossy.len()));
     let metadata = admission::bounded_json(
         &serde_json::json!({"attachment":"a".repeat(available-100),"reaction":"x","game":{}}),
         available,

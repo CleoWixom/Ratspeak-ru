@@ -2829,7 +2829,9 @@ fn games_transport_uses_native_lxmf_fields_and_a_durable_outbox() {
     assert!(games.contains("reason = \"resend_required\";"));
     assert!(games.contains("lrgp::protocol::pack_lxmf_fields"));
     assert!(runtime.contains("inbound_admission::decode_game(msg, sender_authenticated)"));
-    let admission_game=read_source(root.join("crates/ratspeak-runtime/src/inbound_admission/game.rs")).expect("shared LRGP admission");
+    let admission_game =
+        read_source(root.join("crates/ratspeak-runtime/src/inbound_admission/game.rs"))
+            .expect("shared LRGP admission");
     assert!(admission_game.contains("protocol::unpack_envelope(&fields)"));
     assert!(admission_game.contains("meta.unique_map()"));
     assert!(admission_game.contains("if !authenticated"));

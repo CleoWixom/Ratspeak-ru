@@ -1733,6 +1733,7 @@ mod tests {
 
     #[test]
     fn parse_private_identity_accepts_reticulum_base32_text() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap();
         let key = private_key_bytes();
         let encoded = base32_encode_padded(&key);
 

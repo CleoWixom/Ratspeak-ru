@@ -3876,7 +3876,9 @@ fn link_connect_error(error: LinkSessionError) -> ConnectAttemptError {
         LinkSessionError::PublicKeyUnavailable => {
             activity::ChannelSessionFailureReason::InvalidAnnounce
         }
-        LinkSessionError::RequestDispatch(_) | LinkSessionError::TransportUnavailable | LinkSessionError::SessionClosed => {
+        LinkSessionError::RequestDispatch(_)
+        | LinkSessionError::TransportUnavailable
+        | LinkSessionError::SessionClosed => {
             activity::ChannelSessionFailureReason::TransportUnavailable
         }
         LinkSessionError::LinkCrypto

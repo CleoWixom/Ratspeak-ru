@@ -79,7 +79,8 @@ pub async fn set_propagation_hosting(
     .map_err(|_| AppError::internal("set_propagation_hosting db task panicked"))?;
 
     if args.enabled && !state.propagation_host_ready() {
-        ratspeak_runtime::restart_rns_lxmf(Arc::clone(&state)).await
+        ratspeak_runtime::restart_rns_lxmf(Arc::clone(&state))
+            .await
             .map_err(|_| AppError::internal("propagation hosting could not restart safely"))?;
     }
 
@@ -115,26 +116,51 @@ pub struct PropagationRecoveryArgs {
 }
 
 #[tauri::command]
-pub async fn recover_propagation_host(state: State<'_,Arc<AppState>>,args:PropagationRecoveryArgs)->AppResult<Value> {
-    if !validate_hex(&args.identity,32,32) { return Err(AppError::bad_request("Invalid identity")); }
-    let recovery=match (args.manifest_path,args.approved_manifest_sha256) {
-        (None,None)=>None,
-        (Some(path),Some(digest))=> {
-            if !validate_hex(&digest,64,64) { return Err(AppError::bad_request("Invalid manifest digest")); }
-            if path.len()>4096 || !std::path::Path::new(&path).is_absolute() {
-                return Err(AppError::bad_request("Recovery manifest needs an absolute local path"));
+pub async fn recover_propagation_host(
+    state: State<'_, Arc<AppState>>,
+    args: PropagationRecoveryArgs,
+) -> AppResult<Value> {
+    if !validate_hex(&args.identity, 32, 32) {
+        return Err(AppError::bad_request("Invalid identity"));
+    }
+    let recovery = match (args.manifest_path, args.approved_manifest_sha256) {
+        (None, None) => None,
+        (Some(path), Some(digest)) => {
+            if !validate_hex(&digest, 64, 64) {
+                return Err(AppError::bad_request("Invalid manifest digest"));
             }
-            let digest: [u8;32]=hex::decode(digest).map_err(|_|AppError::bad_request("Invalid manifest digest"))?.try_into().map_err(|_|AppError::bad_request("Invalid manifest digest"))?;
-            Some((std::path::PathBuf::from(path),digest))
-        },
-        _=>return Err(AppError::bad_request("Trusted recovery requires both its manifest and approved SHA-256 digest")),
+            if path.len() > 4096 || !std::path::Path::new(&path).is_absolute() {
+                return Err(AppError::bad_request(
+                    "Recovery manifest needs an absolute local path",
+                ));
+            }
+            let digest: [u8; 32] = hex::decode(digest)
+                .map_err(|_| AppError::bad_request("Invalid manifest digest"))?
+                .try_into()
+                .map_err(|_| AppError::bad_request("Invalid manifest digest"))?;
+            Some((std::path::PathBuf::from(path), digest))
+        }
+        _ => {
+            return Err(AppError::bad_request(
+                "Trusted recovery requires both its manifest and approved SHA-256 digest",
+            ));
+        }
     };
-    ratspeak_runtime::propagation_recovery::recover_host(Arc::clone(&state),args.identity,args.supervisor_writers_stopped,recovery).await.map_err(AppError::bad_request)
+    ratspeak_runtime::propagation_recovery::recover_host(
+        Arc::clone(&state),
+        args.identity,
+        args.supervisor_writers_stopped,
+        recovery,
+    )
+    .await
+    .map_err(AppError::bad_request)
 }
 
 #[tauri::command]
-pub async fn retry_deferred_propagation(state:State<'_,Arc<AppState>>)->AppResult<Value> {
-    ratspeak_runtime::propagation_recovery::retry_deferred_downloads(Arc::clone(&state)).await.map_err(AppError::bad_request)?;
+pub async fn retry_deferred_propagation(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    ratspeak_runtime::propagation_recovery::retry_deferred_downloads(Arc::clone(&state))
+        .await
+        .map_err(AppError::bad_request)?;
     Ok(json!({"ok":true}))
 }
 

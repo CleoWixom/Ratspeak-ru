@@ -1979,7 +1979,6 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                         ph
                     };
 
-
                     link_mgr.set_request_handler(move |link_id, path_hash, data| {
                         if !prop_hosting_state.effective_propagation_hosting() {
                             return None;
@@ -2014,12 +2013,30 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                     link_mgr.set_link_endpoint_dispatch_handle(
                         rns_mgr.handle.link_endpoint_dispatch_handle(),
                     );
-                    let get_limit = state.lxmf.lock().ok().and_then(|owner| {
-                        let kb = owner.as_ref()?.router.config.propagation_limit_kb;
-                        Some(kb.saturating_mul(lxmf_core::constants::BYTES_PER_KILOBYTE).min(64 * 1024 * 1024))
-                    }).unwrap_or(0);
-                    if !hosted_propagation::install_get_handler(&mut link_mgr, &state, prop_node.clone(), get_limit) {
-                        state.set_propagation_host_readiness(identity_id, generation, state::PropagationHostReadiness::Unavailable, Some("Propagation transfer budget is invalid".into()));
+                    let get_limit = state
+                        .lxmf
+                        .lock()
+                        .ok()
+                        .and_then(|owner| {
+                            let kb = owner.as_ref()?.router.config.propagation_limit_kb;
+                            Some(
+                                kb.saturating_mul(lxmf_core::constants::BYTES_PER_KILOBYTE)
+                                    .min(64 * 1024 * 1024),
+                            )
+                        })
+                        .unwrap_or(0);
+                    if !hosted_propagation::install_get_handler(
+                        &mut link_mgr,
+                        &state,
+                        prop_node.clone(),
+                        get_limit,
+                    ) {
+                        state.set_propagation_host_readiness(
+                            identity_id,
+                            generation,
+                            state::PropagationHostReadiness::Unavailable,
+                            Some("Propagation transfer budget is invalid".into()),
+                        );
                         break 'propagation_host;
                     }
 
