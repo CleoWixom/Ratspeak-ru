@@ -455,11 +455,8 @@ jobs:
         env:
           PINNED_ANDROID_NDK: ${{ steps.mobile-source.outputs.android_ndk }}
         run: |
-          set +e +o pipefail
-          yes | sdkmanager "ndk;$PINNED_ANDROID_NDK"
-          sdkmanager_status=${PIPESTATUS[1]}
-          set -e -o pipefail
-          test "$sdkmanager_status" -eq 0
+          node scripts/release/android-sdk-view.mjs install \
+            --sdk "$ANDROID_HOME" --ndk "$PINNED_ANDROID_NDK"
           node scripts/release/android-sdk-view.mjs create \
             --sdk "$ANDROID_HOME" --ndk "$PINNED_ANDROID_NDK" \
             --parent "$RUNNER_TEMP" --github-env "$GITHUB_ENV"

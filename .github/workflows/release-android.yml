@@ -159,14 +159,12 @@ jobs:
 
       - name: Install Android NDK
         shell: bash
+        working-directory: Ratspeak
+        env:
+          PINNED_ANDROID_NDK: ${{ steps.source.outputs.android_ndk }}
         run: |
-          set +e +o pipefail
-          yes | sdkmanager "ndk;${{ steps.source.outputs.android_ndk }}"
-          sdkmanager_status=${PIPESTATUS[1]}
-          set -e -o pipefail
-          if [ "$sdkmanager_status" -ne 0 ]; then
-            exit "$sdkmanager_status"
-          fi
+          node scripts/release/android-sdk-view.mjs install \
+            --sdk "$ANDROID_HOME" --ndk "$PINNED_ANDROID_NDK"
 
       - name: Isolate pinned Android NDK
         shell: bash

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { createSdkView, sdkViewEnvironment, verifySdkView } from "./android-sdk-view.mjs";
+import { createSdkView, installNdk, sdkViewEnvironment, verifySdkView } from "./android-sdk-view.mjs";
 
 const pinned = "27.0.12077973";
 const newer = "29.0.13846066";
@@ -40,6 +40,157 @@ function fixture(t) {
   symlinkSync(join(sdk, "ndk", newer), join(sdk, "ndk-bundle"), "dir");
   return { directory, sdk, parent, revision: pinned };
 }
+
+function fakeSdkmanager(input, operation) {
+  const executable = join(input.directory, "sdkmanager");
+  const log = join(input.directory, "sdkmanager-attempts.jsonl");
+  writeFileSync(executable, `#!${process.execPath}
+const { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } = require("node:fs");
+const { join } = require("node:path");
+const assert = require("node:assert/strict");
+const host = ${JSON.stringify(host)};
+const revision = ${JSON.stringify(pinned)};
+const log = ${JSON.stringify(log)};
+const args = process.argv.slice(2);
+assert.deepEqual(args, [${JSON.stringify(`--sdk_root=${input.sdk}`)}, "ndk;" + revision]);
+assert.equal(readFileSync(0, "utf8"), "y\\n".repeat(128));
+const sdk = args[0].slice("--sdk_root=".length);
+const attempt = existsSync(log) ? readFileSync(log, "utf8").trim().split("\\n").length + 1 : 1;
+appendFileSync(log, JSON.stringify(args) + "\\n");
+const ndk = join(sdk, "ndk", revision);
+${addNdk.toString()}
+${operation}
+`);
+  chmodSync(executable, 0o755);
+  return { sdkmanager: executable, log };
+}
+
+test("installer discards only a corrupt pinned resume operation before a fresh retry", async (t) => {
+  const input = fixture(t);
+  const ndk = join(input.sdk, "ndk", pinned);
+  rmSync(ndk, { recursive: true });
+  mkdirSync(join(ndk, ".installer"), { recursive: true });
+  writeFileSync(join(ndk, ".installer", "operation"), "corrupt resumable download\n");
+  mkdirSync(join(input.sdk, ".temp"));
+  writeFileSync(join(input.sdk, ".temp", "other-download"), "unrelated cache\n");
+  const otherProperties = readFileSync(join(input.sdk, "ndk", newer, "source.properties"), "utf8");
+  const { sdkmanager, log } = fakeSdkmanager(input, `
+if (attempt === 1) {
+  assert.ok(existsSync(join(ndk, ".installer", "operation")));
+  process.exit(1);
+}
+assert.equal(existsSync(ndk), false, "failed operation must not be resumed");
+addNdk(sdk, revision);
+`);
+  const alias = join(input.directory, "SDK alias");
+  symlinkSync(input.sdk, alias, "dir");
+  const result = await installNdk({ ...input, sdk: alias, sdkmanager });
+  assert.equal(result.attempts, 2);
+  assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 2);
+  assert.equal(existsSync(join(ndk, ".installer")), false);
+  assert.equal(readFileSync(join(input.sdk, "packages.xml"), "utf8"), "installed metadata\n");
+  assert.equal(readFileSync(join(input.sdk, ".temp", "other-download"), "utf8"), "unrelated cache\n");
+  assert.equal(readFileSync(join(input.sdk, "ndk", newer, "source.properties"), "utf8"), otherProperties);
+  assert.doesNotThrow(() => createSdkView(input));
+});
+
+test("installer stops after three failed attempts without deleting other revisions", async (t) => {
+  const input = fixture(t);
+  rmSync(join(input.sdk, "ndk", pinned), { recursive: true });
+  const { sdkmanager, log } = fakeSdkmanager(input, `
+assert.equal(existsSync(ndk), false);
+mkdirSync(join(ndk, ".installer"), { recursive: true });
+writeFileSync(join(ndk, ".installer", "operation"), "corrupt download");
+process.exit(1);
+`);
+  await assert.rejects(installNdk({ ...input, sdkmanager }), /after 3 attempts/);
+  assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 3);
+  assert.equal(existsSync(join(input.sdk, "ndk", newer, "source.properties")), true);
+  assert.equal(readFileSync(join(input.sdk, "packages.xml"), "utf8"), "installed metadata\n");
+  assert.deepEqual(readdirSync(input.parent), []);
+});
+
+test("sdkmanager success with an invalid compiler or revision still fails installation", async (t) => {
+  const input = fixture(t);
+  rmSync(join(input.sdk, "ndk", pinned), { recursive: true });
+  const { sdkmanager, log } = fakeSdkmanager(input, `
+assert.equal(existsSync(ndk), false);
+mkdirSync(ndk);
+writeFileSync(join(ndk, "source.properties"), "Pkg.Revision = 0.0.0\\n");
+`);
+  await assert.rejects(installNdk({ ...input, sdkmanager }), /after 3 attempts:.*must declare exactly/);
+  assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 3);
+  assert.deepEqual(readdirSync(input.parent), []);
+});
+
+test("installer also rejects a declared pinned revision without its compiler", async (t) => {
+  const input = fixture(t);
+  rmSync(join(input.sdk, "ndk", pinned), { recursive: true });
+  const { sdkmanager, log } = fakeSdkmanager(input, `
+assert.equal(existsSync(ndk), false);
+mkdirSync(ndk);
+writeFileSync(join(ndk, "source.properties"), "Pkg.Revision = " + revision + "\\n");
+`);
+  await assert.rejects(installNdk({ ...input, sdkmanager }), /after 3 attempts:.*ENOENT/);
+  assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 3);
+  assert.deepEqual(readdirSync(input.parent), []);
+});
+
+test("a valid pinned installation survives a failed sdkmanager attempt", async (t) => {
+  const input = fixture(t);
+  const sentinel = join(input.sdk, "ndk", pinned, "preserve-valid-package");
+  writeFileSync(sentinel, "keep this installation\n");
+  const { sdkmanager } = fakeSdkmanager(input, `
+assert.equal(readFileSync(join(ndk, "preserve-valid-package"), "utf8"), "keep this installation\\n");
+if (attempt === 1) process.exit(1);
+`);
+  assert.equal((await installNdk({ ...input, sdkmanager })).attempts, 2);
+  assert.equal(readFileSync(sentinel, "utf8"), "keep this installation\n");
+});
+
+test("installer rejects symlink parents and rechecks child paths after sdkmanager", async (t) => {
+  const parentInput = fixture(t);
+  const { sdkmanager: parentManager, log: parentLog } = fakeSdkmanager(parentInput, "process.exit(0);");
+  rmSync(join(parentInput.sdk, "ndk"), { recursive: true });
+  const outside = join(parentInput.directory, "outside ndk");
+  mkdirSync(outside);
+  writeFileSync(join(outside, "sentinel"), "must not delete\n");
+  symlinkSync(outside, join(parentInput.sdk, "ndk"), "dir");
+  await assert.rejects(installNdk({ ...parentInput, sdkmanager: parentManager }), /non-symlink NDK directory/);
+  assert.equal(existsSync(parentLog), false);
+  assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "must not delete\n");
+
+  const childInput = fixture(t);
+  const { sdkmanager: childManager, log: childLog } = fakeSdkmanager(childInput, `
+rmSync(ndk, { recursive: true });
+symlinkSync(join(sdk, "ndk", ${JSON.stringify(newer)}), ndk, "dir");
+process.exit(1);
+`);
+  await assert.rejects(installNdk({ ...childInput, sdkmanager: childManager }), /pinned NDK must be a non-symlink/);
+  assert.equal(readFileSync(childLog, "utf8").trim().split("\n").length, 1);
+  assert.equal(existsSync(join(childInput.sdk, "ndk", newer, "source.properties")), true);
+});
+
+test("process-start errors and signals are failures even when a valid NDK exists", async (t) => {
+  const input = fixture(t);
+  await assert.rejects(installNdk({ ...input, sdkmanager: join(input.directory, "missing-sdkmanager") }), /after 3 attempts:.*ENOENT/);
+  const { sdkmanager, log } = fakeSdkmanager(input, "process.kill(process.pid, 'SIGTERM');");
+  await assert.rejects(installNdk({ ...input, sdkmanager }), /after 3 attempts/);
+  assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 3);
+  assert.equal(existsSync(join(input.sdk, "ndk", pinned, "source.properties")), true);
+});
+
+test("install CLI validates the package with an explicit SDK root before view creation", (t) => {
+  const input = fixture(t);
+  fakeSdkmanager(input, "assert.ok(existsSync(ndk));");
+  const installed = JSON.parse(execFileSync(process.execPath, [
+    script, "install", "--sdk", input.sdk, "--ndk", pinned,
+  ], { env: { ...process.env, PATH: `${input.directory}:${process.env.PATH}` }, encoding: "utf8" }));
+  assert.equal(installed.sourceSdk, input.sdk);
+  assert.equal(installed.attempts, 1);
+  assert.equal(installed.revision, pinned);
+  assert.doesNotThrow(() => createSdkView(input));
+});
 
 test("isolated view selects the pinned compiler while preserving newer installed NDKs", (t) => {
   const input = fixture(t);
@@ -205,7 +356,7 @@ test("both Android CI toolchains use the reviewed SDK view while iOS skips Andro
   }
   const install = step(/name: Install and isolate reviewed Android NDK/);
   assert.match(install, /PINNED_ANDROID_NDK: \$\{\{ steps\.mobile-source\.outputs\.android_ndk \}\}/);
-  assert.match(install, /sdkmanager "ndk;\$PINNED_ANDROID_NDK"/);
+  assert.match(install, /android-sdk-view\.mjs install/);
   assert.match(install, /android-sdk-view\.mjs create/);
   assert.match(install, /--github-env "\$GITHUB_ENV"/);
   const clippy = step(/name: Clippy Android/);
@@ -224,4 +375,18 @@ test("both Android CI toolchains use the reviewed SDK view while iOS skips Andro
   const ios = step(/name: Clippy iOS simulator/);
   assert.match(ios, /if: matrix\.target == 'aarch64-apple-ios-sim'/);
   assert.doesNotMatch(ios, /ANDROID|NDK|android-sdk-view/);
+});
+
+test("both workflows use the shared bounded installer before exposing the SDK view", () => {
+  for (const name of ["ci.yml", "release-android.yml"]) {
+    const workflow = readFileSync(join(dirname(script), "../../.github/workflows", name), "utf8");
+    const install = workflow.indexOf("android-sdk-view.mjs install");
+    const create = workflow.indexOf("android-sdk-view.mjs create");
+    assert.ok(install > 0 && install < create, `${name}: install must complete before creating a view`);
+    const step = workflow.slice(workflow.lastIndexOf("      - ", install), install + 160);
+    assert.match(step, /working-directory: Ratspeak/);
+    assert.match(step, /PINNED_ANDROID_NDK: \$\{\{ steps\.(?:source|mobile-source)\.outputs\.android_ndk \}\}/);
+    assert.match(step, /--sdk "\$ANDROID_HOME" --ndk "\$PINNED_ANDROID_NDK"/);
+    assert.doesNotMatch(workflow, /yes\s*\|\s*sdkmanager|sdkmanager_status|rm[^\n]*(?:\.temp|\.android\/cache|packages\.xml)/);
+  }
 });

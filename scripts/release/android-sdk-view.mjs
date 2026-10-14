@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { setTimeout } from "node:timers/promises";
 
 const receiptName = ".ratspeak-android-sdk-view.json";
 const environmentNames = ["ANDROID_HOME", "ANDROID_SDK_ROOT", "ANDROID_NDK_HOME", "NDK_HOME"];
@@ -60,6 +61,62 @@ function inspectNdk(ndkPath, revision) {
     throw new Error("Pinned NDK compiler did not report a Clang version");
   }
   return { ndk, revision, compiler, compilerRealPath, compilerVersion };
+}
+
+function installedNdkPath(sdk, revision) {
+  const parent = join(sdk, "ndk");
+  let parentInfo;
+  try { parentInfo = lstatSync(parent); }
+  catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    mkdirSync(parent);
+    parentInfo = lstatSync(parent);
+  }
+  if (parentInfo.isSymbolicLink() || !parentInfo.isDirectory() || realpathSync(parent) !== parent) {
+    throw new Error("Installed SDK must own a non-symlink NDK directory");
+  }
+  const ndk = join(parent, revision);
+  try {
+    const info = lstatSync(ndk);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error("Installed pinned NDK must be a non-symlink directory");
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  return ndk;
+}
+
+export async function installNdk({ sdk, revision, sdkmanager = "sdkmanager" }) {
+  requireRevision(revision);
+  const sourceSdk = requireSingleLine(realpathSync(requireSingleLine(sdk)));
+  if (!statSync(sourceSdk).isDirectory()) throw new Error("Installed SDK must be a directory");
+  requireSingleLine(sdkmanager);
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    installedNdkPath(sourceSdk, revision);
+    try {
+      execFileSync(sdkmanager, [`--sdk_root=${sourceSdk}`, `ndk;${revision}`], {
+        // SDK setup accepts licenses already; bounded input also handles a
+        // newly requested license without relying on a SIGPIPE-prone yes pipe.
+        input: "y\n".repeat(128), stdio: ["pipe", "inherit", "inherit"],
+      });
+      const observed = inspectNdk(installedNdkPath(sourceSdk, revision), revision);
+      return { sourceSdk, attempts: attempt, ...observed };
+    } catch (error) {
+      // sdkmanager can leave .installer pointing to a corrupt resumable zip.
+      // Re-check the exact package after the child exits. Never clear shared
+      // repository metadata, SDK caches, or any other installed revision.
+      const ndk = installedNdkPath(sourceSdk, revision);
+      let valid = false;
+      try { inspectNdk(ndk, revision); valid = true; } catch { /* incomplete package */ }
+      if (attempt === 3) {
+        throw new Error(`Could not install and validate NDK ${revision} after 3 attempts: ${error.message}`);
+      }
+      if (!valid) rmSync(ndk, { recursive: true, force: true });
+      console.error(`NDK ${revision} attempt ${attempt} failed; retrying: ${error.message}`);
+      await setTimeout(attempt * 1_000);
+    }
+  }
 }
 
 export function sdkViewEnvironment(view, revision) {
@@ -166,16 +223,19 @@ function argumentsMap(args) {
   return options;
 }
 
-function main() {
+async function main() {
   const [command, ...args] = process.argv.slice(2);
   const options = argumentsMap(args);
   const allowed = command === "create"
     ? ["--sdk", "--ndk", "--parent", "--github-env"]
-    : command === "verify" ? ["--view", "--ndk", "--build-log"] : [];
+    : command === "verify" ? ["--view", "--ndk", "--build-log"]
+      : command === "install" ? ["--sdk", "--ndk"] : [];
   if (allowed.length === 0 || Object.keys(options).some((key) => !allowed.includes(key))) {
-    throw new Error("Usage: android-sdk-view.mjs create --sdk SDK --ndk REVISION --parent DIR [--github-env FILE], or verify --view VIEW --ndk REVISION [--build-log FILE]");
+    throw new Error("Usage: android-sdk-view.mjs install --sdk SDK --ndk REVISION, create --sdk SDK --ndk REVISION --parent DIR [--github-env FILE], or verify --view VIEW --ndk REVISION [--build-log FILE]");
   }
-  const result = command === "create"
+  const result = command === "install"
+    ? await installNdk({ sdk: options["--sdk"], revision: options["--ndk"] })
+    : command === "create"
     ? createSdkView({ sdk: options["--sdk"], revision: options["--ndk"], parent: options["--parent"] })
     : verifySdkView({
       view: options["--view"], revision: options["--ndk"], environment: process.env,
@@ -190,6 +250,5 @@ function main() {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { main(); }
-  catch (error) { console.error(error.message); process.exitCode = 1; }
+  main().catch((error) => { console.error(error.message); process.exitCode = 1; });
 }
