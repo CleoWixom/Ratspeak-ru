@@ -296,10 +296,22 @@ pub fn restore(
 /// Remove a hardware identity from the app (DB row + `.hwid`). The key remains
 /// on the token — this only forgets it locally.
 pub fn remove(data_dir: &Path, db: &DbPool, hash_hex: &str) -> Result<(), String> {
+    let data_root = data_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let metadata = std::fs::symlink_metadata(data_dir).map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || std::fs::canonicalize(data_dir).map_err(|error| error.to_string())?
+            != std::fs::canonicalize(data_root.join(".ratspeak"))
+                .map_err(|error| error.to_string())?
+    {
+        return Err("hardware identity directory is not the application .ratspeak root".into());
+    }
     ratspeak_db::delete_identity(db, hash_hex, true)?;
-    let id_dir = data_dir.join("identities").join(hash_hex);
-    let _ = std::fs::remove_dir_all(&id_dir);
-    Ok(())
+    crate::lxmf::LxmfManager::purge_identity_profile(data_root, hash_hex, true)
+        .map_err(|error| error.to_string())
 }
 
 pub fn reset_piv_application(expected_serial: u32) -> Result<(), String> {
@@ -502,8 +514,8 @@ fn register(
 ) -> Result<String, String> {
     let lxmf_dest = Destination::hash_from_name_and_identity(LXMF_APP_NAME, Some(identity_hash));
     let lxmf_hex = hex::encode(lxmf_dest);
-    let id_dir = data_dir.join("identities").join(hash_hex);
-    std::fs::create_dir_all(id_dir.join("lxmf")).map_err(|e| format!("identity dir: {e}"))?;
+    crate::lxmf::initialize_identity_storage_namespace(data_dir, hash_hex)
+        .map_err(|e| format!("identity namespace: {e}"))?;
     let display_name = if nickname.is_empty() {
         format!("!Ratspeak.org-{}", &lxmf_hex[..6])
     } else {
@@ -531,5 +543,99 @@ mod tests {
             verify_expected_serial(None, 42),
             Err("Inserted security key changed; hardware operation was cancelled.".to_string())
         );
+    }
+
+    #[test]
+    fn storage_namespace_hardware_remove_retires_markers_and_allows_same_key_reimport() {
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let data_dir = root.path().join(".ratspeak");
+        let pool = ratspeak_db::init_pool(root.path()).unwrap();
+        ratspeak_db::init_schema(&pool).unwrap();
+        let identity = rns_identity::identity::Identity::new();
+        let hash = hex::encode(identity.hash);
+        let directory = data_dir.join("identities").join(&hash);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("identity.hwid"),
+            b"local registration fixture",
+        )
+        .unwrap();
+        super::register(&data_dir, &pool, &hash, &identity.hash, "Hardware").unwrap();
+        std::fs::create_dir(directory.join("files")).unwrap();
+        std::fs::write(
+            directory.join("files/history.bin"),
+            b"cascade this retained history",
+        )
+        .unwrap();
+        let hub = data_dir.join("channel_hub");
+        std::fs::create_dir(&hub).unwrap();
+        let hub_key = hub.join(format!("hub_identity_{hash}"));
+        std::fs::write(&hub_key, b"old scoped hub key").unwrap();
+
+        super::remove(&data_dir, &pool, &hash).unwrap();
+        assert!(!directory.exists());
+        assert!(!hub_key.exists());
+        assert!(ratspeak_db::get_identity(&pool, &hash).is_none());
+        for suffix in ["namespace-ready", "rns-directory", "rns-directory-lock"] {
+            assert!(
+                !data_dir
+                    .join("identities")
+                    .join(format!("{hash}.{suffix}"))
+                    .exists()
+            );
+        }
+        // The real registration path does no card I/O here. Recreate its .hwid
+        // input and prove the exact hardware hash can initialize a fresh tree.
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("identity.hwid"),
+            b"restored local registration fixture",
+        )
+        .unwrap();
+        super::register(&data_dir, &pool, &hash, &identity.hash, "Restored hardware").unwrap();
+        assert!(directory.join("ratchets/received").is_dir());
+        assert!(ratspeak_db::get_identity(&pool, &hash).is_some());
+    }
+
+    #[test]
+    fn storage_namespace_hardware_remove_rejects_wrong_root_and_propagates_cleanup_failure() {
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let data_dir = root.path().join(".ratspeak");
+        let pool = ratspeak_db::init_pool(root.path()).unwrap();
+        ratspeak_db::init_schema(&pool).unwrap();
+        let identity = rns_identity::identity::Identity::new();
+        let hash = hex::encode(identity.hash);
+        let directory = data_dir.join("identities").join(&hash);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("identity.hwid"),
+            b"local registration fixture",
+        )
+        .unwrap();
+        super::register(&data_dir, &pool, &hash, &identity.hash, "Hardware").unwrap();
+        let wrong = root.path().join("other");
+        std::fs::create_dir_all(wrong.join("identities")).unwrap();
+        let sentinel = wrong.join("identities/private-file");
+        std::fs::write(&sentinel, b"leave sibling untouched").unwrap();
+        assert!(super::remove(&wrong, &pool, &hash).is_err());
+        assert!(ratspeak_db::get_identity(&pool, &hash).is_some());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"leave sibling untouched");
+
+        let retired = data_dir
+            .join("identities")
+            .join(format!("{hash}.namespace-retired"));
+        std::fs::create_dir(&retired).unwrap();
+        std::fs::write(retired.join("preserve"), b"ambiguous retirement fixture").unwrap();
+        assert!(super::remove(&data_dir, &pool, &hash).is_err());
+        assert!(directory.join("identity.hwid").is_file());
+        assert!(retired.join("preserve").is_file());
+        // Database deletion remains idempotent; after resolving the blocker,
+        // retry must finish the recorded namespace removal instead of succeeding
+        // silently with private files or sidecars still present.
+        std::fs::remove_dir_all(retired).unwrap();
+        super::remove(&data_dir, &pool, &hash).unwrap();
+        assert!(!directory.exists());
     }
 }

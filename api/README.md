@@ -11,6 +11,22 @@ construction (`TelephonyService::registered`), and LRGP protocol values
 (`lrgp::protocol`) while leaving component implementation APIs under their
 owners' stability policies.
 
+Process startup must call
+`ratspeak_runtime::lxmf::initialize_storage_namespace(data_root)` before
+constructing configuration, opening the database pool, or opening identity and
+network storage. `ratspeak_tauri::init_core` performs this step automatically.
+Standalone runtime callers and test fixtures must do it explicitly. Live
+`LxmfManager` rebuilds validate completed namespace markers; they never repair
+or republish active roots. An incomplete namespace is recovered at the next
+initial startup, before those file users exist.
+
+Identity and factory reset stop their identity/storage workers before calling
+`clear_identity_storage_namespace`. Reset preserves the established database
+and identities roots, records its full child wipe in the outside namespace
+marker, and fences new imports while cleanup is pending. Initial startup can
+finish a recorded reset; successful completion retires that pending state
+before deliberately restored identities are accepted.
+
 - `ratspeak-core` contains shared domain and configuration contracts;
 - `ratspeak-db` owns application persistence;
 - `ratspeak-runtime` owns Reticulum, LXMF, voice, and game orchestration;

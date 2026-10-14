@@ -35,6 +35,10 @@ use lxmf_core::router::{
 };
 use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
+use rns_identity::persistence::{
+    DurableFileReceipt, durable_create_dir_all, durable_reconcile, durable_remove,
+    durable_rename_directory, durable_write, read_file_bounded, validate_durable_storage_directory,
+};
 use rns_identity::ratchet::ReceivedRatchet;
 
 use rns_transport::messages::{PathTableRpcEntry, TransportMessage};
@@ -1541,7 +1545,426 @@ fn apply_lrgp_fields_to_message(
     Ok(())
 }
 
+const STORAGE_NAMESPACE_WITNESS: &str = ".ratspeak-namespace-witness";
+const STORAGE_NAMESPACE_READY: &str = ".ratspeak-namespace-ready";
+const STORAGE_NAMESPACE_BYTES: &[u8] = b"ratspeak-private-namespace-v1\n";
+const STORAGE_NAMESPACE_RESET_BYTES: &[u8] = b"ratspeak-private-namespace-reset-pending-v1\n";
+const IDENTITY_NAMESPACE_BYTES: &[u8] = b"ratspeak-identity-namespace-v1\n";
+const DELETE_IDENTITY_ALL: &[u8] = b"ratspeak-identity-delete-all-v1\n";
+const DELETE_IDENTITY_CRYPTO: &[u8] = b"ratspeak-identity-delete-crypto-v1\n";
+
+fn require_real_directory(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private storage namespace must contain real directories",
+        ));
+    }
+    validate_durable_storage_directory(path).map_err(std::io::Error::other)
+}
+
+fn established_storage_namespace(data_root: &Path) -> std::io::Result<DurableFileReceipt> {
+    require_real_directory(data_root)?;
+    durable_reconcile(&data_root.join(STORAGE_NAMESPACE_READY), STORAGE_NAMESPACE_BYTES)
+        .map_err(|error| std::io::Error::other(format!(
+            "private storage namespace is not initialized; call initialize_storage_namespace before opening the database: {error}"
+        )))?;
+    storage_namespace_witness(data_root)
+}
+
+fn storage_namespace_witness(data_root: &Path) -> std::io::Result<DurableFileReceipt> {
+    require_real_directory(&data_root.join(".ratspeak"))?;
+    require_real_directory(&data_root.join(".ratspeak/identities"))?;
+    durable_reconcile(
+        &data_root.join(STORAGE_NAMESPACE_WITNESS),
+        STORAGE_NAMESPACE_BYTES,
+    )
+    .map_err(std::io::Error::other)
+}
+
+fn data_root_for_identity_namespace(ratspeak_dir: &Path) -> std::io::Result<PathBuf> {
+    require_real_directory(ratspeak_dir)?;
+    let data_root = ratspeak_dir
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing application data root"))?;
+    let expected = data_root.join(".ratspeak");
+    if std::fs::canonicalize(ratspeak_dir)? != std::fs::canonicalize(&expected)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "identity namespace must be the established application .ratspeak root",
+        ));
+    }
+    Ok(data_root.to_owned())
+}
+
+fn identity_namespace_marker(ratspeak_dir: &Path, hash: &str) -> PathBuf {
+    ratspeak_dir
+        .join("identities")
+        .join(format!("{hash}.namespace-ready"))
+}
+
+fn deletion_scope(path: &Path) -> std::io::Result<bool> {
+    match read_file_bounded(path, 64)?.as_deref() {
+        Some(DELETE_IDENTITY_ALL) => Ok(true),
+        Some(DELETE_IDENTITY_CRYPTO) => Ok(false),
+        _ => Err(std::io::Error::other(
+            "invalid identity namespace deletion intent",
+        )),
+    }
+}
+
+fn retire_directory(path: &Path, witness: &DurableFileReceipt) -> std::io::Result<()> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("missing directory name"))?
+        .to_os_string();
+    name.push(".namespace-retired");
+    let retired = path.with_file_name(name);
+    if path.try_exists()? {
+        require_real_directory(path)?;
+        if retired.try_exists()? {
+            return Err(std::io::Error::other(
+                "both identity deletion locations exist",
+            ));
+        }
+        // A strict move publishes the intentional removal before erasing its
+        // bytes. Restart recovery can finish only this exact recorded removal.
+        durable_rename_directory(path, &retired, witness).map_err(std::io::Error::other)?;
+    }
+    if retired.try_exists()? {
+        require_real_directory(&retired)?;
+        std::fs::remove_dir_all(retired)?;
+    }
+    for suffix in [".rns-directory", ".rns-directory-lock"] {
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(suffix);
+        durable_remove(&path.with_file_name(name), witness).map_err(std::io::Error::other)?;
+    }
+    Ok(())
+}
+
+fn unlink_namespace_symlink(path: &Path, witness: &DurableFileReceipt) -> std::io::Result<()> {
+    let kind = std::fs::symlink_metadata(path)?.file_type();
+    if !kind.is_symlink() {
+        return Err(std::io::Error::other(
+            "identity reset symlink changed before removal",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if kind.is_symlink_dir() {
+            std::fs::remove_dir(path)?;
+        } else {
+            std::fs::remove_file(path)?;
+        }
+    }
+    #[cfg(not(windows))]
+    std::fs::remove_file(path)?;
+    durable_remove(path, witness).map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+fn retire_identity_namespace(
+    ratspeak_dir: &Path,
+    hash: &str,
+    cascade: bool,
+    witness: &DurableFileReceipt,
+) -> std::io::Result<()> {
+    let identities = ratspeak_dir.join("identities");
+    let directory = identities.join(hash);
+    let intent = identities.join(format!("{hash}.namespace-delete"));
+    let bytes = if cascade {
+        DELETE_IDENTITY_ALL
+    } else {
+        DELETE_IDENTITY_CRYPTO
+    };
+    let intent_receipt = if intent.try_exists()? {
+        durable_reconcile(&intent, bytes)
+    } else {
+        durable_write(&intent, bytes)
+    }
+    .map_err(std::io::Error::other)?;
+    if cascade {
+        retire_directory(&directory, &intent_receipt)?;
+    } else if directory.try_exists()? {
+        for name in [
+            "ratchets",
+            "known_identities",
+            "lxmf",
+            "reticulum",
+            "cache",
+            "propagation",
+        ] {
+            retire_directory(&directory.join(name), &intent_receipt)?;
+        }
+        for name in ["identity", "identity.enc", "identity.seed"] {
+            durable_remove(&directory.join(name), &intent_receipt)
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    durable_remove(&identity_namespace_marker(ratspeak_dir, hash), witness)
+        .map_err(std::io::Error::other)?;
+    durable_remove(&intent, witness).map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+/// Clear identity profiles after their network/storage workers have stopped.
+/// Keep the established app/database and identities roots while SQLite is live.
+pub fn clear_identity_storage_namespace(ratspeak_dir: &Path) -> std::io::Result<()> {
+    let data_root = data_root_for_identity_namespace(ratspeak_dir)?;
+    let ready = data_root.join(STORAGE_NAMESPACE_READY);
+    let witness =
+        if read_file_bounded(&ready, 64)?.as_deref() == Some(STORAGE_NAMESPACE_RESET_BYTES) {
+            storage_namespace_witness(&data_root)?
+        } else {
+            established_storage_namespace(&data_root)?
+        };
+    // The outside ready marker becomes a durable bulk-reset intent. Manager
+    // creation/imports require its completed value, so a cancelled/failed reset
+    // cannot accept a new identity that a later replay would accidentally erase.
+    let reset =
+        durable_write(&ready, STORAGE_NAMESPACE_RESET_BYTES).map_err(std::io::Error::other)?;
+    finish_identity_storage_reset(ratspeak_dir, &witness, &reset)?;
+    durable_write(&ready, STORAGE_NAMESPACE_BYTES).map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+fn finish_identity_storage_reset(
+    ratspeak_dir: &Path,
+    witness: &DurableFileReceipt,
+    reset: &DurableFileReceipt,
+) -> std::io::Result<()> {
+    let identities = ratspeak_dir.join("identities");
+    // Unlink before interpreting hash-named directories or metadata. Even a
+    // link named like an identity or deletion record remains only a link inside
+    // the authorized reset tree; its destination never enters deletion scope.
+    for entry in std::fs::read_dir(&identities)? {
+        let entry = entry?;
+        if entry.file_type()?.is_symlink() {
+            unlink_namespace_symlink(&entry.path(), reset)?;
+        }
+    }
+    let mut hashes = HashSet::new();
+    for entry in std::fs::read_dir(&identities)? {
+        let name = entry?.file_name();
+        if let Some(name) = name.to_str() {
+            let hash = name.split('.').next().unwrap_or(name);
+            if crate::helpers::is_protocol_hash_16(hash) {
+                hashes.insert(hash.to_owned());
+            }
+        }
+    }
+    for hash in hashes {
+        let deletion = identities.join(format!("{hash}.namespace-delete"));
+        if deletion.try_exists()? {
+            retire_identity_namespace(ratspeak_dir, &hash, deletion_scope(&deletion)?, witness)?;
+        }
+        retire_identity_namespace(ratspeak_dir, &hash, true, witness)?;
+    }
+    // Preserve the previous reset's full child wipe, including unknown folders
+    // and files. The established root and its outside publication journals stay
+    // in place. A symlink is unlinked without following its destination.
+    for entry in std::fs::read_dir(&identities)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            unlink_namespace_symlink(&entry.path(), reset)?;
+        } else if kind.is_dir() {
+            retire_directory(&entry.path(), reset)?;
+        } else if kind.is_file() {
+            durable_remove(&entry.path(), reset).map_err(std::io::Error::other)?;
+        } else {
+            return Err(std::io::Error::other(
+                "unsupported entry in identity reset namespace",
+            ));
+        }
+    }
+    // A restart may resume after the last unlink/remove but before its parent
+    // barrier. Renew the exact identities parent without republishing its root.
+    durable_remove(&identities.join(".ratspeak-reset-barrier"), reset)
+        .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+fn established_identity_namespace(ratspeak_dir: &Path, hash: &str) -> std::io::Result<()> {
+    durable_reconcile(
+        &identity_namespace_marker(ratspeak_dir, hash),
+        IDENTITY_NAMESPACE_BYTES,
+    )
+    .map_err(std::io::Error::other)?;
+    let directory = ratspeak_dir.join("identities").join(hash);
+    for path in [
+        directory.clone(),
+        directory.join("lxmf"),
+        directory.join("ratchets"),
+        directory.join("ratchets/received"),
+    ] {
+        require_real_directory(&path)?;
+    }
+    Ok(())
+}
+
+/// Establish one identity's private namespace before any users of its files.
+/// The app-wide namespace must already be initialized. Existing committed
+/// identities are validated without republishing directories containing live
+/// file handles. Only initial startup or creation/import may recover an
+/// incomplete identity namespace.
+pub(crate) fn initialize_identity_storage_namespace(
+    ratspeak_dir: &Path,
+    hash: &str,
+) -> std::io::Result<()> {
+    if !crate::helpers::is_protocol_hash_16(hash) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid identity namespace hash",
+        ));
+    }
+    let data_root = data_root_for_identity_namespace(ratspeak_dir)?;
+    let witness = established_storage_namespace(&data_root)?;
+    let deletion = ratspeak_dir
+        .join("identities")
+        .join(format!("{hash}.namespace-delete"));
+    if deletion.try_exists()? {
+        retire_identity_namespace(ratspeak_dir, hash, deletion_scope(&deletion)?, &witness)?;
+    }
+    let directory = ratspeak_dir.join("identities").join(hash);
+    if !identity_namespace_marker(ratspeak_dir, hash).try_exists()?
+        && (directory.join("ratchets").try_exists()? || directory.join("lxmf").try_exists()?)
+    {
+        return Err(std::io::Error::other(
+            "existing identity namespace is incomplete; reconcile it before opening database/storage users",
+        ));
+    }
+    prepare_identity_namespace(ratspeak_dir, hash, &witness)
+}
+
+fn prepare_identity_namespace(
+    ratspeak_dir: &Path,
+    hash: &str,
+    witness: &DurableFileReceipt,
+) -> std::io::Result<()> {
+    let deletion = ratspeak_dir
+        .join("identities")
+        .join(format!("{hash}.namespace-delete"));
+    if deletion.try_exists()? {
+        retire_identity_namespace(ratspeak_dir, hash, deletion_scope(&deletion)?, witness)?;
+    }
+    let marker = identity_namespace_marker(ratspeak_dir, hash);
+    if marker.try_exists()? {
+        return established_identity_namespace(ratspeak_dir, hash);
+    }
+    let directory = ratspeak_dir.join("identities").join(hash);
+    for path in [
+        directory.clone(),
+        directory.join("lxmf"),
+        directory.join("ratchets"),
+        directory.join("ratchets/received"),
+    ] {
+        durable_create_dir_all(&path, witness).map_err(std::io::Error::other)?;
+    }
+    durable_write(&marker, IDENTITY_NAMESPACE_BYTES).map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+/// Establish/reconcile the app's private directory tree before configuration,
+/// database pools, identity files or network workers are opened. Call once at
+/// process startup; live identity rebuilds only validate its committed marker.
+pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
+    if data_root.join(STORAGE_NAMESPACE_READY).try_exists()? {
+        // Completed roots cannot become fresh merely because directories have
+        // disappeared. Only an explicit recorded deletion may retire identity
+        // descendants; the app/database roots remain established.
+        let ready = data_root.join(STORAGE_NAMESPACE_READY);
+        if read_file_bounded(&ready, 64)?.as_deref() == Some(STORAGE_NAMESPACE_RESET_BYTES) {
+            let witness = storage_namespace_witness(data_root)?;
+            let reset = durable_reconcile(&ready, STORAGE_NAMESPACE_RESET_BYTES)
+                .map_err(std::io::Error::other)?;
+            finish_identity_storage_reset(&data_root.join(".ratspeak"), &witness, &reset)?;
+            durable_write(&ready, STORAGE_NAMESPACE_BYTES).map_err(std::io::Error::other)?;
+        } else {
+            established_storage_namespace(data_root)?;
+        }
+    }
+    // Platform-provided roots already exist. A fresh explicit/test root may
+    // need multiple ancestors, all established from an existing outside anchor.
+    if !data_root.try_exists()? {
+        let mut anchor = data_root
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        while !anchor.try_exists()? {
+            anchor = anchor
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+        }
+        let digest = hex::encode(rns_crypto::sha::sha256(
+            data_root.as_os_str().as_encoded_bytes(),
+        ));
+        let witness = durable_write(
+            &anchor.join(format!(".ratspeak-root-{digest}.witness")),
+            STORAGE_NAMESPACE_BYTES,
+        )
+        .map_err(std::io::Error::other)?;
+        durable_create_dir_all(data_root, &witness).map_err(std::io::Error::other)?;
+    }
+    require_real_directory(data_root)?;
+    let witness = durable_write(
+        &data_root.join(STORAGE_NAMESPACE_WITNESS),
+        STORAGE_NAMESPACE_BYTES,
+    )
+    .map_err(std::io::Error::other)?;
+    let ratspeak_dir = data_root.join(".ratspeak");
+    let identities = ratspeak_dir.join("identities");
+    durable_create_dir_all(&ratspeak_dir, &witness).map_err(std::io::Error::other)?;
+    durable_create_dir_all(&identities, &witness).map_err(std::io::Error::other)?;
+    for entry in std::fs::read_dir(&identities)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if let Some(hash) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".namespace-delete"))
+            .filter(|hash| crate::helpers::is_protocol_hash_16(hash))
+        {
+            retire_identity_namespace(
+                &ratspeak_dir,
+                hash,
+                deletion_scope(&entry.path())?,
+                &witness,
+            )?;
+        }
+    }
+    for entry in std::fs::read_dir(&identities)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if let Some(hash) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".namespace-ready"))
+            .filter(|hash| crate::helpers::is_protocol_hash_16(hash))
+        {
+            established_identity_namespace(&ratspeak_dir, hash)?;
+        }
+        if entry.file_type()?.is_dir()
+            && let Some(hash) = name
+                .to_str()
+                .filter(|hash| crate::helpers::is_protocol_hash_16(hash))
+        {
+            prepare_identity_namespace(&ratspeak_dir, hash, &witness)?;
+        }
+    }
+    durable_write(
+        &data_root.join(STORAGE_NAMESPACE_READY),
+        STORAGE_NAMESPACE_BYTES,
+    )
+    .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
 impl LxmfManager {
+    /// Load/create a manager after [`initialize_storage_namespace`] has completed
+    /// before database or configuration users are opened.
     pub fn load_or_create(
         data_dir: &Path,
         preferred_identity_hash: Option<&str>,
@@ -1563,10 +1986,9 @@ impl LxmfManager {
             return Err("active identity hash is not a canonical 16-byte protocol hash".into());
         }
         let ratspeak_dir = data_dir.join(".ratspeak");
-        std::fs::create_dir_all(&ratspeak_dir)?;
+        established_storage_namespace(data_dir)?;
 
         let identities_dir = ratspeak_dir.join("identities");
-        std::fs::create_dir_all(&identities_dir)?;
 
         let legacy_path = ratspeak_dir.join("identity");
         let mut is_hardware = false;
@@ -1588,7 +2010,7 @@ impl LxmfManager {
                 let legacy_hash = hex::encode(id.hash);
                 if legacy_hash == hash {
                     let id_dir = identities_dir.join(hash);
-                    std::fs::create_dir_all(&id_dir)?;
+                    initialize_identity_storage_namespace(&ratspeak_dir, hash)?;
                     id.to_file(&id_dir.join("identity"))?;
                     id
                 } else {
@@ -1641,7 +2063,12 @@ impl LxmfManager {
         let identity_hash = hex::encode(identity.hash);
 
         let id_dir = identities_dir.join(&identity_hash);
-        std::fs::create_dir_all(&id_dir)?;
+        let witness = established_storage_namespace(data_dir)?;
+        if id_dir.try_exists()? {
+            established_identity_namespace(&ratspeak_dir, &identity_hash)?;
+        } else {
+            prepare_identity_namespace(&ratspeak_dir, &identity_hash, &witness)?;
+        }
 
         let id_file = id_dir.join("identity");
         if !id_file.exists()
@@ -1653,7 +2080,6 @@ impl LxmfManager {
         }
 
         let lxmf_storage = id_dir.join("lxmf");
-        std::fs::create_dir_all(&lxmf_storage)?;
 
         let lxmf_dest_hash =
             Destination::hash_from_name_and_identity(LXMF_APP_NAME, Some(&identity.hash));
@@ -1674,7 +2100,6 @@ impl LxmfManager {
         }
 
         let ratchet_dir = id_dir.join("ratchets");
-        std::fs::create_dir_all(&ratchet_dir)?;
         let wall_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1690,7 +2115,6 @@ impl LxmfManager {
         // Validate, expire and load each file exactly once. The former
         // clean-then-load sequence decoded every ratchet twice at startup.
         let received_dir = ratchet_dir.join("received");
-        std::fs::create_dir_all(&received_dir)?;
         let mut received_ratchets = HashMap::new();
         let mut removed = 0usize;
         if let Ok(entries) = std::fs::read_dir(&received_dir) {
@@ -1853,9 +2277,8 @@ impl LxmfManager {
         let lxmf_hex = hex::encode(lxmf_dest);
 
         let id_dir = self.data_dir.join("identities").join(&hash_hex);
-        std::fs::create_dir_all(&id_dir)?;
+        initialize_identity_storage_namespace(&self.data_dir, &hash_hex)?;
         identity.to_file(&id_dir.join("identity"))?;
-        std::fs::create_dir_all(id_dir.join("lxmf"))?;
 
         let display_name = if nickname.is_empty() {
             format!("!Ratspeak.org-{}", &lxmf_hex[..6])
@@ -1967,9 +2390,8 @@ impl LxmfManager {
             Destination::hash_from_name_and_identity(LXMF_APP_NAME, Some(&identity.hash));
         let lxmf_hex = hex::encode(lxmf_dest);
 
-        std::fs::create_dir_all(&id_dir)?;
+        initialize_identity_storage_namespace(ratspeak_dir, &hash_hex)?;
         identity.to_file(&id_dir.join("identity"))?;
-        std::fs::create_dir_all(id_dir.join("lxmf"))?;
 
         let display_name = if nickname.is_empty() {
             format!("!Ratspeak.org-{}", &lxmf_hex[..6])
@@ -1987,6 +2409,9 @@ impl LxmfManager {
         hash_hex: &str,
         cascade: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !crate::helpers::is_protocol_hash_16(hash_hex) {
+            return Err("invalid identity namespace hash".into());
+        }
         // The hub keyfile lives outside the identity directory, so it must be
         // removed explicitly and before the early return. Leaving it behind
         // lets a delete-and-reimport resurrect the hub on the same destination
@@ -2000,40 +2425,8 @@ impl LxmfManager {
             std::fs::remove_file(&hub_key)?;
         }
 
-        let id_dir = data_root
-            .join(".ratspeak")
-            .join("identities")
-            .join(hash_hex);
-        if !id_dir.exists() {
-            return Ok(());
-        }
-
-        if cascade {
-            std::fs::remove_dir_all(&id_dir)?;
-            return Ok(());
-        }
-
-        for dir in [
-            "ratchets",
-            "known_identities",
-            "lxmf",
-            "reticulum",
-            "cache",
-            "propagation",
-        ] {
-            let path = id_dir.join(dir);
-            if path.exists() {
-                std::fs::remove_dir_all(path)?;
-            }
-        }
-        // All forms of private material: plaintext key, passcode vault, and the
-        // recovery-phrase sidecar (the phrase is key-equivalent).
-        for file in ["identity", "identity.enc", "identity.seed"] {
-            let path = id_dir.join(file);
-            if path.exists() {
-                std::fs::remove_file(path)?;
-            }
-        }
+        let witness = established_storage_namespace(data_root)?;
+        retire_identity_namespace(&data_root.join(".ratspeak"), hash_hex, cascade, &witness)?;
         Ok(())
     }
 
@@ -3882,6 +4275,7 @@ impl LxmfManager {
     }
 
     pub fn save_crypto_state(&self) -> std::io::Result<()> {
+        established_identity_namespace(&self.data_dir, &self.identity_hash)?;
         self.delivery_ratchets.save_durable(&self.identity)?;
         let received_dir = self.ratchets_dir().join("received");
         for (hash_hex, ratchet) in &self.received_ratchets {
@@ -6587,6 +6981,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        initialize_storage_namespace(&tmp).unwrap();
         LxmfManager::load_or_create(&tmp, None, None).unwrap()
     }
 
@@ -7822,11 +8217,353 @@ mod tests {
                 .as_nanos()
         ));
         let pool = test_pool();
+        initialize_storage_namespace(&tmp).unwrap();
         let mgr = LxmfManager::load_or_create(&tmp, None, None).unwrap();
         let (second_hash, _) = mgr.create_identity("Second", &pool).unwrap();
 
         let loaded = LxmfManager::load_or_create(&tmp, Some(&second_hash), None).unwrap();
         assert_eq!(loaded.identity_hash, second_hash);
+    }
+
+    #[test]
+    fn storage_namespace_requires_initialization_before_manager_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(LxmfManager::load_or_create(temp.path(), None, None).is_err());
+        assert!(!temp.path().join(".ratspeak").exists());
+    }
+
+    #[test]
+    fn storage_namespace_fresh_bootstrap_and_restart_preserve_private_ratchet() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("fresh/nested/profile");
+        initialize_storage_namespace(&root).unwrap();
+        let first = LxmfManager::load_or_create(&root, None, None).unwrap();
+        let hash = first.identity_hash.clone();
+        let key = first.delivery_ratchets.ring().current_public_key();
+        assert!(key.is_some());
+        assert!(first.received_ratchets_dir.is_dir());
+        assert!(identity_namespace_marker(&root.join(".ratspeak"), &hash).is_file());
+        first.save_crypto_state().unwrap();
+        drop(first);
+        initialize_storage_namespace(&root).unwrap();
+        let restarted = LxmfManager::load_or_create(&root, Some(&hash), None).unwrap();
+        assert_eq!(restarted.delivery_ratchets.ring().current_public_key(), key);
+    }
+
+    #[test]
+    fn storage_namespace_live_rebuild_preserves_open_database_and_identity() {
+        use std::io::{Read, Seek};
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let first = LxmfManager::load_or_create(temp.path(), None, None).unwrap();
+        let identity = first.identity.clone();
+        let key = identity.get_private_key().unwrap().to_vec();
+        let id_file = first
+            .data_dir
+            .join("identities")
+            .join(&first.identity_hash)
+            .join("identity");
+        let mut identity_handle = std::fs::File::open(&id_file).unwrap();
+        let pool = crate::db::init_pool(temp.path()).unwrap();
+        crate::db::init_schema(&pool).unwrap();
+        let connection = pool.get().unwrap();
+        let rebuilt =
+            LxmfManager::from_loaded_identity(temp.path(), identity.clone(), false).unwrap();
+        assert_eq!(
+            rebuilt.delivery_ratchets.ring().current_public_key(),
+            first.delivery_ratchets.ring().current_public_key()
+        );
+        let mut observed = Vec::new();
+        identity_handle.read_to_end(&mut observed).unwrap();
+        assert_eq!(observed, key);
+        assert_eq!(
+            connection
+                .query_row("SELECT 1", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            1
+        );
+
+        // Losing a committed marker during a live session must never invoke a
+        // first-time Windows directory publication around its live handles.
+        let marker = identity_namespace_marker(&first.data_dir, &first.identity_hash);
+        std::fs::remove_file(marker).unwrap();
+        let ring = std::fs::read(first.delivery_ratchets.ring_path()).unwrap();
+        assert!(LxmfManager::from_loaded_identity(temp.path(), identity, false).is_err());
+        assert_eq!(
+            std::fs::read(first.delivery_ratchets.ring_path()).unwrap(),
+            ring
+        );
+        identity_handle.rewind().unwrap();
+        observed.clear();
+        identity_handle.read_to_end(&mut observed).unwrap();
+        assert_eq!(observed, key);
+    }
+
+    #[test]
+    fn storage_namespace_barrier_failure_prevents_first_ratchet_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let identity = Identity::new();
+        let hash = hex::encode(identity.hash);
+        let directory = temp.path().join(".ratspeak/identities").join(&hash);
+        std::fs::create_dir_all(&directory).unwrap();
+        identity.to_file(&directory.join("identity")).unwrap();
+        std::fs::write(directory.join("ratchets"), b"preserve namespace blocker").unwrap();
+        assert!(initialize_storage_namespace(temp.path()).is_err());
+        assert!(LxmfManager::from_loaded_identity(temp.path(), identity, false).is_err());
+        assert_eq!(
+            std::fs::read(directory.join("ratchets")).unwrap(),
+            b"preserve namespace blocker"
+        );
+        assert!(!directory.join("ratchets/ring").exists());
+        assert!(!identity_namespace_marker(&temp.path().join(".ratspeak"), &hash).exists());
+    }
+
+    #[test]
+    fn storage_namespace_unexplained_directory_loss_is_not_recreated() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let manager = LxmfManager::load_or_create(temp.path(), None, None).unwrap();
+        let identity = manager.identity.clone();
+        let ring = std::fs::read(manager.delivery_ratchets.ring_path()).unwrap();
+        std::fs::remove_dir(&manager.received_ratchets_dir).unwrap();
+        assert!(LxmfManager::from_loaded_identity(temp.path(), identity.clone(), false).is_err());
+        assert!(manager.save_crypto_state().is_err());
+        drop(manager);
+        assert!(initialize_storage_namespace(temp.path()).is_err());
+        let directory = temp
+            .path()
+            .join(".ratspeak/identities")
+            .join(hex::encode(identity.hash));
+        assert!(!directory.join("ratchets/received").exists());
+        assert_eq!(
+            std::fs::read(directory.join("ratchets/ring")).unwrap(),
+            ring
+        );
+    }
+
+    #[test]
+    fn storage_namespace_intentional_delete_reset_and_reimport_keep_live_roots() {
+        for cascade in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            initialize_storage_namespace(temp.path()).unwrap();
+            let first = LxmfManager::load_or_create(temp.path(), None, None).unwrap();
+            let hash = first.identity_hash.clone();
+            let key = first.identity.get_private_key().unwrap().to_vec();
+            let files = first.data_dir.join("identities").join(&hash).join("files");
+            std::fs::create_dir_all(&files).unwrap();
+            std::fs::write(files.join("history.bin"), b"retained history").unwrap();
+            let pool = crate::db::init_pool(temp.path()).unwrap();
+            crate::db::init_schema(&pool).unwrap();
+            let connection = pool.get().unwrap();
+            drop(first);
+            LxmfManager::purge_identity_profile(temp.path(), &hash, cascade).unwrap();
+            assert_eq!(files.join("history.bin").exists(), !cascade);
+            assert!(!identity_namespace_marker(&temp.path().join(".ratspeak"), &hash).exists());
+            let (imported, _) = LxmfManager::import_identity_to_data_dir(
+                &temp.path().join(".ratspeak"),
+                &key,
+                "Restored",
+                &pool,
+            )
+            .unwrap();
+            assert_eq!(imported, hash);
+            let restored = LxmfManager::load_or_create(temp.path(), Some(&hash), None).unwrap();
+            assert!(
+                restored
+                    .delivery_ratchets
+                    .ring()
+                    .current_public_key()
+                    .is_some()
+            );
+            drop(restored);
+            clear_identity_storage_namespace(&temp.path().join(".ratspeak")).unwrap();
+            assert!(temp.path().join(".ratspeak/identities").is_dir());
+            assert_eq!(
+                connection
+                    .query_row("SELECT 1", [], |row| row.get::<_, i32>(0))
+                    .unwrap(),
+                1
+            );
+            LxmfManager::import_identity_to_data_dir(
+                &temp.path().join(".ratspeak"),
+                &key,
+                "Restored again",
+                &pool,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn storage_namespace_reset_rejects_other_sibling_without_poisoning_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let wrong = temp.path().join("other");
+        std::fs::create_dir_all(wrong.join("identities")).unwrap();
+        let sentinel = wrong.join("identities/private-file");
+        std::fs::write(&sentinel, b"leave this sibling untouched").unwrap();
+        assert!(clear_identity_storage_namespace(&wrong).is_err());
+        assert!(initialize_identity_storage_namespace(&wrong, &"aa".repeat(16)).is_err());
+        assert_eq!(
+            std::fs::read(sentinel).unwrap(),
+            b"leave this sibling untouched"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join(STORAGE_NAMESPACE_READY)).unwrap(),
+            STORAGE_NAMESPACE_BYTES
+        );
+        LxmfManager::load_or_create(temp.path(), None, None).unwrap();
+    }
+
+    #[test]
+    fn storage_namespace_bulk_reset_finishes_pending_crypto_only_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let first = LxmfManager::load_or_create(temp.path(), None, None).unwrap();
+        let hash = first.identity_hash.clone();
+        let ratspeak = first.data_dir.clone();
+        let directory = ratspeak.join("identities").join(&hash);
+        std::fs::create_dir_all(directory.join("files")).unwrap();
+        std::fs::write(
+            directory.join("files/history.bin"),
+            b"also remove this for full reset",
+        )
+        .unwrap();
+        drop(first);
+        // A interrupted crypto-only removal must not block a later authorized
+        // full reset, nor leave retained media after the stronger reset scope.
+        durable_write(
+            &ratspeak
+                .join("identities")
+                .join(format!("{hash}.namespace-delete")),
+            DELETE_IDENTITY_CRYPTO,
+        )
+        .unwrap();
+        clear_identity_storage_namespace(&ratspeak).unwrap();
+        assert!(!directory.exists());
+        assert_eq!(
+            std::fs::read_dir(ratspeak.join("identities"))
+                .unwrap()
+                .count(),
+            0
+        );
+        established_storage_namespace(temp.path()).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn storage_namespace_reset_unlinks_symlink_without_touching_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let ratspeak = temp.path().join(".ratspeak");
+        let outside = temp.path().join("outside-private-file");
+        std::fs::write(&outside, b"outside reset scope").unwrap();
+        let link = ratspeak.join("identities/unknown-link");
+        let outside_dir = temp.path().join("outside-private-directory");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("keep"), b"outside directory unchanged").unwrap();
+        let directory_link = ratspeak.join("identities/unknown-directory-link");
+        let hash_link = ratspeak.join("identities").join("cc".repeat(16));
+        let metadata_link = ratspeak
+            .join("identities")
+            .join(format!("{}.namespace-delete", "dd".repeat(16)));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            std::os::unix::fs::symlink(&outside_dir, &directory_link).unwrap();
+            std::os::unix::fs::symlink(&outside_dir, &hash_link).unwrap();
+            std::os::unix::fs::symlink(&outside, &metadata_link).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(&outside, &link).unwrap();
+            std::os::windows::fs::symlink_dir(&outside_dir, &directory_link).unwrap();
+            std::os::windows::fs::symlink_dir(&outside_dir, &hash_link).unwrap();
+            std::os::windows::fs::symlink_file(&outside, &metadata_link).unwrap();
+        }
+        clear_identity_storage_namespace(&ratspeak).unwrap();
+        assert!(!link.try_exists().unwrap());
+        assert!(!directory_link.try_exists().unwrap());
+        assert!(!hash_link.try_exists().unwrap());
+        assert!(!metadata_link.try_exists().unwrap());
+        assert_eq!(
+            std::fs::read(outside_dir.join("keep")).unwrap(),
+            b"outside directory unchanged"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside reset scope");
+        established_storage_namespace(temp.path()).unwrap();
+    }
+
+    #[test]
+    fn storage_namespace_bulk_reset_restart_fences_imports_and_clears_unknown_children() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let first = LxmfManager::load_or_create(temp.path(), None, None).unwrap();
+        let identity = first.identity.clone();
+        let key = identity.get_private_key().unwrap().to_vec();
+        let ratspeak = first.data_dir.clone();
+        let identities = ratspeak.join("identities");
+        drop(first);
+        std::fs::create_dir_all(identities.join("legacy-unrecognized-profile")).unwrap();
+        std::fs::write(
+            identities.join("legacy-unrecognized-profile/private-key"),
+            b"reset this old data",
+        )
+        .unwrap();
+        std::fs::write(
+            identities.join("unrecognized-keyfile"),
+            b"reset this old file",
+        )
+        .unwrap();
+        // Simulate interruption immediately after committing the outside reset
+        // intent. Creation is fenced until initial startup completes that wipe.
+        durable_write(
+            &temp.path().join(STORAGE_NAMESPACE_READY),
+            STORAGE_NAMESPACE_RESET_BYTES,
+        )
+        .unwrap();
+        let pool = test_pool();
+        assert!(LxmfManager::from_loaded_identity(temp.path(), identity, false).is_err());
+        assert!(
+            LxmfManager::import_identity_to_data_dir(&ratspeak, &key, "Too early", &pool).is_err()
+        );
+        initialize_storage_namespace(temp.path()).unwrap();
+        assert!(identities.is_dir());
+        assert_eq!(std::fs::read_dir(&identities).unwrap().count(), 0);
+        let (hash, _) =
+            LxmfManager::import_identity_to_data_dir(&ratspeak, &key, "Restored", &pool).unwrap();
+        let restored = LxmfManager::load_or_create(temp.path(), Some(&hash), None).unwrap();
+        drop(restored);
+        // A completed reset cannot replay over a deliberately restored profile.
+        initialize_storage_namespace(temp.path()).unwrap();
+        assert!(identities.join(hash).join("identity").is_file());
+    }
+
+    #[test]
+    fn storage_namespace_restart_finishes_only_recorded_identity_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let first = LxmfManager::load_or_create(temp.path(), None, None).unwrap();
+        let hash = first.identity_hash.clone();
+        let key = first.identity.get_private_key().unwrap().to_vec();
+        let ratspeak = first.data_dir.clone();
+        let identities = ratspeak.join("identities");
+        let directory = identities.join(&hash);
+        drop(first);
+        let intent = identities.join(format!("{hash}.namespace-delete"));
+        let receipt = durable_write(&intent, DELETE_IDENTITY_ALL).unwrap();
+        let retired = identities.join(format!("{hash}.namespace-retired"));
+        durable_rename_directory(&directory, &retired, &receipt).unwrap();
+        // Simulate a restart after the move, before sidecar/private-byte cleanup.
+        initialize_storage_namespace(temp.path()).unwrap();
+        assert!(!directory.exists());
+        assert!(!retired.exists());
+        assert!(!intent.exists());
+        assert!(!identity_namespace_marker(&ratspeak, &hash).exists());
+        let pool = test_pool();
+        LxmfManager::import_identity_to_data_dir(&ratspeak, &key, "Restored", &pool).unwrap();
+        LxmfManager::load_or_create(temp.path(), Some(&hash), None).unwrap();
     }
 
     #[test]
@@ -7841,6 +8578,7 @@ mod tests {
                 .as_nanos()
         ));
         let pool = test_pool();
+        initialize_storage_namespace(&tmp).unwrap();
         let first = LxmfManager::load_or_create(&tmp, None, None).unwrap();
         let first_hash = first.identity_hash.clone();
         let first_public = first.delivery_ratchets.ring().current_public_key().unwrap();
@@ -7896,6 +8634,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        initialize_storage_namespace(&tmp).unwrap();
         let first = LxmfManager::load_or_create(&tmp, None, None).unwrap();
         let identity_hash = first.identity_hash.clone();
         let ring_path = first.delivery_ratchets.ring_path().to_path_buf();
@@ -7934,6 +8673,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        initialize_storage_namespace(&tmp).unwrap();
         let mgr = LxmfManager::load_or_create(&tmp, None, None).unwrap();
         let hash = mgr.identity_hash.clone();
         let private_key = mgr.identity.get_private_key().unwrap().to_vec();
@@ -7961,6 +8701,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        initialize_storage_namespace(&tmp).unwrap();
         let mgr = LxmfManager::load_or_create(&tmp, None, None).unwrap();
         let hash = mgr.identity_hash.clone();
         let public_key = mgr.identity.get_public_key();
@@ -7985,6 +8726,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        initialize_storage_namespace(&tmp).unwrap();
         let mgr = LxmfManager::load_or_create(&tmp, None, None).unwrap();
         let hardware_identity = Identity::new();
         let hash = hex::encode(hardware_identity.hash);
@@ -8042,6 +8784,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        initialize_storage_namespace(&tmp).unwrap();
         let _ = LxmfManager::load_or_create(&tmp, None, None).unwrap();
 
         let missing_hash = "ab".repeat(16);
@@ -9995,6 +10738,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        initialize_storage_namespace(&tmp).unwrap();
         let mgr = LxmfManager::load_or_create(&tmp, None, None).unwrap();
         let id_dir = tmp
             .join(".ratspeak")
@@ -10036,6 +10780,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        initialize_storage_namespace(&tmp).unwrap();
         let mgr = LxmfManager::load_or_create(&tmp, None, None).unwrap();
         let id_dir = tmp
             .join(".ratspeak")
@@ -10953,6 +11698,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        initialize_storage_namespace(&tmp).unwrap();
         let mut mgr = LxmfManager::load_or_create(&tmp, None, None).unwrap();
         let identity_hash = mgr.identity_hash.clone();
         let propagation_node = [0x66; 16];

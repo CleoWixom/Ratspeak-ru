@@ -15,9 +15,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RATSPEAK_RSRETICULUM_REF: 817a640ed1e11e3ff3e0ff048d8de13662bfdd78
-  RATSPEAK_RSLXMF_REF: 652dc3cd46bdc1cc9fa73e0c105fc53967dc9f28
-  RATSPEAK_RSLXST_REF: 07ab7d79559864a5756ec8cb90c92456a31e259e
+  RATSPEAK_RSRETICULUM_REF: 8fcf0b678a4bed778b29690b85b378d05684eaf1
+  RATSPEAK_RSLXMF_REF: 580fe1deabecae1ae98533762ba27d47f6022f0f
+  RATSPEAK_RSLXST_REF: ead1652fdabdce6dc41fbd9ebda6938f2f82adad
   RATSPEAK_LRGP_REF: 56ea3ae010d4369dadfc43c72033a3424dc5087a
 
 jobs:
@@ -351,6 +351,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check desktop shell
         run: cargo check --manifest-path Ratspeak/src-tauri/Cargo.toml --locked
+      - name: Test native storage namespace lifecycle
+        run: cargo test -p ratspeak-runtime --lib --all-features --locked storage_namespace_
+        working-directory: Ratspeak
       - name: Test serialized attachment commands on Windows
         if: runner.os == 'Windows'
         run: cargo test -p ratspeak-tauri --test attachment_staging --locked

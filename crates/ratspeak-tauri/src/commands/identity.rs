@@ -19,7 +19,7 @@ use crate::helpers::{
     active_identity_id, sanitize_announced_display_name, sanitize_announced_status, sanitize_text,
     validate_hex,
 };
-use crate::state::AppState;
+use crate::state::{ActivityRequestFence, AppState, OwnedIdentitySwitchGuard};
 
 use ratspeak_core::LXMF_DELIVERY_APP_NAME as LXMF_APP_NAME;
 use ratspeak_runtime::activity::ActivityRecorderError;
@@ -35,6 +35,39 @@ fn identity_activity_reset_error(_error: ActivityRecorderError) -> AppError {
         "identity lifecycle stopped before changing identity state"
     );
     AppError::service_unavailable("Identity change is temporarily unavailable")
+}
+
+/// Capture the fence before preparation, then acquire in identity-before-LXMF
+/// order. A request queued across reset must fail before persistent mutation.
+pub(super) async fn acquire_identity_mutation(
+    state: &AppState,
+    fence: ActivityRequestFence,
+) -> AppResult<Arc<OwnedIdentitySwitchGuard>> {
+    let lease = Arc::new(state.identity_switch_lock.lock_owned().await);
+    if !state.is_current_activity_request_fence_after_identity_lock(fence) {
+        return Err(AppError::conflict(
+            "Identity changed while preparing this operation; retry",
+        ));
+    }
+    Ok(lease)
+}
+
+/// The actual blocking operation retains its lifecycle owner even if the
+/// awaiting command is cancelled. The caller retains a separate clone through
+/// post-operation publication and response construction.
+pub(super) async fn run_identity_mutation<T, F>(
+    lease: Arc<OwnedIdentitySwitchGuard>,
+    operation: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _identity_lifecycle = lease;
+        operation()
+    })
+    .await
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -448,26 +481,24 @@ pub async fn api_create_identity(
     state: State<'_, Arc<AppState>>,
     args: CreateIdentityArgs,
 ) -> AppResult<Value> {
+    let request_fence = state.activity_request_fence();
     let nickname = sanitize_announced_display_name(args.nickname.as_deref().unwrap_or(""))
         .map_err(AppError::bad_request)?;
 
     // New identities are recoverable: derived from a fresh BIP-39 mnemonic, which
     // we return once for the user to back up. Reuses the import path for the
     // duplicate-check, on-disk write, and activation.
-    let identities_dir = state.config.data_dir.join("identities");
     let (mnemonic, key) =
         ratspeak_runtime::generate_recoverable_key().map_err(AppError::internal)?;
-    let mut resp = import_identity_shared(state, key.to_vec(), Some(nickname)).await?;
-    // Persist the phrase (software identity) so it can be re-displayed later.
-    if let Some(hash) = resp.get("hash").and_then(|v| v.as_str()) {
-        match ratspeak_runtime::vault::store_plaintext_seed(&identities_dir.join(hash), &mnemonic) {
-            Ok(()) => {}
-            Err(_) => tracing::warn!(
-                reason = "write_failed",
-                "could not store recovery-phrase sidecar"
-            ),
-        }
-    }
+    let mut resp = import_identity_request(
+        Arc::clone(&state),
+        key.to_vec(),
+        Some(nickname),
+        None,
+        Some(mnemonic.clone()),
+        request_fence,
+    )
+    .await?;
     if let Some(obj) = resp.as_object_mut() {
         obj.insert("mnemonic".to_string(), json!(mnemonic));
     }
@@ -523,22 +554,19 @@ pub async fn restore_seed_identity(
     state: State<'_, Arc<AppState>>,
     args: RestoreSeedArgs,
 ) -> AppResult<Value> {
+    let request_fence = state.activity_request_fence();
     let phrase = args.phrase.trim().to_string();
-    let identities_dir = state.config.data_dir.join("identities");
     let key = ratspeak_runtime::derive_identity_key_from_phrase(&phrase)
         .map_err(AppError::bad_request)?;
-    let resp = import_identity_shared(state, key.to_vec(), args.nickname).await?;
-    // Persist the phrase so a restored identity can re-display it later too.
-    if let Some(hash) = resp.get("hash").and_then(|v| v.as_str()) {
-        match ratspeak_runtime::vault::store_plaintext_seed(&identities_dir.join(hash), &phrase) {
-            Ok(()) => {}
-            Err(_) => tracing::warn!(
-                reason = "write_failed",
-                "could not store recovery-phrase sidecar"
-            ),
-        }
-    }
-    Ok(resp)
+    import_identity_request(
+        Arc::clone(&state),
+        key.to_vec(),
+        args.nickname,
+        None,
+        Some(phrase),
+        request_fence,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -848,87 +876,146 @@ async fn import_identity_shared_with_passcode(
     nickname: Option<String>,
     passcode: Option<String>,
 ) -> AppResult<Value> {
+    let request_fence = state.activity_request_fence();
+    import_identity_request(
+        Arc::clone(&state),
+        key_bytes,
+        nickname,
+        passcode,
+        None,
+        request_fence,
+    )
+    .await
+}
+
+async fn import_identity_request(
+    state: Arc<AppState>,
+    key_bytes: Vec<u8>,
+    nickname: Option<String>,
+    passcode: Option<String>,
+    explicit_mnemonic: Option<String>,
+    request_fence: ActivityRequestFence,
+) -> AppResult<Value> {
+    import_identity_after_parse(
+        state,
+        nickname,
+        explicit_mnemonic,
+        request_fence,
+        parse_identity_import_async(key_bytes, passcode),
+        persist_parsed_identity_import,
+    )
+    .await
+}
+
+fn persist_parsed_identity_import(
+    state: Arc<AppState>,
+    parsed: ParsedIdentityImport,
+    nickname: String,
+    mnemonic: Option<String>,
+) -> Result<(String, String), String> {
+    let result = {
+        let lxmf = state.lxmf.lock().map_err(|_| "Lock error".to_string())?;
+        if let Some(manager) = lxmf.as_ref() {
+            manager.import_identity(&parsed.key_bytes, &nickname, &state.db)
+        } else {
+            crate::lxmf::LxmfManager::import_identity_to_data_dir(
+                &state.config.data_dir,
+                &parsed.key_bytes,
+                &nickname,
+                &state.db,
+            )
+        }
+        .map_err(|error| error.to_string())?
+    };
+    if let Some(phrase) = mnemonic.as_deref() {
+        let seed_dir = state.config.data_dir.join("identities").join(&result.0);
+        if ratspeak_runtime::vault::store_plaintext_seed(&seed_dir, phrase).is_err() {
+            tracing::warn!(
+                reason = "write_failed",
+                "could not store recovery-phrase sidecar"
+            );
+        }
+    }
+    Ok(result)
+}
+
+// The production-used seam lets regression tests pause preparation or the
+// actual persistent worker without requiring a WebView, KDF timing or a card.
+async fn import_identity_after_parse<P, W>(
+    state: Arc<AppState>,
+    nickname: Option<String>,
+    explicit_mnemonic: Option<String>,
+    request_fence: ActivityRequestFence,
+    parse: P,
+    persist: W,
+) -> AppResult<Value>
+where
+    P: std::future::Future<Output = AppResult<ParsedIdentityImport>>,
+    W: FnOnce(
+            Arc<AppState>,
+            ParsedIdentityImport,
+            String,
+            Option<String>,
+        ) -> Result<(String, String), String>
+        + Send
+        + 'static,
+{
     let nickname = sanitize_announced_display_name(nickname.as_deref().unwrap_or(""))
         .map_err(AppError::bad_request)?;
-    let parsed = parse_identity_import_async(key_bytes, passcode).await?;
+    // Bounded parsing/KDF retains its own permit outside the lifecycle lock.
+    let parsed = parse.await?;
+    let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
     let format = parsed.format;
-    let mnemonic = parsed.mnemonic.clone();
+    let mnemonic = explicit_mnemonic.or_else(|| parsed.mnemonic.clone());
     let parsed_identity = Identity::from_private_key(&parsed.key_bytes)
-        .map_err(|e| AppError::bad_request(format!("Invalid identity key: {e}")))?;
+        .map_err(|error| AppError::bad_request(format!("Invalid identity key: {error}")))?;
     let import_hash = hex::encode(parsed_identity.hash);
-    let hash_for_duplicate_check = import_hash.clone();
-    let already_exists = db::spawn_db(state.db.clone(), move |p| {
-        db::get_identity(&p, &hash_for_duplicate_check).is_some()
-    })
+    let already_exists = db::spawn_db_with_lease(
+        state.db.clone(),
+        Arc::clone(&identity_lifecycle),
+        move |pool| db::get_identity(&pool, &import_hash).is_some(),
+    )
     .await
     .map_err(|_| AppError::internal("identity duplicate check db task panicked"))?;
     if already_exists {
         return Err(AppError::conflict("Identity already exists"));
     }
-    let st: Arc<AppState> = Arc::clone(&state);
-    let result = tokio::task::spawn_blocking(move || {
-        if let Ok(lxmf) = st.lxmf.lock() {
-            if let Some(mgr) = lxmf.as_ref() {
-                mgr.import_identity(&parsed.key_bytes, &nickname, &st.db)
-                    .map_err(|e| e.to_string())
-            } else {
-                crate::lxmf::LxmfManager::import_identity_to_data_dir(
-                    &st.config.data_dir,
-                    &parsed.key_bytes,
-                    &nickname,
-                    &st.db,
-                )
-                .map_err(|e| e.to_string())
-            }
-        } else {
-            Err("Lock error".into())
-        }
+    let worker_state = Arc::clone(&state);
+    let (hash, lxmf_hash) = run_identity_mutation(Arc::clone(&identity_lifecycle), move || {
+        persist(worker_state, parsed, nickname, mnemonic)
     })
     .await
-    .map_err(|_| AppError::internal("import_identity task panicked"))?;
+    .map_err(|_| AppError::internal("import_identity task panicked"))?
+    .map_err(AppError::bad_request)?;
 
-    match result {
-        Ok((hash, lxmf_hash)) => {
-            if let Some(phrase) = mnemonic.as_deref() {
-                let seed_dir = state.config.data_dir.join("identities").join(&hash);
-                if ratspeak_runtime::vault::store_plaintext_seed(&seed_dir, phrase).is_err() {
-                    tracing::warn!(
-                        reason = "write_failed",
-                        "could not store imported recovery-phrase sidecar"
-                    );
-                }
-            }
-            let activated = {
-                let _identity_lifecycle = state.identity_switch_lock.lock().await;
-                let active_missing =
-                    db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
-                        .await
-                        .map_err(|_| AppError::internal("active identity db task panicked"))?
-                        .is_none();
-                if active_missing {
-                    let app_state = Arc::clone(state.inner());
-                    crate::shutdown_rns_lxmf(&app_state)
-                        .await
-                        .map_err(identity_activity_reset_error)?;
-                    let hash_for_active = hash.clone();
-                    db::spawn_db(state.db.clone(), move |p| {
-                        db::set_active_identity(&p, &hash_for_active)
-                    })
-                    .await
-                    .map_err(|_| AppError::internal("activate imported identity task panicked"))?
-                    .map_err(|e| AppError::internal(format!("Failed to activate import: {e}")))?;
-                }
-                active_missing
-            };
-            Ok(json!({
-                "hash": hash,
-                "lxmf_hash": lxmf_hash,
-                "format": format,
-                "activated": activated,
-            }))
-        }
-        Err(e) => Err(AppError::bad_request(e)),
+    // Reuse this exact lifecycle owner. A nested acquisition would deadlock,
+    // while releasing it here would allow reset to erase the just-imported row.
+    let active_missing =
+        db::spawn_db_with_lease(state.db.clone(), Arc::clone(&identity_lifecycle), |pool| {
+            db::get_active_identity(&pool).is_none()
+        })
+        .await
+        .map_err(|_| AppError::internal("active identity db task panicked"))?;
+    if active_missing {
+        crate::shutdown_rns_lxmf(&state)
+            .await
+            .map_err(identity_activity_reset_error)?;
+        let hash_for_active = hash.clone();
+        db::spawn_db_with_lease(
+            state.db.clone(),
+            Arc::clone(&identity_lifecycle),
+            move |pool| db::set_active_identity(&pool, &hash_for_active),
+        )
+        .await
+        .map_err(|_| AppError::internal("activate imported identity task panicked"))?
+        .map_err(|error| AppError::internal(format!("Failed to activate import: {error}")))?;
     }
+    Ok(json!({
+        "hash": hash,
+        "lxmf_hash": lxmf_hash,
+        "format": format,
+        "activated": active_missing,
+    }))
 }
 
 #[tauri::command]
@@ -1600,6 +1687,207 @@ mod tests {
     static VAULT_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     static TEMP_IDENTITY_COMMAND_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn mutation_state() -> (tempfile::TempDir, Arc<AppState>) {
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+        let pool = db::init_pool(root.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        let state = Arc::new(AppState::new(
+            config,
+            pool,
+            Arc::new(ratspeak_core::NoopEmitter),
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        (root, state)
+    }
+
+    fn parsed_key(key_bytes: Vec<u8>, mnemonic: Option<String>) -> ParsedIdentityImport {
+        ParsedIdentityImport {
+            key_bytes,
+            format: "test-private-key",
+            mnemonic,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "seed")]
+    async fn identity_mutation_cancelled_import_keeps_reset_blocked_until_seed_worker_finishes() {
+        let (_root, state) = mutation_state();
+        let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
+        let identity = Identity::from_private_key(&key).unwrap();
+        let hash = hex::encode(identity.hash);
+        let request_fence = state.activity_request_fence();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_state = Arc::clone(&state);
+        let import = tokio::spawn(async move {
+            import_identity_after_parse(
+                worker_state,
+                None,
+                Some(phrase),
+                request_fence,
+                std::future::ready(Ok(parsed_key(key.to_vec(), None))),
+                move |state, parsed, nickname, mnemonic| {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    let _serial = VAULT_TEST_SERIAL.lock().unwrap();
+                    persist_parsed_identity_import(state, parsed, nickname, mnemonic)
+                },
+            )
+            .await
+        });
+        ready_rx.await.unwrap();
+        import.abort();
+        assert!(import.await.unwrap_err().is_cancelled());
+        let reset_state = Arc::clone(&state);
+        let reset_hash = hash.clone();
+        let mut reset = tokio::spawn(async move {
+            let _lifecycle = reset_state.identity_switch_lock.lock_owned().await;
+            crate::lxmf::clear_identity_storage_namespace(&reset_state.config.data_dir).unwrap();
+            db::delete_identity(&reset_state.db, &reset_hash, true).unwrap();
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(40), &mut reset)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), reset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !state
+                .config
+                .data_dir
+                .join("identities")
+                .join(&hash)
+                .exists()
+        );
+        assert!(db::get_identity(&state.db, &hash).is_none());
+        assert!(
+            db::get_active_identity(&state.db).is_none(),
+            "cancelled import must not later activate or resurrect its row"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identity_mutation_reset_during_preparation_rejects_before_files() {
+        let (_root, state) = mutation_state();
+        let request_fence = state.activity_request_fence();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let import_state = Arc::clone(&state);
+        let import = tokio::spawn(async move {
+            import_identity_after_parse(
+                import_state,
+                None,
+                None,
+                request_fence,
+                async move {
+                    ready_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(parsed_key(private_key_bytes(), None))
+                },
+                persist_parsed_identity_import,
+            )
+            .await
+        });
+        ready_rx.await.unwrap();
+        {
+            let _lifecycle = state.identity_switch_lock.lock_owned().await;
+            crate::lxmf::clear_identity_storage_namespace(&state.config.data_dir).unwrap();
+        }
+        release_tx.send(()).unwrap();
+        let error = import.await.unwrap().unwrap_err();
+        assert_eq!(error.code, "conflict");
+        assert_eq!(
+            std::fs::read_dir(state.config.data_dir.join("identities"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(db::get_all_identities(&state.db).is_empty());
+        assert!(db::get_active_identity(&state.db).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identity_mutation_waiting_across_reset_rejects_before_files() {
+        let (_root, state) = mutation_state();
+        let request_fence = state.activity_request_fence();
+        let reset = state.identity_switch_lock.lock_owned().await;
+        let import_state = Arc::clone(&state);
+        let mut import = tokio::spawn(async move {
+            import_identity_after_parse(
+                import_state,
+                None,
+                None,
+                request_fence,
+                std::future::ready(Ok(parsed_key(private_key_bytes(), None))),
+                persist_parsed_identity_import,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(40), &mut import)
+                .await
+                .is_err()
+        );
+        crate::lxmf::clear_identity_storage_namespace(&state.config.data_dir).unwrap();
+        drop(reset);
+        assert_eq!(import.await.unwrap().unwrap_err().code, "conflict");
+        assert_eq!(
+            std::fs::read_dir(state.config.data_dir.join("identities"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(db::get_all_identities(&state.db).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "seed")]
+    async fn identity_mutation_explicit_and_backup_seeds_commit_with_first_activation() {
+        for explicit in [true, false] {
+            let (_root, state) = mutation_state();
+            let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
+            let identity = Identity::from_private_key(&key).unwrap();
+            let hash = hex::encode(identity.hash);
+            let parsed = parsed_key(key.to_vec(), (!explicit).then_some(phrase.clone()));
+            let value = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                import_identity_after_parse(
+                    Arc::clone(&state),
+                    None,
+                    explicit.then_some(phrase),
+                    state.activity_request_fence(),
+                    std::future::ready(Ok(parsed)),
+                    |state, parsed, nickname, mnemonic| {
+                        let _serial = VAULT_TEST_SERIAL.lock().unwrap();
+                        persist_parsed_identity_import(state, parsed, nickname, mnemonic)
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(value["hash"], hash);
+            assert_eq!(value["activated"], true);
+            assert!(
+                state
+                    .config
+                    .data_dir
+                    .join("identities")
+                    .join(&hash)
+                    .join("identity.seed")
+                    .is_file()
+            );
+            assert!(db::get_identity(&state.db, &hash).is_some());
+            assert_eq!(db::get_active_identity(&state.db).unwrap()["hash"], hash);
+        }
+    }
 
     fn private_key_bytes() -> Vec<u8> {
         let identity = Identity::new();

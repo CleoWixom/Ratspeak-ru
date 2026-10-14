@@ -1417,6 +1417,7 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, Arc<AppState>) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
+        crate::lxmf::initialize_storage_namespace(&root).unwrap();
         let pool = db::init_pool(&root).unwrap();
         db::init_schema(&pool).unwrap();
         let config = crate::config::DashboardConfig {
@@ -1581,6 +1582,12 @@ mod tests {
     async fn oversized_projection_has_no_staged_files_or_database_effect() {
         let _serial = SERIAL.lock().await;
         let (_temp, state) = fixture();
+        let identities = state.config.data_dir.join("identities");
+        let namespace_before = std::fs::read_dir(&identities)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert!(namespace_before.is_empty());
         let msg = message(&"x".repeat(1024 * 1024), false);
         let error = commit_message(
             &state,
@@ -1592,7 +1599,14 @@ mod tests {
         .err()
         .unwrap();
         assert!(matches!(error, AdmissionDbError::TooLarge));
-        assert!(!state.config.data_dir.join("identities").exists());
+        let namespace_after = std::fs::read_dir(&identities)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            namespace_after, namespace_before,
+            "oversized rejection must not create staged files under the initialized namespace"
+        );
         assert_eq!(
             state
                 .db

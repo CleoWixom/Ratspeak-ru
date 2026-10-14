@@ -1716,10 +1716,12 @@ pub const ratspeak_runtime::lxmf::RATSPEAK_CHAT_CUSTOM_TYPE: &[u8]
 pub const ratspeak_runtime::lxmf::RATSPEAK_CHAT_CUSTOM_TYPE_V1: &[u8]
 pub const ratspeak_runtime::lxmf::RATSPEAK_CHAT_CUSTOM_TYPE_V2: &[u8]
 pub const ratspeak_runtime::lxmf::RATSPEAK_DEFAULT_CAPABILITIES: u64
+pub fn ratspeak_runtime::lxmf::clear_identity_storage_namespace(&std::path::Path) -> core::io::error::Result<()>
 pub fn ratspeak_runtime::lxmf::contact_card_public_key_from_profile(&std::path::Path, &str) -> core::option::Option<[u8; 64]>
 pub fn ratspeak_runtime::lxmf::decode_ratspeak_chat_extension(&lxmf_core::message::LxMessage) -> core::option::Option<ratspeak_runtime::lxmf::RatspeakChatExtension>
 pub fn ratspeak_runtime::lxmf::delivery_method_name(lxmf_core::constants::DeliveryMethod) -> &'static str
 pub fn ratspeak_runtime::lxmf::get_ratspeak_announce_app_data(core::option::Option<&str>, core::option::Option<u8>, core::option::Option<&str>, bool) -> alloc::vec::Vec<u8>
+pub fn ratspeak_runtime::lxmf::initialize_storage_namespace(&std::path::Path) -> core::io::error::Result<()>
 pub fn ratspeak_runtime::lxmf::lxmf_compression_support_db_value(lxmf_core::handlers::CompressionSupport) -> core::option::Option<&'static str>
 pub fn ratspeak_runtime::lxmf::lxmf_compression_support_db_value_from_app_data(&[u8]) -> core::option::Option<&'static str>
 pub fn ratspeak_runtime::lxmf::ratspeak_capability_services_from_app_data(&[u8]) -> alloc::vec::Vec<&'static str>

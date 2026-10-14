@@ -7,10 +7,11 @@ use std::sync::Arc;
 use serde_json::Value;
 use tauri::State;
 
+use super::identity::{acquire_identity_mutation, run_identity_mutation};
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::helpers::{sanitize_announced_display_name, validate_hex};
-use crate::state::AppState;
+use crate::state::{AppState, OwnedIdentitySwitchGuard};
 
 fn to_value<T: serde::Serialize>(v: T) -> AppResult<Value> {
     serde_json::to_value(v).map_err(|e| AppError::internal(e.to_string()))
@@ -82,12 +83,14 @@ async fn prepare_destructive_hardware_operation(
     state: &Arc<AppState>,
     operation: &'static str,
     overwrite_authorized: bool,
+    identity_lifecycle: &Arc<OwnedIdentitySwitchGuard>,
 ) -> AppResult<(u32, bool)> {
     let data_dir = state.config.data_dir.clone();
-    let detected =
-        tokio::task::spawn_blocking(move || ratspeak_runtime::hardware::detect(&data_dir))
-            .await
-            .map_err(|_| AppError::internal("security key detection task panicked"))?;
+    let detected = run_identity_mutation(Arc::clone(identity_lifecycle), move || {
+        ratspeak_runtime::hardware::detect(&data_dir)
+    })
+    .await
+    .map_err(|_| AppError::internal("security key detection task panicked"))?;
     if !detected.detected {
         return Err(AppError::bad_request(
             ratspeak_runtime::hardware::NOT_DETECTED,
@@ -139,13 +142,18 @@ pub async fn hw_provision_recoverable(
     }
     let nickname = clean_nickname(&nickname)?;
     let state = Arc::clone(&state);
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
-    let (expected_serial, shutdown_required) =
-        prepare_destructive_hardware_operation(&state, "hardware_provision_recoverable", force)
-            .await?;
+    let request_fence = state.activity_request_fence();
+    let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
+    let (expected_serial, shutdown_required) = prepare_destructive_hardware_operation(
+        &state,
+        "hardware_provision_recoverable",
+        force,
+        &identity_lifecycle,
+    )
+    .await?;
     let data_dir = state.config.data_dir.clone();
     let db = state.db.clone();
-    let res = tokio::task::spawn_blocking(move || {
+    let res = run_identity_mutation(Arc::clone(&identity_lifecycle), move || {
         ratspeak_runtime::hardware::provision_recoverable(
             &data_dir,
             &db,
@@ -181,13 +189,18 @@ pub async fn hw_provision_hardware_only(
     }
     let nickname = clean_nickname(&nickname)?;
     let state = Arc::clone(&state);
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
-    let (expected_serial, shutdown_required) =
-        prepare_destructive_hardware_operation(&state, "hardware_provision_hardware_only", force)
-            .await?;
+    let request_fence = state.activity_request_fence();
+    let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
+    let (expected_serial, shutdown_required) = prepare_destructive_hardware_operation(
+        &state,
+        "hardware_provision_hardware_only",
+        force,
+        &identity_lifecycle,
+    )
+    .await?;
     let data_dir = state.config.data_dir.clone();
     let db = state.db.clone();
-    let res = tokio::task::spawn_blocking(move || {
+    let res = run_identity_mutation(Arc::clone(&identity_lifecycle), move || {
         ratspeak_runtime::hardware::provision_hardware_only(
             &data_dir,
             &db,
@@ -215,10 +228,11 @@ pub async fn hw_import_existing(
     nickname: String,
 ) -> AppResult<Value> {
     let nickname = clean_nickname(&nickname)?;
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let request_fence = state.activity_request_fence();
+    let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
     let data_dir = state.config.data_dir.clone();
     let db = state.db.clone();
-    let res = tokio::task::spawn_blocking(move || {
+    let res = run_identity_mutation(Arc::clone(&identity_lifecycle), move || {
         ratspeak_runtime::hardware::import_existing(&data_dir, &db, &nickname)
     })
     .await
@@ -242,12 +256,18 @@ pub async fn hw_restore(
     }
     let nickname = clean_nickname(&nickname)?;
     let state = Arc::clone(&state);
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
-    let (expected_serial, shutdown_required) =
-        prepare_destructive_hardware_operation(&state, "hardware_restore", force).await?;
+    let request_fence = state.activity_request_fence();
+    let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
+    let (expected_serial, shutdown_required) = prepare_destructive_hardware_operation(
+        &state,
+        "hardware_restore",
+        force,
+        &identity_lifecycle,
+    )
+    .await?;
     let data_dir = state.config.data_dir.clone();
     let db = state.db.clone();
-    let res = tokio::task::spawn_blocking(move || {
+    let res = run_identity_mutation(Arc::clone(&identity_lifecycle), move || {
         ratspeak_runtime::hardware::restore(
             &data_dir,
             &db,
@@ -276,7 +296,8 @@ pub async fn hw_restore(
 #[tauri::command]
 pub async fn hw_stage_unlock(state: State<'_, Arc<AppState>>, pin: String) -> AppResult<Value> {
     check_pin(&pin)?;
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let request_fence = state.activity_request_fence();
+    let _identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
     state.set_pending_hw_pin(Some(pin));
     to_value(serde_json::json!({ "ok": true }))
 }
@@ -284,11 +305,13 @@ pub async fn hw_stage_unlock(state: State<'_, Arc<AppState>>, pin: String) -> Ap
 #[tauri::command]
 pub async fn hw_reset_piv(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
     let state = Arc::clone(&state);
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let request_fence = state.activity_request_fence();
+    let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
     let (expected_serial, shutdown_required) =
-        prepare_destructive_hardware_operation(&state, "piv_reset", true).await?;
+        prepare_destructive_hardware_operation(&state, "piv_reset", true, &identity_lifecycle)
+            .await?;
 
-    tokio::task::spawn_blocking(move || {
+    run_identity_mutation(Arc::clone(&identity_lifecycle), move || {
         ratspeak_runtime::hardware::reset_piv_application(expected_serial)
     })
     .await
@@ -312,9 +335,10 @@ pub async fn hw_change_pin(
     }
     check_piv_code("Current PIN", &current_pin)?;
     check_piv_code("New PIN", &new_pin)?;
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let request_fence = state.activity_request_fence();
+    let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
     let data_dir = state.config.data_dir.clone();
-    tokio::task::spawn_blocking(move || {
+    run_identity_mutation(Arc::clone(&identity_lifecycle), move || {
         ratspeak_runtime::hardware::change_pin(&data_dir, &hash, &current_pin, &new_pin)
     })
     .await
@@ -329,7 +353,8 @@ pub async fn hw_remove(state: State<'_, Arc<AppState>>, hash: String) -> AppResu
         return Err(AppError::bad_request("Invalid hash"));
     }
     let state = Arc::clone(&state);
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let request_fence = state.activity_request_fence();
+    let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
     let was_locked = state.hw_locked_hash().as_deref() == Some(hash.as_str());
     let was_loaded = state
         .lxmf
@@ -345,7 +370,7 @@ pub async fn hw_remove(state: State<'_, Arc<AppState>>, hash: String) -> AppResu
     let data_dir = state.config.data_dir.clone();
     let db = state.db.clone();
     let hash_for_remove = hash.clone();
-    tokio::task::spawn_blocking(move || {
+    run_identity_mutation(Arc::clone(&identity_lifecycle), move || {
         ratspeak_runtime::hardware::remove(&data_dir, &db, &hash_for_remove)
     })
     .await
@@ -354,7 +379,10 @@ pub async fn hw_remove(state: State<'_, Arc<AppState>>, hash: String) -> AppResu
         tracing::error!(reason = "remove_failed", "hardware identity removal failed");
         AppError::internal("Could not remove hardware identity.")
     })?;
-    let remaining = db::spawn_db(state.db.clone(), |p| db::get_all_identities(&p).len())
+    let remaining =
+        db::spawn_db_with_lease(state.db.clone(), Arc::clone(&identity_lifecycle), |p| {
+            db::get_all_identities(&p).len()
+        })
         .await
         .map_err(|_| AppError::internal("identity count db task panicked"))?;
     if was_locked || was_loaded {
@@ -395,12 +423,15 @@ pub async fn hw_activate_and_unlock(
     }
     check_pin(&pin)?;
     let state = Arc::clone(&state);
-    let _guard = state.identity_switch_lock.lock().await;
+    let request_fence = state.activity_request_fence();
+    let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
 
     let hash_for_lookup = hash.clone();
-    let exists = db::spawn_db(state.db.clone(), move |p| {
-        db::get_identity(&p, &hash_for_lookup).is_some()
-    })
+    let exists = db::spawn_db_with_lease(
+        state.db.clone(),
+        Arc::clone(&identity_lifecycle),
+        move |p| db::get_identity(&p, &hash_for_lookup).is_some(),
+    )
     .await
     .map_err(|_| AppError::internal("identity lookup db task panicked"))?;
     if !exists {
@@ -417,9 +448,11 @@ pub async fn hw_activate_and_unlock(
     shutdown_for_hardware_change(&state, "hardware_identity_activate").await?;
 
     let hash_for_active = hash.clone();
-    db::spawn_db(state.db.clone(), move |p| {
-        db::set_active_identity(&p, &hash_for_active)
-    })
+    db::spawn_db_with_lease(
+        state.db.clone(),
+        Arc::clone(&identity_lifecycle),
+        move |p| db::set_active_identity(&p, &hash_for_active),
+    )
     .await
     .map_err(|_| AppError::internal("activate identity db task panicked"))?
     .map_err(|_| {
@@ -486,4 +519,67 @@ fn parse_remaining(msg: &str) -> Option<u8> {
         .collect::<String>()
         .parse()
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hardware_mutation_cancelled_waiter_keeps_actual_disk_worker_owned() {
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+        let pool = db::init_pool(root.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        let state = Arc::new(AppState::new(
+            config,
+            pool,
+            Arc::new(ratspeak_core::NoopEmitter),
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        let lease = acquire_identity_mutation(&state, state.activity_request_fence())
+            .await
+            .unwrap();
+        let worker_lease = Arc::clone(&lease);
+        let artifact = state
+            .config
+            .data_dir
+            .join("identities/fake-hardware-registration");
+        let worker_artifact = artifact.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // The same production worker wrapper stands in for PCSC/device writes.
+        let waiter = tokio::spawn(async move {
+            run_identity_mutation(worker_lease, move || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                std::fs::write(worker_artifact, b"device registration finished").unwrap();
+            })
+            .await
+        });
+        ready_rx.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        drop(lease);
+        let reset_state = Arc::clone(&state);
+        let mut reset = tokio::spawn(async move {
+            let _lifecycle = reset_state.identity_switch_lock.lock_owned().await;
+            crate::lxmf::clear_identity_storage_namespace(&reset_state.config.data_dir).unwrap();
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(40), &mut reset)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), reset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !artifact.exists(),
+            "a cancelled hardware waiter must not recreate files after reset"
+        );
+    }
 }

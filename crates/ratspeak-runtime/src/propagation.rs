@@ -1554,6 +1554,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
+        crate::lxmf::initialize_storage_namespace(&tmp).unwrap();
         let config = DashboardConfig::from_env_and_defaults(tmp);
         let mgr = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(mgr).unwrap();
@@ -1645,7 +1646,7 @@ mod tests {
     }
 
     fn install_lxmf_manager(state: &Arc<AppState>, mode: &str, manual_node: &str) -> String {
-        let mgr = LxmfManager::load_or_create(&state.config.data_dir, None, None).unwrap();
+        let mgr = LxmfManager::load_or_create(&state.config.data_root, None, None).unwrap();
         let identity_id = mgr.identity_hash.clone();
         crate::db::save_identity(&state.db, &identity_id, &mgr.lxmf_hash, "test", "Test");
         crate::db::set_active_identity(&state.db, &identity_id).unwrap();

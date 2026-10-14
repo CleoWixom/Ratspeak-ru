@@ -367,6 +367,7 @@ mod tests {
 
     fn make_state_with_pool_size(max_size: u32) -> (tempfile::TempDir, Arc<AppState>) {
         let temp = tempfile::TempDir::new().unwrap();
+        crate::lxmf::initialize_storage_namespace(temp.path()).unwrap();
         let config = DashboardConfig::from_env_and_defaults(temp.path().to_path_buf());
         let pool = r2d2::Pool::builder()
             .max_size(max_size)

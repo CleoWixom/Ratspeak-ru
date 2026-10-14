@@ -53,6 +53,12 @@ pub async fn init_core(
     data_dir: std::path::PathBuf,
     app_handle: tauri::AppHandle,
 ) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
+    // Windows may need to publish a fresh sibling during crash reconciliation.
+    // Establish roots before configuration or SQLite can hold live handles.
+    let storage_root = data_dir.clone();
+    tokio::task::spawn_blocking(move || lxmf::initialize_storage_namespace(&storage_root))
+        .await
+        .map_err(|_| std::io::Error::other("storage namespace task panicked"))??;
     let config = config::DashboardConfig::from_env_and_defaults(data_dir.clone());
 
     let data_dir_for_pool = data_dir.clone();

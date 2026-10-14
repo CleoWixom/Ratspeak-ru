@@ -311,6 +311,7 @@ mod tests {
 
     fn make_state() -> Arc<AppState> {
         let tmp = tempfile::TempDir::new().unwrap().keep();
+        crate::lxmf::initialize_storage_namespace(&tmp).unwrap();
         let config = DashboardConfig::from_env_and_defaults(tmp.clone());
         let pool = r2d2::Pool::builder()
             .max_size(2)

@@ -20,6 +20,7 @@ impl Fixture {
     }
     fn with_emitter(emitter: Arc<dyn ratspeak_core::Emitter>) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        ratspeak_runtime::lxmf::initialize_storage_namespace(dir.path()).unwrap();
         let pool = db::init_pool(dir.path()).unwrap();
         db::init_schema(&pool).unwrap();
         db::save_identity(&pool, "alice", &"11".repeat(16), "Alice", "Alice");
@@ -246,7 +247,7 @@ async fn voice_stage_cannot_cross_identity_changes_with_or_without_client_id() {
         f.state.clear_identity_scoped_runtime_state();
         db::set_active_identity(&f.state.db, "bob").unwrap();
         let replacement = f._dir.path().join("replacement-runtime");
-        std::fs::create_dir_all(&replacement).unwrap();
+        ratspeak_runtime::lxmf::initialize_storage_namespace(&replacement).unwrap();
         *f.state.lxmf.lock().unwrap() =
             Some(LxmfManager::load_or_create(&replacement, None, None).unwrap());
         if return_to_alice {

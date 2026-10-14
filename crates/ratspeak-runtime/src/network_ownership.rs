@@ -766,6 +766,7 @@ mod tests {
     }
     async fn fixture() -> (tempfile::TempDir, Arc<AppState>, Arc<TestStore>) {
         let dir = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(dir.path()).unwrap();
         let config = crate::config::DashboardConfig::from_env_and_defaults(dir.path().into());
         let pool = db::init_pool(dir.path()).unwrap();
         db::init_schema(&pool).unwrap();

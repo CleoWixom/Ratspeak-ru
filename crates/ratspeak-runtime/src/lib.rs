@@ -7589,6 +7589,7 @@ mod inbound_pipeline_tests {
                 .unwrap()
                 .as_nanos()
         ));
+        crate::lxmf::initialize_storage_namespace(&root).unwrap();
         let data_dir = root.join(".ratspeak");
         let rns_config_dir = data_dir.join("reticulum");
         std::fs::create_dir_all(&rns_config_dir).unwrap();
@@ -8837,6 +8838,7 @@ mod transport_startup_tests {
     }
 
     fn state_for_root(root: std::path::PathBuf) -> AppState {
+        crate::lxmf::initialize_storage_namespace(&root).unwrap();
         let data_dir = root.join(".ratspeak");
         let rns_config_dir = data_dir.join("reticulum");
         std::fs::create_dir_all(&rns_config_dir).unwrap();

@@ -13,6 +13,13 @@ use crate::error::{AppError, AppResult};
 use crate::helpers::{active_identity_id, sanitize_announced_display_name};
 use crate::state::AppState;
 
+fn reset_identity_storage_error(error: impl std::fmt::Display) -> AppError {
+    tracing::error!(%error, "identity data reset could not finish");
+    AppError::internal(
+        "Reset could not finish removing identity data. Restart the app and retry the reset.",
+    )
+}
+
 fn app_display_version() -> &'static str {
     let tagged_version = option_env!("RATSPEAK_DISPLAY_VERSION")
         .or(option_env!("GITHUB_REF_NAME"))
@@ -661,16 +668,19 @@ pub async fn api_identity_reset(state: State<'_, Arc<AppState>>) -> AppResult<Va
 
     if let Some(data_dir) = reset_data_dir {
         let lifecycle = Arc::clone(&identity_lifecycle);
-        let _ = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let _lifecycle = lifecycle;
-            std::fs::remove_dir_all(data_dir.join("identities")).ok();
+            crate::lxmf::clear_identity_storage_namespace(&data_dir)?;
             std::fs::remove_dir_all(data_dir.join("ratchets")).ok();
             std::fs::remove_file(data_dir.join("identity")).ok();
             // Hub keys are identity-scoped key material; a surviving keyfile
             // would resurrect the hub on its old destination hash.
             std::fs::remove_dir_all(data_dir.join("channel_hub")).ok();
+            Ok::<(), std::io::Error>(())
         })
-        .await;
+        .await
+        .map_err(reset_identity_storage_error)?
+        .map_err(reset_identity_storage_error)?;
     }
 
     state.set_startup_stage("ready");
@@ -735,15 +745,9 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
     // Bulk fs wipe; keep off the runtime.
     let data_dir = state.config.data_dir.clone();
     let lifecycle = Arc::clone(&identity_lifecycle);
-    let _ = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let _lifecycle = lifecycle;
-        let identities_dir = data_dir.join("identities");
-        if identities_dir.exists() && std::fs::remove_dir_all(&identities_dir).is_err() {
-            tracing::warn!(
-                reason = "remove_identities_failed",
-                "Factory reset: failed to remove identities dir"
-            );
-        }
+        crate::lxmf::clear_identity_storage_namespace(&data_dir)?;
         let ratchet_dir = data_dir.join("ratchets");
         if ratchet_dir.exists() && std::fs::remove_dir_all(&ratchet_dir).is_err() {
             tracing::warn!(
@@ -795,8 +799,11 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
                 }
             }
         }
+        Ok::<(), std::io::Error>(())
     })
-    .await;
+    .await
+    .map_err(reset_identity_storage_error)?
+    .map_err(reset_identity_storage_error)?;
 
     let storage_dir = rns_config_dir.join("storage");
     if storage_dir.exists() && std::fs::remove_dir_all(&storage_dir).is_err() {

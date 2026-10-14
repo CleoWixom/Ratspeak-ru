@@ -3445,6 +3445,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        crate::lxmf::initialize_storage_namespace(&tmp).unwrap();
         let config = DashboardConfig::from_env_and_defaults(tmp);
         let mgr = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(mgr).unwrap();

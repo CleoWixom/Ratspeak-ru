@@ -1308,7 +1308,6 @@ pub fn run() {
             let handle = app.handle().clone();
 
             let data_dir = paths::resolve_data_dir(&handle);
-            std::fs::create_dir_all(&data_dir).ok();
             tracing::debug!("resolved Ratspeak data directory");
 
             // setup() has no Tokio runtime; leak one for process-lifetime tasks.
