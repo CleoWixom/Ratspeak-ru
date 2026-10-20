@@ -512,6 +512,22 @@ fn native_ble_failure_code(code: &str) -> ratspeak_tauri::commands::ble::BleRnod
     }
 }
 
+/// Closed reasons a native BLE RNode is still being retried; anything else
+/// stays unexplained rather than forwarding platform text.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn native_ble_waiting_reason(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "not_reachable" => "not_reachable",
+        "link_lost" => "link_lost",
+        "service_missing" => "service_missing",
+        "bluetooth_off" => "bluetooth_off",
+        "permission_needed" => "permission_needed",
+        "radio_disconnected" => "radio_disconnected",
+        "connect_failed" => "connect_failed",
+        _ => return None,
+    })
+}
+
 #[cfg(target_os = "android")]
 fn native_ble_hardware_reason(code: &str) -> &'static str {
     match code {
@@ -553,7 +569,15 @@ pub extern "system" fn Java_org_ratspeak_android_RatspeakNativeBridge_nativeBleR
     match state_code {
         0 | 1 | 3 => {
             // Product status is emitted as a closed state without address,
-            // device name, or platform error detail.
+            // device name, or platform error detail. A retrying radio carries
+            // its last closed failure reason so the user can act on it.
+            let reason = if state_code == 3 {
+                None
+            } else {
+                decode_android_string(&env, error_code)
+                    .as_deref()
+                    .and_then(native_ble_waiting_reason)
+            };
             app_state.publish_mobile_hardware_state(
                 "ble_rnode",
                 match state_code {
@@ -561,7 +585,7 @@ pub extern "system" fn Java_org_ratspeak_android_RatspeakNativeBridge_nativeBleR
                     1 => "waiting_for_radio",
                     _ => "initializing",
                 },
-                None,
+                reason,
             );
         }
         2 => {
@@ -896,8 +920,8 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        accept_sequence, failed_ble_replacement_owner, owner_after_rejected_ble_replacement,
-        valid_ble_native_request, NetworkType,
+        accept_sequence, failed_ble_replacement_owner, native_ble_waiting_reason,
+        owner_after_rejected_ble_replacement, valid_ble_native_request, NetworkType,
     };
     use ratspeak_tauri::mobile_platform::NativeBleRnodeRequest;
 
@@ -921,6 +945,29 @@ mod tests {
             id_interval: None,
             id_callsign: None,
             saved_startup: false,
+        }
+    }
+
+    #[test]
+    fn ble_waiting_reason_is_a_closed_vocabulary() {
+        for code in [
+            "not_reachable",
+            "link_lost",
+            "service_missing",
+            "bluetooth_off",
+            "permission_needed",
+            "radio_disconnected",
+            "connect_failed",
+        ] {
+            assert_eq!(native_ble_waiting_reason(code), Some(code));
+        }
+        for code in [
+            "stale_bond",
+            "Exception: SecurityException",
+            "",
+            "status=133",
+        ] {
+            assert_eq!(native_ble_waiting_reason(code), None, "{code}");
         }
     }
 

@@ -283,6 +283,33 @@ object RatspeakNativeBridge {
         }
     }
 
+    /** Where a stale RNode pairing is forgotten; user action only. */
+    @JvmStatic
+    fun openBluetoothSettings(): Boolean {
+        return startSettings(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+    }
+
+    /** The only grant path once Android stops showing the permission prompt. */
+    @JvmStatic
+    fun openAppPermissionSettings(): Boolean {
+        val context = context() ?: return false
+        return startSettings(
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = "package:${context.packageName}".toUri()
+            },
+        )
+    }
+
+    private fun startSettings(intent: Intent): Boolean {
+        val context = context() ?: return false
+        return try {
+            context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     @JvmStatic
     fun batteryOptimizationStatus(): String {
         val context = context() ?: return "unavailable"

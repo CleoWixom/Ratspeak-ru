@@ -426,6 +426,49 @@ class RatspeakMobilePolicyTest {
     }
 
     @Test
+    fun bleSetupFailureIsClassifiedFromEvidence() {
+        fun classify(
+            bonded: Boolean = true,
+            link: Boolean = false,
+            status: Int = 0,
+            bondLoss: Boolean = false,
+            missing: Boolean = false,
+        ) = RatspeakMobilePolicy.classifyBleSetupFailure(bonded, link, status, bondLoss, missing)
+
+        // Off, out of range, or held by another host: no link ever forms.
+        assertEquals(RatspeakBleGatt.FAILURE_NOT_REACHABLE, classify(status = 133))
+        assertEquals(RatspeakBleGatt.FAILURE_NOT_REACHABLE, classify(status = 147))
+        assertEquals(RatspeakBleGatt.FAILURE_NOT_REACHABLE, classify(bonded = false))
+        assertEquals(RatspeakBleGatt.FAILURE_LINK_LOST, classify(link = true, status = 8))
+        assertEquals(RatspeakBleGatt.FAILURE_SERVICE_MISSING, classify(link = true, missing = true))
+        // Android 17 reports a forgotten pairing as 257/147/133 plus a bond-loss
+        // broadcast; older stacks report an authentication status.
+        assertEquals(RatspeakBleGatt.FAILURE_STALE_BOND, classify(status = 257, bondLoss = true))
+        assertEquals(RatspeakBleGatt.FAILURE_STALE_BOND, classify(link = true, status = 5))
+        assertEquals(RatspeakBleGatt.FAILURE_STALE_BOND, classify(status = 137))
+        // Only a pairing that predates the attempt can be stale.
+        assertEquals(
+            RatspeakBleGatt.FAILURE_LINK_LOST,
+            classify(bonded = false, link = true, status = 5, bondLoss = true),
+        )
+    }
+
+    @Test
+    fun unreachableRadiosRetryButRejectedPairingsWaitForTheUser() {
+        listOf(
+            RatspeakBleGatt.FAILURE_NOT_REACHABLE,
+            RatspeakBleGatt.FAILURE_LINK_LOST,
+            RatspeakBleGatt.FAILURE_SERVICE_MISSING,
+            RatspeakBleGatt.FAILURE_PERMISSION,
+        ).forEach { assertTrue(it, RatspeakMobilePolicy.shouldRetryBle(it)) }
+        listOf(
+            RatspeakBleGatt.FAILURE_STALE_BOND,
+            RatspeakBleGatt.FAILURE_BOND_TIMEOUT,
+            RatspeakBleGatt.FAILURE_PAIRING_REQUIRED,
+        ).forEach { assertFalse(it, RatspeakMobilePolicy.shouldRetryBle(it)) }
+    }
+
+    @Test
     fun androidBleAutoResumeIsExplicitPolicyOverRetryableLoss() {
         assertTrue(
             RatspeakMobilePolicy.shouldAutoResumeBle(

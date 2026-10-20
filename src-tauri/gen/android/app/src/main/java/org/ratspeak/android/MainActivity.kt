@@ -350,6 +350,9 @@ class MainActivity : TauriActivity() {
         RatspeakNativeBridge.activityResumed(activityGeneration, true)
         deliverPendingNotificationRoute()
         RatspeakPlatformSupervisor.replay()
+        // A user returning to the app is the moment a waiting radio is most
+        // likely back (powered on, released by another host); retry now.
+        RatspeakBleRnodeSupervisor.wake()
         // ACTION_REFRESH clears per-sender notifications in RatspeakService
         // and kicks the poll loop so lastKnownUnread is current before the
         // user reads messages to zero.
@@ -1057,6 +1060,7 @@ class MainActivity : TauriActivity() {
             val granted = grantResults.isNotEmpty() && grantResults.all {
                 it == PackageManager.PERMISSION_GRANTED
             }
+            if (granted) RatspeakBleRnodeSupervisor.wake()
             // Notify the WebView of the permission result
             handler.post {
                 webViewRef?.evaluateJavascript(
@@ -1839,6 +1843,16 @@ class MainActivity : TauriActivity() {
         @JavascriptInterface
         fun openNotificationSettings(): Boolean {
             return RatspeakNativeBridge.openNotificationSettings()
+        }
+
+        @JavascriptInterface
+        fun openBluetoothSettings(): Boolean {
+            return RatspeakNativeBridge.openBluetoothSettings()
+        }
+
+        @JavascriptInterface
+        fun openAppPermissionSettings(): Boolean {
+            return RatspeakNativeBridge.openAppPermissionSettings()
         }
 
         @JavascriptInterface

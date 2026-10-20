@@ -273,7 +273,8 @@ RS.listen('stats_update', function(data) {
 
         document.querySelectorAll('.conn-iface-row').forEach(function(row) {
             var ifaceName = row.dataset.ifaceName;
-            if (!ifaceName) return;
+            // Same rule as the full render: paused stays muted, no stats is not up.
+            if (!ifaceName || row.classList.contains('is-paused')) return;
             var dot = row.querySelector('.conn-iface-dot');
             if (!dot) return;
             var liveData = (typeof getInterfaceLiveStatus === 'function') ? getInterfaceLiveStatus(ifaceName) : null;
@@ -285,11 +286,7 @@ RS.listen('stats_update', function(data) {
                 isActive = d > 0 && ((l.txb - p.txb) > 0 || (l.rxb - p.rxb) > 0);
             }
             dot.className = 'conn-iface-dot';
-            if (liveData) {
-                dot.classList.add(liveData.online ? 'up' : 'down');
-            } else {
-                dot.classList.add('up');
-            }
+            dot.classList.add(liveData && liveData.online !== false ? 'up' : 'down');
             if (isActive) dot.classList.add('active');
         });
     }
@@ -1089,6 +1086,21 @@ RS.listen('ble_rnode_pairing_finished', function(data) {
     _bleRnodeDismissModal(record);
 });
 
+// Android BLE connect phases for the add/edit dialog. Retry phases are left
+// out so they never overwrite the explained waiting reason.
+var _BLE_RNODE_PHASES = {
+    bonding: 'Pairing... Enter the PIN shown on the RNode when Android asks.',
+    pairing_settle: 'Paired. Reconnecting securely...',
+    mtu: 'Negotiating link...',
+    discovering: 'Discovering services...',
+    subscribing: 'Enabling notifications...',
+};
+window._onBleConnectProgress = function(progress) {
+    var pd = window._activeProgressDialog;
+    var message = progress && _BLE_RNODE_PHASES[progress.phase];
+    if (message && pd && pd.bleRnode && pd.isOpen()) pd.update(message);
+};
+
 // Android hardware lifecycle is owned by Rust + the application-scoped native
 // supervisor. The WebView observes closed product state only.
 RS.listen('mobile_hardware_state', function(data) {
@@ -1116,6 +1128,14 @@ RS.listen('mobile_hardware_state', function(data) {
         conflict: 'Only one Bluetooth RNode can be active on Android.',
     };
     var message = messages[data.state];
+    var waiting = {
+        not_reachable: 'Radio not found. Check that it is on, charged, and not connected elsewhere. Retrying...',
+        link_lost: 'The RNode connection dropped during setup. Retrying...',
+        service_missing: 'The device did not offer the RNode Bluetooth service. Retrying...',
+        bluetooth_off: 'Turn on Bluetooth to reconnect the RNode.',
+        permission_needed: 'Bluetooth permission is required to use the RNode.',
+    };
+    if (data.state === 'waiting_for_radio' && waiting[data.reason]) message = waiting[data.reason];
     var pd = window._activeProgressDialog;
     if (data.state === 'failed') {
         var failures = {

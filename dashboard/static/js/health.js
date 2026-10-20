@@ -279,6 +279,7 @@ var ICON_RADIO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" str
 var ICON_TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
 var ICON_PAUSE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>';
 var ICON_PLAY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>';
+var ICON_INFO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>';
 
 function buildIfaceActionItems(ifaceType, ifaceName) {
     var items = [];
@@ -294,16 +295,25 @@ function buildIfaceActionItems(ifaceType, ifaceName) {
         ? _cachedConfigIfaces.mobile_hardware.ble_rnode
         : null;
     var bleStateName = bleState && typeof bleState.state === 'string' ? bleState.state : '';
+    var bleReason = bleState && typeof bleState.reason === 'string' ? bleState.reason : '';
     var bleInFlight = bleStateName === 'waiting_for_radio' ||
         bleStateName === 'reconnecting' ||
         bleStateName === 'connecting' ||
         bleStateName === 'initializing';
+    var bleHelp = isBleRnode && !paused ? bleRnodeHelp(bleStateName, bleReason) : null;
     if (supportsPause) {
         if (paused) {
             items.push({
                 label: 'Resume Interface',
                 icon: ICON_PLAY,
                 onSelect: function() { setInterfacePaused(ifaceType, ifaceName, false); }
+            });
+        } else if (isBleRnode && bleInFlight && bleReason === 'permission_needed') {
+            // The supervisor keeps retrying; a grant wakes it immediately.
+            items.push({
+                label: 'Grant Bluetooth Permission',
+                icon: ICON_RADIO,
+                onSelect: function() { requestBleRnodePermission(); }
             });
         } else if (isBleRnode && bleInFlight) {
             // The native supervisor already owns the durable retry. Re-running
@@ -334,6 +344,13 @@ function buildIfaceActionItems(ifaceType, ifaceName) {
                 onSelect: function() { setInterfacePaused(ifaceType, ifaceName, !unavailable); }
             });
         }
+        if (bleHelp) {
+            items.push({
+                label: 'Connection Help',
+                icon: ICON_INFO,
+                onSelect: function() { showBleRnodeHelp(bleHelp); }
+            });
+        }
         items.push({ separator: true });
     }
     if (isLoraInterfaceType(ifaceType)) {
@@ -344,6 +361,96 @@ function buildIfaceActionItems(ifaceType, ifaceName) {
     items.push({ label: 'Rename', icon: ICON_PENCIL, onSelect: function() { openRenameInterfaceDialog(ifaceName); } });
     items.push({ label: 'Remove', icon: ICON_TRASH, danger: true, onSelect: function() { confirmRemoveInterface(ifaceType, ifaceName); } });
     return items;
+}
+
+// Guidance for BLE RNode failures only a person at the radio or phone can fix.
+var BLE_RNODE_HELP = {
+    not_reachable: {
+        title: 'Radio not found',
+        message: 'Ratspeak cannot reach this RNode over Bluetooth. Check that it is ' +
+            'powered on and charged (an e-paper screen keeps its last image when the ' +
+            'battery is empty), that its Bluetooth is enabled (installing RNode ' +
+            'firmware can turn it off), and that no other phone or computer is ' +
+            'connected to it. Ratspeak keeps trying, and tries again right away when ' +
+            'you return to the app.'
+    },
+    link_lost: {
+        title: 'Connection dropped',
+        message: 'The RNode answered, but the Bluetooth link dropped during setup. Keep ' +
+            'it powered and close to this phone. Ratspeak keeps trying.'
+    },
+    service_missing: {
+        title: 'No RNode service',
+        message: 'The device connected but did not offer the RNode Bluetooth service. ' +
+            'Check that it runs RNode firmware with Bluetooth enabled.'
+    },
+    pairing_required: {
+        title: 'Pairing needed',
+        message: 'Put the RNode in Bluetooth pairing mode, then choose Retry Connection ' +
+            'and enter the PIN it shows.'
+    },
+    stale_bond: {
+        title: 'Pair again',
+        message: 'The RNode no longer recognizes the pairing saved on this phone. Forget ' +
+            'the RNode in Android Bluetooth settings, put the RNode in pairing mode, then ' +
+            'choose Retry Connection and enter the PIN it shows.',
+        bluetoothSettings: true
+    },
+};
+
+function bleRnodeHelp(state, reason) {
+    var retrying = state === 'waiting_for_radio' || state === 'connecting';
+    if (retrying && (reason === 'not_reachable' || reason === 'link_lost' ||
+        reason === 'service_missing')) {
+        return BLE_RNODE_HELP[reason];
+    }
+    if (state === 'failed' && (reason === 'pairing_required' || reason === 'bond_timeout')) {
+        return BLE_RNODE_HELP.pairing_required;
+    }
+    if (state === 'failed' && reason === 'stale_bond') return BLE_RNODE_HELP.stale_bond;
+    return null;
+}
+
+function showBleRnodeHelp(help) {
+    var bridge = typeof hasAndroidBridge === 'function' && hasAndroidBridge()
+        ? window.RatspeakAndroid
+        : null;
+    if (help.bluetoothSettings && bridge && typeof bridge.openBluetoothSettings === 'function') {
+        rsConfirm({
+            title: help.title,
+            message: help.message,
+            confirmText: 'Bluetooth Settings',
+            cancelText: 'Close'
+        }).then(function(open) {
+            if (open) {
+                try { bridge.openBluetoothSettings(); } catch (_) {}
+            }
+        });
+        return;
+    }
+    rsAlert({ title: help.title, message: help.message });
+}
+
+function requestBleRnodePermission() {
+    _ensureBlePermissions().then(function(granted) {
+        if (granted) return;
+        // Android stops prompting after repeated denials; only Settings can grant.
+        var bridge = typeof hasAndroidBridge === 'function' && hasAndroidBridge()
+            ? window.RatspeakAndroid
+            : null;
+        if (!bridge || typeof bridge.openAppPermissionSettings !== 'function') return;
+        rsConfirm({
+            title: 'Bluetooth permission needed',
+            message: 'Allow Nearby devices for Ratspeak in Android settings so it can ' +
+                'connect to the RNode.',
+            confirmText: 'Open Settings',
+            cancelText: 'Close'
+        }).then(function(open) {
+            if (open) {
+                try { bridge.openAppPermissionSettings(); } catch (_) {}
+            }
+        });
+    });
 }
 
 function setInterfacePaused(ifaceType, ifaceName, paused) {
@@ -977,14 +1084,24 @@ function _mobileRnodeHealth(port, mobileHardware) {
             connect_failed: 'Connection failed',
             multiple_configured_radios: 'Radio conflict',
         };
+        // Why a retrying radio last failed; unknown reasons stay generic.
+        var retryLabels = {
+            not_reachable: 'Radio not found',
+            link_lost: 'Connection dropped',
+            service_missing: 'No RNode service',
+            bluetooth_off: 'Bluetooth is off',
+            permission_needed: 'Bluetooth permission needed',
+        };
+        var retrying = state.state === 'waiting_for_radio' || state.state === 'connecting';
         return {
             kind: 'ble_rnode',
             state: state.state,
             reason: state.reason || '',
             label: state.state === 'failed'
                 ? (failedLabels[state.reason] || 'Connection failed')
-                : (bleLabels[state.state] || 'Waiting for radio'),
-            actionable: state.state === 'failed' || state.state === 'disabled',
+                : ((retrying && retryLabels[state.reason]) || bleLabels[state.state] || 'Waiting for radio'),
+            actionable: state.state === 'failed' || state.state === 'disabled' ||
+                (retrying && state.reason === 'permission_needed'),
         };
     }
     return null;

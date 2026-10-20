@@ -94,6 +94,15 @@ class RatspeakBleGatt(
         const val FAILURE_BLUETOOTH_OFF = "bluetooth_off"
         const val FAILURE_PERMISSION = "permission_needed"
         const val FAILURE_CONNECT = "connect_failed"
+        const val FAILURE_NOT_REACHABLE = "not_reachable"
+        const val FAILURE_LINK_LOST = "link_lost"
+        const val FAILURE_SERVICE_MISSING = "service_missing"
+
+        // Android delivers the bond-loss broadcast shortly after the encrypted
+        // link fails; wait this long before classifying a bonded link loss.
+        private const val BOND_LOSS_SETTLE_MS = 600L
+        // BluetoothDevice.ACTION_KEY_MISSING; flagged API, sent on newer Android.
+        private const val ACTION_KEY_MISSING = "android.bluetooth.device.action.KEY_MISSING"
     }
 
     data class ConnectFailure(val code: String, val detail: String)
@@ -134,12 +143,21 @@ class RatspeakBleGatt(
     private val rustDetachObserved = AtomicBoolean(false)
     private var detachFrameMatch = 0
 
+    // Facts gathered across one connect() for classifying its failure.
+    private val linkEstablished = AtomicBoolean(false)
+    private val setupLinkLost = AtomicBoolean(false)
+    private val serviceMissing = AtomicBoolean(false)
+    private val bondLossObserved = AtomicBoolean(false)
+    private val lastDescriptorStatus = AtomicInteger(BluetoothGatt.GATT_SUCCESS)
+    @Volatile private var classifiedFailure: String? = null
+    private var bondLossReceiver: BroadcastReceiver? = null
+
     private val handler = Handler(Looper.getMainLooper())
 
     @SuppressLint("MissingPermission")
     fun connect(address: String): ConnectFailure? {
         return connectDetail(address)?.let { detail ->
-            val code = when {
+            val code = classifiedFailure ?: when {
                 detail.startsWith(ERR_STALE_BOND) -> FAILURE_STALE_BOND
                 detail.contains(ERR_BOND_TIMEOUT) -> FAILURE_BOND_TIMEOUT
                 detail.startsWith(ERR_PAIRING_MODE) -> FAILURE_PAIRING_REQUIRED
@@ -157,6 +175,10 @@ class RatspeakBleGatt(
             Log.i(TAG, "=== BLE CONNECT START === address=$address")
             rustDetachObserved.set(false)
             detachFrameMatch = 0
+            classifiedFailure = null
+            linkEstablished.set(false)
+            serviceMissing.set(false)
+            bondLossObserved.set(false)
             adapterUnavailable.set(false)
             tcpWriter?.shutdown()
             tcpWriter = null
@@ -229,6 +251,9 @@ class RatspeakBleGatt(
             }
 
             val alreadyBonded = device.bondState == BluetoothDevice.BOND_BONDED
+            // Only a pairing that predates this connect can have gone stale.
+            val bondPreexisting = alreadyBonded && !bondedDuringThisConnect
+            if (bondPreexisting) registerBondLossReceiver(address)
             val attempts = if (alreadyBonded) BONDED_GATT_CONNECT_ATTEMPTS else 1
             var gattError: String? = null
             for (attempt in 1..attempts) {
@@ -248,20 +273,32 @@ class RatspeakBleGatt(
                 if (gattError == null) break
 
                 Log.w(TAG, "GATT setup attempt $attempt/$attempts failed: $gattError")
+                if (bondPreexisting && setupLinkLost.get()) awaitBondLossEvidence()
                 closeGattOnly("retry after failed setup")
+                // Each retry against a rejected key re-triggers the system
+                // re-pairing prompt; stop at the first evidence.
+                if (bondLossObserved.get()) break
                 if (attempt < attempts) {
                     emitProgress("connecting_retry")
                     Thread.sleep(BONDED_GATT_RETRY_DELAY_MS * attempt)
                 }
             }
+            unregisterBondLossReceiver()
             if (gattError != null) {
-                cleanup()
                 // Error 133 and timeouts are routine Android stack failures,
-                // not evidence that the saved bond is stale. Only explicit
-                // authentication/encryption rejection requires user repair.
-                val authenticationRejected = gattError.contains("status=5") ||
-                    gattError.contains("status=15")
-                val prefix = if (alreadyBonded && authenticationRejected) "$ERR_STALE_BOND " else ""
+                // not evidence that the saved bond is stale. Only rejection of
+                // the stored key (status or the system's bond-loss signal) is.
+                val code = RatspeakMobilePolicy.classifyBleSetupFailure(
+                    alreadyBonded = bondPreexisting,
+                    linkEstablished = linkEstablished.get(),
+                    lastGattStatus = lastGattStatus.get(),
+                    bondLossObserved = bondLossObserved.get(),
+                    serviceMissing = serviceMissing.get(),
+                )
+                // Local adapter loss keeps its own closed code.
+                classifiedFailure = if (adapterUnavailable.get()) null else code
+                cleanup()
+                val prefix = if (classifiedFailure == FAILURE_STALE_BOND) "$ERR_STALE_BOND " else ""
                 return err(prefix + gattError)
             }
             if (adapterUnavailable.get()) {
@@ -288,6 +325,7 @@ class RatspeakBleGatt(
         negotiatedMtu = MTU_FALLBACK_PAYLOAD
         rxChar = null
         txChar = null
+        setupLinkLost.set(false)
 
         // Phase 1: GATT connect over the bonded (encrypted) link.
         connectLatch = CountDownLatch(1)
@@ -324,6 +362,7 @@ class RatspeakBleGatt(
             }
         }
         Log.i(TAG, "Phase 1 COMPLETE: GATT connected")
+        linkEstablished.set(true)
 
         // Phase 2: MTU negotiation.
         emitProgress("mtu")
@@ -335,6 +374,7 @@ class RatspeakBleGatt(
             Log.w(TAG, "MTU negotiation timed out - using fallback payload=$MTU_FALLBACK_PAYLOAD")
         }
         if (adapterUnavailable.get()) return "Bluetooth is turned off"
+        linkLostDuring("MTU negotiation")?.let { return it }
         Log.i(TAG, "Phase 2 COMPLETE: MTU payload=$negotiatedMtu")
 
         // Phase 3: Service discovery.
@@ -342,6 +382,7 @@ class RatspeakBleGatt(
         Log.i(TAG, "Phase 3: Discovering services...")
         if (!discoverServicesWithLatch(15)) {
             if (adapterUnavailable.get()) return "Bluetooth is turned off"
+            linkLostDuring("service discovery")?.let { return it }
             gatt?.let { refreshGattCache(it) }
             return "Service discovery failed"
         }
@@ -356,12 +397,19 @@ class RatspeakBleGatt(
         val nusService: BluetoothGattService = gatt?.getService(BleUuids.NUS_SERVICE)
             ?: run {
                 gatt?.let { refreshGattCache(it) }
+                serviceMissing.set(true)
                 return "NUS service not found"
             }
         rxChar = nusService.getCharacteristic(BleUuids.NUS_RX_CHAR)
-            ?: return "NUS RX characteristic not found"
+            ?: run {
+                serviceMissing.set(true)
+                return "NUS RX characteristic not found"
+            }
         txChar = nusService.getCharacteristic(BleUuids.NUS_TX_CHAR)
-            ?: return "NUS TX characteristic not found"
+            ?: run {
+                serviceMissing.set(true)
+                return "NUS TX characteristic not found"
+            }
         Log.i(TAG, "Phase 3 COMPLETE: NUS found")
 
         // Phase 5: Subscribe to TX notifications (now authenticated).
@@ -383,12 +431,20 @@ class RatspeakBleGatt(
             return "TX notification descriptor write rejected"
         }
         if (!descriptorLatch!!.await(10, TimeUnit.SECONDS)) {
-            return "TX notification subscribe timed out"
+            return linkLostDuring("notification setup") ?: "TX notification subscribe timed out"
         }
         if (adapterUnavailable.get()) return "Bluetooth is turned off"
-        if (!descriptorStatus.get()) return "TX notification subscribe failed"
+        linkLostDuring("notification setup")?.let { return it }
+        if (!descriptorStatus.get()) {
+            return "TX notification subscribe failed (status=${lastDescriptorStatus.get()})"
+        }
         Log.i(TAG, "Phase 5 COMPLETE: TX notifications enabled")
         return null
+    }
+
+    private fun linkLostDuring(phase: String): String? {
+        if (!setupLinkLost.get()) return null
+        return "Link lost during $phase (status=${lastGattStatus.get()})"
     }
 
     /** Run service discovery against the current gatt connection with a timeout. */
@@ -674,6 +730,7 @@ class RatspeakBleGatt(
             Log.i(TAG, "cleanup()")
             running.set(false)
             unregisterBondReceiver()
+            unregisterBondLossReceiver()
             unregisterAdapterReceiver()
             tcpWriter?.shutdown()
             tcpWriter = null
@@ -793,6 +850,70 @@ class RatspeakBleGatt(
             context.registerReceiver(bondReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             context.registerReceiver(bondReceiver, filter)
+        }
+    }
+
+    /**
+     * A radio that lost its pairing rejects the stored key. Android reports
+     * that as bond loss (the stored bond leaves BONDED or the system starts
+     * re-pairing) rather than through a stable GATT status, so observe the
+     * protected system broadcasts for this device while a pre-existing bond
+     * is in use.
+     */
+    private fun registerBondLossReceiver(address: String) {
+        if (bondLossReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                val dev = bluetoothDeviceExtra(intent, BluetoothDevice.EXTRA_DEVICE) ?: return
+                if (dev.address != address) return
+                val lost = when (intent.action) {
+                    ACTION_KEY_MISSING, BluetoothDevice.ACTION_PAIRING_REQUEST -> true
+                    BluetoothDevice.ACTION_BOND_STATE_CHANGED ->
+                        intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, -1) ==
+                            BluetoothDevice.BOND_BONDED &&
+                            intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1) !=
+                            BluetoothDevice.BOND_BONDED
+                    else -> false
+                }
+                if (lost && bondLossObserved.compareAndSet(false, true)) {
+                    Log.w(TAG, "Radio rejected the stored pairing (${intent.action})")
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(ACTION_KEY_MISSING)
+            addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+            addAction(BluetoothDevice.ACTION_PAIRING_REQUEST)
+        }
+        try {
+            ContextCompat.registerReceiver(
+                context,
+                receiver,
+                filter,
+                // Protected system broadcasts; vendor Bluetooth services may run
+                // in a separate privileged package (as for adapter state).
+                ContextCompat.RECEIVER_EXPORTED,
+            )
+            bondLossReceiver = receiver
+        } catch (error: Throwable) {
+            Log.w(TAG, "Bond-loss observer unavailable: ${error.javaClass.simpleName}")
+        }
+    }
+
+    private fun unregisterBondLossReceiver() {
+        bondLossReceiver?.let {
+            try { context.unregisterReceiver(it) }
+            catch (error: Throwable) {
+                Log.d(TAG, "cleanup(unregister bond-loss observer): ${error.javaClass.simpleName}")
+            }
+        }
+        bondLossReceiver = null
+    }
+
+    private fun awaitBondLossEvidence() {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(BOND_LOSS_SETTLE_MS)
+        while (!bondLossObserved.get() && System.nanoTime() < deadline) {
+            Thread.sleep(50)
         }
     }
 
@@ -1084,6 +1205,13 @@ class RatspeakBleGatt(
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     connectStatus.set(false)
+                    // A drop after connect must fail the waiting setup phase
+                    // now; otherwise each phase sits out its full timeout.
+                    setupLinkLost.set(true)
+                    mtuLatch?.countDown()
+                    servicesLatch?.countDown()
+                    descriptorLatch?.countDown()
+                    writeLatch?.countDown()
                     val bondState = bondStateOrNone(gatt)
                     if (bondState != BluetoothDevice.BOND_BONDING) {
                         connectLatch?.countDown()
@@ -1118,6 +1246,10 @@ class RatspeakBleGatt(
         override fun onDescriptorWrite(gatt: BluetoothGatt, desc: BluetoothGattDescriptor, status: Int) {
             if (!isActiveGatt(gatt, "onDescriptorWrite")) return
             descriptorStatus.set(status == BluetoothGatt.GATT_SUCCESS)
+            lastDescriptorStatus.set(status)
+            // An encrypted CCCD still rejected after Android's own
+            // authentication retry is a key rejection, like a link status.
+            if (status == 5 || status == 15 || status == 137) lastGattStatus.set(status)
             Log.i(TAG, "Descriptor write: ${desc.uuid} status=$status")
             descriptorLatch?.countDown()
         }

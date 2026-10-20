@@ -24,6 +24,7 @@ object RatspeakBleRnodeSupervisor {
     private val replacementLock = Any()
     private val retryWake = Object()
     private val autoResume = AtomicBoolean(true)
+    private val retryNow = AtomicBoolean(false)
     private var current: Entry? = null
 
     const val FAILURE_AUTO_RESUME_DISABLED = "auto_resume_disabled"
@@ -31,12 +32,25 @@ object RatspeakBleRnodeSupervisor {
     private enum class RetryWaitOutcome {
         ELAPSED,
         ADAPTER_RECOVERED,
+        WOKEN,
         STOPPED,
     }
 
     @JvmStatic
     fun setAutoResume(enabled: Boolean) {
         autoResume.set(enabled)
+        synchronized(retryWake) { retryWake.notifyAll() }
+    }
+
+    /**
+     * End a backoff wait in progress, for events that make an immediate
+     * attempt worthwhile (permission granted, app back in the foreground).
+     * The backoff schedule continues, so frequent resumes cannot pin an
+     * unreachable radio to fast retries. It never starts or revives an operation.
+     */
+    @JvmStatic
+    fun wake() {
+        retryNow.set(true)
         synchronized(retryWake) { retryWake.notifyAll() }
     }
 
@@ -173,8 +187,10 @@ object RatspeakBleRnodeSupervisor {
 
     private fun run(entry: Entry) {
         var retry = 0
+        // A retry keeps showing why the previous attempt failed.
+        var lastFailure: String? = null
         while (isCurrent(entry)) {
-            publishState(entry, RatspeakNativeBridge.BLE_CONNECTING, null)
+            publishState(entry, RatspeakNativeBridge.BLE_CONNECTING, lastFailure)
             publishProgress(entry, if (retry == 0) "connecting" else "connecting_retry")
             val physical = RatspeakBleGatt(entry.context) { phase -> publishProgress(entry, phase) }
             entry.physical = physical
@@ -197,6 +213,7 @@ object RatspeakBleRnodeSupervisor {
                     break
                 }
                 publishRetry(entry, error.code)
+                lastFailure = closedBleError(error.code)
                 val retryOutcome = if (
                     error.code == RatspeakBleGatt.FAILURE_BLUETOOTH_OFF ||
                     bluetoothEnabled(entry.context) == false
@@ -213,11 +230,17 @@ object RatspeakBleRnodeSupervisor {
                     finishManualHoldIfNeeded(entry)
                     break
                 }
-                retry = if (retryOutcome == RetryWaitOutcome.ADAPTER_RECOVERED) 0 else retry + 1
+                if (retryOutcome == RetryWaitOutcome.ADAPTER_RECOVERED) {
+                    retry = 0
+                    lastFailure = null
+                } else {
+                    retry++
+                }
                 continue
             }
 
             retry = 0
+            lastFailure = null
             if (!isCurrent(entry)) {
                 physical.disconnect(graceful = false)
                 break
@@ -333,6 +356,9 @@ object RatspeakBleRnodeSupervisor {
             "radio_disconnected",
             RatspeakBleGatt.FAILURE_BLUETOOTH_OFF,
             RatspeakBleGatt.FAILURE_PERMISSION,
+            RatspeakBleGatt.FAILURE_NOT_REACHABLE,
+            RatspeakBleGatt.FAILURE_LINK_LOST,
+            RatspeakBleGatt.FAILURE_SERVICE_MISSING,
             RatspeakBleGatt.FAILURE_CONNECT,
             FAILURE_AUTO_RESUME_DISABLED -> reason
             else -> RatspeakBleGatt.FAILURE_CONNECT
@@ -341,7 +367,10 @@ object RatspeakBleRnodeSupervisor {
 
     private fun waitForRetry(entry: Entry, attempt: Int): RetryWaitOutcome {
         var remaining = RatspeakMobilePolicy.bleReconnectDelayMs(attempt, entry.token.hashCode())
+        // Only a wake during this wait may end it early.
+        retryNow.set(false)
         while (remaining > 0 && isCurrent(entry) && autoResume.get()) {
+            if (retryNow.getAndSet(false)) return RetryWaitOutcome.WOKEN
             if (bluetoothEnabled(entry.context) == false) {
                 return if (waitForBluetooth(entry)) {
                     RetryWaitOutcome.ADAPTER_RECOVERED

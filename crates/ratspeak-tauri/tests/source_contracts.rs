@@ -1363,6 +1363,67 @@ fn android_ble_product_state_waits_for_exact_protocol_readiness() {
 }
 
 #[test]
+fn android_ble_retry_reasons_reach_the_user_and_bond_loss_stops_retries() {
+    let root = repo_root();
+    let kotlin_root = root.join("src-tauri/gen/android/app/src/main/java/org/ratspeak/android");
+    let supervisor = read_source(kotlin_root.join("RatspeakBleRnodeSupervisor.kt"))
+        .expect("BLE RNode supervisor");
+    let gatt =
+        read_source(kotlin_root.join("RatspeakBleGatt.kt")).expect("BLE RNode physical generation");
+    let activity = read_source(kotlin_root.join("MainActivity.kt")).expect("main activity");
+    let native = read_source(root.join("src-tauri/src/mobile_native.rs")).expect("native JNI");
+    let health = read_source(root.join("dashboard/static/js/health.js")).expect("health js");
+    let events =
+        read_source(root.join("dashboard/static/js/tauri_events.js")).expect("frontend events");
+    let modals = read_source(root.join("dashboard/static/js/modals.js")).expect("modals js");
+
+    // Each retryable physical failure crosses JNI as its own closed reason,
+    // including on the next connecting attempt, and renders distinctly.
+    for code in ["not_reachable", "link_lost", "service_missing"] {
+        assert!(
+            native.contains(&format!("\"{code}\" => \"{code}\"")),
+            "{code}"
+        );
+        assert!(health.contains(&format!("{code}: {{")), "{code} help");
+        assert!(health.contains(&format!("{code}: '")), "{code} label");
+    }
+    assert!(supervisor.contains("RatspeakBleGatt.FAILURE_NOT_REACHABLE,"));
+    assert!(
+        supervisor
+            .contains("publishState(entry, RatspeakNativeBridge.BLE_CONNECTING, lastFailure)")
+    );
+    assert!(native.contains("let reason = if state_code == 3 {"));
+
+    // A rejected pairing stops at the first evidence instead of re-prompting.
+    assert!(gatt.contains("ACTION_KEY_MISSING, BluetoothDevice.ACTION_PAIRING_REQUEST -> true"));
+    assert!(gatt.contains("if (bondLossObserved.get()) break"));
+    assert!(gatt.contains("RatspeakMobilePolicy.classifyBleSetupFailure("));
+
+    // A permission grant or a return to the app ends the backoff wait.
+    assert!(activity.contains("if (granted) RatspeakBleRnodeSupervisor.wake()"));
+    assert_eq!(
+        activity
+            .matches("RatspeakBleRnodeSupervisor.wake()")
+            .count(),
+        2
+    );
+    assert!(supervisor.contains("if (retryNow.getAndSet(false)) return RetryWaitOutcome.WOKEN"));
+    // A wake that predates the wait must not skip it.
+    assert!(supervisor.contains(
+        "// Only a wake during this wait may end it early.\n        retryNow.set(false)"
+    ));
+
+    // Native connect phases reach only the BLE add/edit dialog.
+    assert!(activity.contains("window._onBleConnectProgress($payload)"));
+    assert!(events.contains("window._onBleConnectProgress = function(progress)"));
+    assert!(events.contains("pd.bleRnode && pd.isOpen()"));
+    assert!(modals.contains("window._activeProgressDialog.bleRnode = true;"));
+    // Live-stat ticks never repaint a paused or stat-less row as up.
+    assert!(events.contains("row.classList.contains('is-paused')"));
+    assert!(events.contains("liveData && liveData.online !== false ? 'up' : 'down'"));
+}
+
+#[test]
 fn incoming_lxmf_limit_setting_is_normal_default_on_and_backend_authoritative() {
     let root = repo_root();
     let index = read_source(root.join("dashboard/index.html")).expect("dashboard index");

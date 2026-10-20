@@ -660,10 +660,36 @@ object RatspeakMobilePolicy {
         return base + jitter
     }
 
+    // HCI/GATT statuses for a peer that rejected the stored link key: auth
+    // failure, key missing, insufficient encryption, MIC failure, GATT auth.
+    private val BLE_BOND_LOSS_STATUSES = setOf(5, 6, 15, 61, 137)
+
+    /**
+     * Closed classification of one failed physical setup. Bond loss outranks
+     * reachability: a peer that rejected the encrypted link was reachable, and
+     * retrying it only repeats the system re-pairing prompt.
+     */
+    fun classifyBleSetupFailure(
+        alreadyBonded: Boolean,
+        linkEstablished: Boolean,
+        lastGattStatus: Int,
+        bondLossObserved: Boolean,
+        serviceMissing: Boolean,
+    ): String = when {
+        alreadyBonded && (bondLossObserved || lastGattStatus in BLE_BOND_LOSS_STATUSES) ->
+            RatspeakBleGatt.FAILURE_STALE_BOND
+        serviceMissing -> RatspeakBleGatt.FAILURE_SERVICE_MISSING
+        !linkEstablished -> RatspeakBleGatt.FAILURE_NOT_REACHABLE
+        else -> RatspeakBleGatt.FAILURE_LINK_LOST
+    }
+
     fun shouldRetryBle(failureCode: String): Boolean {
         return when (failureCode) {
             RatspeakBleGatt.FAILURE_BLUETOOTH_OFF,
             RatspeakBleGatt.FAILURE_PERMISSION,
+            RatspeakBleGatt.FAILURE_NOT_REACHABLE,
+            RatspeakBleGatt.FAILURE_LINK_LOST,
+            RatspeakBleGatt.FAILURE_SERVICE_MISSING,
             RatspeakBleGatt.FAILURE_CONNECT -> true
             RatspeakBleGatt.FAILURE_PAIRING_REQUIRED,
             RatspeakBleGatt.FAILURE_BOND_TIMEOUT,

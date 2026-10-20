@@ -50,6 +50,30 @@ assert.strictEqual(
     }).label,
     'Initializing'
 );
+// A retrying radio keeps explaining its last failure through the next attempt.
+[
+    ['not_reachable', 'Radio not found'],
+    ['link_lost', 'Connection dropped'],
+    ['service_missing', 'No RNode service'],
+    ['permission_needed', 'Bluetooth permission needed'],
+    ['radio_disconnected', null],
+    ['unknown_reason', null],
+].forEach(function(row) {
+    ['waiting_for_radio', 'connecting'].forEach(function(state) {
+        var health = context._mobileRnodeHealth('ble://00:11:22:33:44:55', {
+            ble_rnode: { state: state, reason: row[0] }
+        });
+        var generic = state === 'connecting' ? 'Connecting' : 'Waiting for radio';
+        assert.strictEqual(health.label, row[1] || generic, state + '/' + row[0]);
+        assert.strictEqual(health.actionable, row[0] === 'permission_needed', state + '/' + row[0]);
+    });
+});
+assert.strictEqual(
+    context._mobileRnodeHealth('ble://00:11:22:33:44:55', {
+        ble_rnode: { state: 'failed', reason: 'stale_bond' }
+    }).label,
+    'Pair again'
+);
 assert.strictEqual(
     context._mobileRnodeHealth('ble://00:11:22:33:44:55', {
         ble_rnode: { state: 'connected' }
@@ -86,13 +110,29 @@ var actionStart = source.indexOf('function buildIfaceActionItems');
 var actionEnd = source.indexOf('\nfunction setInterfacePaused', actionStart);
 assert(actionStart >= 0 && actionEnd > actionStart, 'interface action reducer must exist');
 var actionCalls = [];
+var dialogs = [];
+var androidCalls = [];
 var actionRecord = {
     ifaceType: 'rnode',
     iface: { port: 'ble://00:11:22:33:44:55', enabled: true }
 };
 var actionContext = {
     ICON_PLAY: 'play', ICON_PAUSE: 'pause', ICON_RADIO: 'radio',
-    ICON_PENCIL: 'pencil', ICON_TRASH: 'trash',
+    ICON_PENCIL: 'pencil', ICON_TRASH: 'trash', ICON_INFO: 'info',
+    window: {
+        RatspeakAndroid: {
+            openBluetoothSettings: function() { androidCalls.push('bluetooth'); return true; },
+            openAppPermissionSettings: function() { androidCalls.push('app'); return true; },
+        }
+    },
+    hasAndroidBridge: function() { return true; },
+    rsAlert: function(opts) { dialogs.push(['alert', opts.title]); return Promise.resolve(); },
+    rsConfirm: function(opts) { dialogs.push(['confirm', opts.title]); return Promise.resolve(true); },
+    _ensureBlePermissions: function() {
+        actionCalls.push(['ble-permission']);
+        return Promise.resolve(actionContext.permissionGranted);
+    },
+    permissionGranted: true,
     _cachedConfigIfaces: { mobile_hardware: {} },
     getConfiguredInterfaceRecord: function() { return actionRecord; },
     getInterfaceLiveStatus: function() { return null; },
@@ -140,4 +180,64 @@ assert.strictEqual(resume.label, 'Resume Interface');
 resume.onSelect();
 assert.deepStrictEqual(actionCalls.pop(), ['rnode', 'Radio', false]);
 
-console.log('Mobile hardware health tests passed');
+function labels(items) {
+    // Copy into this realm so deepStrictEqual compares values, not prototypes.
+    return Array.from(items).filter(function(item) { return !item.separator; })
+        .map(function(item) { return item.label; });
+}
+function bleState(state, reason) {
+    actionContext._cachedConfigIfaces.mobile_hardware.ble_rnode = { state: state, reason: reason };
+    return actionContext.buildIfaceActionItems('rnode', 'Radio');
+}
+
+actionContext._cachedConfigIfaces.mobile_hardware.ble_rnode = { state: 'failed', reason: 'stale_bond' };
+assert(!labels(actionContext.buildIfaceActionItems('rnode', 'Radio')).includes('Connection Help'),
+    'a paused radio has nothing to troubleshoot');
+actionRecord.iface.enabled = true;
+
+var unreachable = bleState('waiting_for_radio', 'not_reachable');
+assert.deepStrictEqual(labels(unreachable).slice(0, 2), ['Connecting…', 'Connection Help']);
+assert.strictEqual(unreachable[0].disabled, true, 'help never replaces the supervisor-owned retry');
+assert.deepStrictEqual(labels(bleState('connecting', 'link_lost')).slice(0, 2),
+    ['Connecting…', 'Connection Help']);
+var grant = bleState('connecting', 'permission_needed')[0];
+assert.strictEqual(grant.label, 'Grant Bluetooth Permission');
+var stale = bleState('failed', 'stale_bond');
+assert.deepStrictEqual(labels(stale).slice(0, 2), ['Retry Connection', 'Connection Help']);
+assert.deepStrictEqual(labels(bleState('failed', 'bond_timeout')).slice(0, 2),
+    ['Retry Connection', 'Connection Help']);
+[['connected', ''], ['initializing', ''], ['waiting_for_radio', 'radio_disconnected'],
+    ['failed', 'connect_failed']].forEach(function(row) {
+    assert(!labels(bleState(row[0], row[1])).includes('Connection Help'), row.join('/'));
+});
+
+function flush() { return new Promise(function(resolve) { setImmediate(resolve); }); }
+
+(async function() {
+    unreachable[1].onSelect();
+    await flush();
+    assert.deepStrictEqual(dialogs.pop(), ['alert', 'Radio not found']);
+
+    stale[1].onSelect();
+    await flush();
+    assert.deepStrictEqual(dialogs.pop(), ['confirm', 'Pair again']);
+    assert.strictEqual(androidCalls.pop(), 'bluetooth');
+
+    grant.onSelect();
+    await flush();
+    assert.deepStrictEqual(actionCalls.pop(), ['ble-permission']);
+    assert.strictEqual(dialogs.length, 0, 'a granted permission needs no settings detour');
+
+    // Android stops prompting after repeated denials; Settings is the only path.
+    actionContext.permissionGranted = false;
+    grant.onSelect();
+    await flush();
+    assert.deepStrictEqual(actionCalls.pop(), ['ble-permission']);
+    assert.deepStrictEqual(dialogs.pop(), ['confirm', 'Bluetooth permission needed']);
+    assert.strictEqual(androidCalls.pop(), 'app');
+
+    console.log('Mobile hardware health tests passed');
+})().catch(function(error) {
+    console.error(error);
+    process.exit(1);
+});
