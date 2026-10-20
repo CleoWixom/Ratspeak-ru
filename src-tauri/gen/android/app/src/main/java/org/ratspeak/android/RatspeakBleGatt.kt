@@ -150,13 +150,21 @@ class RatspeakBleGatt(
     private val bondLossObserved = AtomicBoolean(false)
     private val lastDescriptorStatus = AtomicInteger(BluetoothGatt.GATT_SUCCESS)
     @Volatile private var classifiedFailure: String? = null
+    private val backgroundCancelled = AtomicBoolean(false)
+    @Volatile private var backgroundWaitCancelled = false
+    @Volatile private var backgroundWaitUnanswered = false
+    @Volatile private var waitingInBackground = false
     private var bondLossReceiver: BroadcastReceiver? = null
 
     private val handler = Handler(Looper.getMainLooper())
 
+    /**
+     * Connect to the radio. With [background], a bonded radio is awaited with
+     * Android's auto-connect instead of a bounded direct attempt.
+     */
     @SuppressLint("MissingPermission")
-    fun connect(address: String): ConnectFailure? {
-        return connectDetail(address)?.let { detail ->
+    fun connect(address: String, background: Boolean = false): ConnectFailure? {
+        return connectDetail(address, background)?.let { detail ->
             val code = classifiedFailure ?: when {
                 detail.startsWith(ERR_STALE_BOND) -> FAILURE_STALE_BOND
                 detail.contains(ERR_BOND_TIMEOUT) -> FAILURE_BOND_TIMEOUT
@@ -169,10 +177,26 @@ class RatspeakBleGatt(
         }
     }
 
+    /** End a background wait early; a foreground wake then connects directly. */
+    fun cancelBackgroundConnect() {
+        backgroundCancelled.set(true)
+        // A direct attempt or a live session is never cut short.
+        if (waitingInBackground) connectLatch?.countDown()
+    }
+
+    /** Whether the last background wait ended because it was cancelled. */
+    fun backgroundConnectCancelled(): Boolean = backgroundWaitCancelled
+
+    /** Whether the last connect waited in the background and no radio came. */
+    fun backgroundWaitedWithoutRadio(): Boolean = backgroundWaitUnanswered
+
     @SuppressLint("MissingPermission")
-    private fun connectDetail(address: String): String? {
+    private fun connectDetail(address: String, background: Boolean): String? {
         try {
             Log.i(TAG, "=== BLE CONNECT START === address=$address")
+            backgroundCancelled.set(false)
+            backgroundWaitCancelled = false
+            backgroundWaitUnanswered = false
             rustDetachObserved.set(false)
             detachFrameMatch = 0
             classifiedFailure = null
@@ -254,7 +278,9 @@ class RatspeakBleGatt(
             // Only a pairing that predates this connect can have gone stale.
             val bondPreexisting = alreadyBonded && !bondedDuringThisConnect
             if (bondPreexisting) registerBondLossReceiver(address)
-            val attempts = if (alreadyBonded) BONDED_GATT_CONNECT_ATTEMPTS else 1
+            // Only a bonded radio can be awaited without prompting for pairing.
+            val waitInBackground = background && bondPreexisting
+            val attempts = if (alreadyBonded && !waitInBackground) BONDED_GATT_CONNECT_ATTEMPTS else 1
             var gattError: String? = null
             for (attempt in 1..attempts) {
                 // Complete inbound records survive Rust TCP replacement, but
@@ -269,7 +295,7 @@ class RatspeakBleGatt(
                     maxAckRecords = PENDING_ACK_MAX_RECORDS,
                     closeSocket = { socket -> try { socket.close() } catch (_: Throwable) {} },
                 )
-                gattError = openGattBridge(device, attempt, attempts)
+                gattError = openGattBridge(device, attempt, attempts, waitInBackground)
                 if (gattError == null) break
 
                 Log.w(TAG, "GATT setup attempt $attempt/$attempts failed: $gattError")
@@ -320,7 +346,12 @@ class RatspeakBleGatt(
     }
 
     @SuppressLint("MissingPermission")
-    private fun openGattBridge(device: BluetoothDevice, attempt: Int, attempts: Int): String? {
+    private fun openGattBridge(
+        device: BluetoothDevice,
+        attempt: Int,
+        attempts: Int,
+        background: Boolean,
+    ): String? {
         if (adapterUnavailable.get()) return "Bluetooth is turned off"
         negotiatedMtu = MTU_FALLBACK_PAYLOAD
         rxChar = null
@@ -333,10 +364,15 @@ class RatspeakBleGatt(
         lastGattStatus.set(BluetoothGatt.GATT_SUCCESS)
 
         emitProgress(if (attempt == 1) "connecting" else "connecting_retry")
-        Log.i(TAG, "Phase 1: Connecting GATT (attempt $attempt/$attempts)...")
+        if (background) {
+            Log.i(TAG, "Phase 1: Waiting for the radio (background connect)...")
+        } else {
+            Log.i(TAG, "Phase 1: Connecting GATT (attempt $attempt/$attempts)...")
+        }
+        val latch = connectLatch!!
         handler.post {
             val newGatt = try {
-                device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                device.connectGatt(context, background, gattCallback, BluetoothDevice.TRANSPORT_LE)
             } catch (e: Exception) {
                 logEx("connectGatt", e)
                 null
@@ -349,8 +385,19 @@ class RatspeakBleGatt(
             Log.i(TAG, "connectGatt() called attempt=$attempt returned=${newGatt != null}")
         }
 
-        if (!connectLatch!!.await(GATT_TIMEOUT_SEC, TimeUnit.SECONDS)) {
-            return "GATT connection timed out"
+        val connected = if (background) {
+            awaitBackgroundConnect(latch)
+        } else {
+            latch.await(GATT_TIMEOUT_SEC, TimeUnit.SECONDS)
+        }
+        if (!connected) {
+            backgroundWaitCancelled = background && backgroundCancelled.get()
+            backgroundWaitUnanswered = background && !adapterUnavailable.get()
+            return if (backgroundWaitCancelled) {
+                "Background connect cancelled"
+            } else {
+                "GATT connection timed out"
+            }
         }
         if (adapterUnavailable.get()) return "Bluetooth is turned off"
         if (!connectStatus.get()) {
@@ -733,7 +780,26 @@ class RatspeakBleGatt(
     }
 
     @SuppressLint("MissingPermission")
+    private fun awaitBackgroundConnect(latch: CountDownLatch): Boolean {
+        waitingInBackground = true
+        try {
+            val deadline = System.nanoTime() +
+                TimeUnit.MILLISECONDS.toNanos(RatspeakMobilePolicy.BLE_BACKGROUND_CONNECT_MAX_MS)
+            while (!backgroundCancelled.get() && !adapterUnavailable.get()) {
+                val remaining = deadline - System.nanoTime()
+                if (remaining <= 0) return false
+                val slice = minOf(remaining, TimeUnit.SECONDS.toNanos(1))
+                if (latch.await(slice, TimeUnit.NANOSECONDS)) return !backgroundCancelled.get()
+            }
+            return false
+        } finally {
+            waitingInBackground = false
+        }
+    }
+
     private fun cleanup() {
+        // A stop must not wait out a background connect.
+        cancelBackgroundConnect()
         synchronized(cleanupLock) {
             Log.i(TAG, "cleanup()")
             running.set(false)

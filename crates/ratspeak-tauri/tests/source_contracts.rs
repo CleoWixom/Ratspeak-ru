@@ -1465,6 +1465,18 @@ fn android_ble_retry_reasons_reach_the_user_and_bond_loss_stops_retries() {
     assert!(supervisor.contains(
         "// Only a wake during this wait may end it early.\n        retryNow.set(false)"
     ));
+    // After a short direct burst a radio that is away is awaited in the
+    // background; a wake tries it directly instead.
+    assert!(supervisor.contains("RatspeakMobilePolicy.bleWaitsInBackground(retry)"));
+    assert!(supervisor.contains("physical.connect(entry.address, background)"));
+    assert!(supervisor.contains("?.cancelBackgroundConnect()"));
+    assert!(supervisor.contains("forceDirect = woken"));
+    // Only a wait that expired or was woken skips the backoff; any other
+    // failure, such as a radio that connects but fails setup, backs off.
+    assert!(
+        supervisor.contains("val waited = background && physical.backgroundWaitedWithoutRadio()")
+    );
+    assert!(supervisor.contains("if (waited && bluetoothEnabled(entry.context) != false &&"));
 
     // Native connect phases reach only the BLE add/edit dialog.
     assert!(activity.contains("window._onBleConnectProgress($payload)"));
@@ -2013,6 +2025,11 @@ fn android_ble_rnode_bridge_retries_writes_and_fallback_detaches() {
         .expect("native bridge forwarding");
     assert!(attach < forward);
     assert!(gatt.contains("RatspeakMobilePolicy.nativeBridgeAttachFrame()"));
+    // A radio that is away is awaited with Android's background auto-connect.
+    assert!(gatt.contains(
+        "device.connectGatt(context, background, gattCallback, BluetoothDevice.TRANSPORT_LE)"
+    ));
+    assert!(gatt.contains("if (waitingInBackground) connectLatch?.countDown()"));
 }
 
 #[test]

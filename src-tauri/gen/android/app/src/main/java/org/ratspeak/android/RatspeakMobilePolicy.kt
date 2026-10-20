@@ -641,6 +641,20 @@ object RatspeakMobilePolicy {
         return previousSendCompleted
     }
 
+    /** Direct attempts that fail before a bonded radio is awaited in the background. */
+    const val BLE_DIRECT_ATTEMPTS_BEFORE_BACKGROUND = 3
+
+    /** Re-arm a background wait this often, in case the stack dropped it. */
+    const val BLE_BACKGROUND_CONNECT_MAX_MS = 10 * 60_000L
+
+    /**
+     * After a short burst of direct attempts, a radio that is away is awaited
+     * with Android's background auto-connect: the controller connects within
+     * seconds of it advertising again, at a fraction of a direct scan's duty.
+     */
+    fun bleWaitsInBackground(failedAttempts: Int): Boolean =
+        failedAttempts >= BLE_DIRECT_ATTEMPTS_BEFORE_BACKGROUND
+
     /**
      * Fast retries handle Android's transient GATT failures; later retries
      * become low duty but never give up on an explicitly configured radio.

@@ -439,6 +439,17 @@ class RatspeakMobilePolicyTest {
     }
 
     @Test
+    fun bondedRadiosAreAwaitedInTheBackgroundAfterAShortDirectBurst() {
+        val burst = RatspeakMobilePolicy.BLE_DIRECT_ATTEMPTS_BEFORE_BACKGROUND
+        assertFalse(RatspeakMobilePolicy.bleWaitsInBackground(0))
+        assertFalse(RatspeakMobilePolicy.bleWaitsInBackground(burst - 1))
+        assertTrue(RatspeakMobilePolicy.bleWaitsInBackground(burst))
+        assertTrue(RatspeakMobilePolicy.bleWaitsInBackground(burst + 20))
+        // A returning radio never waits out a ten-minute backoff any more.
+        assertEquals(10 * 60_000L, RatspeakMobilePolicy.BLE_BACKGROUND_CONNECT_MAX_MS)
+    }
+
+    @Test
     fun reconnectIsFastThenBoundedLowDuty() {
         val delays = (0..24).map { RatspeakMobilePolicy.bleReconnectDelayMs(it, 7) }
         assertTrue(delays.zipWithNext().all { (a, b) -> b >= a })

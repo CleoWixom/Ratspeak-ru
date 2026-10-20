@@ -51,6 +51,8 @@ object RatspeakBleRnodeSupervisor {
     @JvmStatic
     fun wake() {
         retryNow.set(true)
+        // A radio awaited in the background is tried directly instead.
+        synchronized(lock) { current?.physical }?.cancelBackgroundConnect()
         synchronized(retryWake) { retryWake.notifyAll() }
     }
 
@@ -189,7 +191,10 @@ object RatspeakBleRnodeSupervisor {
         var retry = 0
         // A retry keeps showing why the previous attempt failed.
         var lastFailure: String? = null
+        var forceDirect = false
         while (isCurrent(entry)) {
+            val background = !forceDirect && RatspeakMobilePolicy.bleWaitsInBackground(retry)
+            forceDirect = false
             publishState(entry, RatspeakNativeBridge.BLE_CONNECTING, lastFailure)
             publishProgress(entry, if (retry == 0) "connecting" else "connecting_retry")
             val physical = RatspeakBleGatt(entry.context) { phase -> publishProgress(entry, phase) }
@@ -199,8 +204,10 @@ object RatspeakBleRnodeSupervisor {
                 break
             }
 
-            val error = physical.connect(entry.address)
+            val error = physical.connect(entry.address, background)
             if (error != null) {
+                val waited = background && physical.backgroundWaitedWithoutRadio()
+                val woken = waited && physical.backgroundConnectCancelled()
                 entry.physical = null
                 physical.disconnect(graceful = false)
                 if (!isCurrent(entry)) break
@@ -214,6 +221,14 @@ object RatspeakBleRnodeSupervisor {
                 }
                 publishRetry(entry, error.code)
                 lastFailure = closedBleError(error.code)
+                if (waited && bluetoothEnabled(entry.context) != false &&
+                    error.code != RatspeakBleGatt.FAILURE_BLUETOOTH_OFF
+                ) {
+                    // The controller already did the waiting; re-arm at once,
+                    // or try directly after a wake. Any other failure backs off.
+                    forceDirect = woken
+                    continue
+                }
                 val retryOutcome = if (
                     error.code == RatspeakBleGatt.FAILURE_BLUETOOTH_OFF ||
                     bluetoothEnabled(entry.context) == false
