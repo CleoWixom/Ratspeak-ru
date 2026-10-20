@@ -544,6 +544,11 @@ class RatspeakBleGatt(
                         break
                     }
                 }
+                // Rust sends nothing until its generation can reach the radio.
+                if (!publishNativeBridgeAttach(accepted.socket)) {
+                    closeBridgeClient(accepted.socket)
+                    continue
+                }
                 Log.i(TAG, "Rust TCP generation connected — forwarding active")
                 forwardTcpToBle(accepted.input, accepted.socket)
                 closeBridgeClient(accepted.socket)
@@ -660,6 +665,9 @@ class RatspeakBleGatt(
         val frame = RatspeakMobilePolicy.nativeBridgeAckFrame(acknowledgedDataFrames)
         return tcpWriter?.enqueueAck(expectedSocket, frame) == true
     }
+
+    private fun publishNativeBridgeAttach(expectedSocket: java.net.Socket): Boolean =
+        tcpWriter?.enqueueAck(expectedSocket, RatspeakMobilePolicy.nativeBridgeAttachFrame()) == true
 
     private fun closeBridgeClient(expected: java.net.Socket? = null) {
         tcpWriter?.close(expected)

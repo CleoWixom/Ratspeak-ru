@@ -1966,6 +1966,15 @@ fn android_ble_rnode_bridge_retries_writes_and_fallback_detaches() {
     assert!(gatt.contains("rustDetachObserved.set(false)"));
     assert!(gatt.contains("detachFrameMatch = 0"));
     assert!(gatt.contains("closeBridgeClient(accepted.socket)"));
+    // Rust starts its startup clock only once a generation reaches the radio.
+    let attach = gatt
+        .find("publishNativeBridgeAttach(accepted.socket)")
+        .expect("native bridge attach marker");
+    let forward = gatt
+        .find("forwardTcpToBle(accepted.input, accepted.socket)")
+        .expect("native bridge forwarding");
+    assert!(attach < forward);
+    assert!(gatt.contains("RatspeakMobilePolicy.nativeBridgeAttachFrame()"));
 }
 
 #[test]

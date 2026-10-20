@@ -243,6 +243,19 @@ class RatspeakMobilePolicyTest {
     }
 
     @Test
+    fun nativeBridgeAttachIsTheZeroCountAcknowledgement() {
+        assertArrayEquals(
+            byteArrayOf(
+                0xC0.toByte(), 0xA0.toByte(),
+                0x52, 0x53, 0x42, 0x41, 0x01,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0xC0.toByte(),
+            ),
+            RatspeakMobilePolicy.nativeBridgeAttachFrame(),
+        )
+    }
+
+    @Test
     fun nativeBridgeInboundBoundsAndWriterQueueFailClosed() {
         val assembler = RatspeakMobilePolicy.NativeBridgeInboundKissAssembler(maxFrameBytes = 5)
         val oversized = assembler.offer(
@@ -349,6 +362,29 @@ class RatspeakMobilePolicyTest {
             dataGate.beginAfterClosure().awaitQuiet { true },
         )
         assertEquals(200 * millisecond, dataNow)
+    }
+
+    @Test
+    fun periodicStatsNeverFailTheWaitForTheNextGeneration() {
+        val millisecond = 1_000_000L
+        var now = 0L
+        val gate = RatspeakMobilePolicy.NativeBridgeControlQuiescence(
+            quietIntervalNanos = 200 * millisecond,
+            hardMaxNanos = 2_000 * millisecond,
+            nowNanos = { now },
+            waitNanos = { delay -> now += delay },
+        )
+        val boundary = gate.beginAfterClosure()
+        // RNode channel stats arrive about every 1.2 s while Rust reconnects.
+        repeat(5) {
+            now += 1_200 * millisecond
+            gate.observeCompleteRecord(isData = false)
+            assertEquals(
+                RatspeakMobilePolicy.NativeBridgeControlQuiescence.Outcome.READY,
+                boundary.awaitQuiet { true },
+            )
+        }
+        assertEquals(7_000 * millisecond, now)
     }
 
     @Test

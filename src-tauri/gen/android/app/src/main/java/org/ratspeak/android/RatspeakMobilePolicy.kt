@@ -251,10 +251,7 @@ object RatspeakMobilePolicy {
     ) {
         enum class Outcome { READY, HARD_FAILURE, STOPPED, ACTION_FAILED }
 
-        inner class Boundary internal constructor(
-            internal val closedAt: Long,
-            internal val hardDeadline: Long,
-        ) {
+        inner class Boundary internal constructor(internal val closedAt: Long) {
             fun awaitQuiet(shouldContinue: () -> Boolean): Outcome =
                 awaitBoundary(this, shouldContinue, null)
 
@@ -281,16 +278,16 @@ object RatspeakMobilePolicy {
             }
         }
 
-        fun beginAfterClosure(): Boundary {
-            val closedAt = nowNanos()
-            return Boundary(closedAt, saturatingAdd(closedAt, hardMax))
-        }
+        fun beginAfterClosure(): Boundary = Boundary(nowNanos())
 
         private fun awaitBoundary(
             boundary: Boundary,
             shouldContinue: () -> Boolean,
             action: (() -> Boolean)?,
         ): Outcome {
+            // Bound each wait, not the gap: periodic radio stats must not fail
+            // a link while the next Rust generation has yet to connect.
+            val hardDeadline = saturatingAdd(nowNanos(), hardMax)
             while (true) {
                 var outcome: Outcome? = null
                 var delay = 0L
@@ -307,10 +304,10 @@ object RatspeakMobilePolicy {
                             } else {
                                 Outcome.ACTION_FAILED
                             }
-                        } else if (now >= boundary.hardDeadline) {
+                        } else if (now >= hardDeadline) {
                             outcome = Outcome.HARD_FAILURE
                         } else {
-                            delay = minOf(readyAt, boundary.hardDeadline) - now
+                            delay = minOf(readyAt, hardDeadline) - now
                         }
                     }
                 }
@@ -592,6 +589,13 @@ object RatspeakMobilePolicy {
     /** Exact KISS frame Rust recognises as one completed native bridge data write. */
     fun nativeBridgeAckFrame(acknowledgedDataFrames: Long): ByteArray {
         require(acknowledgedDataFrames > 0)
+        return nativeBridgeAckRecord(acknowledgedDataFrames)
+    }
+
+    /** Zero-count acknowledgement: this Rust generation now reaches the radio. */
+    fun nativeBridgeAttachFrame(): ByteArray = nativeBridgeAckRecord(0)
+
+    private fun nativeBridgeAckRecord(acknowledgedDataFrames: Long): ByteArray {
         val payload = ByteArray(NATIVE_BRIDGE_ACK_MAGIC.size + Long.SIZE_BYTES)
         NATIVE_BRIDGE_ACK_MAGIC.copyInto(payload)
         for (index in 0 until Long.SIZE_BYTES) {
