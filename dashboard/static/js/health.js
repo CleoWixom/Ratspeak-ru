@@ -301,6 +301,14 @@ function buildIfaceActionItems(ifaceType, ifaceName) {
         bleStateName === 'connecting' ||
         bleStateName === 'initializing';
     var bleHelp = isBleRnode && !paused ? bleRnodeHelp(bleStateName, bleReason) : null;
+    // Without an Android hardware state the driver's own state explains the row.
+    var runtimeState = ifaceType === 'rnode' && !bleState && !paused && live ? live.rnode_state : null;
+    var runtimeStateName = runtimeState && typeof runtimeState.state === 'string' ? runtimeState.state : '';
+    var runtimeReason = runtimeState && typeof runtimeState.reason === 'string' ? runtimeState.reason : '';
+    var runtimeWaiting = runtimeStateName === 'waiting_for_radio' ||
+        runtimeStateName === 'connecting' ||
+        runtimeStateName === 'initializing';
+    var help = bleHelp || (runtimeStateName ? rnodeConnectionHelp(runtimeStateName, runtimeReason, port) : null);
     if (supportsPause) {
         if (paused) {
             items.push({
@@ -322,13 +330,14 @@ function buildIfaceActionItems(ifaceType, ifaceName) {
             items.push({ label: 'Connecting…', icon: ICON_RADIO, disabled: true });
         } else if (isBleRnode && bleStateName === 'conflict') {
             items.push({ label: 'Radio conflict', icon: ICON_RADIO, disabled: true });
-        } else if (isBleRnode && (bleStateName === 'failed' || bleStateName === 'disabled')) {
+        } else if ((isBleRnode && (bleStateName === 'failed' || bleStateName === 'disabled')) ||
+            runtimeStateName === 'failed') {
             items.push({
                 label: 'Retry Connection',
                 icon: ICON_PLAY,
                 onSelect: function() { setInterfacePaused(ifaceType, ifaceName, false); }
             });
-        } else if (isBleRnode) {
+        } else if (isBleRnode || runtimeWaiting) {
             // Enabled configuration remains owned by its runtime even while
             // live stats are absent or offline. Missing stats alone must never
             // turn Pause into the destructive Resume/replacement path.
@@ -344,12 +353,12 @@ function buildIfaceActionItems(ifaceType, ifaceName) {
                 onSelect: function() { setInterfacePaused(ifaceType, ifaceName, !unavailable); }
             });
         }
-        if (bleHelp) {
+        if (help) {
             items.push({
                 label: 'Connection Help',
                 icon: ICON_INFO,
                 onSelect: function() {
-                    showBleRnodeHelp(bleHelp, function() { openInterfaceEdit(ifaceType, ifaceName); });
+                    showBleRnodeHelp(help, function() { openInterfaceEdit(ifaceType, ifaceName); });
                 }
             });
         }
@@ -379,7 +388,7 @@ var BLE_RNODE_HELP = {
     link_lost: {
         title: 'Connection dropped',
         message: 'The RNode answered, but the Bluetooth link dropped during setup. Keep ' +
-            'it powered and close to this phone. Ratspeak keeps trying.'
+            'it powered and close to this device. Ratspeak keeps trying.'
     },
     service_missing: {
         title: 'No RNode service',
@@ -418,7 +427,52 @@ var BLE_RNODE_HELP = {
         message: 'This RNode\'s firmware is too old for Ratspeak. Update it with rnodeconf, ' +
             'then choose Retry Connection.'
     },
+    unsupported_radio: {
+        title: 'Radio not supported',
+        message: 'This device did not identify itself as a supported RNode. Check that it ' +
+            'runs RNode firmware and that this interface uses the right device.'
+    },
 };
+
+// Wired and network radios need no Bluetooth steps.
+var RNODE_PORT_HELP = {
+    not_reachable: {
+        title: 'Radio not found',
+        message: 'Ratspeak cannot reach this RNode. Check that it is plugged in (or ' +
+            'reachable on the network) and powered on, and that no other program, such ' +
+            'as rnodeconf, is using it. Ratspeak keeps trying.'
+    },
+    link_lost: {
+        title: 'Connection dropped',
+        message: 'The RNode answered, but the connection dropped. Check its cable or ' +
+            'network connection. Ratspeak keeps trying.'
+    },
+    port_not_found: {
+        title: 'Radio not found',
+        message: 'Nothing is attached at this interface\'s port. Check that the RNode is ' +
+            'plugged in, and edit the interface if its port name changed. Ratspeak keeps ' +
+            'trying.'
+    },
+    port_access_denied: {
+        title: 'Port access denied',
+        message: 'This computer did not let Ratspeak open the radio\'s port. On Linux, ' +
+            'add your user to the group that owns it (usually dialout), then sign out and ' +
+            'back in. Ratspeak keeps trying.'
+    },
+    port_in_use: {
+        title: 'Port in use',
+        message: 'Another program, such as rnodeconf, a serial monitor or another ' +
+            'Reticulum instance, is using this radio. Close it and Ratspeak connects.'
+    },
+};
+
+function rnodeConnectionHelp(state, reason, port) {
+    var retrying = state === 'waiting_for_radio' || state === 'connecting';
+    if (retrying && String(port || '').indexOf('ble://') !== 0 && RNODE_PORT_HELP[reason]) {
+        return RNODE_PORT_HELP[reason];
+    }
+    return bleRnodeHelp(state, reason);
+}
 
 function bleRnodeHelp(state, reason) {
     var retrying = state === 'waiting_for_radio' || state === 'connecting';
@@ -435,6 +489,7 @@ function bleRnodeHelp(state, reason) {
         return BLE_RNODE_HELP.unsupported_firmware;
     }
     if (state === 'failed' && /^rejected_/.test(reason)) return BLE_RNODE_HELP.rejected_settings;
+    if (state === 'failed' && reason === 'unsupported_radio') return BLE_RNODE_HELP.unsupported_radio;
     return null;
 }
 
@@ -1077,6 +1132,65 @@ function emptyInterfaceConfigPayload() {
     };
 }
 
+// Row labels shared by Android hardware states and every runtime RNode.
+var RNODE_STATE_LABELS = {
+    connecting: 'Connecting',
+    waiting_for_radio: 'Waiting for radio',
+    reconnecting: 'Waiting for radio',
+    initializing: 'Initializing',
+    disabled: 'Disconnected',
+    conflict: 'Radio conflict',
+};
+var RNODE_FAILED_LABELS = {
+    bluetooth_off: 'Bluetooth is off',
+    permission_needed: 'Bluetooth permission needed',
+    pairing_required: 'Pairing needed',
+    bond_timeout: 'Pairing timed out',
+    stale_bond: 'Pair again',
+    bridge_unavailable: 'Radio service unavailable',
+    radio_disconnected: 'Waiting for radio',
+    auto_resume_disabled: 'Reconnect paused',
+    connect_failed: 'Connection failed',
+    multiple_configured_radios: 'Radio conflict',
+    rejected_tx_power: 'TX power not supported',
+    rejected_frequency: 'Frequency not supported',
+    rejected_bandwidth: 'Bandwidth not supported',
+    rejected_radio_state: 'Radio failed to start',
+    rejected_settings: 'Settings not supported',
+    unsupported_firmware: 'Firmware update needed',
+    unsupported_radio: 'Radio not supported',
+};
+// Why a retrying radio last failed; unknown reasons stay generic.
+var RNODE_RETRY_LABELS = {
+    not_reachable: 'Radio not found',
+    port_not_found: 'Radio not found',
+    port_access_denied: 'Port access denied',
+    port_in_use: 'Port in use',
+    link_lost: 'Connection dropped',
+    service_missing: 'No RNode service',
+    bluetooth_off: 'Bluetooth is off',
+    permission_needed: 'Bluetooth permission needed',
+};
+
+function _rnodeStateLabel(state, reason) {
+    var retrying = state === 'waiting_for_radio' || state === 'connecting';
+    if (state === 'failed') return RNODE_FAILED_LABELS[reason] || 'Connection failed';
+    return (retrying && RNODE_RETRY_LABELS[reason]) || RNODE_STATE_LABELS[state] || 'Waiting for radio';
+}
+
+// Why a runtime RNode (desktop, Android USB) is not Ready, from live stats.
+function _rnodeRuntimeHealth(rnodeState) {
+    if (!rnodeState || typeof rnodeState.state !== 'string') return null;
+    var reason = typeof rnodeState.reason === 'string' ? rnodeState.reason : '';
+    return {
+        kind: 'rnode',
+        state: rnodeState.state,
+        reason: reason,
+        label: _rnodeStateLabel(rnodeState.state, reason),
+        actionable: rnodeState.state === 'failed',
+    };
+}
+
 function _mobileRnodeHealth(port, mobileHardware) {
     port = String(port || '');
     mobileHardware = mobileHardware || {};
@@ -1102,48 +1216,12 @@ function _mobileRnodeHealth(port, mobileHardware) {
     if (port.indexOf('ble://') === 0) {
         state = mobileHardware.ble_rnode || null;
         if (!state || state.state === 'connected') return null;
-        var bleLabels = {
-            connecting: 'Connecting',
-            waiting_for_radio: 'Waiting for radio',
-            reconnecting: 'Waiting for radio',
-            initializing: 'Initializing',
-            disabled: 'Disconnected',
-            conflict: 'Radio conflict',
-        };
-        var failedLabels = {
-            bluetooth_off: 'Bluetooth is off',
-            permission_needed: 'Bluetooth permission needed',
-            pairing_required: 'Pairing needed',
-            bond_timeout: 'Pairing timed out',
-            stale_bond: 'Pair again',
-            bridge_unavailable: 'Radio service unavailable',
-            radio_disconnected: 'Waiting for radio',
-            auto_resume_disabled: 'Reconnect paused',
-            connect_failed: 'Connection failed',
-            multiple_configured_radios: 'Radio conflict',
-            rejected_tx_power: 'TX power not supported',
-            rejected_frequency: 'Frequency not supported',
-            rejected_bandwidth: 'Bandwidth not supported',
-            rejected_radio_state: 'Radio failed to start',
-            rejected_settings: 'Settings not supported',
-            unsupported_firmware: 'Firmware update needed',
-        };
-        // Why a retrying radio last failed; unknown reasons stay generic.
-        var retryLabels = {
-            not_reachable: 'Radio not found',
-            link_lost: 'Connection dropped',
-            service_missing: 'No RNode service',
-            bluetooth_off: 'Bluetooth is off',
-            permission_needed: 'Bluetooth permission needed',
-        };
         var retrying = state.state === 'waiting_for_radio' || state.state === 'connecting';
         return {
             kind: 'ble_rnode',
             state: state.state,
             reason: state.reason || '',
-            label: state.state === 'failed'
-                ? (failedLabels[state.reason] || 'Connection failed')
-                : ((retrying && retryLabels[state.reason]) || bleLabels[state.state] || 'Waiting for radio'),
+            label: _rnodeStateLabel(state.state, state.reason || ''),
             actionable: state.state === 'failed' || state.state === 'disabled' ||
                 (retrying && state.reason === 'permission_needed'),
         };
@@ -1357,6 +1435,9 @@ function _renderConnectionsFromCache() {
 
                 var liveData = (typeof getInterfaceLiveStatus === 'function') ? getInterfaceLiveStatus(name) : null;
                 var online = liveData ? (liveData.online !== false) : false;
+                if (!mobileHealth && !paused && liveData) {
+                    mobileHealth = _rnodeRuntimeHealth(liveData.rnode_state);
+                }
                 // Native USB inventory is ambient and intentionally carries no
                 // serial/path into the WebView. Never project a global negative
                 // state onto an exact interface that live transport stats prove

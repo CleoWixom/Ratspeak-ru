@@ -135,7 +135,7 @@ fn ble_rnode_readiness_failure_feedback(
         ),
         RnodeReadinessFailure::ConfigurationRejected(rejected) => (
             crate::commands::rnode_readiness::configuration_rejection_message(rejected),
-            crate::commands::rnode_readiness::configuration_rejection_reason(rejected),
+            ratspeak_runtime::rnode_status::configuration_rejection_reason(rejected),
             BleRnodeActivityOutcome::RuntimeFailed,
         ),
         RnodeReadinessFailure::ReadyStatsPublication(
@@ -226,7 +226,7 @@ fn watch_android_ble_rnode_rejection(
                         "ble_rnode",
                         "failed",
                         Some(
-                            crate::commands::rnode_readiness::configuration_rejection_reason(
+                            ratspeak_runtime::rnode_status::configuration_rejection_reason(
                                 snapshot.configuration_rejection,
                             ),
                         ),

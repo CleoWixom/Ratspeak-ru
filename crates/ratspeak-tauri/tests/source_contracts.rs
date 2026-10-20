@@ -1371,6 +1371,8 @@ fn android_ble_rejected_settings_release_the_bridge_and_resume_keeps_retrying() 
         .expect("interface commands");
     let readiness = read_source(root.join("crates/ratspeak-tauri/src/commands/rnode_readiness.rs"))
         .expect("RNode readiness");
+    let status = read_source(root.join("crates/ratspeak-runtime/src/rnode_status.rs"))
+        .expect("RNode row status");
     let health = read_source(root.join("dashboard/static/js/health.js")).expect("health js");
 
     // A radio that rejects its settings releases its native bridge and names
@@ -1396,7 +1398,7 @@ fn android_ble_rejected_settings_release_the_bridge_and_resume_keeps_retrying() 
         "unsupported_firmware",
         "rejected_settings",
     ] {
-        assert!(readiness.contains(&format!("\"{reason}\"")), "{reason}");
+        assert!(status.contains(&format!("\"{reason}\"")), "{reason}");
         assert!(health.contains(&format!("{reason}: '")), "{reason} label");
     }
 
@@ -1411,7 +1413,7 @@ fn android_ble_rejected_settings_release_the_bridge_and_resume_keeps_retrying() 
         .expect("Android BLE editable branch");
     assert!(editable_ble.contains("start_native_ble_rnode("));
     assert!(editable_ble.contains("true,\n"));
-    assert!(editable_ble.contains("InterfaceSpawnOutcome::configured_only("));
+    assert!(editable_ble.contains("InterfaceSpawnOutcome::starting("));
     assert!(!editable_ble.contains(".await"));
 }
 
@@ -1879,7 +1881,27 @@ fn dynamic_rnode_activity_monitors_are_exact_covered_and_ownership_gated() {
     for context in add_contexts {
         assert!(context.contains("activity_fence.identity_session_generation()"));
     }
-    for (source, expected_waits) in [(editable, 3usize), (add, 3usize)] {
+    // Resume and edit adopt a spawned radio as startup does; add keeps a
+    // readiness transaction, except that a serial/TCP port it cannot open yet
+    // is adopted and reported at once instead of after the readiness wait.
+    assert_eq!(editable.matches("adopt_spawned_rnode(").count(), 3);
+    assert_eq!(add.matches("adopt_spawned_rnode(").count(), 1);
+    let unopened = add
+        .find("unopened_rnode_port_message(&spawned)")
+        .expect("add checks for an unopened port");
+    let adopted = add.find("adopt_spawned_rnode(").expect("add adopts it");
+    let waited = add[unopened..]
+        .find("await_owned_rnode_ready(")
+        .map(|offset| unopened + offset)
+        .expect("add still waits for a port that opened");
+    assert!(unopened < adopted && adopted < waited);
+    // Every add flow names a setting the radio rejected.
+    assert_eq!(add.matches("error.configuration_rejection()").count(), 3);
+    let adopt = rust_function_block(&interfaces, "adopt_spawned_rnode");
+    assert!(adopt.contains("state.cover_rnode_activity_interface(spawned.interface_id, origin)"));
+    assert!(adopt.contains("ratspeak_runtime::spawn_startup_rnode_activity_monitor("));
+    assert!(adopt.contains("teardown_spawned_rnode_exact(handle, spawned)"));
+    for (source, expected_waits) in [(editable, 0usize), (add, 3usize)] {
         assert_eq!(
             source.matches("await_owned_rnode_ready(").count(),
             expected_waits
@@ -1899,47 +1921,24 @@ fn dynamic_rnode_activity_monitors_are_exact_covered_and_ownership_gated() {
             );
         }
     }
-    // Android BLE resume/edit return configured_only: the startup-owned
-    // supervisor, not the edit transaction, brings that radio up.
-    assert_eq!(
-        editable
-            .matches("InterfaceSpawnOutcome::started_rnode(")
-            .count(),
-        4
-    );
-    assert!(interfaces.contains("rnode_activity_monitor: Option<PendingRNodeActivityMonitor>"));
-    assert!(editable.contains("InterfaceSpawnOutcome::started_rnode("));
+    // Android BLE resume/edit start the supervisor-owned radio; no edit or
+    // resume path carries a readiness monitor of its own any more.
+    assert!(editable.contains("InterfaceSpawnOutcome::starting("));
+    assert!(!interfaces.contains("fn started_rnode("));
+    assert!(!interfaces.contains("rnode_activity_monitor: Option<PendingRNodeActivityMonitor>"));
 
     let replace = rust_function_block(&interfaces, "finish_rnode_interface_replace");
-    assert_eq!(replace.matches(".activate(Arc::clone(&state))").count(), 2);
+    assert_eq!(replace.matches(".activate(").count(), 0);
     assert!(replace.matches("finish_rnode_lifecycle_operation").count() >= 2);
     let resume = rust_function_block(&interfaces, "resume_interface");
-    assert_eq!(resume.matches(".activate(Arc::clone(&st))").count(), 1);
+    assert_eq!(resume.matches(".activate(").count(), 0);
     assert_eq!(add.matches(".activate(Arc::clone(&st))").count(), 3);
-    for (source, activation_marker, finish_marker) in [
-        (
-            replace,
-            ".activate(Arc::clone(&state))",
-            "finish_rnode_lifecycle_operation(&operation_lease)",
-        ),
-        (
-            resume,
-            ".activate(Arc::clone(&st))",
-            "finish_interface_lifecycle_operation(lease)",
-        ),
-        (
-            add,
-            ".activate(Arc::clone(&st))",
-            "finish_rnode_lifecycle_operation(&operation_lease)",
-        ),
-    ] {
-        for (activation, _) in source.match_indices(activation_marker) {
-            let nearby = &source[activation.saturating_sub(240)..activation];
-            assert!(
-                nearby.contains(finish_marker),
-                "monitor activation must immediately follow lifecycle ownership"
-            );
-        }
+    for (activation, _) in add.match_indices(".activate(Arc::clone(&st))") {
+        let nearby = &add[activation.saturating_sub(240)..activation];
+        assert!(
+            nearby.contains("finish_rnode_lifecycle_operation(&operation_lease)"),
+            "monitor activation must immediately follow lifecycle ownership"
+        );
     }
 
     let bridge = rust_function_block(&ble, "apply_ble_rnode_bridge_ready");
@@ -8781,9 +8780,9 @@ fn path_resolution_diagnostics_are_not_duplicate_or_stale() {
     assert!(runtime.contains("for observation in activity_observations"));
     assert!(runtime.contains("record_poll_activity(&state, poll_activity_origin, observation)"));
 
+    // The canonical payload in state.rs is the only interface-row producer.
     let rns = read_source(root.join("crates/ratspeak-runtime/src/rns.rs")).expect("rns");
-    assert!(rns.contains("\"held_announces\": s.held_announces"));
-    assert!(rns.contains("\"burst_active\": s.burst_active"));
+    assert!(!rns.contains("\"held_announces\": s.held_announces"));
 
     let network =
         read_source(root.join("crates/ratspeak-tauri/src/commands/network.rs")).expect("network");

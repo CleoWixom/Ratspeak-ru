@@ -82,23 +82,16 @@ impl fmt::Display for RnodeReadinessFailure {
 
 impl std::error::Error for RnodeReadinessFailure {}
 
-/// Closed product reason for a radio that rejected its settings.
-#[cfg_attr(not(feature = "ble"), allow(dead_code))]
-pub(crate) fn configuration_rejection_reason(
-    rejected: Option<RNodeReadinessEvidence>,
-) -> &'static str {
-    match rejected {
-        Some(RNodeReadinessEvidence::TransmitPower) => "rejected_tx_power",
-        Some(RNodeReadinessEvidence::Frequency) => "rejected_frequency",
-        Some(RNodeReadinessEvidence::Bandwidth) => "rejected_bandwidth",
-        Some(RNodeReadinessEvidence::RadioState) => "rejected_radio_state",
-        Some(RNodeReadinessEvidence::Firmware) => "unsupported_firmware",
-        _ => "rejected_settings",
-    }
-}
-
 /// User-facing explanation for a radio that rejected its settings.
-#[cfg_attr(not(feature = "ble"), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        feature = "ble",
+        feature = "serial",
+        feature = "rnode-tcp",
+        target_os = "android"
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn configuration_rejection_message(
     rejected: Option<RNodeReadinessEvidence>,
 ) -> &'static str {
@@ -423,25 +416,8 @@ mod tests {
     }
 
     #[test]
-    fn configuration_rejections_map_to_closed_reasons() {
-        use RNodeReadinessEvidence::{Bandwidth, CodingRate, Firmware, TransmitPower};
-        assert_eq!(
-            configuration_rejection_reason(Some(TransmitPower)),
-            "rejected_tx_power"
-        );
-        assert_eq!(
-            configuration_rejection_reason(Some(Bandwidth)),
-            "rejected_bandwidth"
-        );
-        assert_eq!(
-            configuration_rejection_reason(Some(Firmware)),
-            "unsupported_firmware"
-        );
-        assert_eq!(
-            configuration_rejection_reason(Some(CodingRate)),
-            "rejected_settings"
-        );
-        assert_eq!(configuration_rejection_reason(None), "rejected_settings");
+    fn configuration_rejection_messages_name_the_setting() {
+        use RNodeReadinessEvidence::TransmitPower;
         assert!(configuration_rejection_message(Some(TransmitPower)).contains("TX power"));
     }
 

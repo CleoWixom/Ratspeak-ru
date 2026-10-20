@@ -10,7 +10,7 @@ var source = fs.readFileSync(
     path.join(__dirname, '..', '..', 'dashboard', 'static', 'js', 'health.js'),
     'utf8'
 );
-var start = source.indexOf('function _mobileRnodeHealth');
+var start = source.indexOf('var RNODE_STATE_LABELS');
 var end = source.indexOf('\nfunction _interfaceConfigByName', start);
 assert(start >= 0 && end > start, 'mobile hardware health reducer must exist');
 var context = {
@@ -92,6 +92,23 @@ assert.strictEqual(
     null,
     'healthy BLE must not retain a warning pill'
 );
+// Desktop and Android USB rows read the driver's own state from live stats.
+[
+    [{ state: 'failed', reason: 'rejected_tx_power' }, 'TX power not supported', true],
+    [{ state: 'failed', reason: 'unsupported_radio' }, 'Radio not supported', true],
+    [{ state: 'waiting_for_radio', reason: 'not_reachable' }, 'Radio not found', false],
+    [{ state: 'waiting_for_radio', reason: 'link_lost' }, 'Connection dropped', false],
+    [{ state: 'waiting_for_radio', reason: 'port_not_found' }, 'Radio not found', false],
+    [{ state: 'waiting_for_radio', reason: 'port_access_denied' }, 'Port access denied', false],
+    [{ state: 'waiting_for_radio', reason: 'port_in_use' }, 'Port in use', false],
+    [{ state: 'initializing', reason: null }, 'Initializing', false],
+    [{ state: 'connecting', reason: null }, 'Connecting', false],
+].forEach(function(row) {
+    var health = context._rnodeRuntimeHealth(row[0]);
+    assert.strictEqual(health.label, row[1], JSON.stringify(row[0]));
+    assert.strictEqual(health.actionable, row[2], JSON.stringify(row[0]));
+});
+assert.strictEqual(context._rnodeRuntimeHealth(null), null, 'a Ready radio has no row state');
 assert.deepStrictEqual(
     JSON.parse(JSON.stringify(context._configuredInterfaceFallback({
         ifaceType: 'rnode',
@@ -146,7 +163,8 @@ var actionContext = {
     permissionGranted: true,
     _cachedConfigIfaces: { mobile_hardware: {} },
     getConfiguredInterfaceRecord: function() { return actionRecord; },
-    getInterfaceLiveStatus: function() { return null; },
+    getInterfaceLiveStatus: function() { return actionContext.liveStatus; },
+    liveStatus: null,
     lastStats: null,
     isInterfaceConfigEnabled: function(iface) { return iface.enabled !== false; },
     isLoraInterfaceType: function() { return true; },
@@ -224,6 +242,27 @@ assert.deepStrictEqual(labels(rejected).slice(0, 2), ['Retry Connection', 'Conne
     assert(!labels(bleState(row[0], row[1])).includes('Connection Help'), row.join('/'));
 });
 
+// A desktop serial RNode has no Android hardware state; its driver explains it.
+actionContext._cachedConfigIfaces.mobile_hardware = {};
+actionRecord.iface.port = '/dev/cu.usbmodem4101';
+function runtimeState(state, reason) {
+    actionContext.liveStatus = { online: false, rnode_state: { state: state, reason: reason } };
+    return actionContext.buildIfaceActionItems('rnode', 'Radio');
+}
+var serialRejected = runtimeState('failed', 'rejected_tx_power');
+assert.deepStrictEqual(labels(serialRejected).slice(0, 2), ['Retry Connection', 'Connection Help']);
+var serialAway = runtimeState('waiting_for_radio', 'not_reachable');
+assert.deepStrictEqual(labels(serialAway).slice(0, 2), ['Pause Interface', 'Connection Help'],
+    'a retrying driver is paused, never replaced by Resume');
+assert.deepStrictEqual(labels(runtimeState('initializing', null)).slice(0, 1), ['Pause Interface']);
+var serialDenied = runtimeState('waiting_for_radio', 'port_access_denied');
+var serialBusy = runtimeState('waiting_for_radio', 'port_in_use');
+// Desktop Bluetooth radios use the same driver state.
+actionRecord.iface.port = 'ble://00:11:22:33:44:55';
+assert.deepStrictEqual(labels(runtimeState('failed', 'rejected_tx_power')).slice(0, 2),
+    ['Retry Connection', 'Connection Help']);
+actionContext.liveStatus = null;
+
 function flush() { return new Promise(function(resolve) { setImmediate(resolve); }); }
 
 (async function() {
@@ -246,6 +285,21 @@ function flush() { return new Promise(function(resolve) { setImmediate(resolve);
     await flush();
     assert.deepStrictEqual(dialogs.pop(), ['confirm', 'TX power not supported']);
     assert.deepStrictEqual(actionCalls.pop(), ['edit', 'rnode', 'Radio']);
+    serialRejected[1].onSelect();
+    await flush();
+    assert.deepStrictEqual(dialogs.pop(), ['confirm', 'TX power not supported']);
+    assert.deepStrictEqual(actionCalls.pop(), ['edit', 'rnode', 'Radio']);
+    // Wired radios get wired guidance, without Bluetooth steps.
+    serialAway[1].onSelect();
+    await flush();
+    assert.deepStrictEqual(dialogs.pop(), ['alert', 'Radio not found']);
+    // A port the OS refuses, or another program holds, says so.
+    serialDenied[1].onSelect();
+    await flush();
+    assert.deepStrictEqual(dialogs.pop(), ['alert', 'Port access denied']);
+    serialBusy[1].onSelect();
+    await flush();
+    assert.deepStrictEqual(dialogs.pop(), ['alert', 'Port in use']);
 
     // Android stops prompting after repeated denials; Settings is the only path.
     actionContext.permissionGranted = false;

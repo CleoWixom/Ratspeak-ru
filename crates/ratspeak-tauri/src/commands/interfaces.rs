@@ -2933,6 +2933,18 @@ impl OwnedRnodeReadinessError {
         matches!(self, Self::Readiness(RnodeReadinessFailure::Timeout))
     }
 
+    /// The radio's rejection as (message, closed reason), when it rejected
+    /// the configured settings.
+    fn configuration_rejection(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Readiness(RnodeReadinessFailure::ConfigurationRejected(rejected)) => Some((
+                crate::commands::rnode_readiness::configuration_rejection_message(rejected),
+                ratspeak_runtime::rnode_status::configuration_rejection_reason(rejected),
+            )),
+            _ => None,
+        }
+    }
+
     fn ready_stats_failure_code(self) -> Option<&'static str> {
         match self {
             Self::Readiness(RnodeReadinessFailure::ReadyStatsPublication(
@@ -2991,6 +3003,65 @@ async fn await_owned_rnode_ready(
             }
         }
     }
+}
+
+/// Why a just-spawned serial/TCP RNode is still retrying its port, which spawn
+/// publishes before it returns.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn unopened_rnode_port_message(
+    spawned: &rns_runtime::reticulum::SpawnedRNodeRuntime,
+) -> Option<&'static str> {
+    use rns_interface::rnode::{RNodePortFailureClass, RNodeRuntimeReason};
+
+    let snapshot = spawned.observer.snapshot();
+    if snapshot.port_failure.is_none()
+        && snapshot.reason != Some(RNodeRuntimeReason::ConnectionAttemptFailed)
+    {
+        return None;
+    }
+    Some(match snapshot.port_failure {
+        Some(RNodePortFailureClass::NotFound) => {
+            "Radio not found on its port; Ratspeak connects when it is plugged in."
+        }
+        Some(RNodePortFailureClass::AccessDenied) => {
+            "This computer denied access to its port; see Connection Help on the interface."
+        }
+        Some(RNodePortFailureClass::InUse) => {
+            "Another program is using its port; Ratspeak connects once that program closes it."
+        }
+        _ => "Radio not reachable yet; Ratspeak keeps trying.",
+    })
+}
+
+/// Resume, edit, and an add whose port cannot be opened yet own a spawned
+/// radio as startup does, as upstream keeps an enabled interface: the driver
+/// retries a radio that is away and its row explains the wait, so it is never
+/// paused again or reverted.
+#[cfg(any(
+    all(feature = "ble", not(target_os = "android")),
+    feature = "serial",
+    feature = "rnode-tcp",
+    target_os = "android"
+))]
+async fn adopt_spawned_rnode(
+    state: &Arc<AppState>,
+    lease: &RNodeLifecycleOperationLease,
+    handle: &rns_runtime::reticulum::ReticulumHandle,
+    spawned: &rns_runtime::reticulum::SpawnedRNodeRuntime,
+    origin: RNodeActivityOrigin,
+) -> Result<u64, String> {
+    if !state.is_current_rnode_lifecycle_operation(lease)
+        || !state.cover_rnode_activity_interface(spawned.interface_id, origin)
+    {
+        teardown_spawned_rnode_exact(handle, spawned).await;
+        return Err("RNode operation was superseded".to_string());
+    }
+    ratspeak_runtime::spawn_startup_rnode_activity_monitor(
+        Arc::clone(state),
+        spawned.observer.clone(),
+        origin,
+    );
+    Ok(spawned.interface_id)
 }
 
 async fn teardown_rnode_interface_for_port(
@@ -3338,7 +3409,6 @@ struct InterfaceSpawnOutcome {
     status: String,
     runtime_started: bool,
     interface_id: Option<u64>,
-    rnode_activity_monitor: Option<PendingRNodeActivityMonitor>,
 }
 
 struct RnodeHandoffTarget {
@@ -3550,7 +3620,6 @@ impl InterfaceSpawnOutcome {
             status: status.into(),
             runtime_started: false,
             interface_id: None,
-            rnode_activity_monitor: None,
         }
     }
 
@@ -3559,31 +3628,17 @@ impl InterfaceSpawnOutcome {
             status: status.into(),
             runtime_started: true,
             interface_id: Some(interface_id),
-            rnode_activity_monitor: None,
         }
     }
 
-    #[cfg(any(
-        feature = "ble",
-        feature = "serial",
-        feature = "rnode-tcp",
-        target_os = "android"
-    ))]
-    fn started_rnode(
-        status: impl Into<String>,
-        interface_id: u64,
-        rnode_activity_monitor: Option<PendingRNodeActivityMonitor>,
-    ) -> Self {
+    /// The native supervisor registers the runtime once the radio answers.
+    #[cfg(all(feature = "ble", target_os = "android"))]
+    fn starting(status: impl Into<String>) -> Self {
         Self {
             status: status.into(),
             runtime_started: true,
-            interface_id: Some(interface_id),
-            rnode_activity_monitor,
+            interface_id: None,
         }
-    }
-
-    fn take_rnode_activity_monitor(&mut self) -> Option<PendingRNodeActivityMonitor> {
-        self.rnode_activity_monitor.take()
     }
 }
 
@@ -3715,7 +3770,7 @@ async fn spawn_editable_interface(
                             .invalidate_ble_rnode_activity_operation_if_token(&activity_operation);
                         return Err("Android BLE supervisor unavailable".to_string());
                     }
-                    return Ok(InterfaceSpawnOutcome::configured_only(
+                    return Ok(InterfaceSpawnOutcome::starting(
                         "BLE LoRa interface started; connecting to the radio",
                     ));
                 }
@@ -3743,20 +3798,17 @@ async fn spawn_editable_interface(
                         )
                         .await
                         .map_err(|error| error.to_string())?;
-                    let pending_monitor = await_owned_rnode_ready(
+                    let id = adopt_spawned_rnode(
                         state,
                         rnode_lease,
                         &handle,
                         &spawned,
                         rnode_activity_origin,
                     )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                    let id = spawned.interface_id;
-                    return Ok(InterfaceSpawnOutcome::started_rnode(
-                        format!("BLE LoRa interface active (#{id})"),
+                    .await?;
+                    return Ok(InterfaceSpawnOutcome::started(
+                        format!("BLE LoRa interface started (#{id}); connecting to the radio"),
                         id,
-                        pending_monitor,
                     ));
                 }
                 #[cfg(not(feature = "ble"))]
@@ -3798,20 +3850,17 @@ async fn spawn_editable_interface(
                         )
                         .await
                         .map_err(|error| error.to_string())?;
-                    let pending_monitor = await_owned_rnode_ready(
+                    let id = adopt_spawned_rnode(
                         state,
                         rnode_lease,
                         &handle,
                         &spawned,
                         rnode_activity_origin,
                     )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                    let id = spawned.interface_id;
-                    return Ok(InterfaceSpawnOutcome::started_rnode(
-                        format!("USB LoRa interface active (#{id})"),
+                    .await?;
+                    return Ok(InterfaceSpawnOutcome::started(
+                        format!("USB LoRa interface started (#{id}); connecting to the radio"),
                         id,
-                        pending_monitor,
                     ));
                 }
                 #[cfg(not(target_os = "android"))]
@@ -3846,29 +3895,23 @@ async fn spawn_editable_interface(
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-                let pending_monitor = await_owned_rnode_ready(
+                let id = adopt_spawned_rnode(
                     state,
                     rnode_lease,
                     &handle,
                     &spawned,
                     rnode_activity_origin,
                 )
-                .await
-                .map_err(|error| error.to_string())?;
-                let id = spawned.interface_id;
-                if is_rnode_tcp_port(port) {
-                    Ok(InterfaceSpawnOutcome::started_rnode(
-                        format!("RNode TCP interface active (#{id})"),
-                        id,
-                        pending_monitor,
-                    ))
+                .await?;
+                let kind = if is_rnode_tcp_port(port) {
+                    "RNode TCP"
                 } else {
-                    Ok(InterfaceSpawnOutcome::started_rnode(
-                        format!("RNode interface active (#{id})"),
-                        id,
-                        pending_monitor,
-                    ))
-                }
+                    "RNode"
+                };
+                Ok(InterfaceSpawnOutcome::started(
+                    format!("{kind} interface started (#{id}); connecting to the radio"),
+                    id,
+                ))
             }
             #[cfg(not(any(feature = "serial", feature = "rnode-tcp")))]
             {
@@ -4144,7 +4187,7 @@ async fn finish_rnode_interface_replace(
     match spawn_editable_interface(&state, activity_fence, &new_runtime, Some(&operation_lease))
         .await
     {
-        Ok(mut outcome) => {
+        Ok(outcome) => {
             if !state.is_current_rnode_lifecycle_operation(&operation_lease) {
                 return;
             }
@@ -4156,12 +4199,7 @@ async fn finish_rnode_interface_replace(
                 InterfaceTransition::Configured,
                 None,
             );
-            let pending_monitor = outcome.take_rnode_activity_monitor();
-            if state.finish_rnode_lifecycle_operation(&operation_lease)
-                && let Some(pending_monitor) = pending_monitor
-            {
-                let _ = pending_monitor.activate(Arc::clone(&state));
-            }
+            let _ = state.finish_rnode_lifecycle_operation(&operation_lease);
         }
         Err(error) => {
             if !state.is_current_rnode_lifecycle_operation(&operation_lease) {
@@ -4175,7 +4213,7 @@ async fn finish_rnode_interface_replace(
                 )
             });
 
-            let (rollback_detail, activity_rollback, rollback_monitor) = match restored {
+            let (rollback_detail, activity_rollback) = match restored {
                 crate::rns_config::InterfaceBlockCasOutcome::Applied => {
                     match spawn_editable_interface(
                         &state,
@@ -4185,31 +4223,23 @@ async fn finish_rnode_interface_replace(
                     )
                     .await
                     {
-                        Ok(mut outcome) => {
-                            let rollback_monitor = outcome.take_rnode_activity_monitor();
-                            if outcome.runtime_started {
-                                (
-                                    " Previous configuration restored and ready.".to_string(),
-                                    Some(InterfaceRollback::ConfigRestored),
-                                    rollback_monitor,
-                                )
-                            } else {
-                                (
-                                    format!(
-                                        " Configuration restored, but the previous radio is not running: {}.",
-                                        outcome.status
-                                    ),
-                                    Some(InterfaceRollback::RestartFailed),
-                                    None,
-                                )
-                            }
-                        }
-                        Err(restart_error) => (
+                        Ok(outcome) if outcome.runtime_started => (
+                            " Previous configuration restored; reconnecting to the radio."
+                                .to_string(),
+                            Some(InterfaceRollback::ConfigRestored),
+                        ),
+                        Ok(outcome) => (
                             format!(
-                                " Configuration restored, but the previous radio did not become ready: {restart_error}."
+                                " Configuration restored, but the previous radio is not running: {}.",
+                                outcome.status
                             ),
                             Some(InterfaceRollback::RestartFailed),
-                            None,
+                        ),
+                        Err(restart_error) => (
+                            format!(
+                                " Configuration restored, but the previous radio could not start: {restart_error}."
+                            ),
+                            Some(InterfaceRollback::RestartFailed),
                         ),
                     }
                 }
@@ -4217,17 +4247,14 @@ async fn finish_rnode_interface_replace(
                     " Settings changed again, so the newer configuration was left untouched."
                         .to_string(),
                     None,
-                    None,
                 ),
                 crate::rns_config::InterfaceBlockCasOutcome::NotFound => (
                     " The interface changed or was removed before rollback.".to_string(),
-                    None,
                     None,
                 ),
                 crate::rns_config::InterfaceBlockCasOutcome::WriteFailed => (
                     " Rollback config write failed.".to_string(),
                     Some(InterfaceRollback::WriteFailed),
-                    None,
                 ),
             };
 
@@ -4252,11 +4279,7 @@ async fn finish_rnode_interface_replace(
                 },
                 None,
             );
-            if state.finish_rnode_lifecycle_operation(&operation_lease)
-                && let Some(rollback_monitor) = rollback_monitor
-            {
-                let _ = rollback_monitor.activate(Arc::clone(&state));
-            }
+            let _ = state.finish_rnode_lifecycle_operation(&operation_lease);
         }
     }
 
@@ -4495,7 +4518,7 @@ pub async fn resume_interface(
         match spawn_resumable_interface(&st, activity_fence, &runtime, operation_lease.as_ref())
             .await
         {
-            Ok(mut outcome) => {
+            Ok(outcome) => {
                 if operation_lease
                     .as_ref()
                     .is_some_and(|lease| !st.is_current_interface_lifecycle_operation(lease))
@@ -4526,12 +4549,8 @@ pub async fn resume_interface(
                     resumable_spawn_transition(activity_class, outcome.runtime_started),
                     resumable_interface_tcp_endpoint(&runtime),
                 );
-                let pending_monitor = outcome.take_rnode_activity_monitor();
-                if let Some(lease) = operation_lease.as_ref()
-                    && st.finish_interface_lifecycle_operation(lease)
-                    && let Some(pending_monitor) = pending_monitor
-                {
-                    let _ = pending_monitor.activate(Arc::clone(&st));
+                if let Some(lease) = operation_lease.as_ref() {
+                    let _ = st.finish_interface_lifecycle_operation(lease);
                 }
             }
             Err(e) => {
@@ -4989,13 +5008,21 @@ pub async fn add_lora_interface(
                             }
                             Err(OwnedRnodeReadinessError::Superseded) => return,
                             Err(error) => {
+                                let rejection = error.configuration_rejection();
                                 emit_op_status_broadcast(
                                     &st,
                                     "add_lora",
                                     "hub",
-                                    "USB radio did not become ready",
+                                    rejection
+                                        .map(|(message, _)| message)
+                                        .unwrap_or("USB radio did not become ready"),
                                     true,
-                                    Some(&error.to_string()),
+                                    Some(
+                                        rejection
+                                            .map(|(_, reason)| reason.to_string())
+                                            .unwrap_or_else(|| error.to_string())
+                                            .as_str(),
+                                    ),
                                 );
                                 record_interface_activity(
                                     &st,
@@ -5433,10 +5460,13 @@ pub async fn add_lora_interface(
                                                 marker,
                                             );
                                     }
+                                    let rejection = error.configuration_rejection();
                                     let step = if error.is_timeout() {
                                         format!(
                                             "BLE pairing timed out for '{name_for_status}'. Check that the RNode is in pairing mode and retry."
                                         )
+                                    } else if let Some((message, _)) = rejection {
+                                        message.to_string()
                                     } else if error.ready_stats_failure_code().is_some() {
                                         error.to_string()
                                     } else {
@@ -5448,12 +5478,14 @@ pub async fn add_lora_interface(
                                         "hub",
                                         &step,
                                         true,
-                                        Some(error.ready_stats_failure_code().unwrap_or(
-                                            if error.is_timeout() {
-                                                "pairing_timeout"
-                                            } else {
-                                                "startup_failed"
-                                            },
+                                        Some(rejection.map(|(_, reason)| reason).unwrap_or(
+                                            error.ready_stats_failure_code().unwrap_or(
+                                                if error.is_timeout() {
+                                                    "pairing_timeout"
+                                                } else {
+                                                    "startup_failed"
+                                                },
+                                            ),
                                         )),
                                     );
                                     record_interface_activity(
@@ -5664,6 +5696,40 @@ pub async fn add_lora_interface(
                 .map_err(|error| error.to_string())
                 {
                     Ok(spawned) => {
+                        if let Some(unopened) = unopened_rnode_port_message(&spawned) {
+                            // The saved interface keeps retrying as at startup;
+                            // say why now rather than after the readiness wait.
+                            let Ok(id) = adopt_spawned_rnode(
+                                &st,
+                                &operation_lease,
+                                &rns,
+                                &spawned,
+                                rnode_activity_origin,
+                            )
+                            .await
+                            else {
+                                return;
+                            };
+                            emit_op_status_broadcast(
+                                &st,
+                                "add_lora",
+                                "hub",
+                                &format!("RNode interface saved (#{id}). {unopened}"),
+                                true,
+                                None,
+                            );
+                            record_interface_activity(
+                                &st,
+                                activity_fence,
+                                InterfaceClass::RNode,
+                                rnode_activity_transition(RnodeActivityOutcome::ConnectFailed),
+                                None,
+                            );
+                            let _ = st.finish_rnode_lifecycle_operation(&operation_lease);
+                            let ifaces = crate::rns_config::get_all_interfaces(&config_dir);
+                            emit_hub_interfaces(&st, ifaces);
+                            return;
+                        }
                         let id = spawned.interface_id;
                         let starting_step = if is_tcp {
                             format!("RNode TCP interface starting (#{id})")
@@ -5717,7 +5783,10 @@ pub async fn add_lora_interface(
                             }
                             Err(OwnedRnodeReadinessError::Superseded) => return,
                             Err(error) => {
-                                let terminal_step = if error.ready_stats_failure_code().is_some() {
+                                let rejection = error.configuration_rejection();
+                                let terminal_step = if let Some((message, _)) = rejection {
+                                    message.to_string()
+                                } else if error.ready_stats_failure_code().is_some() {
                                     error.to_string()
                                 } else if is_tcp {
                                     "RNode TCP did not become ready".to_string()
@@ -5730,12 +5799,14 @@ pub async fn add_lora_interface(
                                     "hub",
                                     &terminal_step,
                                     true,
-                                    Some(error.ready_stats_failure_code().unwrap_or(
-                                        if error.is_timeout() {
-                                            "startup_timeout"
-                                        } else {
-                                            "startup_failed"
-                                        },
+                                    Some(rejection.map(|(_, reason)| reason).unwrap_or(
+                                        error.ready_stats_failure_code().unwrap_or(
+                                            if error.is_timeout() {
+                                                "startup_timeout"
+                                            } else {
+                                                "startup_failed"
+                                            },
+                                        ),
                                     )),
                                 );
                                 record_interface_activity(

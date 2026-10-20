@@ -1,9 +1,8 @@
-//! RNS runtime integration: init + stats queries.
+//! RNS runtime integration: init, path requests and path-table snapshots.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
@@ -176,79 +175,6 @@ impl RnsManager {
         self.handle.query_control(q).await
     }
 
-    pub async fn get_interface_stats(&self) -> Value {
-        match self.query(TransportQuery::GetInterfaceStats).await {
-            Some(TransportQueryResponse::InterfaceStats(stats)) => {
-                let interfaces: Vec<Value> = stats
-                    .iter()
-                    .map(|s| {
-                        json!({
-                            "name": s.name,
-                            "rxb": s.rx_bytes,
-                            "txb": s.tx_bytes,
-                            "online": s.online,
-                            "bitrate": s.bitrate,
-                            "mtu": s.mtu,
-                            "mode": s.mode,
-                            "role": s.role,
-                            "announce_queue": s.announce_queue,
-                            "held_announces": s.held_announces,
-                            "incoming_announce_frequency": s.incoming_announce_frequency,
-                            "outgoing_announce_frequency": s.outgoing_announce_frequency,
-                            "incoming_pr_frequency": s.incoming_pr_frequency,
-                            "outgoing_pr_frequency": s.outgoing_pr_frequency,
-                            "burst_active": s.burst_active,
-                            "burst_activated": s.burst_activated,
-                            "pr_burst_active": s.pr_burst_active,
-                            "pr_burst_activated": s.pr_burst_activated,
-                            "announce_rate_target": s.announce_rate_target,
-                            "announce_rate_grace": s.announce_rate_grace,
-                            "announce_rate_penalty": s.announce_rate_penalty,
-                            "announce_cap": s.announce_cap,
-                            "ifac_size": s.ifac_size,
-                            "tx_drops": s.tx_drops,
-                        })
-                    })
-                    .collect();
-                json!({ "interfaces": interfaces })
-            }
-            _ => json!({ "interfaces": [] }),
-        }
-    }
-
-    pub async fn get_path_table(&self) -> Vec<Value> {
-        crate::transport_observation::authoritative_path_table(&self.handle)
-            .await
-            .map(|entries| path_table_ui_snapshot(entries).0)
-            .unwrap_or_default()
-    }
-
-    pub async fn get_rate_table(&self) -> Vec<Value> {
-        match self.query(TransportQuery::GetRateTable).await {
-            Some(TransportQueryResponse::RateTable(entries)) => entries
-                .iter()
-                .map(|e| {
-                    json!({
-                        "hash": hex::encode(e.hash),
-                        "rate": e.rate,
-                        "last": e.last,
-                        "rate_violations": e.rate_violations,
-                        "blocked_until": e.blocked_until,
-                        "samples": e.timestamps.len(),
-                    })
-                })
-                .collect(),
-            _ => vec![],
-        }
-    }
-
-    pub async fn get_link_count(&self) -> i64 {
-        match self.query(TransportQuery::GetLinkCount).await {
-            Some(TransportQueryResponse::IntResult(n)) => n,
-            _ => 0,
-        }
-    }
-
     pub async fn request_path(&self, dest_hash: [u8; 16]) {
         let _ = self
             .handle
@@ -263,37 +189,6 @@ impl RnsManager {
         let _ = self
             .query(TransportQuery::DropPath { dest: dest_hash })
             .await;
-    }
-
-    pub async fn build_stats_update(&self) -> Value {
-        let interface_stats = self.get_interface_stats().await;
-        let (path_table, path_index, path_table_total, path_table_truncated) =
-            match crate::transport_observation::authoritative_path_table(&self.handle).await {
-                Some(entries) => path_table_stats_snapshot(entries),
-                _ => (vec![], Value::Object(Map::new()), 0, false),
-            };
-        let rate_table = self.get_rate_table().await;
-        let link_count = self.get_link_count().await;
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-
-        let connected = self.handle.instance_mode == InstanceMode::Client
-            || self.handle.instance_mode == InstanceMode::Shared;
-
-        json!({
-            "timestamp": now,
-            "connected": connected,
-            "interface_stats": interface_stats,
-            "path_table": path_table,
-            "path_index": path_index,
-            "path_table_total": path_table_total,
-            "path_table_truncated": path_table_truncated,
-            "rate_table": rate_table,
-            "link_count": link_count,
-        })
     }
 
     pub async fn shutdown(&self) {

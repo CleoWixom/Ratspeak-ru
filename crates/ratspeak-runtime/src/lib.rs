@@ -30,6 +30,7 @@ mod path_response;
 pub mod propagation;
 pub mod propagation_recovery;
 mod rnode_activity;
+pub mod rnode_status;
 pub mod rns;
 pub mod rns_config;
 pub mod rrc;

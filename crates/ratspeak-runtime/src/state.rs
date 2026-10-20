@@ -2855,13 +2855,20 @@ impl AppState {
         &self,
         stats: &[rns_transport::messages::InterfaceStatRpcEntry],
     ) -> serde_json::Value {
+        // rns -> readiness, the order `publish_ready_rnode_interface_stats` uses.
+        let rns = self.rns.read().ok();
+        let handle = rns
+            .as_ref()
+            .and_then(|rns| rns.as_ref())
+            .map(|rns| &rns.handle);
         let readiness = self.rnode_product_readiness.read().ok();
-        Self::interface_stats_payload_with_readiness(stats, readiness.as_deref())
+        Self::interface_stats_payload_with_readiness(stats, readiness.as_deref(), handle)
     }
 
     fn interface_stats_payload_with_readiness(
         stats: &[rns_transport::messages::InterfaceStatRpcEntry],
         readiness: Option<&HashMap<rns_interface::traits::InterfaceId, bool>>,
+        handle: Option<&rns_runtime::reticulum::ReticulumHandle>,
     ) -> serde_json::Value {
         let interfaces = stats
             .iter()
@@ -2870,6 +2877,11 @@ impl AppState {
                     .and_then(|readiness| readiness.get(&entry.id).copied())
                     .map(|product_ready| entry.online && product_ready)
                     .unwrap_or(entry.online);
+                // Why an RNode is not Ready yet, so every row can explain it.
+                let rnode_state = handle
+                    .and_then(|handle| handle.rnode_runtime(entry.id).ok())
+                    .and_then(|observer| crate::rnode_status::rnode_row_state(&observer.snapshot()))
+                    .map(|(state, reason)| serde_json::json!({ "state": state, "reason": reason }));
                 serde_json::json!({
                     "name": entry.name,
                     "rxb": entry.rx_bytes,
@@ -2895,6 +2907,7 @@ impl AppState {
                     "announce_cap": entry.announce_cap,
                     "ifac_size": entry.ifac_size,
                     "tx_drops": entry.tx_drops,
+                    "rnode_state": rnode_state,
                 })
             })
             .collect::<Vec<_>>();
@@ -2948,7 +2961,11 @@ impl AppState {
             return false;
         }
 
-        let interface_stats = Self::interface_stats_payload_with_readiness(stats, Some(&readiness));
+        let interface_stats = Self::interface_stats_payload_with_readiness(
+            stats,
+            Some(&readiness),
+            rns.as_ref().map(|rns| &rns.handle),
+        );
 
         let any_online = interface_stats["interfaces"]
             .as_array()
