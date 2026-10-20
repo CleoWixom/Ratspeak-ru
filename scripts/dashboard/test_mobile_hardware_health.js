@@ -74,6 +74,17 @@ assert.strictEqual(
     }).label,
     'Pair again'
 );
+[
+    ['rejected_tx_power', 'TX power not supported'],
+    ['rejected_frequency', 'Frequency not supported'],
+    ['unsupported_firmware', 'Firmware update needed'],
+].forEach(function(row) {
+    var health = context._mobileRnodeHealth('ble://00:11:22:33:44:55', {
+        ble_rnode: { state: 'failed', reason: row[0] }
+    });
+    assert.strictEqual(health.label, row[1], row[0]);
+    assert.strictEqual(health.actionable, true, row[0]);
+});
 assert.strictEqual(
     context._mobileRnodeHealth('ble://00:11:22:33:44:55', {
         ble_rnode: { state: 'connected' }
@@ -141,7 +152,7 @@ var actionContext = {
     isLoraInterfaceType: function() { return true; },
     isTcpInterfaceType: function() { return false; },
     setInterfacePaused: function(type, name, paused) { actionCalls.push([type, name, paused]); },
-    openInterfaceEdit: function() {},
+    openInterfaceEdit: function(type, name) { actionCalls.push(['edit', type, name]); },
     openRenameInterfaceDialog: function() {},
     confirmRemoveInterface: function() {},
 };
@@ -206,6 +217,8 @@ var stale = bleState('failed', 'stale_bond');
 assert.deepStrictEqual(labels(stale).slice(0, 2), ['Retry Connection', 'Connection Help']);
 assert.deepStrictEqual(labels(bleState('failed', 'bond_timeout')).slice(0, 2),
     ['Retry Connection', 'Connection Help']);
+var rejected = bleState('failed', 'rejected_tx_power');
+assert.deepStrictEqual(labels(rejected).slice(0, 2), ['Retry Connection', 'Connection Help']);
 [['connected', ''], ['initializing', ''], ['waiting_for_radio', 'radio_disconnected'],
     ['failed', 'connect_failed']].forEach(function(row) {
     assert(!labels(bleState(row[0], row[1])).includes('Connection Help'), row.join('/'));
@@ -227,6 +240,12 @@ function flush() { return new Promise(function(resolve) { setImmediate(resolve);
     await flush();
     assert.deepStrictEqual(actionCalls.pop(), ['ble-permission']);
     assert.strictEqual(dialogs.length, 0, 'a granted permission needs no settings detour');
+
+    // A rejected setting is fixed by editing the interface, not by retrying.
+    rejected[1].onSelect();
+    await flush();
+    assert.deepStrictEqual(dialogs.pop(), ['confirm', 'TX power not supported']);
+    assert.deepStrictEqual(actionCalls.pop(), ['edit', 'rnode', 'Radio']);
 
     // Android stops prompting after repeated denials; Settings is the only path.
     actionContext.permissionGranted = false;

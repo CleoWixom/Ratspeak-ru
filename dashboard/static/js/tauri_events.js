@@ -1147,6 +1147,12 @@ RS.listen('mobile_hardware_state', function(data) {
             bridge_unavailable: 'The Bluetooth RNode service is unavailable.',
             radio_disconnected: 'The RNode disconnected. Ratspeak will keep trying.',
             connect_failed: 'The RNode could not connect.',
+            rejected_tx_power: 'The RNode does not support this TX power. Edit the interface.',
+            rejected_frequency: 'The RNode does not support this frequency. Edit the interface.',
+            rejected_bandwidth: 'The RNode does not support this bandwidth. Edit the interface.',
+            rejected_radio_state: 'The RNode could not start its radio with these settings.',
+            rejected_settings: 'The RNode did not accept these radio settings. Edit the interface.',
+            unsupported_firmware: 'The RNode firmware is too old. Update it, then retry.',
         };
         message = failures[data.reason] || failures.connect_failed;
         if (pd && pd.isOpen()) pd.error(message);

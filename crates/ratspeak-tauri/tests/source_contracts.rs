@@ -1363,6 +1363,59 @@ fn android_ble_product_state_waits_for_exact_protocol_readiness() {
 }
 
 #[test]
+fn android_ble_rejected_settings_release_the_bridge_and_resume_keeps_retrying() {
+    let root = repo_root();
+    let ble =
+        read_source(root.join("crates/ratspeak-tauri/src/commands/ble.rs")).expect("BLE commands");
+    let interfaces = read_source(root.join("crates/ratspeak-tauri/src/commands/interfaces.rs"))
+        .expect("interface commands");
+    let readiness = read_source(root.join("crates/ratspeak-tauri/src/commands/rnode_readiness.rs"))
+        .expect("RNode readiness");
+    let health = read_source(root.join("dashboard/static/js/health.js")).expect("health js");
+
+    // A radio that rejects its settings releases its native bridge and names
+    // the setting on the supervisor-owned path.
+    let saved = ble
+        .split("if saved_startup {")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("// Keep cancellation/replacement responsive")
+                .next()
+        })
+        .expect("saved Android BLE startup branch");
+    assert!(saved.contains("watch_android_ble_rnode_rejection("));
+    assert!(ble.contains("RNodeRuntimeReason::ConfigurationRejected"));
+    assert!(
+        readiness
+            .contains("RnodeReadinessFailure::ConfigurationRejected(last.configuration_rejection)")
+    );
+    for reason in [
+        "rejected_tx_power",
+        "rejected_frequency",
+        "rejected_bandwidth",
+        "unsupported_firmware",
+        "rejected_settings",
+    ] {
+        assert!(readiness.contains(&format!("\"{reason}\"")), "{reason}");
+        assert!(health.contains(&format!("{reason}: '")), "{reason} label");
+    }
+
+    // Resume and edit never pause or revert a radio that is merely away.
+    let editable_ble = interfaces
+        .split("// A resumed or edited radio is owned like a saved one")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("#[cfg(all(feature = \"ble\", not(target_os = \"android\")))]")
+                .next()
+        })
+        .expect("Android BLE editable branch");
+    assert!(editable_ble.contains("start_native_ble_rnode("));
+    assert!(editable_ble.contains("true,\n"));
+    assert!(editable_ble.contains("InterfaceSpawnOutcome::configured_only("));
+    assert!(!editable_ble.contains(".await"));
+}
+
+#[test]
 fn android_ble_retry_reasons_reach_the_user_and_bond_loss_stops_retries() {
     let root = repo_root();
     let kotlin_root = root.join("src-tauri/gen/android/app/src/main/java/org/ratspeak/android");
@@ -1731,13 +1784,6 @@ fn dynamic_rnode_activity_monitors_are_exact_covered_and_ownership_gated() {
     assert!(runtime_state.contains("pub fn effective_interface_online("));
     let runtime_activation = rust_function_block(&runtime_monitor, "activate");
     assert!(runtime_activation.contains("self.origin"));
-    assert!(
-        runtime_state
-            .contains("monitor: Option<crate::rnode_activity::PendingRNodeActivityMonitor>")
-    );
-    assert!(!runtime_state.contains(
-        "#[derive(Clone, Copy, Debug, Eq, PartialEq)]\npub enum BleRnodeOperationResult"
-    ));
 
     let shared_wait = rust_function_block(&readiness, "await_spawned_rnode_ready");
     let cover = shared_wait
@@ -1841,15 +1887,15 @@ fn dynamic_rnode_activity_monitors_are_exact_covered_and_ownership_gated() {
             );
         }
     }
+    // Android BLE resume/edit return configured_only: the startup-owned
+    // supervisor, not the edit transaction, brings that radio up.
     assert_eq!(
         editable
             .matches("InterfaceSpawnOutcome::started_rnode(")
             .count(),
-        5
+        4
     );
     assert!(interfaces.contains("rnode_activity_monitor: Option<PendingRNodeActivityMonitor>"));
-    assert!(editable.contains("BleRnodeOperationResult::Ready {"));
-    assert!(editable.contains("interface_id,\n                            monitor,"));
     assert!(editable.contains("InterfaceSpawnOutcome::started_rnode("));
 
     let replace = rust_function_block(&interfaces, "finish_rnode_interface_replace");
@@ -1905,27 +1951,19 @@ fn dynamic_rnode_activity_monitors_are_exact_covered_and_ownership_gated() {
         .nth(1)
         .and_then(|tail| tail.split("Some(Err(failure)) => {").next())
         .expect("native BLE ready branch");
-    let completion_take = ready_branch
-        .find("take_initializing_ble_rnode_activity_operation_with_completion")
+    let terminal_take = ready_branch
+        .find("take_initializing_ble_rnode_activity_operation(&activity_operation)")
         .expect("native BLE terminal ownership take");
-    let completion_branch = ready_branch
-        .split("if let Some(completion) = completion {")
-        .nth(1)
-        .and_then(|tail| tail.split("} else {").next())
-        .expect("completion-bearing native BLE path");
-    assert!(completion_branch.contains("BleRnodeOperationResult::Ready {"));
-    assert!(completion_branch.contains("monitor: pending_monitor"));
-    assert!(completion_branch.contains(".is_err()"));
-    assert!(completion_branch.contains("teardown_spawned_rnode_exact"));
-    assert!(!completion_branch.contains(".activate("));
-    let direct_branch = ready_branch
+    let activation = ready_branch
+        .find("pending_monitor.activate(Arc::clone(&state_arc))")
+        .expect("owned native BLE monitor activation");
+    assert!(terminal_take < activation);
+    let superseded = ready_branch
         .split("} else {")
         .nth(1)
-        .expect("direct native BLE terminal path");
-    let direct_activation = direct_branch
-        .find("pending_monitor.activate(Arc::clone(&state_arc))")
-        .expect("owned direct native BLE monitor activation");
-    assert!(completion_take < direct_activation);
+        .expect("superseded native BLE terminal path");
+    assert!(superseded.contains("teardown_spawned_rnode_exact"));
+    assert!(!superseded.contains(".activate("));
 }
 
 #[test]
@@ -3099,7 +3137,7 @@ fn semantic_ble_and_auto_activity_adapters_preserve_the_privacy_boundary() {
         .and_then(|tail| tail.split("pub async fn cancel_ble_connect").next())
         .expect("typed native bridge failure command");
     let token_accept = bridge_failure
-        .find("take_active_ble_rnode_activity_operation_with_completion")
+        .find("take_active_ble_rnode_activity_operation(")
         .expect("exact operation acceptance");
     let rollback = bridge_failure
         .find("rollback_ble_rnode_context")
@@ -3172,7 +3210,7 @@ fn android_ble_operation_nonce_is_round_tripped_scoped_and_watchdog_owned() {
     assert!(state.contains("rollback_context: Option<BleRnodeRollbackContext>"));
     assert!(state.contains("lifecycle_lease: Option<RNodeLifecycleOperationLease>"));
     assert!(state.contains("begin_ble_rnode_activity_operation_owned"));
-    assert!(state.contains("begin_ble_rnode_activity_operation_with_completion_owned"));
+    assert!(!state.contains("BleRnodeOperationCompletionSender"));
     assert!(state.contains("invalidate_ble_rnode_activity_operation_if_token"));
     assert!(state.contains("ble_completion_ownership_is_lost_when_new_operation_replaces_it"));
     assert!(state.contains("stale_ble_failure_cannot_take_newer_rollback_context"));
@@ -3204,7 +3242,9 @@ fn android_ble_operation_nonce_is_round_tripped_scoped_and_watchdog_owned() {
     assert!(interfaces.contains("schedule_android_ble_rnode_operation_watchdog"));
     assert!(interfaces.contains("couple_android_ble_operation_to_rnode_lease"));
     assert!(interfaces.contains("begin_ble_rnode_activity_operation_owned"));
-    assert!(interfaces.contains("begin_ble_rnode_activity_operation_with_completion_owned"));
+    // Resume/edit hand an Android BLE radio to the startup-owned supervisor
+    // instead of a transaction that pauses or reverts it.
+    assert!(interfaces.contains("state.begin_ble_rnode_activity_operation(activity_fence, None)"));
     assert!(interfaces.contains("Duration::from_secs(180)"));
     assert!(interfaces.contains("take_pending_ble_rnode_activity_operation"));
     assert!(interfaces.contains("rollback_fresh_lora_add_marker"));

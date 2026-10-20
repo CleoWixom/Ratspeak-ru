@@ -2794,23 +2794,11 @@ fn schedule_android_ble_rnode_operation_watchdog(state: &Arc<AppState>, activity
     let config_dir = active_rns_config_dir(&state);
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(180)).await;
-        let Some((activity_fence, rollback_context, completion)) =
-            state.take_pending_ble_rnode_activity_operation_with_completion(&activity_operation)
+        let Some((activity_fence, rollback_context)) =
+            state.take_pending_ble_rnode_activity_operation(&activity_operation)
         else {
             return;
         };
-
-        if let Some(completion) = completion {
-            let _ = completion.send(crate::state::BleRnodeOperationResult::Failed(
-                crate::state::BleRnodeOperationFailure::Setup,
-            ));
-            let _ = state.mobile_platform_bridge().disconnect_ble_rnode(
-                NativeBleRnodeDisconnect::ExactOperation(&activity_operation),
-            );
-            let ifaces = crate::rns_config::get_all_interfaces(&config_dir);
-            emit_hub_interfaces(&state, ifaces);
-            return;
-        }
 
         record_interface_activity(
             &state,
@@ -3070,6 +3058,7 @@ fn start_native_ble_rnode(
     mode: String,
     id_interval: Option<u64>,
     id_callsign: Option<String>,
+    saved_startup: bool,
 ) -> bool {
     let Some(context) = state
         .rnode_activity_runtime_context_for_identity(activity_fence.identity_session_generation())
@@ -3097,7 +3086,7 @@ fn start_native_ble_rnode(
             airtime_limit_long: radio.airtime_limit_long,
             id_interval,
             id_callsign,
-            saved_startup: false,
+            saved_startup,
         })
 }
 
@@ -3691,20 +3680,14 @@ async fn spawn_editable_interface(
                         .map_err(|e| format!("Failed to reserve BLE bridge port: {e}"))?;
                     let address = port.strip_prefix("ble://").unwrap_or(port);
                     cancel_pending_ble_rnode_activity(state);
-                    let (activity_operation, completion) = state
-                        .begin_ble_rnode_activity_operation_with_completion_owned(
-                            activity_fence,
-                            None,
-                            rnode_lease,
-                        );
-                    schedule_android_ble_rnode_operation_watchdog(state, &activity_operation);
-                    couple_android_ble_operation_to_rnode_lease(
-                        state,
-                        &activity_operation,
-                        rnode_lease,
-                        false,
-                    );
-                    let started = start_native_ble_rnode(
+                    // A resumed or edited radio is owned like a saved one, as
+                    // upstream keeps an enabled interface: the native
+                    // supervisor retries until the radio is reachable and the
+                    // row explains each wait, so a radio that is away is never
+                    // paused again or reverted to its previous settings.
+                    let activity_operation =
+                        state.begin_ble_rnode_activity_operation(activity_fence, None);
+                    if !start_native_ble_rnode(
                         state,
                         activity_fence,
                         address.to_string(),
@@ -3726,68 +3709,15 @@ async fn spawn_editable_interface(
                         mode.to_string(),
                         *id_interval,
                         id_callsign.clone(),
-                    );
-                    if !started {
+                        true,
+                    ) {
                         let _ = state
                             .invalidate_ble_rnode_activity_operation_if_token(&activity_operation);
                         return Err("Android BLE supervisor unavailable".to_string());
                     }
-                    return match completion.await {
-                        Ok(crate::state::BleRnodeOperationResult::Ready {
-                            interface_id,
-                            monitor,
-                        }) => {
-                            if !state.is_current_rnode_lifecycle_operation(rnode_lease) {
-                                rns_runtime::reticulum::teardown_ble_rnode_interface(
-                                    &handle,
-                                    interface_id,
-                                )
-                                .await;
-                                let _ = state.mobile_platform_bridge().disconnect_ble_rnode(
-                                    NativeBleRnodeDisconnect::ExactOperation(&activity_operation),
-                                );
-                                return Err("RNode operation was superseded".to_string());
-                            }
-                            Ok(InterfaceSpawnOutcome::started_rnode(
-                                format!("BLE LoRa interface active (#{interface_id})"),
-                                interface_id,
-                                monitor,
-                            ))
-                        }
-                        Ok(crate::state::BleRnodeOperationResult::Failed(failure)) => {
-                            let message = match failure {
-                                crate::state::BleRnodeOperationFailure::Setup => {
-                                    "BLE bridge setup failed"
-                                }
-                                crate::state::BleRnodeOperationFailure::Connect => {
-                                    "BLE connection failed"
-                                }
-                                crate::state::BleRnodeOperationFailure::StartupTimeout => {
-                                    "RNode startup timed out"
-                                }
-                                crate::state::BleRnodeOperationFailure::Readiness => {
-                                    "RNode did not become ready"
-                                }
-                                crate::state::BleRnodeOperationFailure::ReadyStatsTimeout => {
-                                    "RNode became ready, but interface status publication timed out"
-                                }
-                                crate::state::BleRnodeOperationFailure::ReadyObservationLost => {
-                                    "RNode disconnected before setup completed"
-                                }
-                                crate::state::BleRnodeOperationFailure::ReadySessionReplaced => {
-                                    "RNode setup was replaced before it completed"
-                                }
-                                crate::state::BleRnodeOperationFailure::Runtime => {
-                                    "RNode runtime was unavailable"
-                                }
-                                crate::state::BleRnodeOperationFailure::Cancelled => {
-                                    "BLE setup was cancelled"
-                                }
-                            };
-                            Err(message.to_string())
-                        }
-                        Err(_) => Err("BLE setup was cancelled".to_string()),
-                    };
+                    return Ok(InterfaceSpawnOutcome::configured_only(
+                        "BLE LoRa interface started; connecting to the radio",
+                    ));
                 }
                 #[cfg(all(feature = "ble", not(target_os = "android")))]
                 {
@@ -5290,6 +5220,7 @@ pub async fn add_lora_interface(
                     mode.to_string(),
                     None,
                     None,
+                    false,
                 ) {
                     let _ =
                         st_a.invalidate_ble_rnode_activity_operation_if_token(&activity_operation);

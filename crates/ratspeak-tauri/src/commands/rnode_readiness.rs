@@ -11,6 +11,7 @@ use ratspeak_runtime::{PendingRNodeActivityMonitor, RNodeActivityOrigin};
 use rns_interface::rnode::{
     RNodeCapabilityAdmissionFailureClass, RNodeRuntimeReason, RNodeTransportClass,
 };
+use rns_interface::rnode_protocol::RNodeReadinessEvidence;
 use rns_runtime::reticulum::{RNodeReadinessError, ReticulumHandle, SpawnedRNodeRuntime};
 
 use crate::state::AppState;
@@ -49,6 +50,9 @@ pub(crate) enum RnodeReadinessFailure {
     /// The driver terminally rejected the device's capability admission; the
     /// class identifies why, when the driver published one.
     CapabilityAdmissionRejected(Option<RNodeCapabilityAdmissionFailureClass>),
+    /// The device reported settings or firmware this configuration cannot use;
+    /// the category names which, never its value.
+    ConfigurationRejected(Option<RNodeReadinessEvidence>),
     /// Forward-compatible fallback for new non-exhaustive upstream variants.
     Unclassified,
 }
@@ -70,12 +74,47 @@ impl fmt::Display for RnodeReadinessFailure {
                 "RNode session was replaced before stats publication"
             }
             Self::CapabilityAdmissionRejected(_) => "RNode capability admission was rejected",
+            Self::ConfigurationRejected(_) => "RNode rejected the configured radio settings",
             Self::Unclassified => "RNode readiness failed",
         })
     }
 }
 
 impl std::error::Error for RnodeReadinessFailure {}
+
+/// Closed product reason for a radio that rejected its settings.
+#[cfg_attr(not(feature = "ble"), allow(dead_code))]
+pub(crate) fn configuration_rejection_reason(
+    rejected: Option<RNodeReadinessEvidence>,
+) -> &'static str {
+    match rejected {
+        Some(RNodeReadinessEvidence::TransmitPower) => "rejected_tx_power",
+        Some(RNodeReadinessEvidence::Frequency) => "rejected_frequency",
+        Some(RNodeReadinessEvidence::Bandwidth) => "rejected_bandwidth",
+        Some(RNodeReadinessEvidence::RadioState) => "rejected_radio_state",
+        Some(RNodeReadinessEvidence::Firmware) => "unsupported_firmware",
+        _ => "rejected_settings",
+    }
+}
+
+/// User-facing explanation for a radio that rejected its settings.
+#[cfg_attr(not(feature = "ble"), allow(dead_code))]
+pub(crate) fn configuration_rejection_message(
+    rejected: Option<RNodeReadinessEvidence>,
+) -> &'static str {
+    match rejected {
+        Some(RNodeReadinessEvidence::TransmitPower) => {
+            "The RNode does not support this TX power. Choose a TX power this radio supports."
+        }
+        Some(RNodeReadinessEvidence::Frequency) => {
+            "The RNode does not support this frequency. Choose a frequency in its band."
+        }
+        Some(RNodeReadinessEvidence::Firmware) => {
+            "The RNode firmware is too old. Update it, then try again."
+        }
+        _ => "The RNode did not accept these radio settings. Edit the interface and try again.",
+    }
+}
 
 /// Reduce the non-exhaustive upstream error to the command layer's stable,
 /// snapshot-free outcome vocabulary.
@@ -85,11 +124,13 @@ pub(crate) fn classify_rnode_readiness_error(error: &RNodeReadinessError) -> Rno
         RNodeReadinessError::ShuttingDown { .. } => RnodeReadinessFailure::ShuttingDown,
         RNodeReadinessError::Stopped { .. } => {
             let class = error.capability_admission_failure();
+            let last = error.last_snapshot();
             if class.is_some()
-                || error.last_snapshot().reason
-                    == Some(RNodeRuntimeReason::CapabilityAdmissionRejected)
+                || last.reason == Some(RNodeRuntimeReason::CapabilityAdmissionRejected)
             {
                 RnodeReadinessFailure::CapabilityAdmissionRejected(class)
+            } else if last.reason == Some(RNodeRuntimeReason::ConfigurationRejected) {
+                RnodeReadinessFailure::ConfigurationRejected(last.configuration_rejection)
             } else {
                 RnodeReadinessFailure::Stopped
             }
@@ -369,9 +410,39 @@ mod tests {
             "RNode capability admission was rejected"
         );
         assert_eq!(
+            RnodeReadinessFailure::ConfigurationRejected(Some(
+                RNodeReadinessEvidence::TransmitPower
+            ))
+            .to_string(),
+            "RNode rejected the configured radio settings"
+        );
+        assert_eq!(
             RnodeReadinessFailure::Unclassified.to_string(),
             "RNode readiness failed"
         );
+    }
+
+    #[test]
+    fn configuration_rejections_map_to_closed_reasons() {
+        use RNodeReadinessEvidence::{Bandwidth, CodingRate, Firmware, TransmitPower};
+        assert_eq!(
+            configuration_rejection_reason(Some(TransmitPower)),
+            "rejected_tx_power"
+        );
+        assert_eq!(
+            configuration_rejection_reason(Some(Bandwidth)),
+            "rejected_bandwidth"
+        );
+        assert_eq!(
+            configuration_rejection_reason(Some(Firmware)),
+            "unsupported_firmware"
+        );
+        assert_eq!(
+            configuration_rejection_reason(Some(CodingRate)),
+            "rejected_settings"
+        );
+        assert_eq!(configuration_rejection_reason(None), "rejected_settings");
+        assert!(configuration_rejection_message(Some(TransmitPower)).contains("TX power"));
     }
 
     #[test]

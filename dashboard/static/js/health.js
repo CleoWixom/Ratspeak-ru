@@ -348,7 +348,9 @@ function buildIfaceActionItems(ifaceType, ifaceName) {
             items.push({
                 label: 'Connection Help',
                 icon: ICON_INFO,
-                onSelect: function() { showBleRnodeHelp(bleHelp); }
+                onSelect: function() {
+                    showBleRnodeHelp(bleHelp, function() { openInterfaceEdit(ifaceType, ifaceName); });
+                }
             });
         }
         items.push({ separator: true });
@@ -396,6 +398,26 @@ var BLE_RNODE_HELP = {
             'choose Retry Connection and enter the PIN it shows.',
         bluetoothSettings: true
     },
+    rejected_tx_power: {
+        title: 'TX power not supported',
+        message: 'The RNode reported a different transmit power than this interface uses, ' +
+            'so Ratspeak kept it offline. Radios with a power amplifier, such as the ' +
+            'Heltec LoRa32 V4, cannot transmit below about 11 to 13 dBm, and most others ' +
+            'stop at 22 dBm. Choose a TX power this radio supports.',
+        editInterface: true
+    },
+    rejected_settings: {
+        title: 'Settings not supported',
+        message: 'The RNode did not accept this interface\'s radio settings, so Ratspeak ' +
+            'kept it offline. Choose a frequency, bandwidth, spreading factor and coding ' +
+            'rate this radio supports.',
+        editInterface: true
+    },
+    unsupported_firmware: {
+        title: 'Firmware update needed',
+        message: 'This RNode\'s firmware is too old for Ratspeak. Update it with rnodeconf, ' +
+            'then choose Retry Connection.'
+    },
 };
 
 function bleRnodeHelp(state, reason) {
@@ -408,13 +430,29 @@ function bleRnodeHelp(state, reason) {
         return BLE_RNODE_HELP.pairing_required;
     }
     if (state === 'failed' && reason === 'stale_bond') return BLE_RNODE_HELP.stale_bond;
+    if (state === 'failed' && reason === 'rejected_tx_power') return BLE_RNODE_HELP.rejected_tx_power;
+    if (state === 'failed' && reason === 'unsupported_firmware') {
+        return BLE_RNODE_HELP.unsupported_firmware;
+    }
+    if (state === 'failed' && /^rejected_/.test(reason)) return BLE_RNODE_HELP.rejected_settings;
     return null;
 }
 
-function showBleRnodeHelp(help) {
+function showBleRnodeHelp(help, editInterface) {
     var bridge = typeof hasAndroidBridge === 'function' && hasAndroidBridge()
         ? window.RatspeakAndroid
         : null;
+    if (help.editInterface && typeof editInterface === 'function') {
+        rsConfirm({
+            title: help.title,
+            message: help.message,
+            confirmText: 'Edit Interface',
+            cancelText: 'Close'
+        }).then(function(edit) {
+            if (edit) editInterface();
+        });
+        return;
+    }
     if (help.bluetoothSettings && bridge && typeof bridge.openBluetoothSettings === 'function') {
         rsConfirm({
             title: help.title,
@@ -1083,6 +1121,12 @@ function _mobileRnodeHealth(port, mobileHardware) {
             auto_resume_disabled: 'Reconnect paused',
             connect_failed: 'Connection failed',
             multiple_configured_radios: 'Radio conflict',
+            rejected_tx_power: 'TX power not supported',
+            rejected_frequency: 'Frequency not supported',
+            rejected_bandwidth: 'Bandwidth not supported',
+            rejected_radio_state: 'Radio failed to start',
+            rejected_settings: 'Settings not supported',
+            unsupported_firmware: 'Firmware update needed',
         };
         // Why a retrying radio last failed; unknown reasons stay generic.
         var retryLabels = {

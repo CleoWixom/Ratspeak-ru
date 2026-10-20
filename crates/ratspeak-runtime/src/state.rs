@@ -335,7 +335,6 @@ struct BleRnodeActivityOperation {
     started_at: Instant,
     phase: BleRnodeActivityOperationPhase,
     rollback_context: Option<BleRnodeRollbackContext>,
-    completion: Option<BleRnodeOperationCompletionSender>,
 }
 
 struct BleRnodeRollbackContext {
@@ -376,30 +375,6 @@ fn transition_android_ble_cache_to_connected(
     }
 }
 
-/// Closed, snapshot-free failure vocabulary for a native BLE-RNode operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BleRnodeOperationFailure {
-    Setup,
-    Connect,
-    StartupTimeout,
-    Readiness,
-    ReadyStatsTimeout,
-    ReadyObservationLost,
-    ReadySessionReplaced,
-    Runtime,
-    Cancelled,
-}
-
-/// Terminal result delivered only to an internal native BLE-RNode waiter.
-#[derive(Debug)]
-pub enum BleRnodeOperationResult {
-    Ready {
-        interface_id: u64,
-        monitor: Option<crate::rnode_activity::PendingRNodeActivityMonitor>,
-    },
-    Failed(BleRnodeOperationFailure),
-}
-
 #[derive(Clone)]
 pub struct RNodeLifecycleOperationLease {
     generation: u64,
@@ -431,17 +406,6 @@ struct RNodeLifecycleOperationEntry {
 pub type BleRnodeRollback = (PathBuf, String, u64);
 #[doc(hidden)]
 pub type BleRnodeActivityTake = (ActivityRequestFence, Option<BleRnodeRollback>);
-#[doc(hidden)]
-pub type BleRnodeOperationCompletionSender = tokio::sync::oneshot::Sender<BleRnodeOperationResult>;
-#[doc(hidden)]
-pub type BleRnodeOperationCompletionReceiver =
-    tokio::sync::oneshot::Receiver<BleRnodeOperationResult>;
-#[doc(hidden)]
-pub type BleRnodeActivityTakeWithCompletion = (
-    ActivityRequestFence,
-    Option<BleRnodeRollback>,
-    Option<BleRnodeOperationCompletionSender>,
-);
 #[doc(hidden)]
 pub type BleRnodeActivityCancellation = (String, ActivityRequestFence, Option<BleRnodeRollback>);
 
@@ -2201,7 +2165,7 @@ impl AppState {
         fence: ActivityRequestFence,
         rollback_context: Option<BleRnodeRollback>,
     ) -> String {
-        self.begin_ble_rnode_activity_operation_inner(fence, rollback_context, None, None)
+        self.begin_ble_rnode_activity_operation_inner(fence, rollback_context, None)
     }
 
     /// Begin a native BLE operation coupled to one exact RNode lifecycle
@@ -2216,49 +2180,7 @@ impl AppState {
         self.begin_ble_rnode_activity_operation_inner(
             fence,
             rollback_context,
-            None,
             Some(lifecycle_lease.clone()),
-        )
-    }
-
-    /// Begin a native BLE-RNode operation whose terminal protocol result can
-    /// be awaited by an internal update or resume transaction.
-    pub fn begin_ble_rnode_activity_operation_with_completion(
-        &self,
-        fence: ActivityRequestFence,
-        rollback_context: Option<BleRnodeRollback>,
-    ) -> (String, BleRnodeOperationCompletionReceiver) {
-        self.begin_ble_rnode_activity_operation_with_completion_inner(fence, rollback_context, None)
-    }
-
-    pub fn begin_ble_rnode_activity_operation_with_completion_owned(
-        &self,
-        fence: ActivityRequestFence,
-        rollback_context: Option<BleRnodeRollback>,
-        lifecycle_lease: &RNodeLifecycleOperationLease,
-    ) -> (String, BleRnodeOperationCompletionReceiver) {
-        self.begin_ble_rnode_activity_operation_with_completion_inner(
-            fence,
-            rollback_context,
-            Some(lifecycle_lease.clone()),
-        )
-    }
-
-    fn begin_ble_rnode_activity_operation_with_completion_inner(
-        &self,
-        fence: ActivityRequestFence,
-        rollback_context: Option<BleRnodeRollback>,
-        lifecycle_lease: Option<RNodeLifecycleOperationLease>,
-    ) -> (String, BleRnodeOperationCompletionReceiver) {
-        let (completion, receiver) = tokio::sync::oneshot::channel();
-        (
-            self.begin_ble_rnode_activity_operation_inner(
-                fence,
-                rollback_context,
-                Some(completion),
-                lifecycle_lease,
-            ),
-            receiver,
         )
     }
 
@@ -2266,7 +2188,6 @@ impl AppState {
         &self,
         fence: ActivityRequestFence,
         rollback_context: Option<BleRnodeRollback>,
-        completion: Option<BleRnodeOperationCompletionSender>,
         lifecycle_lease: Option<RNodeLifecycleOperationLease>,
     ) -> String {
         let mut token = rns_crypto::random::random_16();
@@ -2294,23 +2215,18 @@ impl AppState {
                     marker,
                 }
             }),
-            completion,
         });
         drop(pending);
 
-        let displaced_lease = displaced
-            .as_ref()
-            .and_then(|operation| operation.lifecycle_lease.clone());
+        let displaced_lease = displaced.and_then(|operation| operation.lifecycle_lease);
         if let Some(displaced_lease) =
             displaced_lease.filter(|lease| Some(lease.generation) != lifecycle_generation)
         {
             // Native BLE setup is process-global. Replacing its token also
-            // revokes a distinct product transaction before dropping its
-            // completion sender. The displaced caller therefore cannot wake,
-            // still observe ownership, and roll back over the new operation.
+            // revokes a distinct product transaction, so the displaced caller
+            // cannot roll back over the new operation.
             let _ = self.finish_rnode_lifecycle_operation(&displaced_lease);
         }
-        drop(displaced);
         hex::encode(token)
     }
 
@@ -2420,11 +2336,11 @@ impl AppState {
         &self,
         token_hex: &str,
     ) -> Option<ActivityRequestFence> {
-        self.take_ble_rnode_activity_operation_in_phase_with_completion(
+        self.take_ble_rnode_activity_operation_in_phase(
             token_hex,
             BleRnodeActivityOperationPhase::CancellationCompleting,
         )
-        .map(|(fence, _, _)| fence)
+        .map(|(fence, _)| fence)
     }
 
     pub fn claim_ble_rnode_activity_operation(
@@ -2458,15 +2374,7 @@ impl AppState {
         &self,
         token_hex: &str,
     ) -> Option<BleRnodeActivityTake> {
-        self.take_pending_ble_rnode_activity_operation_with_completion(token_hex)
-            .map(|(fence, rollback_context, _completion)| (fence, rollback_context))
-    }
-
-    pub fn take_pending_ble_rnode_activity_operation_with_completion(
-        &self,
-        token_hex: &str,
-    ) -> Option<BleRnodeActivityTakeWithCompletion> {
-        self.take_ble_rnode_activity_operation_in_phase_with_completion(
+        self.take_ble_rnode_activity_operation_in_phase(
             token_hex,
             BleRnodeActivityOperationPhase::PendingNative,
         )
@@ -2476,10 +2384,10 @@ impl AppState {
     /// listener handoff. Used for native failures that can race Rust runtime
     /// initialization; later callbacks observe absence and cannot complete it
     /// twice.
-    pub fn take_active_ble_rnode_activity_operation_with_completion(
+    pub fn take_active_ble_rnode_activity_operation(
         &self,
         token_hex: &str,
-    ) -> Option<BleRnodeActivityTakeWithCompletion> {
+    ) -> Option<BleRnodeActivityTake> {
         let token: [u8; 16] = hex::decode(token_hex).ok()?.try_into().ok()?;
         let mut pending = self
             .ble_rnode_activity_operation
@@ -2504,11 +2412,7 @@ impl AppState {
                 let rollback_context = operation
                     .rollback_context
                     .map(|rollback| (rollback.config_dir, rollback.name, rollback.marker));
-                (
-                    operation.activity_fence,
-                    rollback_context,
-                    operation.completion,
-                )
+                (operation.activity_fence, rollback_context)
             });
         }
         None
@@ -2518,15 +2422,7 @@ impl AppState {
         &self,
         token_hex: &str,
     ) -> Option<BleRnodeActivityTake> {
-        self.take_initializing_ble_rnode_activity_operation_with_completion(token_hex)
-            .map(|(fence, rollback_context, _completion)| (fence, rollback_context))
-    }
-
-    pub fn take_initializing_ble_rnode_activity_operation_with_completion(
-        &self,
-        token_hex: &str,
-    ) -> Option<BleRnodeActivityTakeWithCompletion> {
-        self.take_ble_rnode_activity_operation_in_phase_with_completion(
+        self.take_ble_rnode_activity_operation_in_phase(
             token_hex,
             BleRnodeActivityOperationPhase::Initializing,
         )
@@ -2563,25 +2459,17 @@ impl AppState {
         &self,
         token_hex: &str,
     ) -> Option<BleRnodeActivityTake> {
-        self.take_completing_ble_rnode_activity_operation_with_completion(token_hex)
-            .map(|(fence, rollback_context, _completion)| (fence, rollback_context))
-    }
-
-    pub fn take_completing_ble_rnode_activity_operation_with_completion(
-        &self,
-        token_hex: &str,
-    ) -> Option<BleRnodeActivityTakeWithCompletion> {
-        self.take_ble_rnode_activity_operation_in_phase_with_completion(
+        self.take_ble_rnode_activity_operation_in_phase(
             token_hex,
             BleRnodeActivityOperationPhase::Completing,
         )
     }
 
-    fn take_ble_rnode_activity_operation_in_phase_with_completion(
+    fn take_ble_rnode_activity_operation_in_phase(
         &self,
         token_hex: &str,
         expected_phase: BleRnodeActivityOperationPhase,
-    ) -> Option<BleRnodeActivityTakeWithCompletion> {
+    ) -> Option<BleRnodeActivityTake> {
         let token: [u8; 16] = hex::decode(token_hex).ok()?.try_into().ok()?;
         let mut pending = self
             .ble_rnode_activity_operation
@@ -2607,11 +2495,7 @@ impl AppState {
                 let rollback_context = operation
                     .rollback_context
                     .map(|context| (context.config_dir, context.name, context.marker));
-                (
-                    operation.activity_fence,
-                    rollback_context,
-                    operation.completion,
-                )
+                (operation.activity_fence, rollback_context)
             })
         } else {
             None
@@ -4550,13 +4434,13 @@ mod tests {
         let pending = state.begin_ble_rnode_activity_operation(pending_fence, None);
         assert_eq!(
             state
-                .take_active_ble_rnode_activity_operation_with_completion(&pending)
+                .take_active_ble_rnode_activity_operation(&pending)
                 .map(|taken| taken.0),
             Some(pending_fence)
         );
         assert!(
             state
-                .take_active_ble_rnode_activity_operation_with_completion(&pending)
+                .take_active_ble_rnode_activity_operation(&pending)
                 .is_none()
         );
 
@@ -4568,98 +4452,29 @@ mod tests {
         );
         assert_eq!(
             state
-                .take_active_ble_rnode_activity_operation_with_completion(&initializing)
+                .take_active_ble_rnode_activity_operation(&initializing)
                 .map(|taken| taken.0),
             Some(initializing_fence)
         );
         assert!(
             state
-                .take_active_ble_rnode_activity_operation_with_completion(&initializing)
+                .take_active_ble_rnode_activity_operation(&initializing)
                 .is_none()
         );
     }
 
-    #[tokio::test]
-    async fn ble_rnode_completion_reports_ready_with_exact_interface_id() {
+    #[test]
+    fn replacement_and_identity_clear_revoke_ble_rnode_operations() {
         let state = make_state();
-        let fence = state.activity_request_fence();
-        let (token, receiver) =
-            state.begin_ble_rnode_activity_operation_with_completion(fence, None);
-        assert_eq!(
-            state.claim_ble_rnode_activity_operation(&token),
-            Some(fence)
-        );
-
-        let (terminal_fence, rollback_context, completion) = state
-            .take_initializing_ble_rnode_activity_operation_with_completion(&token)
-            .expect("exact initializing operation");
-        assert_eq!(terminal_fence, fence);
-        assert_eq!(rollback_context, None);
-        completion
-            .expect("completion sender")
-            .send(BleRnodeOperationResult::Ready {
-                interface_id: 73,
-                monitor: None,
-            })
-            .expect("waiting receiver");
-
-        assert!(matches!(
-            receiver.await.expect("typed completion"),
-            BleRnodeOperationResult::Ready {
-                interface_id: 73,
-                monitor: None,
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn ble_rnode_completion_reports_closed_failure_type() {
-        let state = make_state();
-        let fence = state.activity_request_fence();
-        let (token, receiver) =
-            state.begin_ble_rnode_activity_operation_with_completion(fence, None);
-        assert_eq!(
-            state.claim_ble_rnode_activity_operation(&token),
-            Some(fence)
-        );
-        assert_eq!(
-            state.claim_ble_rnode_activity_operation_completion(&token),
-            Some(fence)
-        );
-
-        let (_, _, completion) = state
-            .take_completing_ble_rnode_activity_operation_with_completion(&token)
-            .expect("exact completing operation");
-        completion
-            .expect("completion sender")
-            .send(BleRnodeOperationResult::Failed(
-                BleRnodeOperationFailure::Readiness,
-            ))
-            .expect("waiting receiver");
-
-        assert!(matches!(
-            receiver.await.expect("typed completion"),
-            BleRnodeOperationResult::Failed(BleRnodeOperationFailure::Readiness)
-        ));
-    }
-
-    #[tokio::test]
-    async fn replacement_and_identity_clear_close_ble_rnode_completion_receivers() {
-        let state = make_state();
-        let (first, first_receiver) = state.begin_ble_rnode_activity_operation_with_completion(
-            state.activity_request_fence(),
-            None,
-        );
-        let (second, second_receiver) = state.begin_ble_rnode_activity_operation_with_completion(
-            state.activity_request_fence(),
-            None,
-        );
+        let first = state.begin_ble_rnode_activity_operation(state.activity_request_fence(), None);
+        let second = state.begin_ble_rnode_activity_operation(state.activity_request_fence(), None);
         assert_ne!(first, second);
-        assert!(first_receiver.await.is_err());
+        assert!(!state.is_current_ble_rnode_activity_operation(&first));
+        assert!(state.is_current_ble_rnode_activity_operation(&second));
 
         state.clear_identity_scoped_runtime_state();
 
-        assert!(second_receiver.await.is_err());
+        assert!(!state.is_current_ble_rnode_activity_operation(&second));
     }
 
     #[test]
@@ -4687,15 +4502,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn owned_ble_rnode_operation_is_revoked_with_lifecycle_generation() {
+    #[test]
+    fn owned_ble_rnode_operation_is_revoked_with_lifecycle_generation() {
         let state = make_state();
         let lifecycle = state
             .begin_rnode_lifecycle_operation(["Radio"])
             .expect("lifecycle lease");
         let fence = state.activity_request_fence();
-        let (token, receiver) =
-            state.begin_ble_rnode_activity_operation_with_completion_owned(fence, None, &lifecycle);
+        let token = state.begin_ble_rnode_activity_operation_owned(fence, None, &lifecycle);
         assert!(state.is_current_ble_rnode_activity_operation(&token));
 
         let replacement = state
@@ -4708,42 +4522,30 @@ mod tests {
                 .invalidate_ble_rnode_activity_operation_if_token(&token)
                 .is_some()
         );
-        assert!(receiver.await.is_err());
         assert!(state.is_current_rnode_lifecycle_operation(&replacement));
     }
 
-    #[tokio::test]
-    async fn global_ble_replacement_revokes_only_displaced_lifecycle() {
-        let state = Arc::new(make_state());
+    #[test]
+    fn global_ble_replacement_revokes_only_displaced_lifecycle() {
+        let state = make_state();
         let first_lease = state
             .begin_rnode_lifecycle_operation(["Radio A"])
             .expect("first lifecycle");
-        let (_, first_receiver) = state.begin_ble_rnode_activity_operation_with_completion_owned(
+        state.begin_ble_rnode_activity_operation_owned(
             state.activity_request_fence(),
             None,
             &first_lease,
         );
-        let displaced_state = Arc::clone(&state);
-        let displaced_lease = first_lease.clone();
-        let displaced_observer = tokio::spawn(async move {
-            assert!(first_receiver.await.is_err());
-            displaced_state.is_current_rnode_lifecycle_operation(&displaced_lease)
-        });
 
         let second_lease = state
             .begin_rnode_lifecycle_operation(["Radio B"])
             .expect("second lifecycle");
-        let (second_token, _) = state.begin_ble_rnode_activity_operation_with_completion_owned(
+        let second_token = state.begin_ble_rnode_activity_operation_owned(
             state.activity_request_fence(),
             None,
             &second_lease,
         );
 
-        assert!(
-            !displaced_observer
-                .await
-                .expect("displaced receiver observer")
-        );
         assert!(!state.is_current_rnode_lifecycle_operation(&first_lease));
         assert!(state.is_current_rnode_lifecycle_operation(&second_lease));
         assert!(state.is_current_ble_rnode_activity_operation(&second_token));
@@ -4755,20 +4557,6 @@ mod tests {
         );
         assert!(state.is_current_rnode_lifecycle_operation(&second_lease));
         assert!(state.is_current_ble_rnode_activity_operation(&replacement_same_lease));
-    }
-
-    #[tokio::test]
-    async fn legacy_ble_rnode_take_deliberately_closes_completion_receiver() {
-        let state = make_state();
-        let fence = state.activity_request_fence();
-        let (token, receiver) =
-            state.begin_ble_rnode_activity_operation_with_completion(fence, None);
-
-        assert_eq!(
-            state.take_pending_ble_rnode_activity_operation(&token),
-            Some((fence, None))
-        );
-        assert!(receiver.await.is_err());
     }
 
     #[test]

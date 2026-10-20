@@ -2127,21 +2127,6 @@ pub ratspeak_runtime::state::AttachmentTransferAdmissionError::Busy
 pub ratspeak_runtime::state::AttachmentTransferAdmissionError::MemoryPressure
 pub ratspeak_runtime::state::AttachmentTransferAdmissionError::Storage
 pub ratspeak_runtime::state::AttachmentTransferAdmissionError::TooLarge
-pub enum ratspeak_runtime::state::BleRnodeOperationFailure
-pub ratspeak_runtime::state::BleRnodeOperationFailure::Cancelled
-pub ratspeak_runtime::state::BleRnodeOperationFailure::Connect
-pub ratspeak_runtime::state::BleRnodeOperationFailure::Readiness
-pub ratspeak_runtime::state::BleRnodeOperationFailure::ReadyObservationLost
-pub ratspeak_runtime::state::BleRnodeOperationFailure::ReadySessionReplaced
-pub ratspeak_runtime::state::BleRnodeOperationFailure::ReadyStatsTimeout
-pub ratspeak_runtime::state::BleRnodeOperationFailure::Runtime
-pub ratspeak_runtime::state::BleRnodeOperationFailure::Setup
-pub ratspeak_runtime::state::BleRnodeOperationFailure::StartupTimeout
-pub enum ratspeak_runtime::state::BleRnodeOperationResult
-pub ratspeak_runtime::state::BleRnodeOperationResult::Failed(ratspeak_runtime::state::BleRnodeOperationFailure)
-pub ratspeak_runtime::state::BleRnodeOperationResult::Ready
-pub ratspeak_runtime::state::BleRnodeOperationResult::Ready::interface_id: u64
-pub ratspeak_runtime::state::BleRnodeOperationResult::Ready::monitor: core::option::Option<ratspeak_runtime::PendingRNodeActivityMonitor>
 pub enum ratspeak_runtime::state::ImageAttachmentStagingError
 pub ratspeak_runtime::state::ImageAttachmentStagingError::Admission(ratspeak_runtime::state::AttachmentTransferAdmissionError)
 pub ratspeak_runtime::state::ImageAttachmentStagingError::InvalidState
@@ -2253,8 +2238,6 @@ pub fn ratspeak_runtime::state::AppState::begin_attachment_staging(&alloc::sync:
 pub fn ratspeak_runtime::state::AppState::begin_ble_rnode_activity_cancellation(&self) -> core::option::Option<BleRnodeActivityCancellation>
 pub fn ratspeak_runtime::state::AppState::begin_ble_rnode_activity_operation(&self, ratspeak_runtime::state::ActivityRequestFence, core::option::Option<BleRnodeRollback>) -> alloc::string::String
 pub fn ratspeak_runtime::state::AppState::begin_ble_rnode_activity_operation_owned(&self, ratspeak_runtime::state::ActivityRequestFence, core::option::Option<BleRnodeRollback>, &ratspeak_runtime::state::RNodeLifecycleOperationLease) -> alloc::string::String
-pub fn ratspeak_runtime::state::AppState::begin_ble_rnode_activity_operation_with_completion(&self, ratspeak_runtime::state::ActivityRequestFence, core::option::Option<BleRnodeRollback>) -> (alloc::string::String, BleRnodeOperationCompletionReceiver)
-pub fn ratspeak_runtime::state::AppState::begin_ble_rnode_activity_operation_with_completion_owned(&self, ratspeak_runtime::state::ActivityRequestFence, core::option::Option<BleRnodeRollback>, &ratspeak_runtime::state::RNodeLifecycleOperationLease) -> (alloc::string::String, BleRnodeOperationCompletionReceiver)
 pub fn ratspeak_runtime::state::AppState::begin_foreground_transition(&self) -> u64
 pub fn ratspeak_runtime::state::AppState::begin_interface_lifecycle_operation<I, S>(&self, I) -> core::option::Option<ratspeak_runtime::state::InterfaceLifecycleOperationLease> where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<str>
 pub fn ratspeak_runtime::state::AppState::begin_lxmf_client_send(&alloc::sync::Arc<Self>, alloc::string::String) -> core::result::Result<ratspeak_runtime::state::LxmfClientSendGuard, ratspeak_runtime::state::LxmfClientSendAdmissionError>
@@ -2344,19 +2327,16 @@ pub fn ratspeak_runtime::state::AppState::set_rns(&self, ratspeak_runtime::rns::
 pub fn ratspeak_runtime::state::AppState::set_startup_stage(&self, &str)
 pub fn ratspeak_runtime::state::AppState::should_surface_native_notification(&self) -> bool
 pub fn ratspeak_runtime::state::AppState::suppress_next_interface_reannounce(&self, &str)
-pub fn ratspeak_runtime::state::AppState::take_active_ble_rnode_activity_operation_with_completion(&self, &str) -> core::option::Option<BleRnodeActivityTakeWithCompletion>
+pub fn ratspeak_runtime::state::AppState::take_active_ble_rnode_activity_operation(&self, &str) -> core::option::Option<BleRnodeActivityTake>
 pub fn ratspeak_runtime::state::AppState::take_channel_hub(&self) -> core::option::Option<ratspeak_runtime::channel_hub::ChannelHubHandle>
 pub fn ratspeak_runtime::state::AppState::take_channels(&self) -> core::option::Option<ratspeak_runtime::channels::ChannelsManagerHandle>
 pub fn ratspeak_runtime::state::AppState::take_completed_attachment_staging(&self, &str) -> core::option::Option<ratspeak_runtime::state::StagedAttachment>
 pub fn ratspeak_runtime::state::AppState::take_completing_ble_rnode_activity_cancellation(&self, &str) -> core::option::Option<ratspeak_runtime::state::ActivityRequestFence>
 pub fn ratspeak_runtime::state::AppState::take_completing_ble_rnode_activity_operation(&self, &str) -> core::option::Option<BleRnodeActivityTake>
-pub fn ratspeak_runtime::state::AppState::take_completing_ble_rnode_activity_operation_with_completion(&self, &str) -> core::option::Option<BleRnodeActivityTakeWithCompletion>
 pub fn ratspeak_runtime::state::AppState::take_hw_last_error(&self) -> core::option::Option<alloc::string::String>
 pub fn ratspeak_runtime::state::AppState::take_initializing_ble_rnode_activity_operation(&self, &str) -> core::option::Option<BleRnodeActivityTake>
-pub fn ratspeak_runtime::state::AppState::take_initializing_ble_rnode_activity_operation_with_completion(&self, &str) -> core::option::Option<BleRnodeActivityTakeWithCompletion>
 pub fn ratspeak_runtime::state::AppState::take_interface_reannounce_suppression(&self, &str) -> bool
 pub fn ratspeak_runtime::state::AppState::take_pending_ble_rnode_activity_operation(&self, &str) -> core::option::Option<BleRnodeActivityTake>
-pub fn ratspeak_runtime::state::AppState::take_pending_ble_rnode_activity_operation_with_completion(&self, &str) -> core::option::Option<BleRnodeActivityTakeWithCompletion>
 pub fn ratspeak_runtime::state::AppState::take_pending_hw_pin(&self) -> core::option::Option<alloc::string::String>
 pub fn ratspeak_runtime::state::AppState::take_retryable_attachment_staging(&self, &str) -> core::option::Option<ratspeak_runtime::state::StagedAttachment>
 pub fn ratspeak_runtime::state::AppState::trim_propagation_nodes(&self)

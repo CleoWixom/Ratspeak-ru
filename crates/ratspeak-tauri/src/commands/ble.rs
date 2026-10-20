@@ -133,6 +133,11 @@ fn ble_rnode_readiness_failure_feedback(
             "readiness_failed",
             BleRnodeActivityOutcome::RuntimeFailed,
         ),
+        RnodeReadinessFailure::ConfigurationRejected(rejected) => (
+            crate::commands::rnode_readiness::configuration_rejection_message(rejected),
+            crate::commands::rnode_readiness::configuration_rejection_reason(rejected),
+            BleRnodeActivityOutcome::RuntimeFailed,
+        ),
         RnodeReadinessFailure::ReadyStatsPublication(
             RnodeReadyStatsPublicationFailure::Timeout,
         ) => (
@@ -190,22 +195,52 @@ fn rollback_ble_rnode_context(state: &AppState, rollback_context: Option<BleRnod
     }
 }
 
-fn complete_waiting_ble_rnode_operation(
-    completion: Option<crate::state::BleRnodeOperationCompletionSender>,
-    result: crate::state::BleRnodeOperationResult,
-) -> bool {
-    let Some(completion) = completion else {
-        return false;
-    };
-    let _ = completion.send(result);
-    true
-}
-
 #[cfg(target_os = "android")]
 fn disconnect_native_ble_rnode_operation(state: &AppState, activity_operation: &str) {
     let _ = state
         .mobile_platform_bridge()
         .disconnect_ble_rnode(NativeBleRnodeDisconnect::ExactOperation(activity_operation));
+}
+
+/// A radio that rejects its settings stops its driver for good. Release the
+/// exact native bridge and name the setting, instead of leaving the
+/// supervisor holding GATT under an "Initializing" row.
+#[cfg(all(feature = "ble", target_os = "android"))]
+fn watch_android_ble_rnode_rejection(
+    state: Arc<AppState>,
+    mut observer: rns_runtime::reticulum::RNodeRuntimeObserver,
+    activity_operation: String,
+) {
+    use rns_interface::rnode::{RNodeRuntimePhase, RNodeRuntimeReason};
+
+    tokio::spawn(async move {
+        loop {
+            let snapshot = observer.snapshot();
+            if snapshot.phase == RNodeRuntimePhase::Stopped {
+                if snapshot.reason == Some(RNodeRuntimeReason::ConfigurationRejected)
+                    && state.mobile_platform_bridge().disconnect_ble_rnode(
+                        NativeBleRnodeDisconnect::ExactOperation(&activity_operation),
+                    )
+                {
+                    state.publish_mobile_hardware_state(
+                        "ble_rnode",
+                        "failed",
+                        Some(
+                            crate::commands::rnode_readiness::configuration_rejection_reason(
+                                snapshot.configuration_rejection,
+                            ),
+                        ),
+                    );
+                }
+                return;
+            }
+            if observer.changed().await.is_none()
+                && observer.snapshot().phase != RNodeRuntimePhase::Stopped
+            {
+                return;
+            }
+        }
+    });
 }
 
 /// Relay typed BLE pairing/product events. Call once per process.
@@ -1597,14 +1632,8 @@ pub async fn apply_ble_rnode_bridge_ready(
     let Some(mode) = mode else {
         #[cfg(target_os = "android")]
         disconnect_native_ble_rnode_operation(&state_arc, &activity_operation);
-        if let Some((terminal_fence, rollback_context, completion)) = state_arc
-            .take_initializing_ble_rnode_activity_operation_with_completion(&activity_operation)
-            && !complete_waiting_ble_rnode_operation(
-                completion,
-                crate::state::BleRnodeOperationResult::Failed(
-                    crate::state::BleRnodeOperationFailure::Setup,
-                ),
-            )
+        if let Some((terminal_fence, rollback_context)) =
+            state_arc.take_initializing_ble_rnode_activity_operation(&activity_operation)
         {
             rollback_ble_rnode_context(&state_arc, rollback_context);
             record_interface_activity(
@@ -1630,14 +1659,8 @@ pub async fn apply_ble_rnode_bridge_ready(
     if tcp_port == 0 {
         #[cfg(target_os = "android")]
         disconnect_native_ble_rnode_operation(&state_arc, &activity_operation);
-        if let Some((terminal_fence, rollback_context, completion)) = state_arc
-            .take_initializing_ble_rnode_activity_operation_with_completion(&activity_operation)
-            && !complete_waiting_ble_rnode_operation(
-                completion,
-                crate::state::BleRnodeOperationResult::Failed(
-                    crate::state::BleRnodeOperationFailure::Setup,
-                ),
-            )
+        if let Some((terminal_fence, rollback_context)) =
+            state_arc.take_initializing_ble_rnode_activity_operation(&activity_operation)
         {
             rollback_ble_rnode_context(&state_arc, rollback_context);
             emit_op_status_broadcast(
@@ -1670,16 +1693,8 @@ pub async fn apply_ble_rnode_bridge_ready(
                 if state_arc.current_identity_session_generation()
                     != activity_fence.identity_session_generation()
                 {
-                    if let Some((_, rollback_context, completion)) = state_arc
-                        .take_initializing_ble_rnode_activity_operation_with_completion(
-                            &activity_operation,
-                        )
-                        && !complete_waiting_ble_rnode_operation(
-                            completion,
-                            crate::state::BleRnodeOperationResult::Failed(
-                                crate::state::BleRnodeOperationFailure::Cancelled,
-                            ),
-                        )
+                    if let Some((_, rollback_context)) = state_arc
+                        .take_initializing_ble_rnode_activity_operation(&activity_operation)
                     {
                         rollback_ble_rnode_context(&state_arc, rollback_context);
                     }
@@ -1738,9 +1753,7 @@ pub async fn apply_ble_rnode_bridge_ready(
                 Some((rns, rnode_activity_origin, Ok(spawned))) => {
                     if saved_startup {
                         let terminal = state_arc
-                            .take_initializing_ble_rnode_activity_operation_with_completion(
-                                &activity_operation,
-                            );
+                            .take_initializing_ble_rnode_activity_operation(&activity_operation);
                         if terminal.is_some()
                             && state_arc.cover_rnode_activity_interface(
                                 spawned.interface_id,
@@ -1751,6 +1764,12 @@ pub async fn apply_ble_rnode_bridge_ready(
                                 Arc::clone(&state_arc),
                                 spawned.observer.clone(),
                                 rnode_activity_origin,
+                            );
+                            #[cfg(target_os = "android")]
+                            watch_android_ble_rnode_rejection(
+                                Arc::clone(&state_arc),
+                                spawned.observer.clone(),
+                                activity_operation.clone(),
                             );
                         } else {
                             teardown_spawned_rnode_exact(&rns, &spawned).await;
@@ -1784,54 +1803,30 @@ pub async fn apply_ble_rnode_bridge_ready(
 
                     match readiness_result {
                         Some(Ok(pending_monitor)) => {
-                            if let Some((terminal_fence, rollback_context, completion)) = state_arc
-                                .take_initializing_ble_rnode_activity_operation_with_completion(
-                                    &activity_operation,
-                                )
+                            if let Some((terminal_fence, rollback_context)) = state_arc
+                                .take_initializing_ble_rnode_activity_operation(&activity_operation)
                             {
-                                if let Some(completion) = completion {
-                                    if completion
-                                        .send(crate::state::BleRnodeOperationResult::Ready {
-                                            interface_id: spawned.interface_id,
-                                            monitor: pending_monitor,
-                                        })
-                                        .is_err()
-                                    {
-                                        // The lifecycle owner disappeared before accepting the
-                                        // single-use seed. Stop the exact runtime; never activate
-                                        // an orphaned monitor in this callback.
-                                        teardown_spawned_rnode_exact(&rns, &spawned).await;
-                                        #[cfg(target_os = "android")]
-                                        disconnect_native_ble_rnode_operation(
-                                            &state_arc,
-                                            &activity_operation,
-                                        );
-                                    }
-                                } else {
-                                    clear_ble_rnode_rollback_context(&state_arc, rollback_context);
-                                    emit_op_status_broadcast(
-                                        &state_arc,
-                                        "add_lora",
-                                        "hub",
-                                        &format!(
-                                            "BLE LoRa interface active (#{})",
-                                            spawned.interface_id
-                                        ),
-                                        true,
-                                        None,
-                                    );
-                                    record_interface_activity(
-                                        &state_arc,
-                                        terminal_fence,
-                                        InterfaceClass::RNode,
-                                        ble_rnode_activity_transition(
-                                            BleRnodeActivityOutcome::Ready,
-                                        ),
-                                        None,
-                                    );
-                                    if let Some(pending_monitor) = pending_monitor {
-                                        let _ = pending_monitor.activate(Arc::clone(&state_arc));
-                                    }
+                                clear_ble_rnode_rollback_context(&state_arc, rollback_context);
+                                emit_op_status_broadcast(
+                                    &state_arc,
+                                    "add_lora",
+                                    "hub",
+                                    &format!(
+                                        "BLE LoRa interface active (#{})",
+                                        spawned.interface_id
+                                    ),
+                                    true,
+                                    None,
+                                );
+                                record_interface_activity(
+                                    &state_arc,
+                                    terminal_fence,
+                                    InterfaceClass::RNode,
+                                    ble_rnode_activity_transition(BleRnodeActivityOutcome::Ready),
+                                    None,
+                                );
+                                if let Some(pending_monitor) = pending_monitor {
+                                    let _ = pending_monitor.activate(Arc::clone(&state_arc));
                                 }
                             } else {
                                 teardown_spawned_rnode_exact(&rns, &spawned).await;
@@ -1853,59 +1848,30 @@ pub async fn apply_ble_rnode_bridge_ready(
                             #[cfg(target_os = "android")]
                             disconnect_native_ble_rnode_operation(&state_arc, &activity_operation);
                             if completion_claimed
-                                && let Some((terminal_fence, rollback_context, completion)) =
-                                    state_arc
-                                        .take_completing_ble_rnode_activity_operation_with_completion(
-                                            &activity_operation,
-                                        )
-                                {
-                                    let operation_failure = match failure {
-                                        RnodeReadinessFailure::Timeout => {
-                                            crate::state::BleRnodeOperationFailure::StartupTimeout
-                                        }
-                                        RnodeReadinessFailure::ReadyStatsPublication(
-                                            RnodeReadyStatsPublicationFailure::Timeout,
-                                        ) => {
-                                            crate::state::BleRnodeOperationFailure::ReadyStatsTimeout
-                                        }
-                                        RnodeReadinessFailure::ReadyStatsPublication(
-                                            RnodeReadyStatsPublicationFailure::ObservationLost,
-                                        ) => {
-                                            crate::state::BleRnodeOperationFailure::ReadyObservationLost
-                                        }
-                                        RnodeReadinessFailure::ReadyStatsPublication(
-                                            RnodeReadyStatsPublicationFailure::SessionReplaced,
-                                        ) => {
-                                            crate::state::BleRnodeOperationFailure::ReadySessionReplaced
-                                        }
-                                        _ => crate::state::BleRnodeOperationFailure::Readiness,
-                                    };
-                                    if !complete_waiting_ble_rnode_operation(
-                                        completion,
-                                        crate::state::BleRnodeOperationResult::Failed(
-                                            operation_failure,
-                                        ),
-                                    ) {
-                                        let (status, failure_code, activity_outcome) =
-                                            ble_rnode_readiness_failure_feedback(failure);
-                                        rollback_ble_rnode_context(&state_arc, rollback_context);
-                                        emit_op_status_broadcast(
-                                            &state_arc,
-                                            "add_lora",
-                                            "hub",
-                                            status,
-                                            true,
-                                            Some(failure_code),
-                                        );
-                                        record_interface_activity(
-                                            &state_arc,
-                                            terminal_fence,
-                                            InterfaceClass::RNode,
-                                            ble_rnode_activity_transition(activity_outcome),
-                                            None,
-                                        );
-                                    }
-                                }
+                                && let Some((terminal_fence, rollback_context)) = state_arc
+                                    .take_completing_ble_rnode_activity_operation(
+                                        &activity_operation,
+                                    )
+                            {
+                                let (status, failure_code, activity_outcome) =
+                                    ble_rnode_readiness_failure_feedback(failure);
+                                rollback_ble_rnode_context(&state_arc, rollback_context);
+                                emit_op_status_broadcast(
+                                    &state_arc,
+                                    "add_lora",
+                                    "hub",
+                                    status,
+                                    true,
+                                    Some(failure_code),
+                                );
+                                record_interface_activity(
+                                    &state_arc,
+                                    terminal_fence,
+                                    InterfaceClass::RNode,
+                                    ble_rnode_activity_transition(activity_outcome),
+                                    None,
+                                );
+                            }
                         }
                         None => {
                             // Cancellation, replacement, and identity teardown
@@ -1919,19 +1885,10 @@ pub async fn apply_ble_rnode_bridge_ready(
                 }
                 Some((_rns, _rnode_activity_origin, Err(_error))) => {
                     let terminal = state_arc
-                        .take_initializing_ble_rnode_activity_operation_with_completion(
-                            &activity_operation,
-                        );
+                        .take_initializing_ble_rnode_activity_operation(&activity_operation);
                     #[cfg(target_os = "android")]
                     disconnect_native_ble_rnode_operation(&state_arc, &activity_operation);
-                    if let Some((terminal_fence, rollback_context, completion)) = terminal
-                        && !complete_waiting_ble_rnode_operation(
-                            completion,
-                            crate::state::BleRnodeOperationResult::Failed(
-                                crate::state::BleRnodeOperationFailure::Connect,
-                            ),
-                        )
-                    {
+                    if let Some((terminal_fence, rollback_context)) = terminal {
                         rollback_ble_rnode_context(&state_arc, rollback_context);
                         emit_op_status_broadcast(
                             &state_arc,
@@ -1952,19 +1909,10 @@ pub async fn apply_ble_rnode_bridge_ready(
                 }
                 None => {
                     let terminal = state_arc
-                        .take_initializing_ble_rnode_activity_operation_with_completion(
-                            &activity_operation,
-                        );
+                        .take_initializing_ble_rnode_activity_operation(&activity_operation);
                     #[cfg(target_os = "android")]
                     disconnect_native_ble_rnode_operation(&state_arc, &activity_operation);
-                    if let Some((terminal_fence, rollback_context, completion)) = terminal
-                        && !complete_waiting_ble_rnode_operation(
-                            completion,
-                            crate::state::BleRnodeOperationResult::Failed(
-                                crate::state::BleRnodeOperationFailure::Runtime,
-                            ),
-                        )
-                    {
+                    if let Some((terminal_fence, rollback_context)) = terminal {
                         rollback_ble_rnode_context(&state_arc, rollback_context);
                         emit_op_status_broadcast(
                             &state_arc,
@@ -1991,8 +1939,8 @@ pub async fn apply_ble_rnode_bridge_ready(
     }
     #[cfg(not(feature = "ble"))]
     {
-        let terminal = state_arc
-            .take_initializing_ble_rnode_activity_operation_with_completion(&activity_operation);
+        let terminal =
+            state_arc.take_initializing_ble_rnode_activity_operation(&activity_operation);
         #[cfg(target_os = "android")]
         disconnect_native_ble_rnode_operation(&state_arc, &activity_operation);
         let _ = (
@@ -2009,30 +1957,23 @@ pub async fn apply_ble_rnode_bridge_ready(
             st_alock,
             lt_alock,
         );
-        if let Some((terminal_fence, rollback_context, completion)) = terminal {
-            if !complete_waiting_ble_rnode_operation(
-                completion,
-                crate::state::BleRnodeOperationResult::Failed(
-                    crate::state::BleRnodeOperationFailure::Runtime,
-                ),
-            ) {
-                emit_op_status_broadcast(
-                    &state_arc,
-                    "add_lora",
-                    "hub",
-                    "BLE not available (feature not compiled)",
-                    true,
-                    Some("BLE feature not compiled"),
-                );
-                rollback_ble_rnode_context(&state_arc, rollback_context);
-                record_interface_activity(
-                    &state_arc,
-                    terminal_fence,
-                    InterfaceClass::RNode,
-                    ble_rnode_activity_transition(BleRnodeActivityOutcome::RuntimeFailed),
-                    None,
-                );
-            }
+        if let Some((terminal_fence, rollback_context)) = terminal {
+            emit_op_status_broadcast(
+                &state_arc,
+                "add_lora",
+                "hub",
+                "BLE not available (feature not compiled)",
+                true,
+                Some("BLE feature not compiled"),
+            );
+            rollback_ble_rnode_context(&state_arc, rollback_context);
+            record_interface_activity(
+                &state_arc,
+                terminal_fence,
+                InterfaceClass::RNode,
+                ble_rnode_activity_transition(BleRnodeActivityOutcome::RuntimeFailed),
+                None,
+            );
         }
     }
     Ok(json!({ "queued": true }))
@@ -2069,22 +2010,9 @@ pub async fn apply_ble_rnode_bridge_failed(
     state: Arc<AppState>,
     args: BleRnodeBridgeFailureArgs,
 ) -> AppResult<Value> {
-    let (activity_fence, rollback_context, completion) = state
-        .take_active_ble_rnode_activity_operation_with_completion(&args.activity_operation)
+    let (activity_fence, rollback_context) = state
+        .take_active_ble_rnode_activity_operation(&args.activity_operation)
         .ok_or_else(|| AppError::bad_request("Unknown or expired BLE bridge operation"))?;
-    let operation_failure = match args.failure_code {
-        BleRnodeNativeFailureCode::ConnectFailed => crate::state::BleRnodeOperationFailure::Connect,
-        BleRnodeNativeFailureCode::BondTimeout => {
-            crate::state::BleRnodeOperationFailure::StartupTimeout
-        }
-        BleRnodeNativeFailureCode::SetupTimeout => crate::state::BleRnodeOperationFailure::Setup,
-    };
-    if complete_waiting_ble_rnode_operation(
-        completion,
-        crate::state::BleRnodeOperationResult::Failed(operation_failure),
-    ) {
-        return Ok(json!({ "ok": true }));
-    }
     rollback_ble_rnode_context(&state, rollback_context);
     record_interface_activity(
         &state,
