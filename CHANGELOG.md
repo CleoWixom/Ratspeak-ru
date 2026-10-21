@@ -7,6 +7,12 @@ changes that materially affect how an artifact is reproduced.
 
 ### Fixed and improved
 
+- Bluetooth radios that are off, out of range or need pairing again now say why, with Connection Help, instead of always showing "Waiting for radio".
+- A radio that rejects its settings, such as TX power below an amplifier's minimum, stops with the setting named and an Edit action, on Bluetooth, USB, serial and TCP.
+- Resuming or editing a radio that is away keeps it enabled and connects when it returns, instead of pausing or reverting it after two minutes.
+- Desktop serial and TCP radios that are unplugged or busy keep retrying and show why: radio not found, port access denied or port in use.
+- Android reconnects to a returning Bluetooth radio within seconds using background auto-connect, instead of retrying as rarely as every 10 minutes.
+- Fixed Android Bluetooth radio sessions dropping when the app reconnected slowly.
 - Fixed propagation pickup and purge when many messages are stored on a relay.
 - Preserved unknown interface locations and restored discovery announcements.
 - Bounded background announcements at flow-controlled radio writers.
