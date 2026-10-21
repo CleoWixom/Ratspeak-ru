@@ -17,6 +17,9 @@ function _rsBootstrapOnLoad() {
         if (data && data.stage === 'hw_locked' && typeof showHwUnlock === 'function') {
             showHwUnlock(data.hw_locked, data.hw_locked_kind);
         }
+        if (data && data.storage_warning && typeof showToast === 'function') {
+            showToast(data.storage_warning, 'toast-warning', 5000);
+        }
     }).catch(function() {});
     if (window.RS && RS.audioPlayback && typeof RS.audioPlayback.installUnlock === 'function') {
         RS.audioPlayback.installUnlock();

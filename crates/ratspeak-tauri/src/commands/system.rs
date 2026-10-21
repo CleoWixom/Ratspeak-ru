@@ -34,6 +34,18 @@ fn app_display_version() -> &'static str {
     tagged_version.unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
+fn storage_warning(data_dir: &std::path::Path) -> Option<&'static str> {
+    use rns_identity::persistence::{StorageRisk, storage_risk};
+    match storage_risk(data_dir).ok().flatten()? {
+        StorageRisk::Volatile => Some(
+            "Ratspeak's data is in temporary memory, so messages and keys are lost when this device restarts.",
+        ),
+        _ => Some(
+            "Ratspeak's data is on a network or virtual drive, so recent messages and keys may not survive a crash or power loss.",
+        ),
+    }
+}
+
 #[tauri::command]
 pub async fn api_version() -> AppResult<Value> {
     Ok(json!({ "version": app_display_version(), "name": "Ratspeak" }))
@@ -67,6 +79,7 @@ pub async fn api_startup_progress(state: State<'_, Arc<AppState>>) -> AppResult<
         "stage": stage,
         "hw_locked": locked,
         "hw_locked_kind": kind,
+        "storage_warning": storage_warning(&state.config.data_dir),
     }))
 }
 

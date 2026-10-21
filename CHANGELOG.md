@@ -16,6 +16,7 @@ changes that materially affect how an artifact is reproduced.
 - Fixed propagation pickup and purge when many messages are stored on a relay.
 - Preserved unknown interface locations and restored discovery announcements.
 - Bounded background announcements at flow-controlled radio writers.
+- Ratspeak warns at startup when its data is on a network drive or in temporary memory, where messages and keys may not survive a crash or restart.
 
 ### Build and compatibility
 
