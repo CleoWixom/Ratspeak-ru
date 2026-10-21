@@ -342,8 +342,10 @@ test("both Android CI toolchains use the reviewed SDK view while iOS skips Andro
   const androidRows = matrix.split(/(?=^          - os:)/m)
     .filter((entry) => /target: aarch64-linux-android/.test(entry));
   assert.equal(androidRows.length, 2);
-  assert.ok(androidRows.some((entry) => /toolchain: stable/.test(entry)));
-  assert.ok(androidRows.some((entry) => /toolchain: 1\.89\.0/.test(entry)));
+  const { toolchains } = JSON.parse(
+    readFileSync(join(dirname(script), "../../release/dependency-set.json"), "utf8"));
+  assert.ok(androidRows.some((entry) => entry.includes(`toolchain: ${toolchains.rustRelease}\n`)));
+  assert.ok(androidRows.some((entry) => entry.includes(`toolchain: ${toolchains.rustMsrv}\n`)));
   for (const selector of [
     /uses: actions\/setup-node@/,
     /name: Load reviewed mobile toolchains/,
