@@ -669,15 +669,7 @@ pub fn enabled_rnode_names_with_port_prefix(config_dir: &Path, prefix: &str) -> 
                 .get("port")
                 .and_then(Value::as_str)
                 .is_some_and(|port| port.starts_with(prefix))
-                && entry
-                    .get("enabled")
-                    .and_then(Value::as_str)
-                    .is_none_or(|enabled| {
-                        !matches!(
-                            enabled.trim().to_ascii_lowercase().as_str(),
-                            "false" | "no" | "0" | "off"
-                        )
-                    })
+                && interface_entry_enabled(entry)
         })
         .filter_map(|entry| {
             entry
@@ -686,6 +678,11 @@ pub fn enabled_rnode_names_with_port_prefix(config_dir: &Path, prefix: &str) -> 
                 .map(str::to_string)
         })
         .collect()
+}
+
+/// Whether an interface from [`get_all_interfaces`] starts.
+pub fn interface_entry_enabled(entry: &Value) -> bool {
+    entry.get("enabled").and_then(Value::as_bool) == Some(true)
 }
 
 pub fn get_all_interfaces(config_dir: &Path) -> Value {
@@ -734,6 +731,13 @@ pub fn get_all_interfaces(config_dir: &Path) -> Value {
         for key in rns_runtime::config::ifac::SIZE_KEYS {
             object.remove(*key);
         }
+        // Either key set to yes enables an interface; with neither it is on,
+        // the client default that startup writes out for the runtime.
+        object.remove("interface_enabled");
+        object.insert(
+            "enabled".into(),
+            json!(!section.has_enable_key() || section.interface_enabled()),
+        );
         match parse_ifac_size(section) {
             Ok(Some(bytes)) => {
                 object.insert("ifac_size".into(), json!(bytes.to_string()));
@@ -782,17 +786,7 @@ pub fn android_usb_selector_migration_candidates(
         .cloned()
         .unwrap_or_default();
     for entry in entries {
-        let enabled = entry
-            .get("enabled")
-            .map(|value| {
-                value.as_bool().unwrap_or_else(|| {
-                    value
-                        .as_str()
-                        .is_none_or(|value| !matches!(value, "false" | "no" | "0" | "off"))
-                })
-            })
-            .unwrap_or(true);
-        if !enabled {
+        if !interface_entry_enabled(&entry) {
             continue;
         }
         let Some(name) = entry.get("name").and_then(Value::as_str) else {
@@ -1582,13 +1576,72 @@ pub fn set_interface_enabled(config_dir: &Path, name: &str, enabled: bool) -> bo
         .map(|span| (span.range, format!("    {} = {}\n", span.key, enabled)))
         .collect::<Vec<_>>();
     if edits.is_empty() {
-        edits.push((insertion..insertion, format!("    enabled = {}\n", enabled)));
+        edits.push((
+            insertion..insertion,
+            enabled_line(&content, insertion, enabled),
+        ));
     }
     let mut updated = content.clone();
     for (range, replacement) in edits.into_iter().rev() {
         updated.replace_range(range, &replacement);
     }
     write_config_if_unchanged(config_dir, Some(&content), &updated).is_ok()
+}
+
+/// An `enabled` line for insertion at `at`, starting a new line if `at` ends
+/// an unterminated last line.
+fn enabled_line(content: &str, at: usize, enabled: bool) -> String {
+    let separator = if at == content.len() && !content.is_empty() && !content.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    format!("{separator}    enabled = {enabled}\n")
+}
+
+/// Ratspeak's client default: an interface that sets neither `enabled` nor
+/// `interface_enabled` is on. rsReticulum follows upstream and skips such a
+/// block, so write `enabled = true` into each one before the runtime starts.
+pub fn enable_unflagged_interfaces(config_dir: &Path) -> Result<usize, String> {
+    let Some(content) = read_config(config_dir) else {
+        return Ok(0);
+    };
+    let (Ok(sections), Ok(properties)) = (
+        rns_runtime::config::ifac::section_spans(&content),
+        rns_runtime::config::ifac::property_spans(&content),
+    ) else {
+        return Ok(0);
+    };
+    let mut insertions = sections
+        .iter()
+        .filter(|section| section.section == "interfaces" && section.path.len() == 1)
+        .filter_map(|section| {
+            let mut keys = properties
+                .iter()
+                .filter(|span| span.section == "interfaces" && span.path == section.path);
+            if keys
+                .clone()
+                .any(|span| matches!(span.key.as_str(), "enabled" | "interface_enabled"))
+            {
+                return None;
+            }
+            Some(
+                keys.find(|span| matches!(span.key.as_str(), "type" | "interface_type"))
+                    .map_or(section.header_end, |span| span.range.end),
+            )
+        })
+        .collect::<Vec<_>>();
+    if insertions.is_empty() {
+        return Ok(0);
+    }
+    insertions.sort_unstable();
+    let mut updated = content.clone();
+    for at in insertions.iter().rev() {
+        updated.insert_str(*at, &enabled_line(&content, *at, true));
+    }
+    write_config_if_unchanged(config_dir, Some(&content), &updated)
+        .map_err(|_| "interface configuration changed while it was being prepared".to_string())?;
+    Ok(insertions.len())
 }
 
 fn remove_interface_blocks_from_content(content: &str, names: &[&str]) -> (String, bool) {
@@ -3811,6 +3864,76 @@ mod tests {
             "internal"
         );
     }
+    /// Either key set to yes enables a row; with neither, Ratspeak's client
+    /// default keeps it on.
+    #[test]
+    fn interface_rows_report_the_client_enable_rule() {
+        let dir = temp_config_dir();
+        let block = |name: &str, flags: &str| {
+            format!(
+                "  [[{name}]]\n    type = TCPClientInterface\n    target_host = h\n    target_port = 1\n{flags}"
+            )
+        };
+        std::fs::write(
+            dir.join("config"),
+            format!(
+                "[interfaces]\n{}{}{}{}",
+                block("Either", "    enabled = no\n    interface_enabled = yes\n"),
+                block("Legacy", "    interface_enabled = yes\n"),
+                block("Off", "    enabled = no\n"),
+                block("No Flag", ""),
+            ),
+        )
+        .unwrap();
+        let listing = get_all_interfaces(&dir);
+        let rows = listing["tcp_client"].as_array().unwrap();
+        let enabled = |name: &str| {
+            let row = rows.iter().find(|row| row["name"] == name).unwrap();
+            assert!(row.get("interface_enabled").is_none(), "{row}");
+            interface_entry_enabled(row)
+        };
+        assert!(enabled("Either"));
+        assert!(enabled("Legacy"));
+        assert!(!enabled("Off"));
+        assert!(enabled("No Flag"));
+    }
+
+    /// The runtime follows upstream and skips a block without an enable key,
+    /// so startup writes the client default into Ratspeak's own config.
+    #[test]
+    fn startup_writes_enabled_into_interfaces_without_a_setting() {
+        let dir = temp_config_dir();
+        let original = "[reticulum]\n  share_instance = Yes\n\n[interfaces]\n  [[Off]]\n    type = TCPClientInterface\n    enabled = no\n  [[Legacy]]\n    type = AutoInterface\n    interface_enabled = yes\n  [[No Flag]]\n    # kept as written\n    type = TCPClientInterface\n    target_host = h\n    target_port = 1\n  [[Last]]\n    type = AutoInterface";
+        std::fs::write(dir.join("config"), original).unwrap();
+
+        assert_eq!(enable_unflagged_interfaces(&dir), Ok(2));
+        let written = read_config(&dir).unwrap();
+        assert_eq!(
+            written,
+            original
+                .replace(
+                    "    type = TCPClientInterface\n    target_host = h",
+                    "    type = TCPClientInterface\n    enabled = true\n    target_host = h"
+                )
+                .replace(
+                    "  [[Last]]\n    type = AutoInterface",
+                    "  [[Last]]\n    type = AutoInterface\n    enabled = true\n"
+                )
+        );
+        assert_eq!(enable_unflagged_interfaces(&dir), Ok(0), "idempotent");
+
+        let config = rns_runtime::config::Config::parse(&written).unwrap();
+        for (name, expected) in [
+            ("Off", false),
+            ("Legacy", true),
+            ("No Flag", true),
+            ("Last", true),
+        ] {
+            let section = config.subsection("interfaces", name).unwrap();
+            assert_eq!(section.interface_enabled(), expected, "{name}");
+        }
+    }
+
     #[test]
     fn ifac_listing_uses_authoritative_quoted_keys_before_type_and_never_migrates_on_read() {
         let dir = temp_config_dir();

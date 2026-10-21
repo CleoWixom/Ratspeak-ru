@@ -1967,9 +1967,11 @@ pub fn ratspeak_runtime::rns_config::add_tcp_server_with_ifac(&std::path::Path, 
 pub fn ratspeak_runtime::rns_config::android_usb_selector_migration_candidates(&std::path::Path) -> alloc::vec::Vec<ratspeak_runtime::rns_config::AndroidUsbSelectorMigrationCandidate>
 pub fn ratspeak_runtime::rns_config::apply_android_usb_selector_migration(&std::path::Path, &ratspeak_runtime::rns_config::AndroidUsbSelectorMigrationCandidate, u16, u16, core::option::Option<&str>) -> ratspeak_runtime::rns_config::InterfaceBlockCasOutcome
 pub fn ratspeak_runtime::rns_config::auto_interface_names(&std::path::Path) -> alloc::vec::Vec<alloc::string::String>
+pub fn ratspeak_runtime::rns_config::enable_unflagged_interfaces(&std::path::Path) -> core::result::Result<usize, alloc::string::String>
 pub fn ratspeak_runtime::rns_config::enabled_rnode_names_with_port_prefix(&std::path::Path, &str) -> alloc::vec::Vec<alloc::string::String>
 pub fn ratspeak_runtime::rns_config::ensure_app_private_shared_instance_ports(&std::path::Path) -> core::io::error::Result<ratspeak_runtime::rns_config::RatspeakRnsPortConfigChange>
 pub fn ratspeak_runtime::rns_config::get_all_interfaces(&std::path::Path) -> serde_json::value::Value
+pub fn ratspeak_runtime::rns_config::interface_entry_enabled(&serde_json::value::Value) -> bool
 pub fn ratspeak_runtime::rns_config::migrate_ifac_units(&std::path::Path, &str, rns_runtime::config::ifac::IfacSourceUnits, &[u8; 32]) -> core::io::error::Result<bool>
 pub fn ratspeak_runtime::rns_config::normalize_rnode_interface_mode(core::option::Option<&str>) -> core::option::Option<&'static str>
 pub fn ratspeak_runtime::rns_config::read_config(&std::path::Path) -> core::option::Option<alloc::string::String>

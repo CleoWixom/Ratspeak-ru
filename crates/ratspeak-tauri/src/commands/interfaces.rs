@@ -622,7 +622,7 @@ fn projected_enabled_public_tcp_server_ids(
             {
                 continue;
             }
-            if !cfg_bool_default_true(entry, "enabled") {
+            if !crate::rns_config::interface_entry_enabled(entry) {
                 continue;
             }
             if let Some(id) = public_tcp_server_id_from_entry(entry) {
@@ -664,7 +664,7 @@ fn interface_group_has_enabled(ifaces: &Value, key: &str) -> bool {
         .is_some_and(|entries| {
             entries
                 .iter()
-                .any(|entry| cfg_bool_default_true(entry, "enabled"))
+                .any(crate::rns_config::interface_entry_enabled)
         })
 }
 
@@ -958,7 +958,7 @@ async fn reconcile_android_auto_interfaces(
             .and_then(|a| a.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter(|e| cfg_bool_default_true(e, "enabled"))
+                    .filter(|e| crate::rns_config::interface_entry_enabled(e))
                     .filter_map(auto_runtime_config_from_entry)
                     .collect()
             })
@@ -2202,19 +2202,6 @@ fn cfg_bool(entry: &Value, key: &str) -> bool {
         .and_then(|v| v.as_str())
         .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
         .unwrap_or(false)
-}
-
-fn cfg_bool_default_true(entry: &Value, key: &str) -> bool {
-    entry
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| {
-            !matches!(
-                s.trim().to_ascii_lowercase().as_str(),
-                "false" | "no" | "0" | "off"
-            )
-        })
-        .unwrap_or(true)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -8430,7 +8417,7 @@ mod backbone_args_tests {
         let entry = serde_json::json!({
             "name": "Field LAN",
             "type": "AutoInterface",
-            "enabled": "yes",
+            "enabled": true,
             "group_id": "field",
             "discovery_scope": "site",
             "discovery_port": "30000",
@@ -8441,7 +8428,7 @@ mod backbone_args_tests {
             "configured_bitrate": "42000000"
         });
 
-        assert!(cfg_bool_default_true(&entry, "enabled"));
+        assert!(crate::rns_config::interface_entry_enabled(&entry));
         let cfg = auto_runtime_config_from_entry(&entry).expect("auto config");
         assert_eq!(cfg.name, "Field LAN");
         assert_eq!(cfg.group_id, "field");
@@ -8473,7 +8460,6 @@ mod backbone_args_tests {
             "type": "AutoInterface"
         });
 
-        assert!(cfg_bool_default_true(&entry, "enabled"));
         let cfg = auto_runtime_config_from_entry(&entry).expect("auto config");
         assert_eq!(cfg.name, "Default Interface");
         assert_eq!(cfg.group_id, rns_interface::auto::DEFAULT_GROUP_ID);
@@ -8501,10 +8487,10 @@ mod backbone_args_tests {
     fn auto_transport_requires_enabled_non_lora_without_enabled_lora() {
         let ifaces = serde_json::json!({
             "rnode": [
-                { "name": "Disabled LoRa", "type": "RNodeInterface", "enabled": "false" }
+                { "name": "Disabled LoRa", "type": "RNodeInterface", "enabled": false }
             ],
             "auto": [
-                { "name": "LAN", "type": "AutoInterface", "enabled": "true" }
+                { "name": "LAN", "type": "AutoInterface", "enabled": true }
             ],
             "tcp_client": [],
             "tcp_server": [],
@@ -8517,10 +8503,10 @@ mod backbone_args_tests {
 
         let ifaces_with_lora = serde_json::json!({
             "rnode": [
-                { "name": "LoRa", "type": "RNodeInterface", "enabled": "true" }
+                { "name": "LoRa", "type": "RNodeInterface", "enabled": true }
             ],
             "auto": [
-                { "name": "LAN", "type": "AutoInterface", "enabled": "true" }
+                { "name": "LAN", "type": "AutoInterface", "enabled": true }
             ],
             "tcp_client": [],
             "tcp_server": [],
@@ -8562,17 +8548,17 @@ mod backbone_args_tests {
 
         let alias_pair = serde_json::json!({
             "tcp_client": [
-                { "name": "Emerald 2", "target_host": "2.ratspeak.org", "target_port": "4242", "enabled": "true" },
-                { "name": "Emerald RNS", "target_host": "rns.ratspeak.org", "target_port": "4242", "enabled": "true" }
+                { "name": "Emerald 2", "target_host": "2.ratspeak.org", "target_port": "4242", "enabled": true },
+                { "name": "Emerald RNS", "target_host": "rns.ratspeak.org", "target_port": "4242", "enabled": true }
             ]
         });
         assert_eq!(enabled_public_tcp_server_count(&alias_pair), 1);
 
         let multiple_public = serde_json::json!({
             "tcp_client": [
-                { "name": "Ruby", "target_host": "1.ratspeak.org", "target_port": "4141", "enabled": "true" },
-                { "name": "Emerald", "target_host": "2.ratspeak.org", "target_port": "4242", "enabled": "true" },
-                { "name": "Paused Diamond", "target_host": "3.ratspeak.org", "target_port": "4343", "enabled": "false" }
+                { "name": "Ruby", "target_host": "1.ratspeak.org", "target_port": "4141", "enabled": true },
+                { "name": "Emerald", "target_host": "2.ratspeak.org", "target_port": "4242", "enabled": true },
+                { "name": "Paused Diamond", "target_host": "3.ratspeak.org", "target_port": "4343", "enabled": false }
             ]
         });
         assert_eq!(enabled_public_tcp_server_count(&multiple_public), 2);
@@ -8593,8 +8579,8 @@ mod backbone_args_tests {
             "rnode": [],
             "auto": [],
             "tcp_client": [
-                { "name": "Ruby", "type": "TCPClientInterface", "target_host": "1.ratspeak.org", "target_port": "4141", "enabled": "true" },
-                { "name": "Emerald", "type": "TCPClientInterface", "target_host": "2.ratspeak.org", "target_port": "4242", "enabled": "true" }
+                { "name": "Ruby", "type": "TCPClientInterface", "target_host": "1.ratspeak.org", "target_port": "4141", "enabled": true },
+                { "name": "Emerald", "type": "TCPClientInterface", "target_host": "2.ratspeak.org", "target_port": "4242", "enabled": true }
             ],
             "tcp_server": [],
             "backbone_client": [],

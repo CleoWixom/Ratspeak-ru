@@ -854,19 +854,6 @@ fn startup_cfg_u16(entry: &Value, key: &str) -> Option<u16> {
         .and_then(|s| s.parse::<u16>().ok())
 }
 
-fn startup_cfg_bool_default_true(entry: &Value, key: &str) -> bool {
-    entry
-        .get(key)
-        .and_then(Value::as_str)
-        .map(|s| {
-            !matches!(
-                s.trim().to_ascii_lowercase().as_str(),
-                "false" | "no" | "0" | "off"
-            )
-        })
-        .unwrap_or(true)
-}
-
 fn startup_transport_auto_network_allows(network_type: &str) -> bool {
     match network_type.trim().to_ascii_lowercase().as_str() {
         "wifi" | "ethernet" => true,
@@ -882,7 +869,7 @@ fn startup_interface_group_has_enabled(ifaces: &Value, key: &str) -> bool {
         .is_some_and(|entries| {
             entries
                 .iter()
-                .any(|entry| startup_cfg_bool_default_true(entry, "enabled"))
+                .any(crate::rns_config::interface_entry_enabled)
         })
 }
 
@@ -942,7 +929,7 @@ fn startup_enabled_public_tcp_server_count(ifaces: &Value) -> usize {
     let mut ids = Vec::new();
     if let Some(entries) = ifaces.get("tcp_client").and_then(Value::as_array) {
         for entry in entries {
-            if !startup_cfg_bool_default_true(entry, "enabled") {
+            if !crate::rns_config::interface_entry_enabled(entry) {
                 continue;
             }
             if let Some(id) =
@@ -1680,6 +1667,14 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                     "failed to prepare Ratspeak app-private Reticulum config"
                 );
             }
+        }
+        match rns_config::enable_unflagged_interfaces(&config_dir) {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "enabled interfaces that had no enable setting"),
+            Err(_) => tracing::warn!(
+                reason = "enable_interfaces",
+                "failed to write enable settings into Ratspeak interfaces"
+            ),
         }
     }
     let policy = match network_ownership::startup_policy(&state, &config_dir).await {
