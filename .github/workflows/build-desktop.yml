@@ -78,7 +78,7 @@ jobs:
       - name: Checkout rsReticulum sibling
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsReticulum
+          repository: ratspeak/rsReticulum
           ref: ${{ env.RATSPEAK_RSRETICULUM_REF }}
           path: rsReticulum
           fetch-depth: 0
