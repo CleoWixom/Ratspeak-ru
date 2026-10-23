@@ -37,17 +37,17 @@ jobs:
           path: rsReticulum
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXMF
+          repository: ratspeak/rsLXMF
           ref: ${{ env.RATSPEAK_RSLXMF_REF }}
           path: rsLXMF
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXST
+          repository: ratspeak/rsLXST
           ref: ${{ env.RATSPEAK_RSLXST_REF }}
           path: rsLXST
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/lrgp-rs
+          repository: ratspeak/lrgp-rs
           ref: ${{ env.RATSPEAK_LRGP_REF }}
           path: lrgp-rs
       - name: Setup bridge validation Python
@@ -94,19 +94,19 @@ jobs:
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXMF
+          repository: ratspeak/rsLXMF
           ref: ${{ env.RATSPEAK_RSLXMF_REF }}
           path: rsLXMF
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXST
+          repository: ratspeak/rsLXST
           ref: ${{ env.RATSPEAK_RSLXST_REF }}
           path: rsLXST
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/lrgp-rs
+          repository: ratspeak/lrgp-rs
           ref: ${{ env.RATSPEAK_LRGP_REF }}
           path: lrgp-rs
           fetch-depth: 0
@@ -189,19 +189,19 @@ jobs:
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXMF
+          repository: ratspeak/rsLXMF
           ref: ${{ env.RATSPEAK_RSLXMF_REF }}
           path: rsLXMF
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXST
+          repository: ratspeak/rsLXST
           ref: ${{ env.RATSPEAK_RSLXST_REF }}
           path: rsLXST
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/lrgp-rs
+          repository: ratspeak/lrgp-rs
           ref: ${{ env.RATSPEAK_LRGP_REF }}
           path: lrgp-rs
           fetch-depth: 0
@@ -254,19 +254,19 @@ jobs:
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXMF
+          repository: ratspeak/rsLXMF
           ref: ${{ env.RATSPEAK_RSLXMF_REF }}
           path: rsLXMF
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXST
+          repository: ratspeak/rsLXST
           ref: ${{ env.RATSPEAK_RSLXST_REF }}
           path: rsLXST
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/lrgp-rs
+          repository: ratspeak/lrgp-rs
           ref: ${{ env.RATSPEAK_LRGP_REF }}
           path: lrgp-rs
           fetch-depth: 0
@@ -323,19 +323,19 @@ jobs:
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXMF
+          repository: ratspeak/rsLXMF
           ref: ${{ env.RATSPEAK_RSLXMF_REF }}
           path: rsLXMF
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXST
+          repository: ratspeak/rsLXST
           ref: ${{ env.RATSPEAK_RSLXST_REF }}
           path: rsLXST
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/lrgp-rs
+          repository: ratspeak/lrgp-rs
           ref: ${{ env.RATSPEAK_LRGP_REF }}
           path: lrgp-rs
           fetch-depth: 0
@@ -396,19 +396,19 @@ jobs:
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXMF
+          repository: ratspeak/rsLXMF
           ref: ${{ env.RATSPEAK_RSLXMF_REF }}
           path: rsLXMF
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXST
+          repository: ratspeak/rsLXST
           ref: ${{ env.RATSPEAK_RSLXST_REF }}
           path: rsLXST
           fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/lrgp-rs
+          repository: ratspeak/lrgp-rs
           ref: ${{ env.RATSPEAK_LRGP_REF }}
           path: lrgp-rs
           fetch-depth: 0

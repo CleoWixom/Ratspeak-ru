@@ -54,7 +54,7 @@ jobs:
       - name: Checkout rsLXMF
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXMF
+          repository: ratspeak/rsLXMF
           ref: ${{ steps.source-set.outputs.rslxmf_ref }}
           path: rsLXMF
           fetch-depth: 0
@@ -62,7 +62,7 @@ jobs:
       - name: Checkout rsLXST
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/rsLXST
+          repository: ratspeak/rsLXST
           ref: ${{ steps.source-set.outputs.rslxst_ref }}
           path: rsLXST
           fetch-depth: 0
@@ -70,7 +70,7 @@ jobs:
       - name: Checkout lrgp-rs
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ github.repository_owner }}/lrgp-rs
+          repository: ratspeak/lrgp-rs
           ref: ${{ steps.source-set.outputs.lrgp_ref }}
           path: lrgp-rs
           fetch-depth: 0
