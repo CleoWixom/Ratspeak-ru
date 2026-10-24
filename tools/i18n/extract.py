@@ -22,7 +22,7 @@ def looks_human(s: str) -> bool:
     s = s.strip()
     if len(s) < 2 or not re.search(r"[A-Za-z]{2,}", s):
         return False
-    if re.search(r"[{}<>=;]|\|\||&&|\($|^\+ |^https?:|^[./#]|\w\.\w+\(|^[a-z]+(-[a-z0-9]+)+$|^[a-z_]+$|^[A-Z_]+$", s):
+    if re.search(r"[{}<>=]|;\S|;\s*$|\|\||&&|\($|^\+ |^https?:|^[./#]|\w\.\w+\(|^[a-z]+(-[a-z0-9]+)+$|^[a-z_]+$|^[A-Z_]+$", s):
         return False
     return bool(re.match(r"[A-Z0-9(\"'“]", s)) or " " in s
 
@@ -86,6 +86,34 @@ def js_html_fragments(src: str):
             if looks_human(t):
                 yield t
 
+Q1 = r"'(?:[^'\\\n]|\\.)*'"
+Q2 = r'"(?:[^"\\\n]|\\.)*"'
+MERGE = re.compile(r"(?:(%s|%s)\s*\+\s*)+(%s|%s)" % (Q1, Q2, Q1, Q2))
+ANYLIT = re.compile(r"%s|%s" % (Q1, Q2))
+
+def _unq(lit, strip=True):
+    body = lit[1:-1].replace("\\'", "'").replace('\\"', '"').replace("\\n", " ")
+    body = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), body)
+    body = re.sub(r"\s+", " ", body)
+    return body.strip() if strip else body
+
+def js_all_literals(src: str):
+    """Все «человеческие» строковые литералы JS; соседние 'a' + 'b' склеиваются в одну строку."""
+    def merge(m):
+        parts = ANYLIT.findall(m.group(0))
+        return "'" + "".join(_unq(x, False) for x in parts).replace("'", "\\'") + "'"
+    src = MERGE.sub(merge, src)
+    for m in ANYLIT.finditer(src):
+        t = _unq(m.group(0))
+        if "<" in t:
+            for frag in re.split(r"<[^>]*>", t):
+                frag = re.sub(r"\s+", " ", frag).strip()
+                if looks_human(frag) and (" " in frag or re.match(r"[A-Z][a-z]+$", frag)):
+                    yield frag
+            continue
+        if looks_human(t) and (" " in t or re.match(r"[A-Z][a-z]+$", t)):
+            yield t
+
 def collect():
     found = {}
     def add(s, where):
@@ -98,6 +126,7 @@ def collect():
         _src = f.read_text(encoding="utf-8")
         for s in js_strings(_src): add(s, f.name)
         for s in js_html_fragments(_src): add(s, f.name)
+        for s in js_all_literals(_src): add(s, f.name)
     loading = ROOT / "src-tauri" / "loading" / "index.html"
     if loading.exists():
         c = HtmlCollector(); c.feed(loading.read_text(encoding="utf-8"))
