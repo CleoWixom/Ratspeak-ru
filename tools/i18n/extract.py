@@ -69,6 +69,23 @@ def js_strings(src: str):
             elif looks_human(s):
                 yield s.strip()
 
+
+HTML_LIT = re.compile(r"""'((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)"|`((?:[^`\\]|\\.)*)`""", re.S)
+
+def js_html_fragments(src: str):
+    """Текст между тегами в любых строковых литералах/шаблонах, содержащих HTML (в т.ч. с ${...})."""
+    for m in HTML_LIT.finditer(src):
+        s = next(g for g in m.groups() if g is not None)
+        if not re.search(r"</?[a-zA-Z][^>]*>", s):
+            continue
+        s = s.replace("\\'", "'").replace('\\"', '"').replace("\\n", " ")
+        s = re.sub(r"\\u([0-9a-fA-F]{4})", lambda mm: chr(int(mm.group(1), 16)), s)
+        s = re.sub(r"\$\{[^}]*\}", "\x00", s)
+        for t in re.split(r"<[^>]*>|\x00", s):
+            t = re.sub(r"\s+", " ", t).strip()
+            if looks_human(t):
+                yield t
+
 def collect():
     found = {}
     def add(s, where):
@@ -78,7 +95,9 @@ def collect():
         for s in c.out: add(s, f.name)
     for f in sorted((DASH / "static" / "js").glob("*.js")):
         if f.name in SKIP_JS: continue
-        for s in js_strings(f.read_text(encoding="utf-8")): add(s, f.name)
+        _src = f.read_text(encoding="utf-8")
+        for s in js_strings(_src): add(s, f.name)
+        for s in js_html_fragments(_src): add(s, f.name)
     loading = ROOT / "src-tauri" / "loading" / "index.html"
     if loading.exists():
         c = HtmlCollector(); c.feed(loading.read_text(encoding="utf-8"))

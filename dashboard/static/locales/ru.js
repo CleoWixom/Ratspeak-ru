@@ -1,5 +1,8 @@
 window.RATSPEAK_I18N = {
+ "(optional)": "(необязательно)",
  "(Recommended)": "(Рекомендуется)",
+ "-word phrase and stored it safely.": " слов и надёжно сохранил(а) её.",
+ "-word recovery phrase for this identity.": " слов для этой идентичности.",
  "0 / 12 words": "0 / 12 слов",
  "0 contacts": "0 контактов",
  "0 entries": "0 записей",
@@ -10,6 +13,7 @@ window.RATSPEAK_I18N = {
  "15 minutes": "15 минут",
  "16 (default)": "16 (по умолчанию)",
  "16+ hex characters": "16+ hex-символов",
+ "2 hops": "2 прыжка",
  "30 min": "30 мин",
  "30 minutes": "30 минут",
  "32-character hub address": "Адрес хаба (32 символа)",
@@ -17,16 +21,21 @@ window.RATSPEAK_I18N = {
  "5 minutes": "5 минут",
  "60 minutes": "60 минут",
  "6–8 characters": "6–8 символов",
+ "A representative profile status": "Пример статуса профиля",
  "A saved access key is ready. Leave this blank to use it.": "Сохранённый ключ доступа готов. Оставьте поле пустым, чтобы использовать его.",
  "About": "О программе",
  "About channel visibility": "О видимости канала",
+ "About Ratspeak": "О Ratspeak",
+ "Accept": "Принять",
  "Accept Backbone connections from other transport nodes.": "Принимать Backbone-соединения от других транспортных узлов.",
+ "Accept Draw": "Принять ничью",
  "Accept incoming TCP connections from other Reticulum nodes.": "Принимать входящие TCP-соединения от других узлов Reticulum.",
  "Accepting…": "Принятие…",
  "Access": "Доступ",
  "Access configuration (JSON)": "Конфигурация доступа (JSON)",
  "Access key": "Ключ доступа",
  "Access Point (AP)": "Точка доступа (AP)",
+ "Activate after import": "Активировать после импорта",
  "Active": "Активно",
  "Active Identity": "Активная идентичность",
  "Active identity, status, backup, and recovery": "Активная идентичность, статус, резервная копия и восстановление",
@@ -46,6 +55,7 @@ window.RATSPEAK_I18N = {
  "Add Hardware Identity": "Добавить аппаратную идентичность",
  "Add LoRa Device": "Добавить LoRa-устройство",
  "Add Radio": "Добавить радио",
+ "Add someone before starting a game.": "Добавьте кого-нибудь, прежде чем начинать игру.",
  "Add to draft": "Добавить в черновик",
  "Adding...": "Добавление...",
  "Address": "Адрес",
@@ -53,6 +63,7 @@ window.RATSPEAK_I18N = {
  "Admin (administrative boundary)": "Админ. (административная граница)",
  "Advanced": "Дополнительно",
  "Advanced radio parameters": "Расширенные параметры радио",
+ "Advertise and require proof-of-work on messages sent directly to you.": "Объявлять и требовать proof-of-work для сообщений, отправляемых вам напрямую.",
  "Airtime limit, long-term (%)": "Лимит эфирного времени, долгосрочный (%)",
  "Airtime limit, short-term (%)": "Лимит эфирного времени, краткосрочный (%)",
  "All": "Все",
@@ -85,11 +96,15 @@ window.RATSPEAK_I18N = {
  "Attach": "Прикрепить",
  "Attach emoji or file": "Прикрепить эмодзи или файл",
  "Attach the file again for this conversation": "Прикрепите файл заново для этого разговора",
+ "Attachment unavailable": "Вложение недоступно",
+ "Auto": "Авто",
  "Auto-Announce": "Автоанонс",
  "Auto-reconnect radios": "Автопереподключение радио",
  "Automatically announce your presence every:": "Автоматически анонсировать ваше присутствие каждые:",
+ "Availability": "Доступность",
  "Available": "Доступно",
  "Available hubs": "Доступные хабы",
+ "Available inbox nodes": "Доступные узлы входящих",
  "Awaiting a signed identity announce": "Ожидание подписанного анонса идентичности",
  "Back": "Назад",
  "Back to channels": "Назад к каналам",
@@ -118,6 +133,7 @@ window.RATSPEAK_I18N = {
  "Bind Address": "Адрес привязки",
  "Block": "Заблокировать",
  "Block List": "Список блокировки",
+ "Blocked Users": "Заблокированные пользователи",
  "Blocked. Network filtering starts after their next announce.": "Заблокировано. Фильтрация в сети начнётся после их следующего анонса.",
  "Bluetooth": "Bluetooth",
  "Bluetooth access granted. Tap + again to turn on Bluetooth Peer.": "Доступ к Bluetooth предоставлен. Нажмите + ещё раз, чтобы включить Bluetooth Peer.",
@@ -125,6 +141,7 @@ window.RATSPEAK_I18N = {
  "Bluetooth Peer": "Bluetooth Peer",
  "Bluetooth Peer actions": "Действия Bluetooth Peer",
  "Bluetooth Peer:": "Bluetooth Peer:",
+ "Bluetooth permission denied. Grant permission in system settings to scan for LoRa radios.": "Разрешение Bluetooth отклонено. Дайте разрешение в системных настройках, чтобы сканировать LoRa-радио.",
  "Bluetooth permission needed": "Нужно разрешение Bluetooth",
  "Bluetooth Settings": "Настройки Bluetooth",
  "Boundary": "Граница",
@@ -133,6 +150,7 @@ window.RATSPEAK_I18N = {
  "Cache": "Кэш",
  "Cached network routes": "Кэшированные сетевые маршруты",
  "Call": "Позвонить",
+ "Call route": "Маршрут звонка",
  "Camera": "Камера",
  "Camera access is not available in this WebView. Use Scan Photo.": "Доступ к камере недоступен в этом WebView. Используйте «Сканировать фото».",
  "Camera permission is required for live scan. You can still use Scan Photo.": "Для живого сканирования нужно разрешение на камеру. Можно по-прежнему использовать «Сканировать фото».",
@@ -185,6 +203,7 @@ window.RATSPEAK_I18N = {
  "Choose Ratspeak Identity Backup to import this file.": "Выберите «Резервная копия идентичности Ratspeak», чтобы импортировать этот файл.",
  "Choose Reticulum Identity Key to import this file.": "Выберите «Ключ идентичности Reticulum», чтобы импортировать этот файл.",
  "Choose the source format.": "Выберите исходный формат.",
+ "Choose what to play and who to challenge.": "Выберите, во что играть и кого вызвать.",
  "Clear": "Очистить",
  "Clear all system-populated network drops? Manual blocks are not affected.": "Очистить все автоматически добавленные сетевые блокировки? Ручные блокировки не затрагиваются.",
  "Clear Announces": "Очистить анонсы",
@@ -215,6 +234,8 @@ window.RATSPEAK_I18N = {
  "Connect a hub interface before checking Offline Inbox.": "Подключите интерфейс хаба перед проверкой офлайн-входящих.",
  "Connect to a hub": "Подключиться к хабу",
  "Connect to a network first": "Сначала подключитесь к сети",
+ "Connect to a network to discover peers": "Подключитесь к сети, чтобы находить пиров",
+ "Connect to a network, device, or add a contact to discover peers": "Подключитесь к сети или устройству либо добавьте контакт, чтобы находить пиров",
  "Connect to a trusted hub, then choose a channel.": "Подключитесь к доверенному хабу, затем выберите канал.",
  "Connect to an RNode TCP server": "Подключиться к TCP-серверу RNode",
  "Connect to another app's local Reticulum service.": "Подключиться к локальной службе Reticulum другого приложения.",
@@ -224,6 +245,8 @@ window.RATSPEAK_I18N = {
  "Connect via USB cable": "Подключиться по USB-кабелю",
  "Connect via USB-OTG": "Подключиться по USB-OTG",
  "Connected": "Подключено",
+ "Connecting": "Подключение",
+ "Connecting to hub node...": "Подключение к узлу хаба...",
  "Connecting will disconnect your active Bluetooth LoRa radio.": "Подключение отключит ваше активное Bluetooth LoRa-радио.",
  "Connecting will disconnect your active USB LoRa radio.": "Подключение отключит ваше активное USB LoRa-радио.",
  "Connecting...": "Подключение...",
@@ -235,8 +258,11 @@ window.RATSPEAK_I18N = {
  "Connection request failed": "Запрос на подключение не удался",
  "Connection type": "Тип соединения",
  "Connections": "Соединения",
+ "Contact": "Контакт",
  "Contact added": "Контакт добавлен",
  "Contact card is not ready yet": "Карточка контакта ещё не готова",
+ "Contact card unavailable": "Карточка контакта недоступна",
+ "Contact card verified": "Карточка контакта проверена",
  "Contact name (optional):": "Имя контакта (необязательно):",
  "Contacting GitHub...": "Связь с GitHub...",
  "Contacts": "Контакты",
@@ -253,6 +279,7 @@ window.RATSPEAK_I18N = {
  "Copy identity": "Копировать идентичность",
  "Copy link": "Копировать ссылку",
  "Copy LXMF Hash": "Копировать LXMF-хеш",
+ "Copy Message": "Копировать сообщение",
  "Copy phrase": "Копировать фразу",
  "Copy secret": "Копировать секрет",
  "Cost 12": "Стоимость 12",
@@ -321,6 +348,8 @@ window.RATSPEAK_I18N = {
  "Dark": "Тёмная",
  "Data": "Данные",
  "Data will be preserved and reappear if this identity is re-imported.": "Данные сохранятся и появятся снова, если эту идентичность импортировать повторно.",
+ "Decline": "Отклонить",
+ "Decline Draw": "Отклонить ничью",
  "Declining…": "Отклонение…",
  "Delete": "Удалить",
  "Delete All Data": "Удалить все данные",
@@ -335,6 +364,7 @@ window.RATSPEAK_I18N = {
  "denied —": "отказано —",
  "Deriving encryption keys...": "Вычисление ключей шифрования...",
  "Dest Hash": "Хеш назначения",
+ "Destination": "Назначение",
  "Developer and reset controls": "Инструменты разработчика и сброс",
  "Developer Mode": "Режим разработчика",
  "Direct": "Напрямую",
@@ -382,6 +412,7 @@ window.RATSPEAK_I18N = {
  "Enter a stamp cost from 0 to 32.": "Введите стоимость штампа от 0 до 32.",
  "Enter a TCP endpoint.": "Введите TCP-адрес.",
  "Enter address": "Введите адрес",
+ "Enter an Offline Inbox node hash below to connect manually.": "Введите ниже хеш узла офлайн-входящих, чтобы подключиться вручную.",
  "Enter as the owner, then create or join a channel.": "Войдите как владелец, затем создайте канал или присоединитесь к нему.",
  "Enter identity hash:": "Введите хеш идентичности:",
  "Enter interval in hours (1–48):": "Введите интервал в часах (1–48):",
@@ -390,10 +421,12 @@ window.RATSPEAK_I18N = {
  "Enter the 6-digit passkey shown on the RNode’s OLED display.": "Введите 6-значный ключ, показанный на OLED-дисплее RNode.",
  "Enter the backup PIN to continue": "Введите PIN резервной копии, чтобы продолжить",
  "Enter the current YubiKey PIN to finish setup.": "Введите текущий PIN YubiKey, чтобы завершить настройку.",
+ "Enter the PIN that was set when this .rsi backup was exported. The imported identity will be encrypted on this device with the same PIN.": "Введите PIN, заданный при экспорте этой резервной копии .rsi. Импортированная идентичность будет зашифрована на этом устройстве тем же PIN.",
  "Enter the SHA-256 digest approved when this manifest was independently verified.": "Введите SHA-256-дайджест, утверждённый при независимой проверке этого манифеста.",
  "Enter to send, Shift+Enter for a new line": "Enter — отправить, Shift+Enter — новая строка",
  "Enter to send, Shift+Enter for new line": "Enter — отправить, Shift+Enter — новая строка",
  "Enter your 12-word recovery phrase, then set the PIN to write it onto a factory-fresh or reset security key.": "Введите фразу восстановления из 12 слов, затем задайте PIN, чтобы записать её на новый или сброшенный ключ безопасности.",
+ "Enter your PIN to reveal the": "Введите PIN, чтобы показать фразу восстановления из",
  "Enter your PIN.": "Введите ваш PIN.",
  "Error loading interfaces.": "Ошибка загрузки интерфейсов.",
  "Error scanning ports": "Ошибка сканирования портов",
@@ -410,6 +443,7 @@ window.RATSPEAK_I18N = {
  "Failed to remove the local hardware identity.": "Не удалось удалить локальную аппаратную идентичность.",
  "Failed to restore identity": "Не удалось восстановить идентичность",
  "Failed to start BLE scan.": "Не удалось запустить BLE-сканирование.",
+ "Favor Ratspeak inbox nodes": "Предпочитать узлы входящих Ratspeak",
  "File": "Файл",
  "File / Image": "Файл / изображение",
  "Filter activity": "Фильтр активности",
@@ -423,9 +457,11 @@ window.RATSPEAK_I18N = {
  "Finish the game before removing it": "Завершите игру, прежде чем удалять её",
  "Finish voice message recording": "Завершить запись голосового сообщения",
  "Firmware update needed": "Требуется обновление прошивки",
+ "First heard": "Впервые замечен",
  "Frequency": "Частота",
  "From": "От",
  "Full": "Полная",
+ "Game": "Игра",
  "Game action rejected:": "Игровое действие отклонено:",
  "Game challenge": "Вызов на игру",
  "Game challenge from": "Вызов на игру от",
@@ -437,8 +473,10 @@ window.RATSPEAK_I18N = {
  "General": "Общие",
  "Generating Ed25519 keypair...": "Генерация пары ключей Ed25519...",
  "Global (Internet IPv6 multicast)": "Глобальная (интернет, IPv6 multicast)",
+ "Go to Identity": "Перейти к идентичности",
  "Good balance of visibility and efficiency.": "Хороший баланс между видимостью и эффективностью.",
  "Grant Bluetooth Permission": "Дать разрешение Bluetooth",
+ "Guidelines": "Правила",
  "Hang up": "Положить трубку",
  "Hardware": "Оборудование",
  "Hardware identity added": "Аппаратная идентичность добавлена",
@@ -448,10 +486,12 @@ window.RATSPEAK_I18N = {
  "Hardware Key Auto-Lock": "Автоблокировка аппаратного ключа",
  "Hardware setup did not provide an identity. Try setup again.": "Настройка оборудования не предоставила идентичность. Повторите настройку.",
  "Hardware-only": "Только аппаратный",
+ "Hash": "Хеш",
  "Hide known spam peers": "Скрывать известных спам-пиров",
  "Hide peer names and addresses until you reveal an Activity event.": "Скрывать имена и адреса пиров, пока вы не раскроете событие активности.",
  "Hide repeated bridge-style IDs unless you have saved or messaged the peer.": "Скрывать повторяющиеся ID в стиле мостов, если вы не сохраняли пира и не писали ему.",
  "High-throughput Backbone listener for transport-node trunks.": "Высокопроизводительный Backbone-слушатель для магистралей транспортных узлов.",
+ "Higher values make spam harder but slow down senders.": "Более высокие значения затрудняют спам, но замедляют отправителей.",
  "History is temporarily unavailable": "История временно недоступна",
  "Hold to talk, up to 10 seconds": "Удерживайте, чтобы говорить (до 10 секунд)",
  "Home": "Главная",
@@ -459,11 +499,14 @@ window.RATSPEAK_I18N = {
  "Host": "Хост",
  "Host Backbone server": "Запустить Backbone-сервер",
  "Host Backbone Server": "Запустить Backbone-сервер",
+ "Host inbox node": "Запустить узел входящих",
  "Host network": "Запустить сеть",
  "Host Network": "Запустить сеть",
  "Host Server": "Запустить сервер",
+ "Hosted Offline Inbox": "Размещённые офлайн-входящие",
  "Hosting": "Хостинг",
  "Hosting and channel preferences": "Хостинг и настройки каналов",
+ "Hosting unavailable": "Хостинг недоступен",
  "How should this identity be backed up?": "Как сделать резервную копию этой идентичности?",
  "Hub": "Хаб",
  "Hub address": "Адрес хаба",
@@ -472,6 +515,7 @@ window.RATSPEAK_I18N = {
  "Hub information": "Информация о хабе",
  "Hub options": "Параметры хаба",
  "Hub welcome": "Приветствие хаба",
+ "I have written down my": "Я записал(а) фразу из",
  "I have written down my 12-word phrase and stored it safely.": "Я записал(а) фразу из 12 слов и надёжно сохранил(а) её.",
  "Identifying peer…": "Определение пира…",
  "Identities": "Идентичности",
@@ -480,6 +524,7 @@ window.RATSPEAK_I18N = {
  "Identity created, but the PIN could not be set:": "Идентичность создана, но PIN не удалось задать:",
  "Identity deleted": "Идентичность удалена",
  "Identity Detail": "Сведения об идентичности",
+ "Identity Hash": "Хеш идентичности",
  "Identity hash": "Хеш идентичности",
  "Identity imported": "Идентичность импортирована",
  "Identity imported, but the local PIN could not be set:": "Идентичность импортирована, но локальный PIN не удалось задать:",
@@ -487,6 +532,7 @@ window.RATSPEAK_I18N = {
  "Identity restored": "Идентичность восстановлена",
  "Identity restored, but the PIN could not be set:": "Идентичность восстановлена, но PIN не удалось задать:",
  "Identity switched": "Идентичность переключена",
+ "Identity:": "Идентичность:",
  "If you do not back up this identity, you will be unable to recover or use it without your YubiKey.": "Если вы не сделаете резервную копию этой идентичности, восстановить или использовать её без вашего YubiKey будет невозможно.",
  "IFAC Network Name": "Имя сети IFAC",
  "IFAC Passphrase": "Парольная фраза IFAC",
@@ -499,8 +545,11 @@ window.RATSPEAK_I18N = {
  "Import Identity": "Импорт идентичности",
  "Import or Restore Identity": "Импорт или восстановление идентичности",
  "Import or restore identity": "Импорт или восстановление идентичности",
+ "Inbox node hash (hex):": "Хеш узла входящих (hex):",
+ "Incoming call": "Входящий звонок",
  "Initializing": "Инициализация",
  "Instance name": "Имя экземпляра",
+ "Interface": "Интерфейс",
  "Interface Mode": "Режим интерфейса",
  "Interface settings are still loading": "Настройки интерфейса ещё загружаются",
  "Internet/TCP": "Интернет/TCP",
@@ -513,6 +562,7 @@ window.RATSPEAK_I18N = {
  "Joining": "Присоединение",
  "Joining as": "Присоединение как",
  "Joining…": "Присоединение…",
+ "just now": "только что",
  "Keep existing key": "Оставить существующий ключ",
  "Keep for later": "Оставить на потом",
  "Keep item": "Оставить элемент",
@@ -521,6 +571,7 @@ window.RATSPEAK_I18N = {
  "Keep your existing text and add the shared content?": "Сохранить ваш текст и добавить полученное содержимое?",
  "Keys are generated on the device and never leave it. There is no phrase to lose — but if the key is lost or reset, this identity is gone forever.": "Ключи генерируются на устройстве и никогда его не покидают. Фразу терять нечего — но если ключ будет утерян или сброшен, эта идентичность исчезнет навсегда.",
  "Large attachment — transfer may take a while on slow links": "Большое вложение — на медленных каналах передача может занять время",
+ "Last check:": "Последняя проверка:",
  "Last heard": "Последний сигнал",
  "Last heard recently": "Недавно был на связи",
  "Last heard today": "Был на связи сегодня",
@@ -541,16 +592,19 @@ window.RATSPEAK_I18N = {
  "Live membership will end. Local history stays on this device.": "Активное участие прекратится. Локальная история останется на этом устройстве.",
  "Live now": "Сейчас в эфире",
  "Live QR scanning is not available in this WebView. Use Scan Photo.": "Живое сканирование QR недоступно в этом WebView. Используйте «Сканировать фото».",
+ "Live Scan": "Живое сканирование",
  "Live sessions": "Активные сеансы",
  "Load configuration": "Загрузить конфигурацию",
  "Loading history…": "Загрузка истории…",
  "Loading interfaces...": "Загрузка интерфейсов...",
  "Loading interfaces…": "Загрузка интерфейсов…",
+ "Loading peers...": "Загрузка пиров...",
  "Loading public servers...": "Загрузка публичных серверов...",
  "Loading...": "Загрузка...",
  "Loading…": "Загрузка…",
  "Local Network": "Локальная сеть",
  "Local Network (WiFi/LAN)": "Локальная сеть (Wi-Fi/LAN)",
+ "Local storage is being checked. Messages stay on the inbox node until they can be saved safely.": "Проверяется локальное хранилище. Сообщения остаются на узле входящих, пока их нельзя будет безопасно сохранить.",
  "Lock your hardware identity after this much idle time. You’ll re-enter the PIN to resume.": "Блокировать аппаратную идентичность после такого простоя. Для продолжения нужно будет снова ввести PIN.",
  "Long-term airtime limit must be between 0 and 100 %": "Долгосрочный лимит эфирного времени должен быть от 0 до 100 %",
  "Longitude": "Долгота",
@@ -558,6 +612,7 @@ window.RATSPEAK_I18N = {
  "Looking for a security key…": "Поиск ключа безопасности…",
  "LoRa Interfaces": "LoRa-интерфейсы",
  "Low-traffic, long-running nodes.": "Узлы с малым трафиком и длительной работой.",
+ "LXMF Address": "LXMF-адрес",
  "Main navigation": "Главная навигация",
  "Manage": "Управление",
  "Manage access": "Управление доступом",
@@ -566,8 +621,10 @@ window.RATSPEAK_I18N = {
  "Manage your channel hub": "Управление хабом каналов",
  "Manage your hub": "Управление вашим хабом",
  "Managed by Ratspeak": "Управляется Ratspeak",
+ "Manual": "Вручную",
  "Match system color mode": "Как в системе",
  "Me": "Я",
+ "Measured peer name": "Измеренное имя пира",
  "Member details": "Сведения об участнике",
  "Members": "Участники",
  "Mention": "Упомянуть",
@@ -576,6 +633,8 @@ window.RATSPEAK_I18N = {
  "Message from": "Сообщение от",
  "Message identifier": "Идентификатор сообщения",
  "Message input": "Поле ввода сообщения",
+ "Message route": "Маршрут сообщения",
+ "Message stamp protection": "Защита штампами сообщений",
  "Message timed out. The recipient may be unreachable.": "Время ожидания сообщения истекло. Возможно, получатель недоступен.",
  "Message...": "Сообщение...",
  "Messages": "Сообщения",
@@ -609,10 +668,13 @@ window.RATSPEAK_I18N = {
  "New conversation": "Новый разговор",
  "New Conversation": "Новый разговор",
  "New Game": "Новая игра",
+ "New game": "Новая игра",
  "New Message": "Новое сообщение",
  "New networks, new freedoms": "Новые сети — новые свободы",
+ "New PIN": "Новый PIN",
  "New PIN must be 6-8 characters.": "Новый PIN должен содержать 6–8 символов.",
  "Next": "Далее",
+ "Next retry:": "Следующая попытка:",
  "Nickname for this session": "Псевдоним для этого сеанса",
  "No": "Нет",
  "No active identity.": "Нет активной идентичности.",
@@ -629,15 +691,19 @@ window.RATSPEAK_I18N = {
  "No events matching filter.": "Нет событий, соответствующих фильтру.",
  "No games yet": "Игр пока нет",
  "No identities found.": "Идентичности не найдены.",
+ "No interfaces detected.": "Интерфейсы не обнаружены.",
  "No known paths.": "Известных путей нет.",
  "No limit": "Без ограничений",
  "No live send remained. The local message was cancelled, but a copy may still arrive.": "Активной отправки не осталось. Локальное сообщение отменено, но копия всё равно может дойти.",
  "No local send remained to cancel. A copy may already have left this device.": "Нет локальной отправки для отмены. Копия могла уже покинуть это устройство.",
+ "No matches": "Совпадений нет",
  "No messages yet": "Сообщений пока нет",
  "No peers discovered yet": "Пиры пока не обнаружены",
  "No peers match your filter": "Нет пиров, соответствующих фильтру",
+ "No peers yet": "Пиров пока нет",
  "No rate limit entries.": "Записей ограничения скорости нет.",
  "No recent emoji": "Недавних эмодзи нет",
+ "no recovery": "без восстановления",
  "No results": "Нет результатов",
  "No RNode devices found. Make sure your device is powered on and paired.": "RNode-устройства не найдены. Убедитесь, что устройство включено и сопряжено.",
  "No RNode service": "Нет службы RNode",
@@ -648,11 +714,13 @@ window.RATSPEAK_I18N = {
  "None configured.": "Ничего не настроено.",
  "Normal": "Обычный",
  "Not advertised by this hub": "Не объявлено этим хабом",
+ "Not available for hardware-key identities — a hosted inbox would stop whenever the security key is removed or the session locks.": "Недоступно для идентичностей на аппаратном ключе — размещённый ящик перестанет работать, как только ключ безопасности будет извлечён или сеанс заблокируется.",
  "Not connected": "Не подключено",
  "Not currently joined.": "Сейчас не присоединён.",
  "Not enabled.": "Не включено.",
  "Not hosting": "Не размещается",
  "Not now": "Не сейчас",
+ "Not Paired": "Не сопряжено",
  "Not running": "Не запущено",
  "Not set.": "Не задано.",
  "Nothing is sent automatically. Ratspeak will prepare an email containing the details above for you to review.": "Ничего не отправляется автоматически. Ratspeak подготовит письмо с указанными выше сведениями для вашей проверки.",
@@ -673,6 +741,7 @@ window.RATSPEAK_I18N = {
  "Only public channels disclosed on this Link appear here. Private or secret channels may be intentionally hidden.": "Здесь показаны только публичные каналы, раскрытые на этом Link. Приватные и секретные каналы могут быть намеренно скрыты.",
  "Open an invitation without connecting automatically.": "Открыть приглашение без автоматического подключения.",
  "Open channel": "Открыть канал",
+ "Open Contacts": "Открыть контакты",
  "Open hub": "Открыть хаб",
  "Open hub details to stop or review this connection.": "Откройте сведения о хабе, чтобы остановить или проверить это подключение.",
  "Open Identity": "Открыть идентичность",
@@ -681,17 +750,23 @@ window.RATSPEAK_I18N = {
  "Open your hub": "Открыть ваш хаб",
  "Open:": "Открыть:",
  "Opening camera...": "Открытие камеры...",
+ "Opponent": "Соперник",
  "Opportunistic": "Оппортунистический",
  "Optional": "Необязательно",
  "or start a new game with a contact": "или начните новую игру с контактом",
  "Organisation": "Организация",
+ "Original": "Оригинал",
  "Overview": "Обзор",
  "Packet port": "Порт пакетов",
  "Pair": "Сопрягать",
  "Pair again": "Сопрячь заново",
  "Pair with RNode": "Сопряжение с RNode",
+ "Paired": "Сопряжено",
  "Pairing needed": "Требуется сопряжение",
  "Paste a Ratspeak link or scan its QR.": "Вставьте ссылку Ratspeak или отсканируйте её QR.",
+ "Path Age": "Возраст пути",
+ "Path age": "Возраст пути",
+ "Paths": "Пути",
  "Pause Interface": "Приостановить интерфейс",
  "Pause recording": "Приостановить запись",
  "Pause voice message recording": "Приостановить запись голосового сообщения",
@@ -721,14 +796,18 @@ window.RATSPEAK_I18N = {
  "Port": "Порт",
  "Port access denied": "Доступ к порту запрещён",
  "Port in use": "Порт занят",
+ "Prefer reachable Ratspeak inbox nodes, with fallback when none can be reached.": "Предпочитать доступные узлы входящих Ratspeak, с запасным вариантом, если ни один недоступен.",
  "Prepare email": "Подготовить письмо",
+ "Preparing scanner...": "Подготовка сканера...",
  "Preparing...": "Подготовка...",
  "Preparing…": "Подготовка…",
  "Preset": "Пресет",
  "Preview recording": "Прослушать запись",
  "Privacy": "Конфиденциальность",
  "Private channel?": "Приватный канал?",
+ "Private Key": "Приватный ключ",
  "Profile": "Профиль",
+ "Propagation address": "Адрес распространения",
  "Protect Activity identities": "Защищать идентичности в активности",
  "Provision a factory-fresh or reset security key.": "Настроить новый или сброшенный ключ безопасности.",
  "Provisioning failed": "Настройка не удалась",
@@ -736,6 +815,7 @@ window.RATSPEAK_I18N = {
  "Public": "Публичный",
  "Public channels": "Публичные каналы",
  "Public channels are shared spaces hosted by Ratspeak or independent operators.": "Публичные каналы — это общие пространства, которые размещают Ratspeak или независимые операторы.",
+ "Public Identity Key": "Публичный ключ идентичности",
  "Purge": "Очистить",
  "Purge unverified": "Очистить неподтверждённые",
  "Purged": "Очищено",
@@ -752,9 +832,11 @@ window.RATSPEAK_I18N = {
  "Radio not supported": "Радио не поддерживается",
  "Ratspeak": "Ratspeak",
  "Ratspeak - Dashboard": "Ratspeak — Панель",
+ "Ratspeak authenticates the destination and Link before any channel action. This view is not proof of an active session.": "Ratspeak аутентифицирует назначение и Link перед любым действием в канале. Это представление не доказывает наличие активного сеанса.",
  "Ratspeak backups are PIN-encrypted. Reticulum exports are raw unencrypted private-key material.": "Резервные копии Ratspeak зашифрованы PIN-кодом. Экспорт Reticulum — это необработанный незашифрованный приватный ключ.",
  "Ratspeak can investigate app conduct and activity on official Ratspeak services. Independent hub operators control and moderate their own hubs.": "Ratspeak может расследовать поведение в приложении и активность на официальных сервисах Ratspeak. Независимые операторы хабов сами управляют своими хабами и модерируют их.",
  "Ratspeak channel share QR": "QR для обмена каналом Ratspeak",
+ "Ratspeak Contact Card": "Карточка контакта Ratspeak",
  "Ratspeak Hub": "Хаб Ratspeak",
  "Ratspeak Identity Backup": "Резервная копия идентичности Ratspeak",
  "Ratspeak identity backup": "Резервная копия идентичности Ratspeak",
@@ -767,6 +849,7 @@ window.RATSPEAK_I18N = {
  "Reading QR image...": "Чтение QR-изображения...",
  "Ready to review. Tap Send when you’re ready.": "Готово к проверке. Нажмите «Отправить», когда будете готовы.",
  "Ready when you are": "Готово, когда вы готовы",
+ "Real-time dashboard for Reticulum mesh networks. Encrypted messaging, dynamic node management, and network health monitoring.": "Панель реального времени для mesh-сетей Reticulum. Зашифрованные сообщения, динамическое управление узлами и мониторинг состояния сети.",
  "Reappears if they message again.": "Появится снова, если они напишут ещё раз.",
  "Recent": "Недавние",
  "Recent activity": "Недавняя активность",
@@ -799,9 +882,11 @@ window.RATSPEAK_I18N = {
  "Reject": "Отклонить",
  "Reject call": "Отклонить звонок",
  "Reject larger messages and attachments.": "Отклонять более крупные сообщения и вложения.",
+ "Rejected": "Отклонено",
  "Relay is not in your peer list": "Ретранслятор отсутствует в вашем списке пиров",
  "Relay packets for other nodes on the network": "Ретранслировать пакеты других узлов сети",
  "Relay packets for other nodes on the network.": "Ретранслировать пакеты других узлов сети.",
+ "Rematch": "Реванш",
  "Remember for reconnect": "Запомнить для переподключения",
  "Remove": "Удалить",
  "Remove every live session for": "Удалить все активные сеансы для",
@@ -831,13 +916,17 @@ window.RATSPEAK_I18N = {
  "Rename interface": "Переименовать интерфейс",
  "Replace key": "Заменить ключ",
  "Replace key while registering": "Замените ключ во время регистрации",
+ "Reply": "Ответить",
  "Report": "Пожаловаться",
  "Report channel content": "Пожаловаться на содержимое канала",
  "Report message": "Пожаловаться на сообщение",
  "Report message from": "Пожаловаться на сообщение от",
  "Requesting": "Запрос",
  "Requesting current approximate location...": "Запрос текущего приблизительного местоположения...",
+ "Require stamps": "Требовать штампы",
  "Required for most IFAC networks": "Требуется для большинства IFAC-сетей",
+ "Required work": "Требуемая работа",
+ "Resend last move": "Отправить последний ход снова",
  "Resending…": "Повторная отправка…",
  "Reset": "Сбросить",
  "Reset Everything": "Сбросить всё",
@@ -850,6 +939,7 @@ window.RATSPEAK_I18N = {
  "Restore failed": "Не удалось восстановить",
  "Restore from a 12-word recovery phrase (creates a software identity).": "Восстановить из фразы из 12 слов (создаёт программную идентичность).",
  "Restore Identity": "Восстановить идентичность",
+ "Restored software identities can be encrypted on this device with an optional PIN.": "Восстановленные программные идентичности можно зашифровать на этом устройстве необязательным PIN-кодом.",
  "Resume Interface": "Возобновить интерфейс",
  "Reticulum Base32 Key": "Ключ Reticulum (Base32)",
  "Reticulum base32 key": "Ключ Reticulum (base32)",
@@ -858,6 +948,8 @@ window.RATSPEAK_I18N = {
  "Reticulum Identity Key": "Ключ идентичности Reticulum",
  "Retry": "Повторить",
  "Retry Connection": "Повторить подключение",
+ "Retry storage recovery": "Повторить восстановление хранилища",
+ "Retry waiting messages": "Повторить ожидающие сообщения",
  "Retrying...": "Повторная попытка...",
  "Reveal": "Показать",
  "Reveal recovery phrase": "Показать фразу восстановления",
@@ -868,8 +960,12 @@ window.RATSPEAK_I18N = {
  "Revoke invitation": "Отозвать приглашение",
  "Revoke invitation?": "Отозвать приглашение?",
  "Revoke the invitation for": "Отозвать приглашение для",
+ "Ringing": "Вызов",
  "Roaming (recommended)": "Роуминг (рекомендуется)",
+ "Route": "Маршрут",
+ "Routing": "Маршрутизация",
  "RPC key (hex)": "RPC-ключ (hex)",
+ "RX Rate": "Скорость приёма",
  "Safe to clear at any time. Data re-populates automatically.": "Можно очищать в любой момент. Данные заполнятся автоматически.",
  "Save": "Сохранить",
  "Save changes": "Сохранить изменения",
@@ -883,6 +979,7 @@ window.RATSPEAK_I18N = {
  "Saving...": "Сохранение...",
  "Saving…": "Сохранение…",
  "Scan Again": "Сканировать снова",
+ "Scan Photo": "Сканировать фото",
  "Scan Ratspeak QR": "Сканировать QR Ratspeak",
  "Scan timed out. Try again.": "Время сканирования истекло. Повторите.",
  "Scanning...": "Сканирование...",
@@ -906,6 +1003,7 @@ window.RATSPEAK_I18N = {
  "Select an identity to remove": "Выберите идентичность для удаления",
  "Select device...": "Выберите устройство...",
  "Send as file": "Отправить как файл",
+ "Send Challenge": "Отправить вызов",
  "Send channel message": "Отправить сообщение в канал",
  "Send image as a file?": "Отправить изображение как файл?",
  "Send message": "Отправить сообщение",
@@ -943,7 +1041,10 @@ window.RATSPEAK_I18N = {
  "Sort Peers": "Сортировка пиров",
  "Sort peers": "Сортировать пиров",
  "Spreading Factor": "Коэффициент расширения (SF)",
+ "Stamp cost": "Стоимость штампа",
+ "Stamp Cost": "Стоимость штампа",
  "Standard TCP listener for incoming nodes.": "Стандартный TCP-слушатель для входящих узлов.",
+ "Start a new game with a contact": "Начать новую игру с контактом",
  "Start a private, on-device view of what Ratspeak is doing.": "Запустить приватный просмотр того, что делает Ratspeak, прямо на устройстве.",
  "Start Activity": "Запустить активность",
  "Start Conversation": "Начать разговор",
@@ -956,6 +1057,8 @@ window.RATSPEAK_I18N = {
  "Storage recovered.": "Хранилище восстановлено.",
  "Storage recovery could not finish:": "Не удалось завершить восстановление хранилища:",
  "Store messages on an Offline Inbox when you're away": "Хранить сообщения в офлайн-входящих, пока вас нет",
+ "Support": "Поддержка",
+ "Swipe up for more info": "Проведите вверх для подробностей",
  "Switch hubs": "Сменить хаб",
  "Switch hubs?": "Сменить хаб?",
  "Switch Identity": "Сменить идентичность",
@@ -964,6 +1067,7 @@ window.RATSPEAK_I18N = {
  "Switching identity...": "Переключение идентичности...",
  "System": "Системная",
  "System drops": "Системные блокировки",
+ "Tap and hold to announce": "Нажмите и удерживайте для анонса",
  "Tap the compose button to start messaging": "Нажмите кнопку создания, чтобы начать переписку",
  "Tap to reveal phrase": "Нажмите, чтобы показать фразу",
  "TCP (localhost)": "TCP (localhost)",
@@ -975,14 +1079,18 @@ window.RATSPEAK_I18N = {
  "Technical details": "Технические подробности",
  "Temporary (default — RFC 4291 transient)": "Временный (по умолчанию — transient по RFC 4291)",
  "Temporary moderation context, held only in memory": "Временный контекст модерации, хранится только в памяти",
+ "Terms": "Условия",
  "Test connection": "Проверить соединение",
  "Text size": "Размер текста",
  "The active identity cannot be removed": "Активную идентичность нельзя удалить",
  "The channel message is already at its byte limit": "Сообщение канала уже достигло лимита в байтах",
  "The channel session ended": "Сеанс канала завершён",
+ "The destination and Link are authenticated and encrypted. The hub operator can still read, moderate, and relay everything posted to its channels.": "Назначение и Link аутентифицированы и зашифрованы. Оператор хаба по-прежнему может читать, модерировать и ретранслировать всё, что публикуется в его каналах.",
  "The device connected but did not offer the RNode Bluetooth service.": "Устройство подключилось, но не предоставило Bluetooth-службу RNode.",
+ "The hub ended the authenticated Reticulum Link. The close signal carries no detailed reason.": "Хаб завершил аутентифицированный Reticulum Link. Сигнал закрытия не содержит подробной причины.",
  "The link contains no channel key and never joins automatically.": "Ссылка не содержит ключа канала и никогда не присоединяет автоматически.",
  "The original identity cannot be removed": "Исходную идентичность нельзя удалить",
+ "The retry list is full. New downloads will resume when entries expire or you retry them.": "Список повторных попыток заполнен. Новые загрузки возобновятся, когда записи истекут или вы повторите их.",
  "The YubiKey PIN is locked. Ratspeak can reset the key’s PIV application and continue setup. This erases any Ratspeak identity currently on this YubiKey, but does not affect passkeys, FIDO sign-ins, OTP, or other non-PIV features.": "PIN YubiKey заблокирован. Ratspeak может сбросить PIV-приложение ключа и продолжить настройку. Это сотрёт любую идентичность Ratspeak на этом YubiKey, но не затронет passkey, вход через FIDO, OTP и другие не-PIV функции.",
  "The YubiKey PIN is locked. Ratspeak can reset the key’s PIV application and return to setup. This erases the Ratspeak identity keys on this YubiKey, but does not affect passkeys, FIDO sign-ins, OTP, or other non-PIV features.": "PIN YubiKey заблокирован. Ratspeak может сбросить PIV-приложение ключа и вернуться к настройке. Это сотрёт ключи идентичности Ratspeak на этом YubiKey, но не затронет passkey, вход через FIDO, OTP и другие не-PIV функции.",
  "The YubiKey PIN is locked. Ratspeak can reset the key’s PIV application and then restore this phrase onto it. This erases any Ratspeak identity currently on this YubiKey, but does not affect passkeys, FIDO sign-ins, OTP, or other non-PIV features.": "PIN YubiKey заблокирован. Ratspeak может сбросить PIV-приложение ключа, а затем восстановить на нём эту фразу. Это сотрёт любую идентичность Ratspeak на этом YubiKey, но не затронет passkey, вход через FIDO, OTP и другие не-PIV функции.",
@@ -997,7 +1105,9 @@ window.RATSPEAK_I18N = {
  "This hub did not send welcome or rules guidance for this Link session.": "Этот хаб не прислал приветствие или правила для этого сеанса Link.",
  "This identity is already on this device": "Эта идентичность уже есть на этом устройстве",
  "This identity will be removed from your device completely, and can not be recovered. Are you sure you want to delete it?": "Эта идентичность будет полностью удалена с вашего устройства, и восстановить её будет нельзя. Вы уверены, что хотите её удалить?",
+ "This is the beginning of your encrypted conversation.": "Это начало вашего зашифрованного разговора.",
  "This is your LXMF identity, it's the address others use to message you.": "Это ваша LXMF-идентичность — адрес, по которому вам пишут другие.",
+ "This PIN encrypts the .rsi backup file. You will need it to import this identity on another device.": "Этот PIN шифрует файл резервной копии .rsi. Он понадобится, чтобы импортировать эту идентичность на другом устройстве.",
  "This removes its saved recovery copy. Content already in a chat is not erased.": "Это удалит сохранённую копию для восстановления. Содержимое, уже находящееся в чате, не стирается.",
  "This saved interface does not say which units its IFAC size uses. Choose the size used by the other peer. A backup will be kept.": "В этом сохранённом интерфейсе не указано, в каких единицах задан размер IFAC. Выберите размер, который использует другой пир. Резервная копия будет сохранена.",
  "This security key is already provisioned. Register it on this device.": "Этот ключ безопасности уже настроен. Зарегистрируйте его на этом устройстве.",
@@ -1017,12 +1127,14 @@ window.RATSPEAK_I18N = {
  "Transport behavior and announce cadence": "Поведение транспорта и частота анонсов",
  "Transport Mode": "Транспортный режим",
  "Transport Mode is managed by Ratspeak’s shared service on this device.": "Транспортным режимом управляет общая служба Ratspeak на этом устройстве.",
+ "Trust": "Доверие",
  "Try again": "Повторить",
  "Try again in a moment.": "Повторите через мгновение.",
  "Try again when the local runtime is ready.": "Повторите, когда локальная среда выполнения будет готова.",
  "Turn on Channel hosting in Settings first": "Сначала включите хостинг каналов в настройках",
  "TX Power": "Мощность передачи",
  "TX power not supported": "Мощность передачи не поддерживается",
+ "TX Rate": "Скорость передачи",
  "Unavailable": "Недоступно",
  "Unblock": "Разблокировать",
  "Unencrypted text form of the same private identity key.": "Незашифрованная текстовая форма того же приватного ключа идентичности.",
@@ -1033,6 +1145,7 @@ window.RATSPEAK_I18N = {
  "Unlocking…": "Разблокировка…",
  "Unregister channel": "Отменить регистрацию канала",
  "Unregister channel?": "Отменить регистрацию канала?",
+ "Unsupported game type": "Неподдерживаемый тип игры",
  "Uptime": "Время работы",
  "USB / Serial": "USB / последовательный порт",
  "USB not available on this platform.": "USB недоступен на этой платформе.",
@@ -1041,6 +1154,7 @@ window.RATSPEAK_I18N = {
  "USB RNode disconnected. Reconnect it, then resume the interface.": "USB RNode отключён. Подключите его снова, затем возобновите интерфейс.",
  "USB-Serial radio found, but permission was denied. Install the Ratspeak udev rules, then reconnect it.": "USB-Serial радио найдено, но в доступе отказано. Установите udev-правила Ratspeak и подключите устройство снова.",
  "Use": "Использовать",
+ "Use a different identity": "Использовать другую идентичность",
  "Use a YubiKey 5+ security key as your identity. The private key is generated on the device and never leaves it.": "Используйте ключ безопасности YubiKey 5+ как свою идентичность. Приватный ключ генерируется на устройстве и никогда его не покидает.",
  "Use an existing key": "Использовать существующий ключ",
  "Use current location": "Использовать текущее местоположение",
@@ -1058,6 +1172,7 @@ window.RATSPEAK_I18N = {
  "User unblocked": "Пользователь разблокирован",
  "Verify recovery manifest": "Проверить манифест восстановления",
  "Verifying": "Проверка",
+ "Via": "Через",
  "Vibration": "Вибрация",
  "Video": "Видео",
  "View": "Просмотр",
@@ -1084,8 +1199,10 @@ window.RATSPEAK_I18N = {
  "Waiting for interface status from the shared instance.": "Ожидание статуса интерфейса от общего экземпляра.",
  "Waiting for microphone…": "Ожидание микрофона…",
  "Waiting for network": "Ожидание сети",
+ "Waiting for opponent to respond...": "Ожидание ответа соперника...",
  "Waiting for status...": "Ожидание статуса...",
  "Waiting for the hub to confirm your join.": "Ожидание подтверждения присоединения от хаба.",
+ "Waiting for USB": "Ожидание USB",
  "Waiting messages will be checked again.": "Ожидающие сообщения будут проверены снова.",
  "Welcome and guidance from the authenticated channel hub": "Приветствие и рекомендации от аутентифицированного хаба канала",
  "Welcome people, share rules, and tell them where to begin": "Приветствуйте людей, делитесь правилами и подскажите, с чего начать",
@@ -1103,5 +1220,394 @@ window.RATSPEAK_I18N = {
  "Your firewall or router may need to allow this port.": "Возможно, вашему файрволу или маршрутизатору нужно разрешить этот порт.",
  "Your hub": "Ваш хаб",
  "Your Identity": "Ваша идентичность",
- "Your messages": "Ваши сообщения"
+ "Your messages": "Ваши сообщения",
+ "· last known": "· последнее известное",
+ "· View →": "· Открыть →",
+ "Allow Nearby devices for Ratspeak in Android settings so it can connect to the RNode.": "Разрешите «Устройства поблизости» для Ratspeak в настройках Android, чтобы он мог подключиться к RNode.",
+ "Another program, such as rnodeconf, a serial monitor or another Reticulum instance, is using this radio. Close it and Ratspeak connects.": "Другая программа, например rnodeconf, монитор последовательного порта или другой экземпляр Reticulum, использует это радио. Закройте её, и Ratspeak подключится.",
+ "Enter the 6-digit passkey shown on the RNode’s OLED display. If the RNode has already left pairing mode, cancel here, hold the RNode’s left button to re-arm pairing, then add the radio again.": "Введите 6-значный ключ, показанный на OLED-дисплее RNode. Если RNode уже вышел из режима сопряжения, отмените здесь, удерживайте левую кнопку RNode, чтобы снова включить сопряжение, и добавьте радио заново.",
+ "Nothing is attached at this interface's port. Check that the RNode is plugged in, and edit the interface if its port name changed. Ratspeak keeps trying.": "К порту этого интерфейса ничего не подключено. Проверьте, что RNode подключён, и измените интерфейс, если имя порта изменилось. Ratspeak продолжает попытки.",
+ "Put the RNode in Bluetooth pairing mode, then choose Retry Connection and enter the PIN it shows.": "Переведите RNode в режим Bluetooth-сопряжения, затем выберите «Повторить подключение» и введите показанный PIN.",
+ "Ratspeak cannot reach this RNode over Bluetooth. Check that it is powered on and charged (an e-paper screen keeps its last image when the battery is empty), that its Bluetooth is enabled (installing RNode firmware can turn it off), and that no other phone or computer is connected to it. Ratspeak keeps trying, and tries again right away when you return to the app.": "Ratspeak не может связаться с этим RNode по Bluetooth. Проверьте, что он включён и заряжен (экран на электронных чернилах сохраняет последнее изображение при разряженной батарее), что его Bluetooth включён (установка прошивки RNode может его отключить) и что к нему не подключён другой телефон или компьютер. Ratspeak продолжает попытки и повторяет их сразу при возврате в приложение.",
+ "Ratspeak cannot reach this RNode. Check that it is plugged in (or reachable on the network) and powered on, and that no other program, such as rnodeconf, is using it. Ratspeak keeps trying.": "Ratspeak не может связаться с этим RNode. Проверьте, что он подключён (или доступен по сети) и включён, и что никакая другая программа, например rnodeconf, его не использует. Ratspeak продолжает попытки.",
+ "The device connected but did not offer the RNode Bluetooth service. Check that it runs RNode firmware with Bluetooth enabled.": "Устройство подключилось, но не предоставило Bluetooth-службу RNode. Проверьте, что на нём работает прошивка RNode с включённым Bluetooth.",
+ "The RNode answered, but the Bluetooth link dropped during setup. Keep it powered and close to this device. Ratspeak keeps trying.": "RNode ответил, но Bluetooth-связь оборвалась во время настройки. Держите его включённым и рядом с этим устройством. Ratspeak продолжает попытки.",
+ "The RNode answered, but the connection dropped. Check its cable or network connection. Ratspeak keeps trying.": "RNode ответил, но соединение оборвалось. Проверьте кабель или сетевое подключение. Ratspeak продолжает попытки.",
+ "The RNode did not accept this interface's radio settings, so Ratspeak kept it offline. Choose a frequency, bandwidth, spreading factor and coding rate this radio supports.": "RNode не принял радиопараметры этого интерфейса, поэтому Ratspeak оставил его отключённым. Выберите частоту, полосу, коэффициент расширения и скорость кодирования, которые поддерживает это радио.",
+ "The RNode no longer recognizes the pairing saved on this phone. Forget the RNode in Android Bluetooth settings, put the RNode in pairing mode, then choose Retry Connection and enter the PIN it shows.": "RNode больше не узнаёт сопряжение, сохранённое на этом телефоне. Забудьте RNode в настройках Bluetooth Android, переведите RNode в режим сопряжения, затем выберите «Повторить подключение» и введите показанный PIN.",
+ "The RNode reported a different transmit power than this interface uses, so Ratspeak kept it offline. Radios with a power amplifier, such as the Heltec LoRa32 V4, cannot transmit below about 11 to 13 dBm, and most others stop at 22 dBm. Choose a TX power this radio supports.": "RNode сообщил о другой мощности передачи, чем использует этот интерфейс, поэтому Ratspeak оставил его отключённым. Радио с усилителем мощности, например Heltec LoRa32 V4, не может передавать ниже примерно 11–13 дБм, а большинство остальных ограничено 22 дБм. Выберите мощность передачи, которую поддерживает это радио.",
+ "This computer did not let Ratspeak open the radio's port. On Linux, add your user to the group that owns it (usually dialout), then sign out and back in. Ratspeak keeps trying.": "Этот компьютер не позволил Ratspeak открыть порт радио. В Linux добавьте своего пользователя в группу, которой он принадлежит (обычно dialout), затем выйдите и войдите снова. Ratspeak продолжает попытки.",
+ "This device did not identify itself as a supported RNode. Check that it runs RNode firmware and that this interface uses the right device.": "Это устройство не представилось поддерживаемым RNode. Проверьте, что на нём работает прошивка RNode и что этот интерфейс использует правильное устройство.",
+ "This RNode's firmware is too old for Ratspeak. Update it with rnodeconf, then choose Retry Connection.": "Прошивка этого RNode слишком старая для Ratspeak. Обновите её через rnodeconf, затем выберите «Повторить подключение».",
+ "Grant": "Предоставить"
 };
+window.RATSPEAK_I18N_PATTERNS = [
+ [
+  "^This\\ removes\\ the\\ hardware\\ identity\\ \"([\\s\\S]*?)\"\\ from\\ this\\ device\\ only\\.\\ The\\ security\\ key\\ itself\\ is\\ not\\ modified\\ —\\ its\\ keys\\ stay\\ on\\ the\\ device,\\ and\\ you\\ can\\ add\\ it\\ again\\ later\\.$",
+  "Это удалит аппаратную идентичность «{0}» только с этого устройства. Сам ключ безопасности не изменяется — его ключи остаются на устройстве, и позже вы можете добавить его снова."
+ ],
+ [
+  "^Remove\\ the\\ saved\\ policy\\ and\\ access\\ lists\\ for\\ \\#([\\s\\S]*?)\\?\\ Current\\ members\\ remain\\ until\\ they\\ leave,\\ but\\ the\\ channel\\ becomes\\ live\\-only\\ and\\ will\\ disappear\\ when\\ empty\\.$",
+  "Удалить сохранённую политику и списки доступа для #{0}? Текущие участники останутся, пока сами не уйдут, но канал станет только «живым» и исчезнет, когда опустеет."
+ ],
+ [
+  "^This\\ frequency\\ is\\ outside\\ the\\ selected\\ band\\ range\\ of\\ ([\\s\\S]*?)\\-([\\s\\S]*?)\\ MHz\\.\\ Check\\ hardware\\ support\\ and\\ local\\ regulations\\ before\\ transmitting\\.$",
+  "Эта частота вне диапазона выбранного региона {0}–{1} МГц. Проверьте поддержку оборудованием и местные правила, прежде чем передавать."
+ ],
+ [
+  "^Ban\\ ([\\s\\S]*?)\\?\\ Every\\ live\\ session\\ for\\ this\\ identity\\ will\\ close,\\ and\\ future\\ hub\\ access\\ will\\ be\\ blocked\\.$",
+  "Забанить {0}? Все активные сеансы этой идентичности будут закрыты, а будущий доступ к хабу — заблокирован."
+ ],
+ [
+  "^Local\\ Network\\ is\\ blocked\\ on\\ ([\\s\\S]*?)\\.\\ Set\\ the\\ active\\ Wi\\-Fi\\ network\\ to\\ Private\\ in\\ Windows\\ Settings\\.$",
+  "Локальная сеть заблокирована на {0}. Установите для активной Wi-Fi-сети тип «Частная» в настройках Windows."
+ ],
+ [
+  "^Ratspeak\\ sent\\ the\\ request\\ to\\ join\\ ([\\s\\S]*?)\\.\\ Messages\\ unlock\\ when\\ the\\ hub\\ confirms\\ your\\ membership\\.$",
+  "Ratspeak отправил запрос на присоединение к {0}. Сообщения откроются, когда хаб подтвердит ваше членство."
+ ],
+ [
+  "^Ban\\ ([\\s\\S]*?)\\ from\\ ([\\s\\S]*?)\\?\\ Every\\ current\\ session\\ will\\ leave\\ the\\ channel,\\ and\\ rejoining\\ will\\ be\\ blocked\\.$",
+  "Забанить {0} в {1}? Все текущие сеансы покинут канал, а повторное присоединение будет заблокировано."
+ ],
+ [
+  "^Remove\\ voice\\ for\\ ([\\s\\S]*?)\\ in\\ ([\\s\\S]*?)\\?\\ If\\ the\\ channel\\ is\\ moderated,\\ they\\ will\\ no\\ longer\\ be\\ able\\ to\\ post\\.$",
+  "Убрать право голоса для {0} в {1}? Если канал модерируется, этот участник больше не сможет писать."
+ ],
+ [
+  "^Block\\ \"([\\s\\S]*?)\"\\?\\ They\\ won't\\ appear\\ in\\ your\\ peers\\ list\\ and\\ their\\ messages\\ will\\ be\\ hidden\\.$",
+  "Заблокировать «{0}»? Он не будет отображаться в списке пиров, а его сообщения будут скрыты."
+ ],
+ [
+  "^Revoke\\ the\\ invitation\\ for\\ ([\\s\\S]*?)\\ in\\ ([\\s\\S]*?)\\?\\ Its\\ active\\ reconnect\\ lease\\ will\\ also\\ be\\ removed\\.$",
+  "Отозвать приглашение для {0} в {1}? Его активная аренда переподключения тоже будет удалена."
+ ],
+ [
+  "^Remove\\ every\\ live\\ session\\ for\\ ([\\s\\S]*?)\\ from\\ ([\\s\\S]*?)\\?\\ They\\ may\\ rejoin\\ unless\\ separately\\ banned\\.$",
+  "Удалить все активные сеансы {0} из {1}? Он сможет присоединиться снова, если его отдельно не забанить."
+ ],
+ [
+  "^Block\\ \"([\\s\\S]*?)\"\\?\\ Their\\ channel\\ messages\\ and\\ member\\ entry\\ will\\ be\\ hidden\\.$",
+  "Заблокировать «{0}»? Его сообщения в каналах и запись в списке участников будут скрыты."
+ ],
+ [
+  "^The\\ announce\\ said\\ “([\\s\\S]*?)”;\\ this\\ authenticated\\ WELCOME\\ says\\ “([\\s\\S]*?)”\\.$",
+  "Анонс содержал «{0}»; это аутентифицированное WELCOME содержит «{1}»."
+ ],
+ [
+  "^Identity\\ imported,\\ but\\ the\\ local\\ PIN\\ could\\ not\\ be\\ set:\\ ([\\s\\S]*?)$",
+  "Идентичность импортирована, но локальный PIN не удалось задать: {0}"
+ ],
+ [
+  "^Identity\\ restored,\\ but\\ the\\ PIN\\ could\\ not\\ be\\ set:\\ ([\\s\\S]*?)$",
+  "Идентичность восстановлена, но PIN не удалось задать: {0}"
+ ],
+ [
+  "^Identity\\ created,\\ but\\ the\\ PIN\\ could\\ not\\ be\\ set:\\ ([\\s\\S]*?)$",
+  "Идентичность создана, но PIN не удалось задать: {0}"
+ ],
+ [
+  "^Bluetooth\\ Peer:\\ ([\\s\\S]*?)\\ —\\ running\\ as\\ central\\ only$",
+  "Bluetooth Peer: {0} — работает только в роли central"
+ ],
+ [
+  "^This\\ will\\ leave\\ ([\\s\\S]*?)\\ and\\ connect\\ to\\ your\\ hub\\.$",
+  "Вы покинете {0} и подключитесь к вашему хабу."
+ ],
+ [
+  "^Recovery\\ phrase\\ must\\ be\\ exactly\\ ([\\s\\S]*?)\\ words\\.$",
+  "Фраза восстановления должна содержать ровно {0:слово|слова|слов}."
+ ],
+ [
+  "^([\\s\\S]*?)/512\\ ·\\ Use\\ for\\ rules\\ and\\ where\\ to\\ begin$",
+  "{0}/512 · Правила и с чего начать"
+ ],
+ [
+  "^Spreading\\ factor\\ must\\ be\\ between\\ ([\\s\\S]*?)\\ and\\ ([\\s\\S]*?)$",
+  "Коэффициент расширения должен быть от {0} до {1}"
+ ],
+ [
+  "^([\\s\\S]*?)\\ message([\\s\\S]*?)\\ downloaded\\ from\\ Offline\\ Inbox$",
+  "Из офлайн-входящих загружено: {0:сообщение|сообщения|сообщений}"
+ ],
+ [
+  "^Could\\ not\\ change\\ Offline\\ Inbox\\ mode:\\ ([\\s\\S]*?)$",
+  "Не удалось изменить режим офлайн-входящих: {0}"
+ ],
+ [
+  "^Keep\\ existing\\ Ratspeak\\ size\\ \\(([\\s\\S]*?)\\ bytes\\)$",
+  "Оставить размер Ratspeak ({0} байт)"
+ ],
+ [
+  "^Bandwidth\\ must\\ be\\ between\\ ([\\s\\S]*?)\\ and\\ ([\\s\\S]*?)\\ kHz$",
+  "Полоса пропускания должна быть от {0} до {1} кГц"
+ ],
+ [
+  "^Frequency\\ must\\ be\\ between\\ ([\\s\\S]*?)\\ and\\ ([\\s\\S]*?)\\ MHz$",
+  "Частота должна быть от {0} до {1} МГц"
+ ],
+ [
+  "^Storage\\ recovery\\ could\\ not\\ finish:\\ ([\\s\\S]*?)$",
+  "Не удалось завершить восстановление хранилища: {0}"
+ ],
+ [
+  "^TX\\ power\\ must\\ be\\ between\\ ([\\s\\S]*?)\\ and\\ ([\\s\\S]*?)\\ dBm$",
+  "Мощность передачи должна быть от {0} до {1} дБм"
+ ],
+ [
+  "^Coding\\ rate\\ must\\ be\\ between\\ ([\\s\\S]*?)\\ and\\ ([\\s\\S]*?)$",
+  "Скорость кодирования должна быть от {0} до {1}"
+ ],
+ [
+  "^Could\\ not\\ complete\\ the\\ request:\\ ([\\s\\S]*?)$",
+  "Не удалось выполнить запрос: {0}"
+ ],
+ [
+  "^Could\\ not\\ update\\ hosted\\ inbox:\\ ([\\s\\S]*?)$",
+  "Не удалось обновить размещённый ящик: {0}"
+ ],
+ [
+  "^([\\s\\S]*?)\\ operator\\ authority\\ for\\ ([\\s\\S]*?)\\ in\\ ([\\s\\S]*?)\\?$",
+  "{0} права оператора для {1} в {2}?"
+ ],
+ [
+  "^Delete\\ conversation\\ with\\ \"([\\s\\S]*?)\"\\?$",
+  "Удалить разговор с «{0}»?"
+ ],
+ [
+  "^Offline\\ Inbox\\ check\\ failed:\\ ([\\s\\S]*?)$",
+  "Проверка офлайн-входящих не удалась: {0}"
+ ],
+ [
+  "^Use\\ Python\\ bit\\ size\\ \\(([\\s\\S]*?)\\ bytes\\)$",
+  "Использовать размер Python по битам ({0} байт)"
+ ],
+ [
+  "^([\\s\\S]*?)([\\s\\S]*?)\\ MHz\\.\\ Config\\ is\\ written\\ as\\ ([\\s\\S]*?)([\\s\\S]*?)$",
+  "По умолчанию {0}{1} МГц. В конфигурацию записывается {2}{3}"
+ ],
+ [
+  "^Could\\ not\\ retry\\ messages:\\ ([\\s\\S]*?)$",
+  "Не удалось повторить отправку сообщений: {0}"
+ ],
+ [
+  "^Could\\ not\\ update\\ stamps:\\ ([\\s\\S]*?)$",
+  "Не удалось обновить штампы: {0}"
+ ],
+ [
+  "^Could\\ not\\ stop\\ sending:\\ ([\\s\\S]*?)$",
+  "Не удалось остановить отправку: {0}"
+ ],
+ [
+  "^Purged\\ ([\\s\\S]*?)\\ unverified\\ entr([\\s\\S]*?)\\.$",
+  "Очищено неподтверждённых записей: {0}."
+ ],
+ [
+  "^([\\s\\S]*?)\\ ·\\ ([\\s\\S]*?)\\ ·\\ Managed\\ externally$",
+  "{0} · {1} · Управляется извне"
+ ],
+ [
+  "^\\+([\\s\\S]*?)\\ more\\ in\\ local\\ history$",
+  "+{0} ещё в локальной истории"
+ ],
+ [
+  "^Save\\ prompt\\ opened\\ for\\ ([\\s\\S]*?)$",
+  "Открыт диалог сохранения для {0}"
+ ],
+ [
+  "^Game\\ action\\ rejected:\\ ([\\s\\S]*?)$",
+  "Игровое действие отклонено: {0}"
+ ],
+ [
+  "^Could\\ not\\ open\\ link:\\ ([\\s\\S]*?)$",
+  "Не удалось открыть ссылку: {0}"
+ ],
+ [
+  "^Offline\\ Inbox\\ error:\\ ([\\s\\S]*?)$",
+  "Ошибка офлайн-входящих: {0}"
+ ],
+ [
+  "^Could\\ not\\ download:\\ ([\\s\\S]*?)$",
+  "Не удалось скачать: {0}"
+ ],
+ [
+  "^Game\\ challenge\\ from\\ ([\\s\\S]*?)$",
+  "Вызов на игру от {0}"
+ ],
+ [
+  "^Report\\ message\\ from\\ ([\\s\\S]*?)$",
+  "Пожаловаться на сообщение от {0}"
+ ],
+ [
+  "^Requesting\\ ([\\s\\S]*?)\\ path\\(s\\)…$",
+  "Запрос путей: {0}…"
+ ],
+ [
+  "^Member\\ details\\ for\\ ([\\s\\S]*?)$",
+  "Сведения об участнике {0}"
+ ],
+ [
+  "^([\\s\\S]*?)([\\s\\S]*?),\\ BW\\ ([\\s\\S]*?)\\ kHz,\\ CR\\ ([\\s\\S]*?),\\ TX\\ ([\\s\\S]*?)([\\s\\S]*?)$",
+  "{0}{1}, BW {2} кГц, CR {3}, TX {4}{5}"
+ ],
+ [
+  "^Remove\\ contact\\ \"([\\s\\S]*?)\"\\?$",
+  "Удалить контакт «{0}»?"
+ ],
+ [
+  "^([\\s\\S]*?)\\ was\\ not\\ confirmed$",
+  "{0} не подтверждено"
+ ],
+ [
+  "^Game\\ update\\ from\\ ([\\s\\S]*?)$",
+  "Обновление игры от {0}"
+ ],
+ [
+  "^View\\ details\\ for\\ ([\\s\\S]*?)([\\s\\S]*?)$",
+  "Сведения о {0}{1}"
+ ],
+ [
+  "^Could\\ not\\ copy:\\ ([\\s\\S]*?)$",
+  "Не удалось скопировать: {0}"
+ ],
+ [
+  "^Could\\ not\\ save:\\ ([\\s\\S]*?)$",
+  "Не удалось сохранить: {0}"
+ ],
+ [
+  "^Reconnecting\\ to\\ ([\\s\\S]*?)$",
+  "Переподключение к {0}"
+ ],
+ [
+  "^Click\\ to\\ copy:\\ ([\\s\\S]*?)$",
+  "Нажмите, чтобы скопировать: {0}"
+ ],
+ [
+  "^Could\\ not\\ copy\\ ([\\s\\S]*?)$",
+  "Не удалось скопировать: {0}"
+ ],
+ [
+  "^Last\\ heard\\ ([\\s\\S]*?)\\ ago$",
+  "Был на связи {0} назад"
+ ],
+ [
+  "^Quote\\ ([\\s\\S]*?)\\ in\\ reply$",
+  "Цитировать {0} в ответе"
+ ],
+ [
+  "^Copy\\ identity\\ ([\\s\\S]*?)$",
+  "Копировать идентичность {0}"
+ ],
+ [
+  "^Message\\ from\\ ([\\s\\S]*?)$",
+  "Сообщение от {0}"
+ ],
+ [
+  "^Connected([\\s\\S]*?)\\ ·\\ ([\\s\\S]*?)$",
+  "Подключено{0} · {1}"
+ ],
+ [
+  "^Waiting\\ for\\ ([\\s\\S]*?)$",
+  "Ожидание: {0}"
+ ],
+ [
+  "^Latest\\ ([\\s\\S]*?)\\ of\\ ([\\s\\S]*?)$",
+  "Последние {0} из {1}"
+ ],
+ [
+  "^Switch\\ to\\ ([\\s\\S]*?)\\?$",
+  "Переключиться на {0}?"
+ ],
+ [
+  "^Unblock\\ \"([\\s\\S]*?)\"\\?$",
+  "Разблокировать «{0}»?"
+ ],
+ [
+  "^Verifying\\ ([\\s\\S]*?)…$",
+  "Проверка {0}…"
+ ],
+ [
+  "^Use\\ ([\\s\\S]*?)\\ theme$",
+  "Использовать тему: {0}"
+ ],
+ [
+  "^Leaving\\ ([\\s\\S]*?)…$",
+  "Выход из {0}…"
+ ],
+ [
+  "^([\\s\\S]*?)\\ /\\ ([\\s\\S]*?)\\ words$",
+  "{0} / {1} слов"
+ ],
+ [
+  "^([\\s\\S]*?)([\\s\\S]*?)\\ reaction$",
+  "{0}{1} реакция"
+ ],
+ [
+  "^\\[Alert\\]\\ ([\\s\\S]*?)$",
+  "[Оповещение] {0}"
+ ],
+ [
+  "^Channels([\\s\\S]*?)$",
+  "Каналы{0}"
+ ],
+ [
+  "^Messages([\\s\\S]*?)$",
+  "Сообщения{0}"
+ ],
+ [
+  "^Refresh\\ ([\\s\\S]*?)$",
+  "Обновить: {0}"
+ ],
+ [
+  "^Leave\\ ([\\s\\S]*?)\\?$",
+  "Покинуть {0}?"
+ ],
+ [
+  "^Manage\\ ([\\s\\S]*?)$",
+  "Управление {0}"
+ ],
+ [
+  "^([\\s\\S]*?)\\ copied$",
+  "{0}: скопировано"
+ ],
+ [
+  "^([\\s\\S]*?)\\ unread([\\s\\S]*?)$",
+  "Непрочитанных: {0}{1}"
+ ],
+ [
+  "^Open:\\ ([\\s\\S]*?)$",
+  "Открыть: {0}"
+ ],
+ [
+  "^([\\s\\S]*?)\\ paths$",
+  "Путей: {0}"
+ ],
+ [
+  "^([\\s\\S]*?)\\ saved$",
+  "{0}: сохранено"
+ ],
+ [
+  "^Copy\\ ([\\s\\S]*?)$",
+  "Копировать {0}"
+ ],
+ [
+  "^From\\ ([\\s\\S]*?)$",
+  "От {0}"
+ ],
+ [
+  "^Join\\ ([\\s\\S]*?)$",
+  "Присоединиться к {0}"
+ ],
+ [
+  "^([\\s\\S]*?)\\ entr([\\s\\S]*?)$",
+  "{0:запись|записи|записей}"
+ ],
+ [
+  "^([\\s\\S]*?)Ready$",
+  "{0}Готово"
+ ],
+ [
+  "^([\\s\\S]*?)\\ hop([\\s\\S]*?)$",
+  "{0:прыжок|прыжка|прыжков}"
+ ]
+];

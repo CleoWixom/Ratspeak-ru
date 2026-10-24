@@ -7,7 +7,9 @@
 |---|---|
 | `tools/i18n/extract.py [--lang xx]` | Находит UI-строки в `dashboard/*.html`, `static/js/*.js`, `src-tauri/loading/index.html`, пишет `locales/en.json` и дополняет `locales/<lang>.json` (новые ключи — с пустым значением) |
 | `tools/i18n/merge.py <lang> <batch.json>` | Вливает пакет переводов `{ "English": "Перевод" }` |
-| `tools/i18n/build.py <lang>` | Собирает `locales/<lang>.json` → `locales/<lang>.js` (`window.RATSPEAK_I18N`) |
+| `tools/i18n/extract_patterns.py [--lang xx]` | Находит динамические строки (`'a ' + x`, `` `a ${x}` ``) и записывает шаблоны с `{0}`, `{1}` в `locales/<lang>.patterns.json` |
+| `tools/i18n/merge_patterns.py <lang> <batch.json>` | Вливает переводы шаблонов (точный ключ или однозначное начало) |
+| `tools/i18n/build.py <lang>` | Собирает `locales/<lang>.json` и `.patterns.json` → `locales/<lang>.js` (`RATSPEAK_I18N` и `RATSPEAK_I18N_PATTERNS`) |
 | `dashboard/static/js/i18n.js` | Рантайм: переводит текстовые узлы и атрибуты `placeholder/title/aria-label/data-tooltip/alt`, следит за DOM через MutationObserver |
 
 Язык берётся из `localStorage['ratspeak_lang']` (например `'ru'`, `'en'` — отключает перевод)
@@ -19,8 +21,12 @@
 3. `python3 tools/i18n/build.py de`
 4. Подключить `locales/de.js` в `dashboard/index.html` вместо/рядом с `ru.js`.
 
+## Шаблоны и плюралы
+В значении шаблона `{N}` подставляет N-ю захваченную часть; `{N:запись|записи|записей}` выбирает
+русскую форму по числу из `{N}` (1 / 2–4 / 5+). Захваченный текст, который сам есть в словаре
+(например `Remove`, `Grant`), переводится автоматически.
+
 ## Известные ограничения
-- Строки, собираемые конкатенацией в JS (`'Latitude must be between ' + a + ...`), и динамические
-  счётчики не переводятся точным совпадением — нужен шаблонный проход (TODO).
+- Строки, которые разрезаны тегами посреди предложения (`<strong>12</strong>-word`), переводятся кусками; порядок слов должен совпадать.
 - Длинные юридические тексты (`legal_documents.js`) и эмодзи-данные пропускаются.
-- Статус: ru — 1105 из 1138 ключей; оставшиеся — фрагменты конкатенации.
+- Статус: ru — 1124 из 1265 точных ключей (остальные — обрывки склеенных строк, закрытые шаблонами) и 92 шаблона.
