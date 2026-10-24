@@ -1,7 +1,7 @@
 name: Android debug APK
 
 # Сборка APK для личной установки: подпись общеизвестным debug-ключом из репозитория
-# (tools/android/ratspeak-debug.p12), секреты не нужны. Без AAB, lint и релизных проверок.
+# (tools/android/ratspeak-debug-keystore.base64, PKCS12, пароль android, alias ratspeak-debug), секреты не нужны. Без AAB, lint и релизных проверок.
 # Не для распространения: любой, у кого есть этот ключ, может подписать «обновление».
 
 on:
@@ -151,7 +151,7 @@ jobs:
         run: |
           set -euo pipefail
           android_dir=src-tauri/gen/android
-          cp tools/android/ratspeak-debug.p12 "$android_dir/upload-keystore.jks"
+          base64 --decode tools/android/ratspeak-debug-keystore.base64 > "$android_dir/upload-keystore.jks"
           cat > "$android_dir/keystore.properties" <<EOF
           storeFile=upload-keystore.jks
           storePassword=android
