@@ -1,6 +1,7 @@
 #[cfg(any(target_os = "android", test))]
 mod android_lifecycle;
 mod channel_deep_link;
+mod connection_deep_link;
 #[cfg(any(target_os = "android", target_os = "ios", test))]
 #[cfg_attr(
     all(test, not(any(target_os = "android", target_os = "ios"))),
@@ -984,8 +985,9 @@ pub fn run() {
 
     let linux_webkit_dmabuf_workaround = apply_linux_webkit_rendering_workarounds();
 
-    let builder =
-        tauri::Builder::default().manage(channel_deep_link::NativeChannelShareInbox::default());
+    let builder = tauri::Builder::default()
+        .manage(channel_deep_link::NativeChannelShareInbox::default())
+        .manage(connection_deep_link::NativeConnectionLinkInbox::default());
 
     // Tauri requires single-instance to be the first plugin when it forwards
     // secondary-process deep-link arguments into the primary process.
@@ -1012,6 +1014,7 @@ pub fn run() {
     let context = {
         let mut context = context;
         channel_deep_link::configure_android_runtime(context.config_mut());
+        connection_deep_link::extend_android_runtime(context.config_mut());
         context
     };
 
@@ -1025,6 +1028,8 @@ pub fn run() {
             request_microphone_permission,
             channel_deep_link::peek_native_channel_share,
             channel_deep_link::ack_native_channel_share,
+            connection_deep_link::peek_native_connection_link,
+            connection_deep_link::ack_native_connection_link,
             text_share::list_text_shares,
             text_share::edit_text_share,
             ratspeak_tauri::commands::system::api_version,
@@ -1403,6 +1408,7 @@ pub fn run() {
 
             let _window = window.build()?;
             channel_deep_link::install(app);
+            connection_deep_link::install(app);
             #[cfg(target_os = "android")]
             text_share::install(app.handle());
 

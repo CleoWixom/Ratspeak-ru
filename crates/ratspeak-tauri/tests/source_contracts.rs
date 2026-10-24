@@ -9543,3 +9543,54 @@ fn native_codec2_distribution_notices_match_selected_rs_lxst() {
         );
     }
 }
+
+#[test]
+fn native_connection_links_prefill_forms_and_never_connect_on_their_own() {
+    let root = repo_root();
+    let index = read_source(root.join("dashboard/index.html")).expect("dashboard index");
+    let bridge = read_source(root.join("dashboard/static/js/native_connection_link.js"))
+        .expect("native connection-link bridge");
+    let modals = read_source(root.join("dashboard/static/js/modals.js")).expect("modals");
+    let native = read_source(root.join("src-tauri/src/connection_deep_link.rs"))
+        .expect("native Rust connection-link bridge");
+    let parser = read_source(root.join("crates/ratspeak-tauri/src/commands/connection_link.rs"))
+        .expect("connection-link parser");
+    let lib = read_source(root.join("src-tauri/src/lib.rs")).expect("Tauri entry point");
+    let manifest =
+        read_source(root.join("src-tauri/gen/android/app/src/main/AndroidManifest.xml"))
+            .expect("Android manifest");
+
+    // Rust is the only parser; the frontend never sees the raw platform URL.
+    assert!(native.contains("parse_connection_link(payload)"));
+    assert!(native.contains("app.deep_link().on_open_url"));
+    assert!(bridge.contains("RS.invoke('peek_native_connection_link')"));
+    assert!(bridge.contains("RS.invoke('ack_native_connection_link',"));
+    assert!(bridge.contains("'native_connection_link_available'"));
+    assert!(!bridge.contains("on_open_url"));
+    assert!(lib.contains("connection_deep_link::NativeConnectionLinkInbox::default()"));
+    assert!(lib.contains("connection_deep_link::peek_native_connection_link"));
+    assert!(lib.contains("connection_deep_link::ack_native_connection_link"));
+    assert!(lib.contains("connection_deep_link::install(app)"));
+    assert!(lib.contains("connection_deep_link::extend_android_runtime(context.config_mut())"));
+    assert!(index.contains("/static/js/native_connection_link.js"));
+
+    // A link pre-fills the normal forms. It must not call an add command.
+    let presenter = modals
+        .split("function _openTcpConnectionLink")
+        .nth(1)
+        .and_then(|rest| rest.split("window.openNativeConnectionLink").next())
+        .expect("connection-link presenters");
+    for forbidden in ["add_tcp_connection", "add_lora_interface", "submitConnection(", "rnodeSubmit"] {
+        assert!(
+            !presenter.contains(forbidden),
+            "connection links must not call {forbidden}"
+        );
+    }
+
+    // The parser rejects config-injection characters; radio links carry no device
+    // field (unit-tested in connection_link.rs).
+    assert!(parser.contains("'[' | ']' | '=' | '#'"));
+    assert!(parser.contains("c.is_control() || c == '#'"));
+    assert!(manifest.contains(r#"android:host="tcp""#));
+    assert!(manifest.contains(r#"android:host="radio""#));
+}
