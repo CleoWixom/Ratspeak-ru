@@ -3067,3 +3067,63 @@ document.addEventListener('keydown', function(e) {
         }
     }
 });
+
+// Native `ratspeak://connection` presenter. Receives only the typed result of
+// the canonical Rust parser and pre-fills the normal Internet/TCP or Radio
+// sheet. It is preview-only: opening a link never adds, edits or connects an
+// interface, never carries secrets (IFAC passphrases, keys) and never chooses
+// a local device. The person reviews the values and confirms in the sheet.
+function connectionsOpenNativeLink(target) {
+    if (!target || target.format !== 'ratspeak.connection.v1') return false;
+    if (typeof target.payload !== 'string' || target.payload.length > 230) return false;
+    // The typed target never carries these; any appearance means a bad producer.
+    var secretFields = ['key', 'join_key', 'ifac', 'ifac_passphrase', 'ifac_network_name',
+        'ifac_netname', 'passphrase', 'device', 'address'];
+    for (var s = 0; s < secretFields.length; s++) {
+        if (Object.prototype.hasOwnProperty.call(target, secretFields[s])) return false;
+    }
+    var name = target.name;
+    if (name != null && (typeof name !== 'string' || name.length === 0 ||
+            name.length > 32 || /[\u0000-\u001f\u007f]/.test(name))) return false;
+
+    if (target.kind === 'tcp') {
+        if (typeof target.host !== 'string' || !/^[A-Za-z0-9.:-]{1,253}$/.test(target.host)) return false;
+        if (!Number.isInteger(target.port) || target.port < 1 || target.port > 65535) return false;
+        openConnectModal();
+        setConnectTab('custom');
+        document.getElementById('connect-host').value = target.host;
+        document.getElementById('connect-port').value = String(target.port);
+        var nameField = document.getElementById('connect-name-field');
+        var nameInput = document.getElementById('connect-name');
+        if (nameInput) nameInput.value = name || '';
+        if (nameField && name) nameField.style.display = '';
+        showToast('Connection details loaded from a link. Check them, then tap Connect.', 'toast-info', 5000);
+        return true;
+    }
+
+    if (target.kind === 'radio') {
+        var f = target.frequency, bw = target.bandwidth, sf = target.spreading_factor,
+            cr = target.coding_rate, tx = target.tx_power;
+        if (!Number.isInteger(f) || f < 137000000 || f > 3000000000) return false;
+        if (!Number.isInteger(bw) || bw < 7800 || bw > 1625000) return false;
+        if (!Number.isInteger(sf) || sf < 5 || sf > 12) return false;
+        if (!Number.isInteger(cr) || cr < 5 || cr > 8) return false;
+        if (!Number.isInteger(tx) || tx < 0 || tx > 37) return false;
+        openRnodeModal('ble');
+        var applyLinkRadio = function() {
+            // Open Advanced so every received value is visible before saving.
+            _rnodeApplyRadioControls(_rnodeRegionForFrequency(f), _rnodePresetForParams(bw, sf, cr, tx),
+                f, bw, sf, cr, tx, true);
+            var nameEl = document.getElementById('rnode-iface-name');
+            if (nameEl && name) nameEl.value = name;
+        };
+        applyLinkRadio();
+        // openRnodeModal re-applies defaults once the preset catalog loads;
+        // handlers on the cached promise run in order, so this one wins.
+        loadRnodePresetCatalog().then(applyLinkRadio, applyLinkRadio);
+        showToast('Radio settings loaded from a link. Choose your LoRa device to continue.', 'toast-info', 5000);
+        return true;
+    }
+    return false;
+}
+window.connectionsOpenNativeLink = connectionsOpenNativeLink;

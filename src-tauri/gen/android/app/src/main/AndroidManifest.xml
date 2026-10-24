@@ -107,6 +107,7 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="ratspeak" />
                 <data android:host="channel" />
+                <data android:host="connection" />
             </intent-filter>
         </activity>
 

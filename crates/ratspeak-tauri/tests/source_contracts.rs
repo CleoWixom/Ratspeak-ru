@@ -642,7 +642,8 @@ fn native_channel_share_lifecycle_uses_rust_inbox_and_requires_preview() {
         .find("channel_deep_link::configure_android_runtime(context.config_mut())")
         .expect("Android runtime-only plugin filter");
     assert!(runtime_configuration < lib.find(".build(context)").unwrap());
-    assert!(native.contains(r#""mobile": [{ "scheme": ["ratspeak"], "host": "channel" }]"#));
+    assert!(native.contains(r#"{ "scheme": ["ratspeak"], "host": "channel" }"#));
+    assert!(native.contains(r#"{ "scheme": ["ratspeak"], "host": "connection" }"#));
 
     assert!(native.contains("state: Mutex<InboxState>"));
     assert!(native.contains("pending: Option<PendingShare>"));
@@ -702,6 +703,93 @@ fn native_channel_share_lifecycle_uses_rust_inbox_and_requires_preview() {
     assert!(!bridge.contains("connect_channel_hub"));
     assert!(!bridge.contains("join_channel"));
     assert!(bridge_test.contains("native channel link tests passed"));
+}
+
+/// `ratspeak://connection` mirrors the channel-share lifecycle: Rust parses once,
+/// the frontend only pre-fills the existing sheet, and nothing is added or
+/// connected without the person confirming. Secrets and device identifiers
+/// never travel in a link.
+#[test]
+fn native_connection_link_lifecycle_prefills_sheets_and_never_submits() {
+    let root = repo_root();
+    let index = read_source(root.join("dashboard/index.html")).expect("dashboard index");
+    let modals = read_source(root.join("dashboard/static/js/modals.js")).expect("modals frontend");
+    let bridge = read_source(root.join("dashboard/static/js/native_connection_link.js"))
+        .expect("native connection-link bridge");
+    let native = read_source(root.join("src-tauri/src/connection_deep_link.rs"))
+        .expect("native Rust bridge");
+    let parser = read_source(root.join("crates/ratspeak-tauri/src/commands/connection_share.rs"))
+        .expect("connection-share parser");
+    let lib = read_source(root.join("src-tauri/src/lib.rs")).expect("Tauri entry point");
+    let android_lifecycle = read_source(root.join("src-tauri/src/android_lifecycle.rs"))
+        .expect("Android lifecycle");
+    let android_manifest =
+        read_source(root.join("src-tauri/gen/android/app/src/main/AndroidManifest.xml"))
+            .expect("Android manifest");
+
+    assert!(android_manifest.contains(r#"android:host="connection""#));
+    assert!(lib.contains("connection_deep_link::NativeConnectionLinkInbox::default()"));
+    assert!(lib.contains("connection_deep_link::peek_native_connection_link"));
+    assert!(lib.contains("connection_deep_link::ack_native_connection_link"));
+    assert!(lib.contains("connection_deep_link::install(app)"));
+    assert!(android_lifecycle.contains("connection_deep_link::notify_pending(app)"));
+
+    assert!(native.contains("state: Mutex<InboxState>"));
+    assert!(native.contains("state.last_revision.checked_add(1)"));
+    assert!(native.contains("revision: pending.revision.to_string()"));
+    assert!(native.contains("parse_connection_share_target(payload)"));
+    assert!(native.contains("with_presentation_owner(Some(generation)"));
+    assert!(native.contains("app.emit(NATIVE_CONNECTION_LINK_AVAILABLE, ())"));
+    assert!(native.contains("app.deep_link().on_open_url"));
+    assert!(native.contains("app.deep_link().get_current()"));
+    assert!(!native.contains("std::fs"));
+    assert!(!native.contains("localStorage"));
+    assert!(!native.contains("add_tcp_connection"));
+    assert!(!native.contains("add_lora_interface"));
+
+    // The parser must stay secret-free: no field that could carry a passphrase,
+    // key, serial port, BLE address or other device-local identifier.
+    for forbidden in ["ifac", "passphrase", "\"key\"", "\"device\"", "ble://", "serial"] {
+        let production = parser.split("#[cfg(test)]").next().unwrap();
+        let fields = production
+            .lines()
+            .filter(|line| line.trim_start().starts_with("\"") && line.contains("=> &mut raw"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!fields.contains(forbidden), "{forbidden} must not be an accepted link field");
+    }
+    assert!(parser.contains("unsupported field"));
+
+    let channel_pos = index
+        .find("/static/js/native_channel_share.js")
+        .expect("native channel-share bridge");
+    let bridge_pos = index
+        .find("/static/js/native_connection_link.js")
+        .expect("native connection-link bridge");
+    let modals_pos = index.find("/static/js/modals.js").expect("modals script");
+    let events_pos = index
+        .find("/static/js/tauri_events.js")
+        .expect("general Tauri event bridge");
+    assert!(modals_pos < bridge_pos && channel_pos < bridge_pos && bridge_pos < events_pos);
+    assert!(modals.contains("function connectionsOpenNativeLink(target)"));
+    assert!(modals.contains("window.connectionsOpenNativeLink = connectionsOpenNativeLink;"));
+    let presenter = modals
+        .split("function connectionsOpenNativeLink(target)")
+        .nth(1)
+        .expect("presenter body");
+    assert!(!presenter.contains("submitConnection("));
+    assert!(!presenter.contains("rnodeWizardNext("));
+    assert!(!presenter.contains("RS.invoke"));
+
+    assert!(bridge.contains("RS.invoke('peek_native_connection_link')"));
+    assert!(bridge.contains("RS.invoke('ack_native_connection_link',"));
+    assert!(bridge.contains("'native_connection_link_available'"));
+    assert!(bridge.contains("_isSetupActive()"));
+    assert!(bridge.contains("MutationObserver"));
+    assert!(!bridge.contains("deep-link://new-url"));
+    assert!(!bridge.contains("localStorage"));
+    assert!(!bridge.contains("add_tcp_connection"));
+    assert!(!bridge.contains("add_lora_interface"));
 }
 
 /// The hub persists operator policy and nothing else, creates rooms only for

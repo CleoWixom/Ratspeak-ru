@@ -6,6 +6,7 @@ pub mod activity;
 pub mod ble;
 pub mod channel_hub;
 pub mod channels;
+pub mod connection_share;
 pub mod contact_card;
 pub mod contacts;
 pub mod games;

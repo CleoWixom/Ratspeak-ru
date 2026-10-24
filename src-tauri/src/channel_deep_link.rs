@@ -18,12 +18,17 @@ const NATIVE_CHANNEL_SHARE_AVAILABLE: &str = "native_channel_share_available";
 /// Android's plugin filters incoming Intents independently of the manifest.
 /// Supply that filter at runtime: mobile build-time plugin configuration would
 /// rewrite platform registration/signing inputs during native builds.
+/// One plugin config serves every `ratspeak://` host: `channel` (this module)
+/// and `connection` (see `connection_deep_link`).
 #[cfg(any(target_os = "android", test))]
 pub(crate) fn configure_android_runtime(config: &mut tauri::Config) {
     config.plugins.0.insert(
         "deep-link".into(),
         serde_json::json!({
-            "mobile": [{ "scheme": ["ratspeak"], "host": "channel" }]
+            "mobile": [
+                { "scheme": ["ratspeak"], "host": "channel" },
+                { "scheme": ["ratspeak"], "host": "connection" }
+            ]
         }),
     );
 }
@@ -248,7 +253,10 @@ mod tests {
         configure_android_runtime(&mut config);
         assert_eq!(
             config.plugins.0["deep-link"],
-            serde_json::json!({"mobile": [{"scheme": ["ratspeak"], "host": "channel"}]})
+            serde_json::json!({"mobile": [
+                {"scheme": ["ratspeak"], "host": "channel"},
+                {"scheme": ["ratspeak"], "host": "connection"}
+            ]})
         );
         config.plugins.0.remove("deep-link");
         assert_eq!(
