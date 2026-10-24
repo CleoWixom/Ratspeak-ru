@@ -11,6 +11,11 @@ on:
         description: "Commit or ref to build; defaults to the selected dispatch ref."
         required: false
         type: string
+      app_id_suffix:
+        description: "Suffix for the package id so the build installs next to the original app (empty = org.ratspeak.android)."
+        required: false
+        default: ".ru"
+        type: string
       targets:
         description: "Rust Android targets, space separated (aarch64 = most phones)."
         required: true
@@ -165,6 +170,7 @@ jobs:
         env:
           PINNED_ANDROID_NDK: ${{ steps.source.outputs.android_ndk }}
           ANDROID_TARGETS: ${{ inputs.targets }}
+          ORG_GRADLE_PROJECT_ratspeakAppIdSuffix: ${{ inputs.app_id_suffix }}
         run: |
           unset TAURI_CONFIG
           unset TAURI_DEV_HOST

@@ -47,6 +47,8 @@ android {
         // Tauri production bundles load from the asset protocol, not HTTP.
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "org.ratspeak.android"
+        // Optional side-by-side install (fork builds): -PratspeakAppIdSuffix=.ru
+        (project.findProperty("ratspeakAppIdSuffix") as String?)?.takeIf { it.isNotBlank() }?.let { applicationIdSuffix = it }
         minSdk = 24
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
