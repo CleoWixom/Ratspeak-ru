@@ -1,0 +1,190 @@
+name: Android debug APK
+
+# Сборка APK для личной установки: подпись общеизвестным debug-ключом из репозитория
+# (tools/android/ratspeak-debug.p12), секреты не нужны. Без AAB, lint и релизных проверок.
+# Не для распространения: любой, у кого есть этот ключ, может подписать «обновление».
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Commit or ref to build; defaults to the selected dispatch ref."
+        required: false
+        type: string
+      targets:
+        description: "Rust Android targets, space separated (aarch64 = most phones)."
+        required: true
+        default: "aarch64"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Android debug-signed APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Ratspeak
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          path: Ratspeak
+          fetch-depth: 0
+          ref: ${{ inputs.source_ref || github.sha }}
+
+      - name: Setup source qualification Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.22.0
+
+      - name: Setup Android bridge Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+
+      - name: Load reviewed source set
+        id: source
+        shell: bash
+        working-directory: Ratspeak
+        run: node scripts/release/source-integrity.mjs github-outputs >> "$GITHUB_OUTPUT"
+
+      - name: Checkout rsReticulum
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ratspeak/rsReticulum
+          ref: ${{ steps.source.outputs.rsreticulum_ref }}
+          path: rsReticulum
+          fetch-depth: 0
+
+      - name: Checkout rsLXMF
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ratspeak/rsLXMF
+          ref: ${{ steps.source.outputs.rslxmf_ref }}
+          path: rsLXMF
+          fetch-depth: 0
+
+      - name: Checkout rsLXST
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ratspeak/rsLXST
+          ref: ${{ steps.source.outputs.rslxst_ref }}
+          path: rsLXST
+          fetch-depth: 0
+
+      - name: Checkout lrgp-rs
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ratspeak/lrgp-rs
+          ref: ${{ steps.source.outputs.lrgp_ref }}
+          path: lrgp-rs
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ steps.source.outputs.rust_toolchain }}
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Setup Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: ${{ steps.source.outputs.java }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+        with:
+          # Do not inherit the action's obsolete "tools platform-tools" default.
+          packages: platform-tools
+
+      - name: Install Android NDK
+        shell: bash
+        working-directory: Ratspeak
+        env:
+          PINNED_ANDROID_NDK: ${{ steps.source.outputs.android_ndk }}
+        run: |
+          node scripts/release/android-sdk-view.mjs install \
+            --sdk "$ANDROID_HOME" --ndk "$PINNED_ANDROID_NDK"
+
+      - name: Isolate pinned Android NDK
+        shell: bash
+        working-directory: Ratspeak
+        env:
+          PINNED_ANDROID_NDK: ${{ steps.source.outputs.android_ndk }}
+        run: |
+          # Tauri 2.11.1 ignores an existing NDK_HOME and selects the last SDK/ndk
+          # entry. Keep this view alive until the job ends: generated JNI links,
+          # Gradle lint, and the optional AAB still depend on it after APK build.
+          node scripts/release/android-sdk-view.mjs create \
+            --sdk "$ANDROID_HOME" --ndk "$PINNED_ANDROID_NDK" \
+            --parent "$RUNNER_TEMP" --github-env "$GITHUB_ENV"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          cache-bin: true
+          key: tauri-${{ steps.source.outputs.tauri_cli }}
+          workspaces: |
+            Ratspeak
+            Ratspeak/src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Tauri CLI
+        shell: bash
+        working-directory: Ratspeak
+        run: bash scripts/release/install-tauri-cli.sh "${{ steps.source.outputs.tauri_cli }}"
+
+      - name: Build CSS
+        shell: bash
+        working-directory: Ratspeak
+        run: bash dashboard/build-css.sh
+
+      - name: Configure debug signing
+        shell: bash
+        working-directory: Ratspeak
+        run: |
+          set -euo pipefail
+          android_dir=src-tauri/gen/android
+          cp tools/android/ratspeak-debug.p12 "$android_dir/upload-keystore.jks"
+          cat > "$android_dir/keystore.properties" <<EOF
+          storeFile=upload-keystore.jks
+          storePassword=android
+          keyAlias=ratspeak-debug
+          keyPassword=android
+          EOF
+
+      - name: Build signed Android APK
+        shell: bash
+        working-directory: Ratspeak/src-tauri
+        env:
+          PINNED_ANDROID_NDK: ${{ steps.source.outputs.android_ndk }}
+          ANDROID_TARGETS: ${{ inputs.targets }}
+        run: |
+          unset TAURI_CONFIG
+          unset TAURI_DEV_HOST
+          # shellcheck disable=SC2086
+          cargo tauri android build --target $ANDROID_TARGETS --apk --split-per-abi -- --locked
+
+      - name: Collect APKs
+        shell: bash
+        working-directory: Ratspeak
+        run: |
+          set -euo pipefail
+          mkdir -p dist/android
+          find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -exec cp {} dist/android/ \;
+          test -n "$(ls dist/android)"
+          (cd dist/android && sha256sum *.apk | tee checksums.txt)
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ratspeak-android-debug-signed
+          path: Ratspeak/dist/android/*
+          if-no-files-found: error
+          retention-days: 14
