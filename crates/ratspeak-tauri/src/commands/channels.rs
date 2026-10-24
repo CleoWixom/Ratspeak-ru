@@ -121,6 +121,10 @@ fn build_channel_share_target(
     })
 }
 
+fn unsupported_field(label: &str) -> String {
+    format!("{label} contains an unsupported field")
+}
+
 /// Parse one canonical, key-free Ratspeak channel share target.
 ///
 /// This is the shared authority for pasted/QR shares and native deep links.
@@ -153,7 +157,7 @@ pub fn parse_channel_share_target(payload: &str) -> Result<ChannelShareTarget, S
             "v" => &mut version,
             "hub" => &mut hub,
             "room" => &mut room,
-            _ => return Err("Channel share contains an unsupported field".into()),
+            _ => return Err(unsupported_field("Channel share")),
         };
         if slot.replace(value.into_owned()).is_some() {
             return Err("Channel share repeats a field".into());
@@ -1037,3 +1041,4 @@ mod tests {
         }
     }
 }
+

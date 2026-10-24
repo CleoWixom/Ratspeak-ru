@@ -234,6 +234,10 @@ fn parse_number<T: std::str::FromStr>(raw: Option<&String>, label: &str) -> Resu
         .map_err(|_| format!("Connection share {label} is not valid"))
 }
 
+fn unsupported_field(label: &str) -> String {
+    format!("{label} contains an unsupported field")
+}
+
 /// Parse one canonical, secret-free Ratspeak connection link.
 pub fn parse_connection_share_target(payload: &str) -> Result<ConnectionShareTarget, String> {
     if payload != payload.trim() {
@@ -270,7 +274,7 @@ pub fn parse_connection_share_target(payload: &str) -> Result<ConnectionShareTar
             "name" => &mut raw.name,
             // Includes every secret-bearing spelling (`ifac`, `passphrase`,
             // `key`, ...): an unknown field rejects the whole link.
-            _ => return Err("Connection share contains an unsupported field".into()),
+            _ => return Err(unsupported_field("Connection share")),
         };
         if slot.replace(value.into_owned()).is_some() {
             return Err("Connection share repeats a field".into());
@@ -376,7 +380,8 @@ mod tests {
     fn secrets_and_unknown_fields_reject_the_whole_link() {
         for extra in ["ifac=secret", "passphrase=x", "key=x", "network_name=n", "port2=1"] {
             let link = format!("{TCP}&{extra}");
-            assert!(parse_connection_share_target(&link).is_err(), "{extra}");
+            let error = parse_connection_share_target(&link).unwrap_err();
+            assert!(error.contains("unsupported field"), "{extra}: {error}");
         }
     }
 
@@ -452,3 +457,5 @@ mod tests {
         assert!(build_tcp_connection_share(&host, 1, Some(&max)).is_err());
     }
 }
+
+
