@@ -34,6 +34,8 @@ let importReply = null;
 let applyReply = null;
 let refreshReply = null;
 let confirmationReply = true;
+let authorization = { passcode: 'synthetic pin' };
+const authorizations = [], exportArgs = [], copied = [];
 const appliedRequests = [];
 const toasts = [];
 let developer = false;
@@ -49,9 +51,16 @@ const context = {
     window: { ratspeakDeveloperModeEnabled: () => developer,
         addEventListener(name, fn) { windowEvents[name] = fn; } },
     rsConfirm: async () => confirmationReply,
-    RS: { listen(name, fn) { events[name] = fn; }, copyText: async () => true,
+    activeIdentity: () => ({ hash: 'synthetic identity', passcode_protected: true }),
+    async authorizeIdentityKey(target, opts, send) {
+        authorizations.push(target.hash);
+        return authorization ? send(authorization) : null;
+    },
+    RS: { listen(name, fn) { events[name] = fn; },
+        async copyText(text) { copied.push(text); return true; },
         async invoke(name, args) {
             calls.push(name);
+            if (name === 'export_shared_access') { exportArgs.push(JSON.parse(JSON.stringify(args))); return 'synthetic access'; }
             if (name === 'api_network_ownership') return refreshReply || data;
             if (name === 'import_shared_access') return importReply;
             if (name === 'test_shared_instance') throw new Error('RPC key rejected; unchanged');
@@ -147,6 +156,14 @@ function access(port, key) {
     events.network_ownership({...data, share: true});
     assert.equal(field('export').hidden, false);
     assert.equal(field('export').disabled, false, 'ready saved sharing allows access copy');
+    await field('export').events.click(); await settle();
+    assert.deepEqual(authorizations, ['synthetic identity'], "the active identity's PIN, or a confirmation without one");
+    assert.deepEqual(exportArgs, [{ passcode: 'synthetic pin' }]);
+    assert.deepEqual(copied, ['synthetic access']);
+    authorization = null;
+    await field('export').events.click(); await settle();
+    assert.equal(exportArgs.length, 1, 'declining fetches nothing');
+    assert.equal(copied.length, 1);
     const beforeEdit = calls.length;
     node('network-ownership-settings').events.input();
     assert.equal(field('actions').hidden, false);

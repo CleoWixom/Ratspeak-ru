@@ -106,12 +106,15 @@ impl StartupFailure {
 
 /// Open the profile (storage, DB pool + schema), AppState, BLE diag relay, then
 /// spawn `init_rns_lxmf`. AppHandle is wrapped in a `TauriEmitter` and stashed
-/// in AppState before any background task can `emit_to_all`.
+/// in AppState before any background task can `emit_to_all`. `default_root`:
+/// `data_dir` is the platform's data folder, not one the user named, and is
+/// kept private on the desktop.
 pub async fn init_core(
     data_dir: std::path::PathBuf,
+    default_root: bool,
     app_handle: tauri::AppHandle,
 ) -> Result<Arc<AppState>, StartupFailure> {
-    let (config, db_pool) = open_profile(data_dir.clone()).await?;
+    let (config, db_pool) = open_profile(data_dir.clone(), default_root).await?;
 
     let emitter: Arc<dyn ratspeak_core::Emitter> =
         Arc::new(emitter::TauriEmitter::new(app_handle.clone()));
@@ -144,14 +147,21 @@ pub async fn init_core(
 /// another process owns, and nothing is written to a newer Ratspeak's database.
 async fn open_profile(
     data_dir: std::path::PathBuf,
+    default_root: bool,
 ) -> Result<(config::DashboardConfig, db::DbPool), StartupFailure> {
     // Windows may need to publish a fresh sibling during crash reconciliation.
     // Establish roots before configuration or SQLite can hold live handles.
     let storage_root = data_dir.clone();
-    tokio::task::spawn_blocking(move || lxmf::initialize_storage_namespace(&storage_root))
-        .await
-        .map_err(|_| StartupFailure::task("storage"))?
-        .map_err(|error| StartupFailure::at("storage", &error))?;
+    tokio::task::spawn_blocking(move || {
+        lxmf::initialize_storage_namespace(&storage_root)?;
+        if default_root && cfg!(not(any(target_os = "android", target_os = "ios"))) {
+            lxmf::make_private(&storage_root)?;
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .map_err(|_| StartupFailure::task("storage"))?
+    .map_err(|error| StartupFailure::at("storage", &error))?;
     let config = config::DashboardConfig::from_env_and_defaults(data_dir.clone());
 
     let db_pool = tokio::task::spawn_blocking(move || db::init_pool(&data_dir))
@@ -175,7 +185,9 @@ mod tests {
         let other = std::fs::File::create(root.path().join(".ratspeak-host.lock")).unwrap();
         rns_identity::persistence::try_lock_exclusive(&other).unwrap();
 
-        let failure = open_profile(root.path().to_path_buf()).await.unwrap_err();
+        let failure = open_profile(root.path().to_path_buf(), false)
+            .await
+            .unwrap_err();
         assert_eq!(failure.error, StartupError::ProfileInUse);
         assert_eq!(
             (failure.step, failure.kind),
@@ -201,7 +213,9 @@ mod tests {
             .unwrap();
         drop(pool);
 
-        let failure = open_profile(root.path().to_path_buf()).await.unwrap_err();
+        let failure = open_profile(root.path().to_path_buf(), false)
+            .await
+            .unwrap_err();
         assert_eq!(
             failure.error,
             StartupError::SchemaNewer {
@@ -234,7 +248,9 @@ mod tests {
         };
         let bytes = std::fs::read(&path).unwrap();
 
-        let failure = open_profile(root.path().to_path_buf()).await.unwrap_err();
+        let failure = open_profile(root.path().to_path_buf(), false)
+            .await
+            .unwrap_err();
 
         assert!(
             std::fs::read(&path).unwrap() == bytes,
@@ -249,13 +265,33 @@ mod tests {
         );
     }
 
+    // The platform's own data folder is made private; one RATSPEAK_DATA_DIR
+    // names keeps the access its owner gave it.
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+    #[tokio::test]
+    async fn only_the_default_data_folder_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        for default_root in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            open_profile(root.path().to_path_buf(), default_root)
+                .await
+                .unwrap();
+
+            let mode = std::fs::metadata(root.path()).unwrap().permissions().mode();
+            let expected = if default_root { 0o700 } else { 0o755 };
+            assert_eq!(mode & 0o777, expected, "default root: {default_root}");
+        }
+    }
+
     #[tokio::test]
     async fn storage_that_cannot_hold_a_profile_is_a_storage_error() {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("profile");
         std::fs::write(&file, b"not a directory").unwrap();
 
-        let failure = open_profile(file).await.unwrap_err();
+        let failure = open_profile(file, false).await.unwrap_err();
         assert_eq!(failure.error, StartupError::Storage);
         assert_eq!(
             (failure.step, failure.kind),

@@ -750,6 +750,73 @@ fn protected_identity_kind(state: &AppState, hash: &str) -> Option<&'static str>
     }
 }
 
+/// A key, phrase or access file of `hash`'s is released with the identity's
+/// passcode when it has one, otherwise only after an explicit confirmation: a
+/// hardware PIN would need the token. Returns the passcode to open its vault.
+pub(crate) fn release_passcode(
+    state: &AppState,
+    hash: &str,
+    passcode: Option<String>,
+    confirmed: Option<bool>,
+) -> AppResult<Option<Zeroizing<String>>> {
+    let passcode = passcode.map(Zeroizing::new);
+    if protected_identity_kind(state, hash) == Some("passcode") {
+        return match passcode.filter(|passcode| !passcode.is_empty()) {
+            Some(passcode) => Ok(Some(passcode)),
+            None => Err(AppError::unauthorized("Enter this identity's PIN")),
+        };
+    }
+    if confirmed == Some(true) {
+        Ok(None)
+    } else {
+        Err(AppError::bad_request(
+            "Confirm before releasing this identity's keys",
+        ))
+    }
+}
+
+/// `hash`'s key and stored phrase, opened as an unlock opens them.
+fn open_identity_files(
+    job: &VaultJob,
+    id_dir: &std::path::Path,
+    hash: &str,
+    passcode: Option<&str>,
+) -> Result<(vault::UnlockedVault, Identity), vault::VaultError> {
+    let unlocked = job.open_identity(id_dir, passcode)?;
+    let identity = Identity::from_private_key(unlocked.key())
+        .map_err(|_| vault::VaultError::InvalidFormat("private identity".into()))?;
+    if hex::encode(identity.hash) != hash {
+        return Err(vault::VaultError::InvalidFormat(
+            "vault identity does not match selected profile".into(),
+        ));
+    }
+    Ok((unlocked, identity))
+}
+
+fn key_release_error(error: vault::VaultError) -> AppError {
+    match error {
+        vault::VaultError::Auth => AppError::unauthorized("Incorrect PIN"),
+        error => AppError::bad_request(error.to_string()),
+    }
+}
+
+/// Checks `passcode` against `hash`'s vault.
+pub(crate) async fn verify_identity_passcode(
+    state: &AppState,
+    hash: &str,
+    passcode: Zeroizing<String>,
+) -> AppResult<()> {
+    let id_dir = state.config.data_dir.join("identities").join(hash);
+    let hash = hash.to_owned();
+    let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        open_identity_files(&job, &id_dir, &hash, Some(&passcode)).map(drop)
+    })
+    .await
+    .map_err(|_| AppError::internal("passcode check task panicked"))?
+    .map_err(key_release_error)
+}
+
 fn check_unlock_secret(kind: Option<&str>, secret: &str) -> AppResult<()> {
     if secret.len() < 6 {
         return Err(AppError::bad_request("PIN must be at least 6 characters"));
@@ -794,25 +861,12 @@ pub(crate) async fn unlock_protected_identity(
     // lives in the actual worker if this awaiting command is cancelled.
     let unlocked = if kind == Some("passcode") {
         let hash = expected_hash.clone();
-        let path = state
-            .config
-            .data_dir
-            .join("identities")
-            .join(&hash)
-            .join("identity.enc");
+        let id_dir = state.config.data_dir.join("identities").join(&hash);
         let passcode = secret.clone();
         let job =
             vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
         let unlocked = tokio::task::spawn_blocking(move || {
-            let decoded = job.decrypt_identity(&passcode, &vault::read_vault(&path)?)?;
-            let identity = Identity::from_private_key(decoded.key())
-                .map_err(|_| vault::VaultError::InvalidFormat("private identity".into()))?;
-            if hex::encode(identity.hash) != hash {
-                return Err(vault::VaultError::InvalidFormat(
-                    "vault identity does not match selected profile".into(),
-                ));
-            }
-            Ok::<_, vault::VaultError>(identity)
+            open_identity_files(&job, &id_dir, &hash, Some(&passcode)).map(|(_, identity)| identity)
         })
         .await
         .map_err(|_| AppError::internal("identity unlock task panicked"))?;

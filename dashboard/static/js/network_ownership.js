@@ -194,12 +194,18 @@
     async function exportAccess() {
         if (busy || !developer()) return;
         var requestEpoch = epoch;
-        var ok = await rsConfirm({ message: 'This configuration includes a secret granting access to your local Reticulum control service. Copy it only to apps you trust. Clipboard history may retain it.', confirmText: 'Copy secret' });
-        if (!ok || requestEpoch !== epoch || !developer()) return;
         var content = '';
         try {
-            content = await RS.invoke('export_shared_access');
-            if (requestEpoch !== epoch || !developer()) return;
+            // The active identity's PIN, or a confirmation when it has none.
+            content = await authorizeIdentityKey(activeIdentity(), {
+                title: 'Copy Access Configuration',
+                message: 'This configuration includes a secret granting access to your local Reticulum control service. Copy it only to apps you trust. Clipboard history may retain it.',
+                confirmText: 'Copy secret'
+            }, function(auth) {
+                if (requestEpoch !== epoch || !developer()) return Promise.resolve(null);
+                return RS.invoke('export_shared_access', auth);
+            });
+            if (!content || requestEpoch !== epoch || !developer()) return;
             var copied = await RS.copyText(content);
             status(copied ? 'Access configuration copied. Clear your clipboard after use.' : 'Copy failed. The secret was not displayed.');
         } catch (error) { status(error.message || String(error)); }

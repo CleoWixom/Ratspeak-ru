@@ -411,6 +411,28 @@ impl VaultJob {
         ValidatedVault::new(&v)?;
         Ok(v)
     }
+    /// The identity in `id_dir` with its stored recovery phrase: from its vault
+    /// with `passcode`, or without one from its plaintext files.
+    pub fn open_identity(
+        &self,
+        id_dir: &Path,
+        passcode: Option<&str>,
+    ) -> Result<UnlockedVault, VaultError> {
+        if id_dir.join("identity.hwid").exists() {
+            return Err(VaultError::InvalidFormat(
+                "hardware identity keeps its key on the token".into(),
+            ));
+        }
+        let enc = id_dir.join("identity.enc");
+        match passcode {
+            Some(passcode) => self.decrypt_identity(passcode, &read_vault(&enc)?),
+            None if enc.exists() => Err(VaultError::InvalidFormat("passcode required".into())),
+            None => Ok(UnlockedVault {
+                key: read_plain_identity_key(&id_dir.join("identity"))?,
+                mnemonic: read_seed(&id_dir.join(SEED_FILE))?,
+            }),
+        }
+    }
     pub fn reveal_mnemonic(
         &self,
         id_dir: &Path,

@@ -1733,6 +1733,7 @@ pub fn ratspeak_runtime::lxmf::get_ratspeak_announce_app_data(core::option::Opti
 pub fn ratspeak_runtime::lxmf::initialize_storage_namespace(&std::path::Path) -> core::io::error::Result<()>
 pub fn ratspeak_runtime::lxmf::lxmf_compression_support_db_value(lxmf_core::handlers::CompressionSupport) -> core::option::Option<&'static str>
 pub fn ratspeak_runtime::lxmf::lxmf_compression_support_db_value_from_app_data(&[u8]) -> core::option::Option<&'static str>
+pub fn ratspeak_runtime::lxmf::make_private(&std::path::Path) -> core::io::error::Result<()>
 pub fn ratspeak_runtime::lxmf::ratspeak_capability_services_from_app_data(&[u8]) -> alloc::vec::Vec<&'static str>
 pub fn ratspeak_runtime::lxmf::ratspeak_chat_custom_fields(&ratspeak_runtime::lxmf::RatspeakChatExtension) -> core::option::Option<alloc::vec::Vec<(u8, alloc::vec::Vec<u8>)>>
 pub fn ratspeak_runtime::lxmf::ratspeak_status_from_app_data(&[u8]) -> core::option::Option<alloc::string::String>
@@ -2476,6 +2477,7 @@ pub fn ratspeak_runtime::vault::VaultJob::commit_protection(&self, ratspeak_runt
 pub fn ratspeak_runtime::vault::VaultJob::commit_unprotection(&self, ratspeak_runtime::vault::PreparedUnprotection) -> core::result::Result<(), ratspeak_runtime::vault::VaultError>
 pub fn ratspeak_runtime::vault::VaultJob::decrypt_identity(&self, &str, &ratspeak_runtime::vault::EncryptedVault) -> core::result::Result<ratspeak_runtime::vault::UnlockedVault, ratspeak_runtime::vault::VaultError>
 pub fn ratspeak_runtime::vault::VaultJob::encrypt_identity(&self, &str, &[u8; 64], core::option::Option<&str>) -> core::result::Result<ratspeak_runtime::vault::EncryptedVault, ratspeak_runtime::vault::VaultError>
+pub fn ratspeak_runtime::vault::VaultJob::open_identity(&self, &std::path::Path, core::option::Option<&str>) -> core::result::Result<ratspeak_runtime::vault::UnlockedVault, ratspeak_runtime::vault::VaultError>
 pub fn ratspeak_runtime::vault::VaultJob::prepare_protection(&self, &std::path::Path, &str, core::option::Option<&str>) -> core::result::Result<ratspeak_runtime::vault::PreparedProtection, ratspeak_runtime::vault::VaultError>
 pub fn ratspeak_runtime::vault::VaultJob::prepare_unprotection(&self, &std::path::Path, &str) -> core::result::Result<ratspeak_runtime::vault::PreparedUnprotection, ratspeak_runtime::vault::VaultError>
 pub fn ratspeak_runtime::vault::VaultJob::protect_identity(&self, &std::path::Path, &str, core::option::Option<&str>) -> core::result::Result<(), ratspeak_runtime::vault::VaultError>

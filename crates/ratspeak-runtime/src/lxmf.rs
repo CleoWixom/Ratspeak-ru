@@ -1940,6 +1940,8 @@ pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
     .map_err(std::io::Error::other)?;
     let identities = ratspeak_dir.join("identities");
     durable_create_dir_all(&ratspeak_dir, &witness).map_err(std::io::Error::other)?;
+    // Builds before private folders left it readable by every local user.
+    make_private(&ratspeak_dir)?;
     durable_create_dir_all(&identities, &witness).map_err(std::io::Error::other)?;
     for entry in std::fs::read_dir(&identities)? {
         let entry = entry?;
@@ -1980,6 +1982,21 @@ pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
         STORAGE_NAMESPACE_BYTES,
     )
     .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+/// Leaves `dir` to its owner alone, as a fresh profile's folders are. Unix
+/// only; elsewhere the platform's own folders already are.
+pub fn make_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(dir)?.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -8692,6 +8709,22 @@ mod tests {
             "the linked database was read"
         );
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // A profile made before private folders is readable by every local user.
+    #[cfg(unix)]
+    #[test]
+    fn storage_namespace_makes_an_older_readable_profile_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let ratspeak = temp.path().join(".ratspeak");
+        std::fs::create_dir(&ratspeak).unwrap();
+        std::fs::set_permissions(&ratspeak, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        initialize_storage_namespace(temp.path()).unwrap();
+
+        let mode = std::fs::metadata(&ratspeak).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]

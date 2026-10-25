@@ -1314,14 +1314,18 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
-            let data_dir = paths::resolve_data_dir(&handle);
+            let (data_dir, default_data_dir) = paths::resolve_data_dir(&handle);
             tracing::debug!("resolved Ratspeak data directory");
 
             // setup() has no Tokio runtime; leak one for process-lifetime tasks.
             let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
             let tauri_handle = handle.clone();
             // Without AppState no command runs; the window shows the failure.
-            let state = match rt.block_on(ratspeak_tauri::init_core(data_dir, tauri_handle)) {
+            let state = match rt.block_on(ratspeak_tauri::init_core(
+                data_dir,
+                default_data_dir,
+                tauri_handle,
+            )) {
                 Ok(state) => Some(state),
                 Err(failure) => {
                     tracing::error!(

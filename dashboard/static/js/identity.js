@@ -102,6 +102,44 @@ function identityPinError(err, fallback) {
         .replace(/Passcode/g, 'PIN');
 }
 
+// A key, phrase or access file is released with its identity's PIN, or after
+// an explicit confirmation when it has none; the backend requires the same.
+// `send(auth)` makes the request with `{ passcode }` or `{ confirmed: true }`
+// and resolves its result. Resolves null when declined. In the PIN sheet every
+// failure stays inline until the user cancels, which never resolves.
+function authorizeIdentityKey(target, opts, send) {
+    if (!(target && target.passcode_protected)) {
+        return rsConfirm({
+            title: opts.title,
+            message: opts.message,
+            confirmText: opts.confirmText,
+            danger: !!opts.danger
+        }).then(function(ok) { return ok ? send({ confirmed: true }) : null; });
+    }
+    return new Promise(function(resolve) {
+        showIdentityModal(opts.title,
+            '<p class="recovery-warn">' + escapeHtml(opts.message) + '</p>' +
+            '<div class="modal-field"><label>PIN</label>' +
+                '<input type="password" id="identity-key-pin" class="modal-input" maxlength="128" autocomplete="off"></div>' +
+            '<div class="modal-error" id="identity-key-error" style="display:none"></div>',
+            function() {
+                var pin = document.getElementById('identity-key-pin').value;
+                var errEl = document.getElementById('identity-key-error');
+                function fail(text) { if (errEl) { errEl.textContent = text; errEl.style.display = ''; } }
+                if (!pin) { fail('Enter your PIN.'); return; }
+                return send({ passcode: pin }).then(function(result) {
+                    closeIdentityModal();
+                    resolve(result);
+                }, function(err) {
+                    fail(identityPinError(err, 'PIN failed.'));
+                });
+            }, opts.danger ? 'danger' : '');
+        var btn = document.getElementById('identity-modal-confirm');
+        if (btn) { btn.textContent = opts.confirmText; btn.dataset.baseLabel = opts.confirmText; }
+    });
+}
+window.authorizeIdentityKey = authorizeIdentityKey;
+
 function identityPasscodeOptionHtml(prefix, opts) {
     opts = opts || {};
     var label = opts.label || 'Encrypt this identity on this device';
