@@ -1871,22 +1871,8 @@ fn prepare_identity_namespace(
 /// Establish/reconcile the app's private directory tree before configuration,
 /// database pools, identity files or network workers are opened. Call once at
 /// process startup; live identity rebuilds only validate its committed marker.
+/// Takes the profile owner lock before reconciling anything.
 pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
-    if data_root.join(STORAGE_NAMESPACE_READY).try_exists()? {
-        // Completed roots cannot become fresh merely because directories have
-        // disappeared. Only an explicit recorded deletion may retire identity
-        // descendants; the app/database roots remain established.
-        let ready = data_root.join(STORAGE_NAMESPACE_READY);
-        if read_file_bounded(&ready, 64)?.as_deref() == Some(STORAGE_NAMESPACE_RESET_BYTES) {
-            let witness = storage_namespace_witness(data_root)?;
-            let reset = durable_reconcile(&ready, STORAGE_NAMESPACE_RESET_BYTES)
-                .map_err(std::io::Error::other)?;
-            finish_identity_storage_reset(&data_root.join(".ratspeak"), &witness, &reset)?;
-            durable_write(&ready, STORAGE_NAMESPACE_BYTES).map_err(std::io::Error::other)?;
-        } else {
-            established_storage_namespace(data_root)?;
-        }
-    }
     // Platform-provided roots already exist. A fresh explicit/test root may
     // need multiple ancestors, all established from an existing outside anchor.
     if !data_root.try_exists()? {
@@ -1911,6 +1897,23 @@ pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
         durable_create_dir_all(data_root, &witness).map_err(std::io::Error::other)?;
     }
     require_real_directory(data_root)?;
+    // Reconciliation may retire identities; never run it beside another owner.
+    crate::owner_lock::acquire_owner_lock(data_root)?;
+    if data_root.join(STORAGE_NAMESPACE_READY).try_exists()? {
+        // Completed roots cannot become fresh merely because directories have
+        // disappeared. Only an explicit recorded deletion may retire identity
+        // descendants; the app/database roots remain established.
+        let ready = data_root.join(STORAGE_NAMESPACE_READY);
+        if read_file_bounded(&ready, 64)?.as_deref() == Some(STORAGE_NAMESPACE_RESET_BYTES) {
+            let witness = storage_namespace_witness(data_root)?;
+            let reset = durable_reconcile(&ready, STORAGE_NAMESPACE_RESET_BYTES)
+                .map_err(std::io::Error::other)?;
+            finish_identity_storage_reset(&data_root.join(".ratspeak"), &witness, &reset)?;
+            durable_write(&ready, STORAGE_NAMESPACE_BYTES).map_err(std::io::Error::other)?;
+        } else {
+            established_storage_namespace(data_root)?;
+        }
+    }
     let witness = durable_write(
         &data_root.join(STORAGE_NAMESPACE_WITNESS),
         STORAGE_NAMESPACE_BYTES,
@@ -8573,6 +8576,68 @@ mod tests {
         let pool = test_pool();
         LxmfManager::import_identity_to_data_dir(&ratspeak, &key, "Restored", &pool).unwrap();
         LxmfManager::load_or_create(temp.path(), Some(&hash), None).unwrap();
+    }
+
+    #[test]
+    fn storage_namespace_touches_nothing_while_another_owner_holds_the_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let other = std::fs::File::create(temp.path().join(".ratspeak-host.lock")).unwrap();
+        rns_identity::persistence::try_lock_exclusive(&other).unwrap();
+
+        let error = initialize_storage_namespace(temp.path()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
+        assert!(!temp.path().join(".ratspeak").exists());
+        assert!(!temp.path().join(STORAGE_NAMESPACE_WITNESS).exists());
+    }
+
+    /// Set only in the second process: the profile root it tries to open.
+    const SECOND_OWNER_ROOT: &str = "RATSPEAK_TEST_SECOND_OWNER_ROOT";
+
+    #[test]
+    fn storage_namespace_second_process_leaves_recorded_deletions_untouched() {
+        if let Some(root) = std::env::var_os(SECOND_OWNER_ROOT) {
+            let error = initialize_storage_namespace(Path::new(&root)).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let manager = LxmfManager::load_or_create(temp.path(), None, None).unwrap();
+        let hash = manager.identity_hash.clone();
+        let identities = manager.data_dir.join("identities");
+        drop(manager);
+        let intent = identities.join(format!("{hash}.namespace-delete"));
+        durable_write(&intent, DELETE_IDENTITY_ALL).unwrap();
+        let ready = temp.path().join(STORAGE_NAMESPACE_READY);
+        durable_write(&ready, STORAGE_NAMESPACE_RESET_BYTES).unwrap();
+
+        // The same test, run as another process against this profile.
+        let name = concat!(
+            module_path!(),
+            "::storage_namespace_second_process_leaves_recorded_deletions_untouched"
+        );
+        let name = name.split_once("::").unwrap().1;
+        let second = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(SECOND_OWNER_ROOT, temp.path())
+            .output()
+            .unwrap();
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&second.stdout),
+            String::from_utf8_lossy(&second.stderr)
+        );
+
+        assert!(
+            std::fs::read(&ready).unwrap() == STORAGE_NAMESPACE_RESET_BYTES,
+            "the second process finished the pending reset"
+        );
+        assert!(
+            intent.is_file() && identities.join(&hash).join("identity").is_file(),
+            "the second process retired the identity"
+        );
+        assert!(second.status.success(), "{output}");
+        assert!(output.contains("test result: ok. 1 passed"), "{output}");
     }
 
     #[test]

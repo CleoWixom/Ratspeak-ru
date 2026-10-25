@@ -1167,6 +1167,17 @@
             "windows-native"
           ],
           "sourceKind": "registry"
+        },
+        {
+          "name": "libc",
+          "rename": null,
+          "kind": null,
+          "target": "cfg(unix)",
+          "requirement": "^0.2",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
         }
       ]
     },

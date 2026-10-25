@@ -98,8 +98,9 @@ function checkSetupStatus() {
             }
             document.body.classList.remove('checking-setup');
         })
-        .catch(function() {
-            document.body.classList.remove('checking-setup');
+        .catch(function(err) {
+            // A failed start keeps the app hidden behind its startup screen.
+            if (!err || err.code !== 'startup_error') document.body.classList.remove('checking-setup');
         });
 }
 

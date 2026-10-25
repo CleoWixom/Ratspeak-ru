@@ -23,6 +23,7 @@ changes that materially affect how an artifact is reproduced.
 - Removing the active hardware identity, or starting with no identity selected, opens the most recently used one that still opens; a protected one asks for its PIN.
 - Messages and game moves received during an identity switch stay with the identity they were sent to and never show under the next one.
 - Renames, status changes and blocks made during an identity switch are refused instead of landing on the next identity, and a rename never announces the old name afterwards.
+- Ratspeak won't open data that another Ratspeak app is using or that a newer version saved, and says what to do instead. Drives that can't lock get a warning.
 
 ### Build and compatibility
 

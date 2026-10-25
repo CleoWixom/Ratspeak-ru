@@ -47,6 +47,12 @@ fn storage_warning(data_dir: &std::path::Path) -> Option<&'static str> {
     }
 }
 
+fn profile_lock_warning(data_root: &std::path::Path) -> Option<&'static str> {
+    ratspeak_runtime::owner_lock::unenforced(data_root).then_some(
+        "This drive can't lock Ratspeak's data, so open it in only one app, on one device, at a time.",
+    )
+}
+
 #[tauri::command]
 pub async fn api_version() -> AppResult<Value> {
     Ok(json!({ "version": app_display_version(), "name": "Ratspeak" }))
@@ -81,6 +87,7 @@ pub async fn api_startup_progress(state: State<'_, Arc<AppState>>) -> AppResult<
         "hw_locked": locked,
         "hw_locked_kind": kind,
         "storage_warning": storage_warning(&state.config.data_dir),
+        "profile_lock_warning": profile_lock_warning(&state.config.data_root),
     }))
 }
 

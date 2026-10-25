@@ -26,6 +26,7 @@ pub mod messaging;
 pub mod mobile_platform;
 pub mod network_ownership;
 mod network_secrets;
+pub mod owner_lock;
 mod path_response;
 pub mod propagation;
 pub mod propagation_recovery;

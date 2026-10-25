@@ -147,12 +147,20 @@ fn main_window_builder(
     } else {
         ""
     };
+    // A core that failed to start manages no command state; the page says why.
+    let startup_script = handle
+        .try_state::<ratspeak_tauri::StartupError>()
+        .and_then(|error| serde_json::to_string(error.inner()).ok())
+        .map(|error| format!("window.__RATSPEAK_STARTUP_ERROR__ = {error};"))
+        .unwrap_or_default();
     let window = tauri::WebviewWindowBuilder::new(
         handle,
         "main",
         tauri::WebviewUrl::App("index.html".into()),
     )
-    .initialization_script(format!("{platform_script}{diagnostics_script}"));
+    .initialization_script(format!(
+        "{platform_script}{diagnostics_script}{startup_script}"
+    ));
     // The devtools Cargo feature is needed for desktop field diagnostics, but
     // leaves inspection enabled by default on mobile too. Set the mobile policy
     // explicitly for every window, including Android session reattachment.
@@ -1314,30 +1322,39 @@ pub fn run() {
             // setup() has no Tokio runtime; leak one for process-lifetime tasks.
             let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
             let tauri_handle = handle.clone();
-            let state = rt.block_on(async move {
-                ratspeak_tauri::init_core(data_dir, tauri_handle)
-                    .await
-                    .expect("Failed to start Ratspeak core")
-            });
+            // Without AppState no command runs; the window shows the failure.
+            let state = match rt.block_on(ratspeak_tauri::init_core(data_dir, tauri_handle)) {
+                Ok(state) => Some(state),
+                Err(error) => {
+                    app.manage(error);
+                    None
+                }
+            };
 
             // Window prefs must be read before the window is built.
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-            let (decorations_setting, developer_mode) = rt
-                .block_on(ratspeak_tauri::db::spawn_db(state.db.clone(), |p| {
-                    (
-                        ratspeak_tauri::db::get_setting(&p, "window_decorations"),
-                        ratspeak_tauri::db::get_setting(&p, "developer_mode_enabled")
-                            .is_some_and(|v| v == "true"),
-                    )
-                }))
+            let (decorations_setting, developer_mode) = state
+                .as_ref()
+                .and_then(|state| {
+                    rt.block_on(ratspeak_tauri::db::spawn_db(state.db.clone(), |p| {
+                        (
+                            ratspeak_tauri::db::get_setting(&p, "window_decorations"),
+                            ratspeak_tauri::db::get_setting(&p, "developer_mode_enabled")
+                                .is_some_and(|v| v == "true"),
+                        )
+                    }))
+                    .ok()
+                })
                 .unwrap_or((None, false));
 
             std::mem::forget(rt);
 
-            app.manage(std::sync::Arc::clone(&state));
-            #[cfg(any(target_os = "android", target_os = "ios"))]
-            mobile_native::install(&state);
+            if let Some(state) = &state {
+                app.manage(std::sync::Arc::clone(state));
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                mobile_native::install(state);
+            }
 
             // Programmatic window construction so we can attach on_download.
             let window = main_window_builder(&handle);
@@ -1489,6 +1506,9 @@ pub fn run() {
     if linux_webkit_dmabuf_workaround {
         tracing::info!("WebKitGTK < 2.46: disabled DMA-BUF renderer for Wayland startup");
     }
+    if let Some(error) = app.try_state::<ratspeak_tauri::StartupError>() {
+        tracing::error!(reason = ?*error, "Ratspeak could not start");
+    }
 
     app.run(|app_handle, event| {
         #[cfg(target_os = "android")]
@@ -1515,11 +1535,16 @@ pub fn run() {
 
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         match event {
+            // A core that failed to start holds nothing; closing its window quits.
             tauri::RunEvent::WindowEvent {
                 label,
                 event: tauri::WindowEvent::CloseRequested { api, .. },
                 ..
-            } if label == "main" => {
+            } if label == "main"
+                && app_handle
+                    .try_state::<ratspeak_tauri::StartupError>()
+                    .is_none() =>
+            {
                 api.prevent_close();
                 set_desktop_foreground(app_handle, false);
                 if let Some(window) = app_handle.get_webview_window("main") {

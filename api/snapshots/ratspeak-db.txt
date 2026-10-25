@@ -224,6 +224,9 @@ pub ratspeak_db::db::NewChannelParticipantObservation::nickname: core::option::O
 pub ratspeak_db::db::NewChannelParticipantObservation::room_name: alloc::string::String
 impl core::fmt::Debug for ratspeak_db::NewChannelParticipantObservation
 pub fn ratspeak_db::NewChannelParticipantObservation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ratspeak_db::db::NewerSchema
+pub ratspeak_db::db::NewerSchema::found: i64
+pub ratspeak_db::db::NewerSchema::supported: i64
 pub struct ratspeak_db::db::PendingBlackholeRow
 pub ratspeak_db::db::PendingBlackholeRow::dest_hash: alloc::string::String
 pub ratspeak_db::db::PendingBlackholeRow::identity_id: alloc::string::String
@@ -575,6 +578,9 @@ pub ratspeak_db::NewChannelParticipantObservation::nickname: core::option::Optio
 pub ratspeak_db::NewChannelParticipantObservation::room_name: alloc::string::String
 impl core::fmt::Debug for ratspeak_db::NewChannelParticipantObservation
 pub fn ratspeak_db::NewChannelParticipantObservation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ratspeak_db::NewerSchema
+pub ratspeak_db::NewerSchema::found: i64
+pub ratspeak_db::NewerSchema::supported: i64
 pub struct ratspeak_db::PendingBlackholeRow
 pub ratspeak_db::PendingBlackholeRow::dest_hash: alloc::string::String
 pub ratspeak_db::PendingBlackholeRow::identity_id: alloc::string::String

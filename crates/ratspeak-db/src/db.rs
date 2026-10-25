@@ -107,6 +107,15 @@ pub fn init_pool(data_dir: &Path) -> Result<DbPool, Box<dyn std::error::Error + 
     Ok(pool)
 }
 
+/// A database written by a newer Ratspeak. [`init_schema`] refuses it before
+/// writing anything.
+#[derive(Debug, thiserror::Error)]
+#[error("database schema {found} is newer than this build ({supported})")]
+pub struct NewerSchema {
+    pub found: i64,
+    pub supported: i64,
+}
+
 pub fn init_schema(pool: &DbPool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let conn = pool.get()?;
 
@@ -123,6 +132,14 @@ pub fn init_schema(pool: &DbPool) -> Result<(), Box<dyn std::error::Error + Send
             })
             .unwrap_or(0);
 
+        // Older code must never run against a schema it does not understand.
+        if version > SCHEMA_VERSION {
+            return Err(NewerSchema {
+                found: version,
+                supported: SCHEMA_VERSION,
+            }
+            .into());
+        }
         if version < SCHEMA_VERSION {
             run_migrations(&conn, version)?;
         }
@@ -11036,6 +11053,68 @@ mod migration_tests {
             .query_row("SELECT COUNT(*) FROM identities", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1, "data survives repeat init_schema calls");
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused_before_anything_is_written() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratspeak-newer-schema-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let newer = SCHEMA_VERSION + 1;
+        {
+            let pool = init_pool(&dir).unwrap();
+            init_schema(&pool).unwrap();
+            // What a newer build leaves behind: its version, a table and usage
+            // accounting this build does not know, and an index it dropped.
+            pool.get()
+                .unwrap()
+                .execute_batch(&format!(
+                    "UPDATE schema_version SET version = {newer};
+                     CREATE TABLE lxmf_outbox (id TEXT PRIMARY KEY);
+                     INSERT INTO identities (hash, created_at) VALUES ('{id}', 0.0);
+                     INSERT INTO channel_history_room_usage
+                         VALUES ('{id}', '{hub}', 'room', 1, 4096);
+                     DROP INDEX idx_messages_identity_state;",
+                    id = "aa".repeat(16),
+                    hub = "bb".repeat(16),
+                ))
+                .unwrap();
+        }
+        let observer = Connection::open(dir.join(".ratspeak/ratspeak.db")).unwrap();
+        let rows = |sql: &str| -> Vec<String> {
+            let mut statement = observer.prepare(sql).unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        // Changes as soon as any other connection commits.
+        let data_version = || -> i64 {
+            observer
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        let schema = || rows("SELECT type || ' ' || name FROM sqlite_master ORDER BY name");
+        let usage =
+            || rows("SELECT room_name || ' ' || payload_bytes FROM channel_history_room_usage");
+        let (version_before, schema_before, usage_before) = (data_version(), schema(), usage());
+
+        let pool = init_pool(&dir).unwrap();
+        let result = init_schema(&pool);
+
+        assert_eq!(data_version(), version_before, "a write was committed");
+        assert_eq!(schema(), schema_before);
+        assert_eq!(usage(), usage_before);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("database schema {newer} is newer than this build ({SCHEMA_VERSION})")
+        );
+        drop(pool);
+        drop(observer);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// T1-8: every user-data table must be wiped by factory reset, and every

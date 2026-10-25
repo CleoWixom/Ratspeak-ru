@@ -20,6 +20,13 @@ Standalone runtime callers and test fixtures must do it explicitly. Live
 or republish active roots. An incomplete namespace is recovered at the next
 initial startup, before those file users exist.
 
+The same call takes the profile's owner lock, `.ratspeak-host.lock` in the data
+root, and the process keeps it until exit. While another process holds it, the
+call fails with `ResourceBusy` carrying `owner_lock::ProfileInUse` before
+reconciling anything. `ratspeak_db::init_schema` refuses a database written by a
+newer build with `NewerSchema`, before writing to it. `init_core` reports both
+as a `StartupError`.
+
 Identity and factory reset stop their identity/storage workers before calling
 `clear_identity_storage_namespace`. Reset preserves the established database
 and identities roots, records its full child wipe in the outside namespace

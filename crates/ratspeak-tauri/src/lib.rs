@@ -48,35 +48,33 @@ use std::sync::Arc;
 
 use state::AppState;
 
-/// Init DB pool + schema, AppState, BLE diag relay, then spawn `init_rns_lxmf`.
-/// AppHandle is wrapped in a `TauriEmitter` and stashed in AppState before any
-/// background task can `emit_to_all`.
+/// Why the core could not start. The shell then manages no AppState, so no
+/// command can run, and the window shows a static screen for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum StartupError {
+    /// Another app or process owns this profile.
+    ProfileInUse,
+    /// The database was written by a newer Ratspeak.
+    SchemaNewer { found: i64, supported: i64 },
+    /// The profile's storage or database could not be opened.
+    Storage,
+}
+
+/// Open the profile (storage, DB pool + schema), AppState, BLE diag relay, then
+/// spawn `init_rns_lxmf`. AppHandle is wrapped in a `TauriEmitter` and stashed
+/// in AppState before any background task can `emit_to_all`.
 pub async fn init_core(
     data_dir: std::path::PathBuf,
     app_handle: tauri::AppHandle,
-) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
-    // Windows may need to publish a fresh sibling during crash reconciliation.
-    // Establish roots before configuration or SQLite can hold live handles.
-    let storage_root = data_dir.clone();
-    tokio::task::spawn_blocking(move || lxmf::initialize_storage_namespace(&storage_root))
-        .await
-        .map_err(|_| std::io::Error::other("storage namespace task panicked"))??;
-    let config = config::DashboardConfig::from_env_and_defaults(data_dir.clone());
-
-    let data_dir_for_pool = data_dir.clone();
-    let db_pool = tokio::task::spawn_blocking(move || db::init_pool(&data_dir_for_pool))
-        .await
-        .expect("db task panicked")?;
-    let pool_for_schema = db_pool.clone();
-    db::spawn_db(pool_for_schema, |p| db::init_schema(&p))
-        .await
-        .expect("db task panicked")?;
+) -> Result<Arc<AppState>, StartupError> {
+    let (config, db_pool) = open_profile(data_dir.clone()).await?;
 
     let emitter: Arc<dyn ratspeak_core::Emitter> =
         Arc::new(emitter::TauriEmitter::new(app_handle.clone()));
     let notifier: Arc<dyn ratspeak_core::NativeNotifier> =
         Arc::new(notifier::TauriNotifier::new(app_handle));
-    let app_state = Arc::new(AppState::new(config.clone(), db_pool, emitter, notifier));
+    let app_state = Arc::new(AppState::new(config, db_pool, emitter, notifier));
     app_state.set_startup_stage("checking");
 
     // Relay typed BLE pairing/product events. Raw ble_diag strings are never
@@ -97,4 +95,97 @@ pub async fn init_core(
     });
 
     Ok(app_state)
+}
+
+/// Take the profile and open its database. Nothing is reconciled in a profile
+/// another process owns, and nothing is written to a newer Ratspeak's database.
+async fn open_profile(
+    data_dir: std::path::PathBuf,
+) -> Result<(config::DashboardConfig, db::DbPool), StartupError> {
+    // Windows may need to publish a fresh sibling during crash reconciliation.
+    // Establish roots before configuration or SQLite can hold live handles.
+    let storage_root = data_dir.clone();
+    tokio::task::spawn_blocking(move || lxmf::initialize_storage_namespace(&storage_root))
+        .await
+        .map_err(|_| StartupError::Storage)?
+        .map_err(|error| {
+            let in_use = error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<ratspeak_runtime::owner_lock::ProfileInUse>());
+            if in_use {
+                StartupError::ProfileInUse
+            } else {
+                StartupError::Storage
+            }
+        })?;
+    let config = config::DashboardConfig::from_env_and_defaults(data_dir.clone());
+
+    let db_pool = tokio::task::spawn_blocking(move || db::init_pool(&data_dir))
+        .await
+        .map_err(|_| StartupError::Storage)?
+        .map_err(|_| StartupError::Storage)?;
+    db::spawn_db(db_pool.clone(), |p| db::init_schema(&p))
+        .await
+        .map_err(|_| StartupError::Storage)?
+        .map_err(|error| match error.downcast_ref::<db::NewerSchema>() {
+            Some(newer) => StartupError::SchemaNewer {
+                found: newer.found,
+                supported: newer.supported,
+            },
+            None => StartupError::Storage,
+        })?;
+    Ok((config, db_pool))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_profile_another_process_owns_is_reported_in_use() {
+        let root = tempfile::tempdir().unwrap();
+        let other = std::fs::File::create(root.path().join(".ratspeak-host.lock")).unwrap();
+        rns_identity::persistence::try_lock_exclusive(&other).unwrap();
+
+        let error = open_profile(root.path().to_path_buf()).await.unwrap_err();
+        assert_eq!(error, StartupError::ProfileInUse);
+        assert!(!root.path().join(".ratspeak").exists());
+    }
+
+    #[tokio::test]
+    async fn a_database_from_a_newer_build_is_reported_with_both_versions() {
+        let root = tempfile::tempdir().unwrap();
+        lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let pool = db::init_pool(root.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        let supported: i64 = pool
+            .get()
+            .unwrap()
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute("UPDATE schema_version SET version = ?1", [supported + 1])
+            .unwrap();
+        drop(pool);
+
+        let error = open_profile(root.path().to_path_buf()).await.unwrap_err();
+        assert_eq!(
+            error,
+            StartupError::SchemaNewer {
+                found: supported + 1,
+                supported
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_that_cannot_hold_a_profile_is_a_storage_error() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("profile");
+        std::fs::write(&file, b"not a directory").unwrap();
+
+        let error = open_profile(file).await.unwrap_err();
+        assert_eq!(error, StartupError::Storage);
+    }
 }

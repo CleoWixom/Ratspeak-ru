@@ -101,6 +101,12 @@ function _rsWaitForInvoke() {
 }
 
 window.RS.invoke = function(name, args) {
+    // A core that could not start has no command state; its screen is static.
+    if (window.__RATSPEAK_STARTUP_ERROR__) {
+        var refused = new Error('Ratspeak could not start');
+        refused.code = 'startup_error';
+        return Promise.reject(refused);
+    }
     return _rsWaitForInvoke().then(function() {
         return window.__TAURI_INTERNALS__.invoke(name, args || {});
     }).catch(function(raw) {

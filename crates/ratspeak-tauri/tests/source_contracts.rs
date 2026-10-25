@@ -3791,6 +3791,67 @@ fn mobile_window_inspection_is_explicit_on_cold_start_and_reattachment() {
     assert!(shell.contains(".devtools(diagnostics_enabled() || developer_mode)"));
 }
 
+/// A core that cannot start manages no AppState, so no command can run. The
+/// window still opens, cold or reattached, and shows the failure.
+#[test]
+fn a_failed_start_shows_its_screen_without_command_state() {
+    let root = repo_root();
+    let shell = read_source(root.join("src-tauri/src/lib.rs")).expect("app shell");
+
+    assert!(!shell.contains("Failed to start Ratspeak core"));
+    let setup = shell.split(".setup(|app| {").nth(1).expect("setup closure");
+    let failure = setup
+        .find("Err(error) => {")
+        .expect("startup failure branch");
+    let managed = setup
+        .find("app.manage(error);")
+        .expect("startup failure is managed for the window");
+    let window = setup
+        .find("let window = main_window_builder(&handle);")
+        .expect("main window");
+    assert!(failure < managed && managed < window);
+
+    let builder = shell
+        .split("fn main_window_builder(")
+        .nth(1)
+        .expect("common window builder")
+        .split("#[cfg(target_os = \"linux\")]")
+        .next()
+        .unwrap();
+    assert!(builder.contains("try_state::<ratspeak_tauri::StartupError>()"));
+    assert!(builder.contains("window.__RATSPEAK_STARTUP_ERROR__ = "));
+
+    // Closing the screen quits instead of hiding a process that holds nothing.
+    let close = shell
+        .split("event: tauri::WindowEvent::CloseRequested { api, .. },")
+        .nth(1)
+        .and_then(|tail| tail.split("api.prevent_close();").next())
+        .expect("desktop close handler");
+    assert!(close.contains("try_state::<ratspeak_tauri::StartupError>()"));
+    assert!(close.contains(".is_none()"));
+}
+
+/// A profile on a filesystem that cannot lock opens with a warning beside the
+/// storage warning; the lock itself is covered by the runtime's tests.
+#[test]
+fn an_unenforced_profile_lock_is_shown_beside_the_storage_warning() {
+    let root = repo_root();
+    let system = read_source(root.join("crates/ratspeak-tauri/src/commands/system.rs"))
+        .expect("system commands");
+    let events =
+        read_source(root.join("dashboard/static/js/tauri_events.js")).expect("frontend events");
+
+    let progress = system
+        .split("pub async fn api_startup_progress(")
+        .nth(1)
+        .and_then(|tail| tail.split("#[tauri::command]").next())
+        .expect("startup progress command");
+    assert!(progress.contains("\"storage_warning\": storage_warning("));
+    assert!(progress.contains("\"profile_lock_warning\": profile_lock_warning("));
+    assert!(system.contains("ratspeak_runtime::owner_lock::unenforced("));
+    assert!(events.contains("showToast(data.profile_lock_warning, 'toast-warning', 5000);"));
+}
+
 #[test]
 fn modal_action_footers_use_shared_dialog_buttons() {
     let root = repo_root();

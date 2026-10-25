@@ -830,4 +830,10 @@ pub ratspeak_tauri::window_prefs::SessionEnv::wayland_session: bool
 pub fn ratspeak_tauri::window_prefs::desktop_names_indicate_tiling(core::option::Option<&str>, core::option::Option<&str>) -> bool
 pub fn ratspeak_tauri::window_prefs::detect_session_env() -> ratspeak_tauri::window_prefs::SessionEnv
 pub fn ratspeak_tauri::window_prefs::resolve_window_decorations(ratspeak_tauri::window_prefs::DecorationsPref, ratspeak_tauri::window_prefs::SessionEnv) -> bool
-pub async fn ratspeak_tauri::init_core(std::path::PathBuf, tauri::app::AppHandle) -> core::result::Result<alloc::sync::Arc<ratspeak_runtime::state::AppState>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
+pub enum ratspeak_tauri::StartupError
+pub ratspeak_tauri::StartupError::ProfileInUse
+pub ratspeak_tauri::StartupError::SchemaNewer
+pub ratspeak_tauri::StartupError::SchemaNewer::found: i64
+pub ratspeak_tauri::StartupError::SchemaNewer::supported: i64
+pub ratspeak_tauri::StartupError::Storage
+pub async fn ratspeak_tauri::init_core(std::path::PathBuf, tauri::app::AppHandle) -> core::result::Result<alloc::sync::Arc<ratspeak_runtime::state::AppState>, ratspeak_tauri::StartupError>

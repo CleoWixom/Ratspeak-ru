@@ -9,8 +9,61 @@ function showConnectionSummary() {
     connectionWatcher = null;
 }
 
+// Shown in place of the app when the core could not start. It is static: no
+// command state exists, so nothing here may invoke.
+var _RS_STARTUP_ERROR_COPY = {
+    profile_in_use: {
+        title: 'Ratspeak is already open',
+        message: 'Another Ratspeak app is using this data. Quit it, then open Ratspeak again.'
+    },
+    schema_newer: {
+        title: 'Update Ratspeak',
+        message: 'This data was saved by a newer version of Ratspeak. Install the latest version to open it.'
+    },
+    storage: {
+        title: "Ratspeak can't open its data",
+        message: 'Restart Ratspeak. If this keeps happening, make sure this device has free space.'
+    }
+};
+
+function _rsShowStartupError(failure) {
+    var copy = _RS_STARTUP_ERROR_COPY[failure.code] || _RS_STARTUP_ERROR_COPY.storage;
+    var overlay = document.createElement('div');
+    overlay.id = 'startup-error-overlay';
+    overlay.className = 'hw-unlock-overlay';
+    overlay.setAttribute('role', 'alert');
+    overlay.style.display = 'flex';
+    var card = document.createElement('div');
+    card.className = 'hw-unlock-card';
+    var icon = document.createElement('div');
+    icon.className = 'hw-unlock-icon';
+    icon.innerHTML = '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" ' +
+        'stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 6.5v7m0 4v.01"/></svg>';
+    var title = document.createElement('div');
+    title.className = 'hw-unlock-title';
+    title.textContent = copy.title;
+    var message = document.createElement('div');
+    message.className = 'hw-unlock-sub';
+    message.textContent = copy.message;
+    card.appendChild(icon);
+    card.appendChild(title);
+    card.appendChild(message);
+    if (failure.code === 'schema_newer') {
+        var detail = document.createElement('div');
+        detail.className = 'inline-hint-sm font-mono';
+        detail.textContent = 'Data version ' + failure.found + ', supported up to ' + failure.supported;
+        card.appendChild(detail);
+    }
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+}
+
 // One-shot bootstrap; subsequent updates arrive via push events.
 function _rsBootstrapOnLoad() {
+    if (window.__RATSPEAK_STARTUP_ERROR__) {
+        _rsShowStartupError(window.__RATSPEAK_STARTUP_ERROR__);
+        return;
+    }
     // Race-free check for a locked protected identity at boot (the
     // hardware_locked event can fire before this listener attaches).
     RS.invoke('api_startup_progress').then(function(data) {
@@ -19,6 +72,9 @@ function _rsBootstrapOnLoad() {
         }
         if (data && data.storage_warning && typeof showToast === 'function') {
             showToast(data.storage_warning, 'toast-warning', 5000);
+        }
+        if (data && data.profile_lock_warning && typeof showToast === 'function') {
+            showToast(data.profile_lock_warning, 'toast-warning', 5000);
         }
     }).catch(function() {});
     if (window.RS && RS.audioPlayback && typeof RS.audioPlayback.installUnlock === 'function') {
