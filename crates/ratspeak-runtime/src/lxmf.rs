@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 use lxmf_core::admission::{AdmissionEpochs, DownloadedPropagationMessage, SuppressionLedger};
 use lxmf_core::constants::{
-    DELIVERY_RETRY_WAIT, MAX_DELIVERY_ATTEMPTS, MAX_PATHLESS_TRIES, PATH_REQUEST_WAIT,
-    STRUCT_OVERHEAD, TIMESTAMP_SIZE,
+    DELIVERY_RETRY_WAIT, ENCRYPTED_PACKET_MAX_CONTENT, MAX_DELIVERY_ATTEMPTS, MAX_PATHLESS_TRIES,
+    PATH_REQUEST_WAIT, STRUCT_OVERHEAD, TIMESTAMP_SIZE,
 };
 use lxmf_core::delivery_ratchet::{
     DeliveryAnnounceKind, DeliveryRatchetError, DeliveryRatchetState,
@@ -56,7 +56,6 @@ pub const COMPACT_AUDIO_FILE_NAME: &str = "Voice message.c2raw";
 // MessagePack bin8 representation is marker + u8 length + 32 stamp bytes; the
 // surrounding fixarray marker remains one byte when the payload grows 4 -> 5.
 const MAX_DEFERRED_STAMP_WIRE_BYTES: usize = 2 + lxmf_core::constants::STAMP_SIZE;
-const OPPORTUNISTIC_MAX_CONTENT_BYTES: usize = 295;
 const AUTO_PROPAGATION_CHECK_INTERVAL_SECS: f64 = 5.0 * 60.0;
 const BACKCHANNEL_COMMAND_BUFFER: usize = 64;
 mod packet_delivery;
@@ -872,7 +871,7 @@ fn normalize_protocol_delivery_method(msg: &mut impl OutboundMessageView) {
         && let Ok(packed_len) = msg.packed_len()
     {
         let content_size = packed_len.saturating_sub(96 + TIMESTAMP_SIZE + STRUCT_OVERHEAD);
-        if content_size > OPPORTUNISTIC_MAX_CONTENT_BYTES {
+        if content_size > ENCRYPTED_PACKET_MAX_CONTENT {
             msg.method = DeliveryMethod::Direct;
         }
     }
@@ -11289,7 +11288,7 @@ mod tests {
     fn oversized_opportunistic_payload_normalizes_to_direct() {
         let mut mgr = test_manager();
         let dest = "cccccccccccccccccccccccccccccccc";
-        let content = "x".repeat(OPPORTUNISTIC_MAX_CONTENT_BYTES + 512);
+        let content = "x".repeat(ENCRYPTED_PACKET_MAX_CONTENT + 512);
         let mut msg = mgr
             .create_final_message(dest, &content, "", DeliveryMethod::Opportunistic)
             .unwrap();
@@ -11305,7 +11304,7 @@ mod tests {
         let mut mgr = test_manager();
         let identity_id = mgr.identity_hash.clone();
         let dest = "cd".repeat(16);
-        let content = "x".repeat(OPPORTUNISTIC_MAX_CONTENT_BYTES + 512);
+        let content = "x".repeat(ENCRYPTED_PACKET_MAX_CONTENT + 512);
 
         let queued = mgr
             .send_message_with_preference_report(MessageSendRequest {
@@ -11324,6 +11323,45 @@ mod tests {
             db::get_message_delivery_method(&pool, &queued.message_id, &identity_id).as_deref(),
             Some("direct")
         );
+    }
+
+    #[test]
+    fn opportunistic_content_over_one_encrypted_packet_is_recorded_as_direct() {
+        // Content size as the method choice measures it, stamp room included.
+        fn measured(mgr: &mut LxmfManager, dest: &str, len: usize) -> usize {
+            let msg = mgr
+                .create_message(dest, &"x".repeat(len), "", DeliveryMethod::Opportunistic)
+                .unwrap();
+            OutboundMessageView::packed_len(&msg).unwrap() - (96 + TIMESTAMP_SIZE + STRUCT_OVERHEAD)
+        }
+        let pool = test_pool();
+        let mut mgr = test_manager();
+        let identity_id = mgr.identity_hash.clone();
+        let dest = "ce".repeat(16);
+        for (size, method) in [(287_usize, "opportunistic"), (288, "direct")] {
+            let estimate = (2 * size).saturating_sub(measured(&mut mgr, &dest, size));
+            let len = (estimate.saturating_sub(2)..=estimate + 2)
+                .find(|&len| measured(&mut mgr, &dest, len) == size)
+                .expect("content of the measured size");
+
+            let queued = mgr
+                .send_message_with_preference_report(MessageSendRequest {
+                    dest_hash_hex: &dest,
+                    content: &"x".repeat(len),
+                    title: "",
+                    db_pool: &pool,
+                    identity_id: &identity_id,
+                    preference: DeliveryPreference::Opportunistic,
+                    profile: DeliveryProfile::Message,
+                })
+                .unwrap();
+
+            assert_eq!(
+                db::get_message_delivery_method(&pool, &queued.message_id, &identity_id).as_deref(),
+                Some(method),
+                "content of {size} bytes"
+            );
+        }
     }
 
     #[test]
