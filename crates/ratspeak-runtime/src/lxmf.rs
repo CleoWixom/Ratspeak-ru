@@ -1499,12 +1499,10 @@ pub fn contact_card_public_key_from_profile(data_dir: &Path, hash_hex: &str) -> 
     }
 
     let id_file = data_dir.join("identities").join(hash_hex).join("identity");
-    std::fs::read(id_file).ok().and_then(|key_bytes| {
-        Identity::from_private_key(&key_bytes)
-            .ok()
-            .filter(|identity| hex::encode(identity.hash) == hash_hex)
-            .map(|identity| identity.get_public_key())
-    })
+    bounded_plain_identity_from_file(&id_file)
+        .ok()
+        .filter(|identity| hex::encode(identity.hash) == hash_hex)
+        .map(|identity| identity.get_public_key())
 }
 
 #[cfg(feature = "seed")]

@@ -5,6 +5,7 @@
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use zeroize::Zeroizing;
@@ -703,28 +704,55 @@ pub fn read_vault(path: &Path) -> Result<EncryptedVault, VaultError> {
     ValidatedVault::new(&v)?;
     Ok(v)
 }
+/// Reads a secret file of at most `max_len` bytes into one buffer allocated
+/// up front and wiped on drop, so neither growth nor a refused file leaves a
+/// copy behind. `None` when the file does not exist.
+fn read_secret_file(path: &Path, max_len: usize) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut data = Zeroizing::new(vec![0u8; max_len + 1]);
+    let mut filled = 0;
+    while filled < data.len() {
+        match file.read(&mut data[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if filled > max_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {max_len}-byte limit"),
+        ));
+    }
+    data.truncate(filled);
+    Ok(Some(data))
+}
+/// A plain identity file holds the raw 64-byte key; larger files are refused
+/// after reading at most this much.
+const PLAIN_IDENTITY_MAX_BYTES: usize = 1024;
 pub fn read_plain_identity_key(path: &Path) -> Result<Zeroizing<[u8; 64]>, VaultError> {
-    let bytes = Zeroizing::new(
-        read_file_bounded(path, 64)
-            .map_err(io_error)?
-            .ok_or_else(|| VaultError::Io("identity not found".into()))?,
-    );
-    let key: [u8; 64] = bytes.as_slice().try_into().map_err(|_| {
+    let bytes = read_secret_file(path, PLAIN_IDENTITY_MAX_BYTES)
+        .map_err(io_error)?
+        .ok_or_else(|| VaultError::Io("identity not found".into()))?;
+    let key = Zeroizing::new(<[u8; 64]>::try_from(bytes.as_slice()).map_err(|_| {
         VaultError::InvalidFormat("private identity must be exactly 64 bytes".into())
-    })?;
-    Identity::from_private_key(&key)
+    })?);
+    Identity::from_private_key(&key[..])
         .map_err(|_| VaultError::InvalidFormat("private identity".into()))?;
-    Ok(Zeroizing::new(key))
+    Ok(key)
 }
 fn read_seed(path: &Path) -> Result<Option<Zeroizing<String>>, VaultError> {
-    read_file_bounded(path, MAX_SEED_BYTES)
+    read_secret_file(path, MAX_SEED_BYTES)
         .map_err(io_error)?
         .map(|bytes| {
-            let value = Zeroizing::new(
-                String::from_utf8(bytes)
-                    .map_err(|_| VaultError::InvalidFormat("seed utf8".into()))?,
-            );
-            Ok(Zeroizing::new(value.trim().to_string()))
+            let phrase = std::str::from_utf8(&bytes)
+                .map_err(|_| VaultError::InvalidFormat("seed utf8".into()))?;
+            Ok(Zeroizing::new(phrase.trim().to_string()))
         })
         .transpose()
 }
