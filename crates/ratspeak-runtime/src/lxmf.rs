@@ -52,10 +52,6 @@ const MAX_LXMF_RESOURCE_BYTES: usize = rns_protocol::resource::MAX_RESOURCE_SIZE
 pub const MAX_AUDIO_FIELD_BYTES: usize = 1_000_000;
 pub const AUDIO_MESSAGE_FILE_NAME: &str = "Voice message.opus";
 pub const COMPACT_AUDIO_FILE_NAME: &str = "Voice message.c2raw";
-// A deferred PoW stamp can still be attached after semantic submission. Its
-// MessagePack bin8 representation is marker + u8 length + 32 stamp bytes; the
-// surrounding fixarray marker remains one byte when the payload grows 4 -> 5.
-const MAX_DEFERRED_STAMP_WIRE_BYTES: usize = 2 + lxmf_core::constants::STAMP_SIZE;
 const AUTO_PROPAGATION_CHECK_INTERVAL_SECS: f64 = 5.0 * 60.0;
 const BACKCHANNEL_COMMAND_BUFFER: usize = 64;
 mod packet_delivery;
@@ -792,11 +788,25 @@ impl OutboundMessageView for SignedLxMessage {
         self.message_id()
     }
     fn packed_len(&self) -> Result<usize, MessageError> {
-        self.packed_len().and_then(|n| {
-            n.checked_add(MAX_DEFERRED_STAMP_WIRE_BYTES)
-                .ok_or_else(|| MessageError::PackFailed("wire size overflow".into()))
-        })
+        finalized_packed_len(self)
     }
+}
+
+/// The wire length `msg` has once finalized with its recipient stamp, which
+/// `finalize` derives from the same signed inputs. As in Python's `pack()`, the
+/// stamp is one more bin8 element: marker, length, and a ticket's 16-byte hash
+/// or a 32-byte proof of work. The payload's fixarray marker stays one byte.
+fn finalized_packed_len(msg: &SignedLxMessage) -> Result<usize, MessageError> {
+    let stamp = if msg.outbound_ticket().is_some() {
+        2 + lxmf_core::constants::TICKET_LENGTH
+    } else if msg.stamp_cost().is_some() {
+        2 + lxmf_core::constants::STAMP_SIZE
+    } else {
+        0
+    };
+    msg.packed_len()?
+        .checked_add(stamp)
+        .ok_or_else(|| MessageError::PackFailed("wire size overflow".into()))
 }
 
 fn message_within_resource_limit(msg: &impl OutboundMessageView) -> bool {
@@ -2917,12 +2927,8 @@ impl LxmfManager {
             .sign_with(|bytes| identity.sign(bytes).ok_or("identity signing unavailable"))
             .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         normalize_protocol_delivery_method(&mut msg);
-        let packed_len = msg
-            .packed_len()
-            .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
-        let packed_len = packed_len
-            .checked_add(MAX_DEFERRED_STAMP_WIRE_BYTES)
-            .ok_or(LxmfSubmissionFailure::PreparationFailed)?;
+        let packed_len =
+            finalized_packed_len(&msg).map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         if let Err(error) = validate_attachment_envelope_size(packed_len) {
             tracing::warn!(
                 packed_len,
@@ -3066,12 +3072,8 @@ impl LxmfManager {
             .sign_with(|bytes| identity.sign(bytes).ok_or("identity signing unavailable"))
             .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         normalize_protocol_delivery_method(&mut msg);
-        let packed_len = msg
-            .packed_len()
-            .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
-        let packed_admission_len = packed_len
-            .checked_add(MAX_DEFERRED_STAMP_WIRE_BYTES)
-            .ok_or(LxmfSubmissionFailure::PreparationFailed)?;
+        let packed_admission_len =
+            finalized_packed_len(&msg).map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         validate_audio_message_size(packed_admission_len)?;
         if audio_mode == lxmf_core::constants::AM_CODEC2_700C && packed_admission_len > 3_659 {
             return Err(LxmfSubmissionFailure::ResourceLimitExceeded {
@@ -11325,30 +11327,151 @@ mod tests {
         );
     }
 
-    #[test]
-    fn opportunistic_content_over_one_encrypted_packet_is_recorded_as_direct() {
-        // Content size as the method choice measures it, stamp room included.
-        fn measured(mgr: &mut LxmfManager, dest: &str, len: usize) -> usize {
-            let msg = mgr
-                .create_message(dest, &"x".repeat(len), "", DeliveryMethod::Opportunistic)
+    /// Python LXMF's own `pack()` decisions on either side of the fallback to
+    /// direct delivery, with no stamp, a ticket stamp and a proof of work
+    /// (`tools/generate-lxmf-opportunistic-golden.py`).
+    fn opportunistic_golden() -> Value {
+        let golden: Value =
+            serde_json::from_str(include_str!("../testdata/lxmf-opportunistic-golden.json"))
                 .unwrap();
-            OutboundMessageView::packed_len(&msg).unwrap() - (96 + TIMESTAMP_SIZE + STRUCT_OVERHEAD)
+        assert_eq!(
+            golden["encrypted_packet_max_content"],
+            ENCRYPTED_PACKET_MAX_CONTENT
+        );
+        golden
+    }
+
+    /// The recipient stamp inputs of a golden case on a message being drafted.
+    fn golden_stamp(golden: &Value, case: &Value) -> (Option<[u8; 16]>, Option<u8>) {
+        match case["stamp"].as_str().unwrap() {
+            "none" => (None, None),
+            "ticket" => (Some([0x5A; 16]), None),
+            "proof_of_work" => (None, Some(golden["stamp_cost"].as_u64().unwrap() as u8)),
+            other => panic!("unknown stamp {other}"),
         }
+    }
+
+    #[test]
+    fn the_stamp_room_is_what_finalization_attaches() {
+        let ticket = Some([0x5A; 16]);
+        for (outbound_ticket, stamp_cost) in [
+            (None, None),
+            (ticket, None),
+            (None, Some(0)),
+            (ticket, Some(8)),
+        ] {
+            let mut draft = LxMessageDraft::new(
+                [0x11; 16],
+                [0x22; 16],
+                "",
+                "hello",
+                DeliveryMethod::Opportunistic,
+            )
+            .unwrap();
+            draft.outbound_ticket = outbound_ticket;
+            draft.stamp_cost = stamp_cost;
+            let msg = draft
+                .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                    &[7; 32],
+                ))
+                .unwrap();
+            let predicted = OutboundMessageView::packed_len(&msg).unwrap();
+            let stamp = msg.generate_recipient_stamp().unwrap();
+            assert_eq!(
+                msg.finalize(stamp).unwrap().packed_len().unwrap(),
+                predicted,
+                "ticket {outbound_ticket:?}, stamp cost {stamp_cost:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_opportunistic_fallback_matches_python_for_each_stamp() {
+        let golden = opportunistic_golden();
+        for case in golden["cases"].as_array().unwrap() {
+            let length = case["content_length"].as_u64().unwrap() as usize;
+            let mut draft = LxMessageDraft::new(
+                [0x11; 16],
+                [0x22; 16],
+                golden["title"].as_str().unwrap(),
+                &"x".repeat(length),
+                DeliveryMethod::Opportunistic,
+            )
+            .unwrap();
+            (draft.outbound_ticket, draft.stamp_cost) = golden_stamp(&golden, case);
+            let mut msg = draft
+                .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                    &[7; 32],
+                ))
+                .unwrap();
+            assert_eq!(
+                msg.packed_len().unwrap() as u64,
+                case["unstamped_packed_size"].as_u64().unwrap(),
+                "{case}"
+            );
+
+            normalize_protocol_delivery_method(&mut msg);
+
+            assert_eq!(
+                delivery_method_name(msg.method),
+                case["method"].as_str().unwrap(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn opportunistic_sends_are_recorded_as_python_sends_them() {
+        // A title and content that make this manager's message, before its
+        // stamp, `size` bytes on the wire.
+        fn sized(mgr: &mut LxmfManager, dest: &str, size: usize) -> (String, String) {
+            let mut wire = |title: usize, content: usize| {
+                mgr.create_message(
+                    dest,
+                    &"x".repeat(content),
+                    &"t".repeat(title),
+                    DeliveryMethod::Opportunistic,
+                )
+                .unwrap()
+                .packed_len()
+                .unwrap()
+            };
+            let estimate = (200 + size).saturating_sub(wire(0, 200));
+            (0..3)
+                .flat_map(|title| {
+                    (estimate.saturating_sub(3)..=estimate + 1).map(move |c| (title, c))
+                })
+                .find(|&(title, content)| wire(title, content) == size)
+                .map(|(title, content)| ("t".repeat(title), "x".repeat(content)))
+                .expect("a message of the golden size")
+        }
+        let golden = opportunistic_golden();
         let pool = test_pool();
-        let mut mgr = test_manager();
-        let identity_id = mgr.identity_hash.clone();
-        let dest = "ce".repeat(16);
-        for (size, method) in [(287_usize, "opportunistic"), (288, "direct")] {
-            let estimate = (2 * size).saturating_sub(measured(&mut mgr, &dest, size));
-            let len = (estimate.saturating_sub(2)..=estimate + 2)
-                .find(|&len| measured(&mut mgr, &dest, len) == size)
-                .expect("content of the measured size");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        for case in golden["cases"].as_array().unwrap() {
+            let mut mgr = test_manager();
+            let identity_id = mgr.identity_hash.clone();
+            let dest = [0xCE; 16];
+            let dest_hex = hex::encode(dest);
+            match golden_stamp(&golden, case) {
+                (Some(token), _) => mgr
+                    .router
+                    .ticket_store
+                    .remember_outbound(lxmf_core::ticket::Ticket::new(token, dest, now + 3600.0)),
+                (None, Some(cost)) => mgr.router.set_stamp_cost(dest, cost),
+                (None, None) => {}
+            }
+            let size = case["unstamped_packed_size"].as_u64().unwrap() as usize;
+            let (title, content) = sized(&mut mgr, &dest_hex, size);
 
             let queued = mgr
                 .send_message_with_preference_report(MessageSendRequest {
-                    dest_hash_hex: &dest,
-                    content: &"x".repeat(len),
-                    title: "",
+                    dest_hash_hex: &dest_hex,
+                    content: &content,
+                    title: &title,
                     db_pool: &pool,
                     identity_id: &identity_id,
                     preference: DeliveryPreference::Opportunistic,
@@ -11358,8 +11481,8 @@ mod tests {
 
             assert_eq!(
                 db::get_message_delivery_method(&pool, &queued.message_id, &identity_id).as_deref(),
-                Some(method),
-                "content of {size} bytes"
+                case["method"].as_str(),
+                "{case}"
             );
         }
     }
@@ -11572,7 +11695,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_stamp_reserve_matches_actual_packed_lxm_at_efficient_boundary() {
+    fn the_stamp_room_matches_the_stamped_message_at_the_efficient_boundary() {
         fn message_with_audio_len(audio_len: usize) -> SignedLxMessage {
             let mut message = lxmf_core::message::LxMessageDraft::new(
                 [0x11; 16],
@@ -11585,6 +11708,8 @@ mod tests {
             message
                 .set_audio_field(lxmf_core::constants::AM_OPUS_OGG, &vec![0; audio_len])
                 .unwrap();
+            // A recipient that asks for a proof-of-work stamp.
+            message.stamp_cost = Some(8);
             message
                 .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
                     &[7; 32],
@@ -11594,45 +11719,40 @@ mod tests {
 
         let limit = rns_protocol::resource::MAX_EFFICIENT_SIZE;
         let mut audio_len = limit - 512;
-        let unstamped = loop {
+        let at_limit = loop {
             let message = message_with_audio_len(audio_len);
-            let packed_len = message.packed_len().unwrap();
-            let predicted = packed_len + MAX_DEFERRED_STAMP_WIRE_BYTES;
+            let predicted = finalized_packed_len(&message).unwrap();
             match predicted.cmp(&limit) {
                 std::cmp::Ordering::Equal => break message,
                 std::cmp::Ordering::Less => audio_len += limit - predicted,
                 std::cmp::Ordering::Greater => audio_len -= predicted - limit,
             }
         };
-        let unstamped_len = unstamped.packed_len().unwrap();
-        assert_eq!(unstamped_len + MAX_DEFERRED_STAMP_WIRE_BYTES, limit);
-
-        let stamped = unstamped
-            .finalize(Some(lxmf_core::message::RecipientStamp::ProofOfWork(
-                [0x44; 32],
-            )))
-            .unwrap();
-        assert_eq!(stamped.packed_len().unwrap(), limit);
         assert_eq!(
-            validate_audio_message_size(unstamped_len + MAX_DEFERRED_STAMP_WIRE_BYTES),
+            validate_audio_message_size(finalized_packed_len(&at_limit).unwrap()),
             Err(LxmfSubmissionFailure::ResourceLimitExceeded {
                 actual_bytes: limit,
                 limit_bytes: limit,
             })
         );
+        let stamped = at_limit
+            .finalize(Some(lxmf_core::message::RecipientStamp::ProofOfWork(
+                [0x44; 32],
+            )))
+            .unwrap();
+        assert_eq!(stamped.packed_len().unwrap(), limit);
 
         let below = message_with_audio_len(audio_len - 1);
-        let below_unstamped_len = below.packed_len().unwrap();
+        assert_eq!(
+            validate_audio_message_size(finalized_packed_len(&below).unwrap()),
+            Ok(())
+        );
         let below = below
             .finalize(Some(lxmf_core::message::RecipientStamp::ProofOfWork(
                 [0x55; 32],
             )))
             .unwrap();
         assert_eq!(below.packed_len().unwrap(), limit - 1);
-        assert_eq!(
-            validate_audio_message_size(below_unstamped_len + MAX_DEFERRED_STAMP_WIRE_BYTES),
-            Ok(())
-        );
     }
 
     #[test]
@@ -12300,7 +12420,7 @@ mod tests {
         let field = message.audio_field().unwrap().unwrap();
         assert_eq!(field.mode, 3);
         assert_eq!(field.bytes, audio);
-        assert!(message.packed_len().unwrap() + MAX_DEFERRED_STAMP_WIRE_BYTES <= 3659);
+        assert!(message.packed_len().unwrap() <= 3659);
         let rows = db::get_conversation(&pool, &dest, "me", 10);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["id"], queued.message_id);
