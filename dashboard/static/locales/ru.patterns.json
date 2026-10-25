@@ -1,6 +1,7 @@
 {
  "+{0} more in local history": "+{0} ещё в локальной истории",
  "[Alert] {0}": "[Оповещение] {0}",
+ "Added {0} contacts and {1} connections": "Добавлено: {0:контакт|контакта|контактов} и {1:подключение|подключения|подключений}",
  "Allow Nearby devices for Ratspeak in Android settings so it can connect to the RNode.": "Разрешите «Устройства поблизости» для Ratspeak в настройках Android, чтобы он мог подключиться к RNode.",
  "Another program, such as rnodeconf, a serial monitor or another Reticulum instance, is using this radio. Close it and Ratspeak connects.": "Другая программа, например rnodeconf, монитор последовательного порта или другой экземпляр Reticulum, использует это радио. Закройте её, и Ratspeak подключится.",
  "Ban {0} from {1}? Every current session will leave the channel, and rejoining will be blocked.": "Забанить {0} в {1}? Все текущие сеансы покинут канал, а повторное присоединение будет заблокировано.",
@@ -47,6 +48,7 @@
  "Member details for {0}": "Сведения об участнике {0}",
  "Message from {0}": "Сообщение от {0}",
  "Messages{0}": "Сообщения{0}",
+ "Not added: {0}{1}": "Не добавлено: {0}{1}",
  "Nothing is attached at this interface's port. Check that the RNode is plugged in, and edit the interface if its port name changed. Ratspeak keeps trying.": "К порту этого интерфейса ничего не подключено. Проверьте, что RNode подключён, и измените интерфейс, если имя порта изменилось. Ratspeak продолжает попытки.",
  "Offline Inbox check failed: {0}": "Проверка офлайн-входящих не удалась: {0}",
  "Offline Inbox error: {0}": "Ошибка офлайн-входящих: {0}",
@@ -112,5 +114,7 @@
  "{0}m ago": "{0} мин назад",
  "{0}h ago": "{0} ч назад",
  "{0}d ago": "{0} д назад",
- "On": "Вкл."
+ "On": "Вкл.",
+ "Add {0} contacts and {1} connections? Entries that already exist are skipped.": "Добавить {0:контакт|контакта|контактов} и {1:подключение|подключения|подключений}? Уже существующие записи будут пропущены.",
+ "Contacts: {0}. Connections: {1}. The file is not encrypted.": "Контактов: {0}. Подключений: {1}. Файл не шифруется."
 }

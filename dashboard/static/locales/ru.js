@@ -93,6 +93,7 @@ window.RATSPEAK_I18N = {
  "Add Connection": "Добавить соединение",
  "Add contact": "Добавить контакт",
  "Add Contact": "Добавить контакт",
+ "Add contacts and Internet/TCP connections from a file. Existing ones are kept.": "Добавить контакты и подключения Интернет/TCP из файла. Уже существующие остаются без изменений.",
  "Add Hardware Identity": "Добавить аппаратную идентичность",
  "Add LoRa Device": "Добавить LoRa-устройство",
  "Add Radio": "Добавить радио",
@@ -156,6 +157,7 @@ window.RATSPEAK_I18N = {
  "Answer": "Ответить",
  "Answer call": "Принять звонок",
  "Answering": "Ответ",
+ "Anyone who has the file can read them. Without them, connections are imported without their IFAC passphrase.": "Любой, у кого есть файл, сможет их прочитать. Без них подключения импортируются без парольной фразы IFAC.",
  "App event": "Событие приложения",
  "App event delivery failed": "Не удалось доставить событие приложения",
  "App version": "Версия приложения",
@@ -493,6 +495,7 @@ window.RATSPEAK_I18N = {
  "Contact name:": "Имя контакта:",
  "Contacting GitHub...": "Связь с GitHub...",
  "Contacts": "Контакты",
+ "Contacts and connections saved": "Контакты и подключения сохранены",
  "Contacts, messages, games, and all other data will be permanently deleted.": "Контакты, сообщения, игры и все остальные данные будут удалены безвозвратно.",
  "Contains a secret. Only paste from an app you trust.": "Содержит секрет. Вставляйте только из приложения, которому доверяете.",
  "Continue": "Продолжить",
@@ -563,10 +566,12 @@ window.RATSPEAK_I18N = {
  "Could not encrypt identity with PIN": "Не удалось зашифровать идентичность PIN-кодом",
  "Could not end channel session": "Не удалось завершить сеанс канала",
  "Could not enumerate interfaces.": "Не удалось перечислить интерфейсы.",
+ "Could not export contacts and connections": "Не удалось экспортировать контакты и подключения",
  "Could not export the identity": "Не удалось экспортировать идентичность",
  "Could not finish the voice message.": "Не удалось завершить голосовое сообщение.",
  "Could not hang up call": "Не удалось завершить звонок",
  "Could not import the identity": "Не удалось импортировать идентичность",
+ "Could not import this file": "Не удалось импортировать этот файл",
  "Could not join this channel.": "Не удалось присоединиться к этому каналу.",
  "Could not leave channel": "Не удалось покинуть канал",
  "Could not load": "Не удалось загрузить",
@@ -846,6 +851,8 @@ window.RATSPEAK_I18N = {
  "Export": "Экспорт",
  "Export active identity": "Экспорт активной идентичности",
  "Export cancelled": "Экспорт отменён",
+ "Export Contacts & Connections": "Экспорт контактов и подключений",
+ "Export contacts and connections": "Экспорт контактов и подключений",
  "Export failed": "Не удалось экспортировать",
  "Export Identity": "Экспорт идентичности",
  "Export Identity Backup": "Экспорт резервной копии идентичности",
@@ -1067,9 +1074,13 @@ window.RATSPEAK_I18N = {
  "Import a raw, base32, base64, or hex Reticulum private identity key.": "Импортировать приватный ключ идентичности Reticulum в формате raw, base32, base64 или hex.",
  "Import access configuration": "Импорт конфигурации доступа",
  "Import cancelled": "Импорт отменён",
+ "Import Contacts & Connections": "Импорт контактов и подключений",
+ "Import contacts and connections": "Импорт контактов и подключений",
+ "Import finished with errors": "Импорт завершён с ошибками",
  "Import Identity": "Импорт идентичности",
  "Import or Restore Identity": "Импорт или восстановление идентичности",
  "Import or restore identity": "Импорт или восстановление идентичности",
+ "Importing…": "Импорт…",
  "In a moderated channel, this identity will no longer be able to post.": "В модерируемом канале эта идентичность больше не сможет писать.",
  "In call": "В звонке",
  "in progress": "выполняется",
@@ -1080,6 +1091,7 @@ window.RATSPEAK_I18N = {
  "Inbox node hash (hex):": "Хеш узла входящих (hex):",
  "inbox nodes. Lower-ranked nodes are still tracked.": "узлов входящих. Узлы с меньшим рангом по-прежнему отслеживаются.",
  "Inbox storage is not ready.": "Хранилище входящих не готово.",
+ "Include IFAC passphrases": "Включить парольные фразы IFAC",
  "Incoming call": "Входящий звонок",
  "Incoming message": "Входящее сообщение",
  "Incorrect PIN —": "Неверный PIN —",
@@ -1498,6 +1510,7 @@ window.RATSPEAK_I18N = {
  "Not your turn": "Сейчас не ваш ход",
  "Nothing is attached at this interface's port. Check that the RNode is": "К порту этого интерфейса ничего не подключено. Проверьте, что RNode подключён, и измените интерфейс, если имя порта изменилось. Ratspeak продолжает попытки.",
  "Nothing is sent automatically. Ratspeak will prepare an email containing the details above for you to review.": "Ничего не отправляется автоматически. Ratspeak подготовит письмо с указанными выше сведениями для вашей проверки.",
+ "Nothing new to import: everything in the file is already here": "Нечего импортировать: всё из файла уже есть",
  "Nothing to purge — all blocks are verified.": "Очищать нечего — все блокировки подтверждены.",
  "Nothing to review yet.": "Проверять пока нечего.",
  "Notice accepted and relayed": "Уведомление принято и передано",
@@ -1945,6 +1958,7 @@ window.RATSPEAK_I18N = {
  "Save pending": "Сохранение в ожидании",
  "Save prompt opened for": "Открыт диалог сохранения для",
  "Save timed out": "Время сохранения истекло",
+ "Save your contacts and all Internet/TCP connections to a file.": "Сохранить контакты и все подключения Интернет/TCP в файл.",
  "Saved": "Сохранено",
  "Saved access is read-only while stopped": "Сохранённый доступ доступен только для чтения, пока хаб остановлен",
  "Saved channel": "Сохранённый канал",
@@ -2188,6 +2202,10 @@ window.RATSPEAK_I18N = {
  "The draft changed. Your shared item is saved; open it again.": "Черновик изменился. Полученный элемент сохранён; откройте его снова.",
  "The durable registry is retrying this channel.": "Постоянный реестр повторяет попытку для этого канала.",
  "The existing key cannot be recovered. Replacing it invalidates the old key.": "Существующий ключ восстановить нельзя. Замена аннулирует старый ключ.",
+ "The file has an unsupported layout": "Структура файла не поддерживается",
+ "The file has too many entries": "В файле слишком много записей",
+ "The file is empty": "Файл пуст",
+ "The file is too large": "Файл слишком большой",
  "The hub did not confirm this join. Try again without reconnecting, or leave this channel.": "Хаб не подтвердил это присоединение. Повторите без переподключения или покиньте канал.",
  "The hub ended the authenticated Reticulum Link. The close signal carries no detailed reason.": "Хаб завершил аутентифицированный Reticulum Link. Сигнал закрытия не содержит подробной причины.",
  "The hub kept its response within one constrained packet": "Хаб уложил ответ в один ограниченный пакет",
@@ -2222,6 +2240,7 @@ window.RATSPEAK_I18N = {
  "Theme family": "Семейство тем",
  "Theme, haptics, and app preferences.": "Тема, тактильный отклик и настройки приложения.",
  "Theme, vibration, notifications, and blocks": "Тема, вибрация, уведомления и блокировки",
+ "There are no contacts or connections to export": "Нет контактов и подключений для экспорта",
  "These": "Эти",
  "These values come from the destination and authenticated Link, not from a share label.": "Эти значения берутся из назначения и аутентифицированного Link, а не из подписи ссылки.",
  "They resigned": "Они сдались",
@@ -2253,6 +2272,8 @@ window.RATSPEAK_I18N = {
  "This identity will be removed from your device completely, and can not be recovered. Are you sure you want to delete it?": "Эта идентичность будет полностью удалена с вашего устройства, и восстановить её будет нельзя. Вы уверены, что хотите её удалить?",
  "This image format cannot be resized here.": "Этот формат изображения нельзя уменьшить здесь.",
  "This image is too large to resize safely.": "Это изображение слишком велико для безопасного уменьшения.",
+ "This is not a Ratspeak contacts and connections file": "Это не файл контактов и подключений Ratspeak",
+ "This is not a Ratspeak contacts file": "Это не файл контактов Ratspeak",
  "This is the beginning of your encrypted conversation.": "Это начало вашего зашифрованного разговора.",
  "This is your LXMF identity, it's the address others use to message you.": "Это ваша LXMF-идентичность — адрес, по которому вам пишут другие.",
  "This is your only identity on this device. You can remove the local registration and return to setup; the YubiKey itself will not be erased.": "Это ваша единственная идентичность на этом устройстве. Вы можете удалить локальную регистрацию и вернуться к настройке; сам YubiKey не будет стёрт.",
@@ -2590,6 +2611,10 @@ window.RATSPEAK_I18N_PATTERNS = [
   "Удалить все активные сеансы {0} из {1}? Он сможет присоединиться снова, если его отдельно не забанить."
  ],
  [
+  "^Add\\ ([\\s\\S]*?)\\ contacts\\ and\\ ([\\s\\S]*?)\\ connections\\?\\ Entries\\ that\\ already\\ exist\\ are\\ skipped\\.$",
+  "Добавить {0:контакт|контакта|контактов} и {1:подключение|подключения|подключений}? Уже существующие записи будут пропущены."
+ ],
+ [
   "^Block\\ \"([\\s\\S]*?)\"\\?\\ Their\\ channel\\ messages\\ and\\ member\\ entry\\ will\\ be\\ hidden\\.$",
   "Заблокировать «{0}»? Его сообщения в каналах и запись в списке участников будут скрыты."
  ],
@@ -2600,6 +2625,10 @@ window.RATSPEAK_I18N_PATTERNS = [
  [
   "^Identity\\ imported,\\ but\\ the\\ local\\ PIN\\ could\\ not\\ be\\ set:\\ ([\\s\\S]*?)$",
   "Идентичность импортирована, но локальный PIN не удалось задать: {0}"
+ ],
+ [
+  "^Contacts:\\ ([\\s\\S]*?)\\.\\ Connections:\\ ([\\s\\S]*?)\\.\\ The\\ file\\ is\\ not\\ encrypted\\.$",
+  "Контактов: {0}. Подключений: {1}. Файл не шифруется."
  ],
  [
   "^Identity\\ restored,\\ but\\ the\\ PIN\\ could\\ not\\ be\\ set:\\ ([\\s\\S]*?)$",
@@ -2660,6 +2689,10 @@ window.RATSPEAK_I18N_PATTERNS = [
  [
   "^Coding\\ rate\\ must\\ be\\ between\\ ([\\s\\S]*?)\\ and\\ ([\\s\\S]*?)$",
   "Скорость кодирования должна быть от {0} до {1}"
+ ],
+ [
+  "^Added\\ ([\\s\\S]*?)\\ contacts\\ and\\ ([\\s\\S]*?)\\ connections$",
+  "Добавлено: {0:контакт|контакта|контактов} и {1:подключение|подключения|подключений}"
  ],
  [
   "^Could\\ not\\ complete\\ the\\ request:\\ ([\\s\\S]*?)$",
@@ -2816,6 +2849,10 @@ window.RATSPEAK_I18N_PATTERNS = [
  [
   "^Latest\\ ([\\s\\S]*?)\\ of\\ ([\\s\\S]*?)$",
   "Последние {0} из {1}"
+ ],
+ [
+  "^Not\\ added:\\ ([\\s\\S]*?)([\\s\\S]*?)$",
+  "Не добавлено: {0}{1}"
  ],
  [
   "^Switch\\ to\\ ([\\s\\S]*?)\\?$",

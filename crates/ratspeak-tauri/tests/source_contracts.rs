@@ -9585,6 +9585,21 @@ fn native_connection_links_prefill_forms_and_never_connect_on_their_own() {
     assert!(index.contains("/static/js/connection_qr.js"));
     assert!(health.contains("openConnectionQrShare(ifaceType, ifaceName)"));
 
+    // Contacts and connections backup lives in Settings -> Identity and only
+    // goes through the normal add commands.
+    let backup =
+        read_source(root.join("dashboard/static/js/contacts_backup.js")).expect("contacts backup");
+    assert!(index.contains("settings-export-contacts-btn"));
+    assert!(index.contains("settings-import-contacts-btn"));
+    assert!(index.contains("/static/js/contacts_backup.js"));
+    for command in [
+        "add_contact",
+        "add_tcp_connection",
+        "add_backbone_connection",
+    ] {
+        assert!(backup.contains(command), "import must use {command}");
+    }
+
     // A link pre-fills the normal forms. It must not call an add command.
     let presenter = modals
         .split("function _openTcpConnectionLink")

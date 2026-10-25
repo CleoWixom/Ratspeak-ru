@@ -4437,6 +4437,14 @@ body.setup-active .main-content {
     min-width: 0;
 }
 
+/* Notes under the QR code line up with the address block above them. */
+.contact-share-sheet .inline-warning,
+.contact-share-sheet .inline-hint {
+    margin: var(--space-4) var(--space-7) 0;
+    line-height: var(--type-leading-copy);
+    overflow-wrap: anywhere;
+}
+
 .contact-share-address-label {
     color: var(--text-muted);
     font-size: var(--text-xs);

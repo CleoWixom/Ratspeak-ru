@@ -1,0 +1,23 @@
+{
+"Export Contacts & Connections": "Экспорт контактов и подключений",
+"Save your contacts and all Internet/TCP connections to a file.": "Сохранить контакты и все подключения Интернет/TCP в файл.",
+"Import Contacts & Connections": "Импорт контактов и подключений",
+"Add contacts and Internet/TCP connections from a file. Existing ones are kept.": "Добавить контакты и подключения Интернет/TCP из файла. Уже существующие остаются без изменений.",
+"Export contacts and connections": "Экспорт контактов и подключений",
+"Import contacts and connections": "Импорт контактов и подключений",
+"Include IFAC passphrases": "Включить парольные фразы IFAC",
+"Anyone who has the file can read them. Without them, connections are imported without their IFAC passphrase.": "Любой, у кого есть файл, сможет их прочитать. Без них подключения импортируются без парольной фразы IFAC.",
+"There are no contacts or connections to export": "Нет контактов и подключений для экспорта",
+"Contacts and connections saved": "Контакты и подключения сохранены",
+"Could not export contacts and connections": "Не удалось экспортировать контакты и подключения",
+"Could not import this file": "Не удалось импортировать этот файл",
+"Import finished with errors": "Импорт завершён с ошибками",
+"Importing…": "Импорт…",
+"Nothing new to import: everything in the file is already here": "Нечего импортировать: всё из файла уже есть",
+"The file has an unsupported layout": "Структура файла не поддерживается",
+"The file has too many entries": "В файле слишком много записей",
+"The file is empty": "Файл пуст",
+"The file is too large": "Файл слишком большой",
+"This is not a Ratspeak contacts and connections file": "Это не файл контактов и подключений Ratspeak",
+"This is not a Ratspeak contacts file": "Это не файл контактов Ratspeak"
+}

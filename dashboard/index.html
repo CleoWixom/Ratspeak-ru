@@ -1004,6 +1004,7 @@
                 <button class="rs-dialog-confirm" id="identity-modal-confirm">Create</button>
             </div>
         </div>
+        <input type="file" id="contacts-backup-file-input" accept=".json,application/json,text/plain" style="display:none;">
         <input type="file" id="identity-file-input" accept=".rsi,.rniid,.key,.identity,.bin,application/json,application/octet-stream,text/plain" style="display:none;">
 
         <div class="bottom-sheet-overlay" id="hw-modal-overlay"></div>
@@ -1423,6 +1424,20 @@
                                     <span class="settings-row-desc">Export the active software identity as a Ratspeak backup or Reticulum key.</span>
                                 </div>
                                 <button class="selector-badge selector-badge-no-caret" id="settings-backup-identity-btn">Export</button>
+                            </div>
+                            <div class="settings-row">
+                                <div class="settings-row-info">
+                                    <span class="settings-row-label">Export Contacts &amp; Connections</span>
+                                    <span class="settings-row-desc">Save your contacts and all Internet/TCP connections to a file.</span>
+                                </div>
+                                <button class="selector-badge selector-badge-no-caret" id="settings-export-contacts-btn">Export</button>
+                            </div>
+                            <div class="settings-row">
+                                <div class="settings-row-info">
+                                    <span class="settings-row-label">Import Contacts &amp; Connections</span>
+                                    <span class="settings-row-desc">Add contacts and Internet/TCP connections from a file. Existing ones are kept.</span>
+                                </div>
+                                <button class="selector-badge selector-badge-no-caret" id="settings-import-contacts-btn">Import</button>
                             </div>
                             <div class="settings-row">
                                 <div class="settings-row-info">
@@ -2104,6 +2119,7 @@
 <script src="/static/js/voice_ringtones.js?v=ui-20260924-4"></script>
 <script src="/static/js/vendor/jsQR.js"></script>
 <script src="/static/js/contact_card.js?v=ui-20260924-4"></script>
+<script src="/static/js/contacts_backup.js?v=ui-20260924-4"></script>
 <script src="/static/js/connection_qr.js?v=ui-20260924-4"></script>
 <script src="/static/js/lxmf.js?v=ui-20260924-4"></script>
 <script src="/static/js/message_search.js?v=ui-20260924-4"></script>
