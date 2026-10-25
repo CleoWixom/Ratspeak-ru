@@ -2467,17 +2467,17 @@ pub async fn delete_conversation(
     let st: Arc<AppState> = Arc::clone(&state);
     let dh = dest_hash.clone();
     let id_c = identity_id.clone();
-    let total =
-        tokio::task::spawn_blocking(move || -> Result<i64, db::admission::AdmissionDbError> {
-            let _deletion = deletion;
+    let (total, files) = tokio::task::spawn_blocking(move || {
+        let _deletion = deletion;
+        let deleted =
             ratspeak_runtime::propagation_recovery::delete_messages(&st, &id_c, Some(&dh))?;
-            st.invalidate_conversation_lists();
-            let counts = db::get_all_unread_counts(&st.db, &id_c);
-            Ok(counts.values().sum())
-        })
-        .await
-        .map_err(|_| AppError::internal("message deletion worker failed"))?
-        .map_err(|error| AppError::database_unavailable(error.to_string()))?;
+        let files = deleted.remove_files();
+        let total: i64 = db::get_all_unread_counts(&st.db, &id_c).values().sum();
+        Ok::<_, db::admission::AdmissionDbError>((total, files))
+    })
+    .await
+    .map_err(|_| AppError::internal("message deletion worker failed"))?
+    .map_err(|error| AppError::database_unavailable(error.to_string()))?;
 
     let _lifecycle = state.identity_switch_lock.lock().await;
     if generation != state.current_identity_session_generation() {
@@ -2489,6 +2489,7 @@ pub async fn delete_conversation(
     );
     state.emit_to_all("unread_total", json!({ "count": total }));
     broadcast_conversations(Arc::clone(&state));
+    files.map_err(super::shared::files_not_removed)?;
     Ok(json!({ "hash": dest_hash, "unread_total": total }))
 }
 

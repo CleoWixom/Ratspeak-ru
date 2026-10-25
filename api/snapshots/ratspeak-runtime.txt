@@ -1854,11 +1854,14 @@ pub async fn ratspeak_runtime::propagation::refresh_paths(&alloc::sync::Arc<rats
 pub async fn ratspeak_runtime::propagation::request_relay_path(&alloc::sync::Arc<ratspeak_runtime::state::AppState>, [u8; 16])
 pub fn ratspeak_runtime::propagation::seed_static_nodes(&ratspeak_runtime::state::AppState)
 pub mod ratspeak_runtime::propagation_recovery
+pub struct ratspeak_runtime::propagation_recovery::DeletedMessages
+impl ratspeak_runtime::propagation_recovery::DeletedMessages
+pub fn ratspeak_runtime::propagation_recovery::DeletedMessages::remove_files(self) -> core::result::Result<(), ratspeak_db::admission::AdmissionDbError>
 pub struct ratspeak_runtime::propagation_recovery::DownloadDeletionGuard
 impl core::ops::drop::Drop for ratspeak_runtime::propagation_recovery::DownloadDeletionGuard
 pub fn ratspeak_runtime::propagation_recovery::DownloadDeletionGuard::drop(&mut self)
 pub async fn ratspeak_runtime::propagation_recovery::begin_download_deletion(alloc::sync::Arc<ratspeak_runtime::state::AppState>) -> ratspeak_runtime::propagation_recovery::DownloadDeletionGuard
-pub fn ratspeak_runtime::propagation_recovery::delete_messages(&ratspeak_runtime::state::AppState, &str, core::option::Option<&str>) -> core::result::Result<(), ratspeak_db::admission::AdmissionDbError>
+pub fn ratspeak_runtime::propagation_recovery::delete_messages(&ratspeak_runtime::state::AppState, &str, core::option::Option<&str>) -> core::result::Result<ratspeak_runtime::propagation_recovery::DeletedMessages, ratspeak_db::admission::AdmissionDbError>
 pub fn ratspeak_runtime::propagation_recovery::invalidate_downloads(&ratspeak_runtime::state::AppState)
 pub async fn ratspeak_runtime::propagation_recovery::recover_host(alloc::sync::Arc<ratspeak_runtime::state::AppState>, alloc::string::String, bool, core::option::Option<(std::path::PathBuf, [u8; 32])>) -> core::result::Result<serde_json::value::Value, alloc::string::String>
 pub async fn ratspeak_runtime::propagation_recovery::retry_deferred_downloads(alloc::sync::Arc<ratspeak_runtime::state::AppState>) -> core::result::Result<(), alloc::string::String>

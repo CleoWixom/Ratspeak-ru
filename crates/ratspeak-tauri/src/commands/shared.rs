@@ -27,6 +27,15 @@ pub(crate) async fn forget_shared_text_drafts(
         .map_err(crate::error::AppError::internal)
 }
 
+/// The messages are deleted; some of their files wait for the cleanup sweep.
+pub(crate) fn files_not_removed(error: db::admission::AdmissionDbError) -> crate::error::AppError {
+    tracing::warn!(?error, "deleted messages' files wait for the cleanup sweep");
+    crate::error::AppError::new(
+        "files_not_removed",
+        "Messages deleted. Some files could not be removed yet; Ratspeak will retry.",
+    )
+}
+
 pub(crate) fn transport_sender(
     state: &AppState,
 ) -> Option<tokio::sync::mpsc::Sender<rns_transport::messages::TransportMessage>> {

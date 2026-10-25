@@ -599,16 +599,22 @@ pub async fn api_clear_messages(state: State<'_, Arc<AppState>>) -> AppResult<Va
     }
     let id_for_db = identity_id.clone();
     let worker_state = Arc::clone(&state);
-    db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
-        ratspeak_runtime::propagation_recovery::delete_messages(&worker_state, &id_for_db, None)
+    let files = db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
+        let deleted = ratspeak_runtime::propagation_recovery::delete_messages(
+            &worker_state,
+            &id_for_db,
+            None,
+        )?;
+        announce_identity_data_cleared(&worker_state, true, false);
+        Ok::<_, db::admission::AdmissionDbError>(deleted.remove_files())
     })
     .await
     .map_err(|_| AppError::internal("message deletion worker failed"))?
     .map_err(|error| AppError::database_unavailable(error.to_string()))?;
-    announce_identity_data_cleared(&state, true, false);
     let lists = read_identity_lists(&state, identity_id).await;
     drop(deletion);
     publish_identity_lists(state.inner(), generation, lists).await;
+    files.map_err(super::shared::files_not_removed)?;
     Ok(json!(null))
 }
 
@@ -654,7 +660,7 @@ pub async fn api_reset_database(state: State<'_, Arc<AppState>>) -> AppResult<Va
     }
     let id1 = identity_id.clone();
     let worker_state = Arc::clone(&state);
-    db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
+    let deleted = db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
         ratspeak_runtime::propagation_recovery::delete_messages(&worker_state, &id1, None)
     })
     .await
@@ -674,9 +680,15 @@ pub async fn api_reset_database(state: State<'_, Arc<AppState>>) -> AppResult<Va
         Default::default()
     });
     announce_identity_data_cleared(&state, true, true);
+    let files = db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
+        deleted.remove_files()
+    })
+    .await
+    .map_err(|_| AppError::internal("message file removal worker failed"));
     let lists = read_identity_lists(&state, identity_id).await;
     drop(deletion);
     publish_identity_lists(state.inner(), generation, lists).await;
+    files?.map_err(super::shared::files_not_removed)?;
     Ok(json!(null))
 }
 
@@ -706,6 +718,7 @@ pub async fn api_identity_reset(state: State<'_, Arc<AppState>>) -> AppResult<Va
             Arc::clone(&identity_lifecycle),
             move |_p| {
                 ratspeak_runtime::propagation_recovery::delete_messages(&worker_state, &id1, None)
+                    .and_then(|deleted| deleted.remove_files())
             },
         )
         .await

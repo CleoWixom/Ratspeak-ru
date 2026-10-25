@@ -410,6 +410,57 @@ fn bulk_deletes_publish_the_lists_they_changed() {
 }
 
 #[test]
+fn a_file_that_cannot_be_removed_does_not_hide_the_delete() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (command, body, event) in [
+        ("api_clear_messages", json!({}), "identity_data_cleared"),
+        ("api_reset_database", json!({}), "identity_data_cleared"),
+        (
+            "delete_conversation",
+            json!({ "hash": PEER }),
+            "conversation_deleted",
+        ),
+    ] {
+        let fixture = Fixture::new(Some(A), false);
+        // A directory where the file was: no privilege can unlink it as a file.
+        let stored = media_dir(&fixture.state.config, A).join(format!("{A}.bin"));
+        std::fs::remove_file(&stored).unwrap();
+        std::fs::create_dir(&stored).unwrap();
+        std::fs::write(stored.join("held"), b"media").unwrap();
+        let result = fixture.invoke(command, body);
+        let pool = &fixture.state.db;
+        assert!(
+            db::get_conversation(pool, PEER, A, 10).is_empty(),
+            "{command}"
+        );
+        assert_eq!(
+            db::get_conversation(pool, PEER, B, 10).len(),
+            1,
+            "{command}"
+        );
+        assert!(
+            fixture.last_event(event).is_some(),
+            "{command}: the window was not told the messages are gone"
+        );
+        assert_eq!(
+            fixture.last_event("unread_total"),
+            Some(json!({ "count": 0 })),
+            "{command}"
+        );
+        let listed = fixture.wait_for_event("conversations_update");
+        assert_eq!(listed.as_array().map(Vec::len), Some(0), "{command}");
+        assert_eq!(
+            result.unwrap_err()["code"],
+            "files_not_removed",
+            "{command}"
+        );
+        assert!(stored.exists(), "{command}: the cleanup sweep owns it now");
+    }
+}
+
+#[test]
 fn setup_refuses_when_the_active_identity_cannot_be_read() {
     let _serial = SERIAL
         .lock()

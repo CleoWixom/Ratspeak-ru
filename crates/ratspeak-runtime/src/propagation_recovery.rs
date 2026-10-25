@@ -93,12 +93,15 @@ pub async fn begin_download_deletion(state: Arc<AppState>) -> DownloadDeletionGu
         _lifecycle: lifecycle,
     }
 }
-/// Invoke inside the blocking worker while retaining its deletion lifecycle guard.
+pub use crate::inbound_admission::DeletedMessages;
+
+/// Invoke inside the blocking worker while retaining its deletion lifecycle
+/// guard. The rows are gone when this returns; remove their files after.
 pub fn delete_messages(
     state: &AppState,
     identity: &str,
     peer: Option<&str>,
-) -> Result<(), crate::db::admission::AdmissionDbError> {
+) -> Result<DeletedMessages, crate::db::admission::AdmissionDbError> {
     crate::inbound_admission::delete_messages(state, identity, peer)
 }
 

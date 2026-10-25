@@ -1905,14 +1905,26 @@ if (_manageIdentitiesBtn) {
 
 syncSettingsIdentityActions();
 
+// A delete that removed the rows but left files for the cleanup sweep
+// succeeded with a caveat. Returns whether that was the case.
+function _showBulkDeleteFailure(err, failMsg) {
+    if (err && err.code === 'files_not_removed') {
+        showToast('Messages deleted. Some files could not be removed yet; Ratspeak will retry.',
+            'toast-warning', 5000);
+        return true;
+    }
+    showToast(failMsg, 'toast-error', 3000);
+    return false;
+}
+
 function clearWithConfirm(commandName, confirmMsg, successMsg, failMsg) {
     var errorMsg = failMsg || 'Operation failed.';
     rsConfirm({ message: confirmMsg, danger: true, confirmText: 'Clear' }).then(function(ok) {
         if (!ok) return;
         RS.invoke(commandName).then(function() {
             showToast(successMsg, 'toast-success', 3000);
-        }).catch(function() {
-            showToast(errorMsg, 'toast-error', 3000);
+        }).catch(function(err) {
+            _showBulkDeleteFailure(err, errorMsg);
         });
     });
 }
@@ -2188,9 +2200,9 @@ function confirmDangerAction(action, onClose) {
         RS.invoke(cfg.command).then(function() {
             if (typeof haptic === 'function') haptic('success');
             showToast(cfg.success, 'toast-success', 3000);
-        }).catch(function() {
-            if (typeof haptic === 'function') haptic('error');
-            showToast(cfg.fail || 'Could not complete the operation', 'toast-error', 3000);
+        }).catch(function(err) {
+            var partial = _showBulkDeleteFailure(err, cfg.fail || 'Could not complete the operation');
+            if (typeof haptic === 'function') haptic(partial ? 'warning' : 'error');
         });
     });
 }

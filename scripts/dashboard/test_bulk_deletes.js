@@ -132,10 +132,12 @@ vm.runInContext(functionSource(events, '_reloadPeersAfterCacheClear'), reload,
 
 // The commands' own replies drive nothing: the event already reset the window.
 var replies = [];
+var toasts = [];
+var reply = function() { return Promise.resolve(null); };
 var danger = {
     rsConfirm: function() { return Promise.resolve(true); },
-    RS: { invoke: function(name) { replies.push('invoke ' + name); return Promise.resolve(null); } },
-    showToast: function() {},
+    RS: { invoke: function(name) { replies.push('invoke ' + name); return reply(); } },
+    showToast: function(message, kind) { toasts.push([message, kind]); },
     haptic: function() {},
     closeDangerZone: function() {},
     resetConversationCaches: function() { replies.push('reset'); },
@@ -144,7 +146,7 @@ var danger = {
 };
 vm.createContext(danger);
 vm.runInContext(
-    ['clearWithConfirm', 'confirmDangerAction'].map(function(name) {
+    ['_showBulkDeleteFailure', 'clearWithConfirm', 'confirmDangerAction'].map(function(name) {
         return functionSource(settings, name);
     }).join('\n'),
     danger,
@@ -160,25 +162,92 @@ vm.runInContext(
     assert.deepEqual(peers, ['clear'], 'a cleared announce cache still drops its peers');
 
     var cases = [
-        ['clearWithConfirm', 'api_clear_messages'],
-        ['clearWithConfirm', 'api_clear_contacts'],
-        ['clearWithConfirm', 'api_reset_database'],
-        ['confirmDangerAction', 'clear-messages'],
-        ['confirmDangerAction', 'clear-contacts'],
-        ['confirmDangerAction', 'clear-all-data'],
+        ['clearWithConfirm', 'api_clear_messages', 'Done'],
+        ['clearWithConfirm', 'api_clear_contacts', 'Done'],
+        ['clearWithConfirm', 'api_reset_database', 'Done'],
+        ['confirmDangerAction', 'clear-messages', 'All messages deleted'],
+        ['confirmDangerAction', 'clear-contacts', 'All contacts deleted'],
+        ['confirmDangerAction', 'clear-all-data', 'All messages and contacts cleared'],
     ];
-    for (var i = 0; i < cases.length; i++) {
+    async function run(entry) {
         replies = [];
-        if (cases[i][0] === 'clearWithConfirm') {
-            danger.clearWithConfirm(cases[i][1], 'Sure?', 'Done', 'Failed');
+        toasts = [];
+        if (entry[0] === 'clearWithConfirm') {
+            danger.clearWithConfirm(entry[1], 'Sure?', 'Done', 'Failed');
         } else {
-            danger.confirmDangerAction(cases[i][1]);
+            danger.confirmDangerAction(entry[1]);
         }
         await settle();
         await settle();
-        assert.equal(replies.length, 1, cases[i][1] + ': ' + replies.join(', '));
-        assert.equal(replies[0].indexOf('invoke '), 0, cases[i][1]);
+        assert.equal(replies.length, 1, entry[1] + ': ' + replies.join(', '));
+        assert.equal(replies[0].indexOf('invoke '), 0, entry[1]);
     }
+    for (var i = 0; i < cases.length; i++) {
+        reply = function() { return Promise.resolve(null); };
+        await run(cases[i]);
+        assert.deepEqual(toasts, [[cases[i][2], 'toast-success']], cases[i][1]);
+    }
+
+    // Deleted rows with files the cleanup sweep still has to remove: a
+    // success with a caveat, not a failure.
+    var leftover = 'Messages deleted. Some files could not be removed yet; Ratspeak will retry.';
+    for (var j = 0; j < cases.length; j++) {
+        if (cases[j][1].indexOf('contacts') !== -1) continue;
+        reply = function() {
+            var error = new Error(leftover);
+            error.code = 'files_not_removed';
+            return Promise.reject(error);
+        };
+        await run(cases[j]);
+        assert.deepEqual(toasts, [[leftover, 'toast-warning']], cases[j][1]);
+    }
+
+    // A conversation read that began before a messages clear must not bring
+    // the deleted messages back when it lands.
+    var answer = null;
+    var loadingHandlers = {};
+    var loading = {
+        RS: {
+            text: caches.RS.text,
+            listen: function(event, handler) { loadingHandlers[event] = handler; },
+            invoke: function() {
+                return new Promise(function(resolve) { answer = resolve; });
+            },
+        },
+        renderConversation: function() {},
+        clearReplyTarget: function() {},
+        _resetConversationList: function() {},
+        _reloadPeersAfterCacheClear: function() {},
+    };
+    vm.createContext(loading);
+    vm.runInContext(
+        lxmf.slice(0, lxmf.indexOf('var _imageBlobUrlCache')) +
+            ['_canonicalConversationHash', '_conversationOwnerSnapshot',
+                '_conversationOwnerIsCurrent', '_utf8ByteLength', 'cacheGet', 'cacheSet',
+                'cacheDel', '_mergeConversationMessages', '_loadConversation'].map(function(name) {
+                return functionSource(lxmf, name);
+            }).join('\n') + '\n' + functionSource(identity, 'resetConversationCaches') + '\n' +
+            listenerSource(identity, 'identity_data_cleared'),
+        loading,
+        { filename: 'conversation-load.js' }
+    );
+    var deleted = { id: 'gone-1', direction: 'inbound', state: 'received', timestamp: 1 };
+    loading.lxmfActiveContact = peer;
+    loading._loadConversation(peer);
+    answer({ messages: [deleted] });
+    await settle();
+    assert.equal(loading.lxmfConversation.length, 1, 'an undisturbed read lands');
+    loading.resetConversationCaches();
+    loading._loadConversation(peer);
+    loadingHandlers.identity_data_cleared({ messages: true, contacts: false });
+    answer({ messages: [deleted] });
+    await settle();
+    assert.equal(loading.lxmfConversation.length, 0, 'a read from before the clear landed');
+    assert.equal((loading.cacheGet(peer) || []).length, 0);
+    loading._loadConversation(peer);
+    answer({ messages: [] });
+    await settle();
+    assert.equal(loading.lxmfConversation.length, 0);
     console.log('Bulk delete tests passed');
 })().catch(function(error) {
     console.error(error);

@@ -4,6 +4,8 @@ var lxmfConversations = [];
 var lxmfActiveContact = null;
 var _conversationEpoch = 0;
 var _conversationIdentityGeneration = 0;
+// Advanced by a bulk messages delete; a read from before it is dropped.
+var _messagesClearedCount = 0;
 var lxmfConversation = [];
 var lxmfPendingFile = null;
 var _ghostConversationHash = null;
@@ -2371,6 +2373,7 @@ function _onChatDetailExit() {
 function _loadConversation(hash) {
     hash = _canonicalConversationHash(hash);
     var loadOwner = _conversationOwnerSnapshot();
+    var loadClears = _messagesClearedCount;
     // Reactions are keyed per message; drop the previous conversation's
     // entries so the map doesn't accumulate across switches.
     _msgReactions = {};
@@ -2383,7 +2386,7 @@ function _loadConversation(hash) {
     renderConversation({ forceScrollBottom: true });
     // get_conversation fetches messages AND marks-read; broadcasts unread_total.
     RS.invoke('get_conversation', { hash: hash }).then(function(result) {
-        if (!_conversationOwnerIsCurrent(loadOwner)) return;
+        if (!_conversationOwnerIsCurrent(loadOwner) || loadClears !== _messagesClearedCount) return;
         var messages = _mergeConversationMessages(hash, (result && result.messages) || []);
         cacheSet(hash, messages);
         if (hash === lxmfActiveContact) {

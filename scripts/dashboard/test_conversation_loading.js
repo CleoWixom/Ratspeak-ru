@@ -76,7 +76,7 @@ function fire() { const batch = [...timers.values()]; timers.clear(); batch.forE
     let cacheWrites = 0;
     Object.assign(context, {
         _canonicalConversationHash: hash => hash,
-        _msgReactions: {}, cacheGet: () => null,
+        _msgReactions: {}, _messagesClearedCount: 0, cacheGet: () => null,
         renderConversation() {},
         _mergeConversationMessages: (_hash, messages) => messages,
         cacheSet() { cacheWrites++; }

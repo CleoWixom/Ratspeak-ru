@@ -1842,6 +1842,7 @@ function resetConversationCaches() {
 // Events arrive in order, so this drops only what the window held before it.
 RS.listen('identity_data_cleared', function(data) {
     if (data && data.messages) {
+        if (typeof _messagesClearedCount !== 'undefined') _messagesClearedCount += 1;
         resetConversationCaches();
         if (typeof clearReplyTarget === 'function') clearReplyTarget();
         if (typeof _resetConversationList === 'function') _resetConversationList();

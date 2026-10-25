@@ -678,15 +678,38 @@ fn cleanup_deleted_batch(
     Ok((pending.last().unwrap().id, pending.len()))
 }
 
+/// Messages whose delete has committed; their files are still on disk.
+#[must_use = "files left here wait for the cleanup sweep"]
+pub struct DeletedMessages {
+    guard: AdmissionGuard,
+    store: DurableInboundStore,
+    artifacts: db::admission::MessageDeletionArtifacts,
+    data_dir: std::path::PathBuf,
+}
+
+impl DeletedMessages {
+    /// A file that cannot be removed now stays journaled for the cleanup sweep.
+    pub fn remove_files(self) -> Result<(), AdmissionDbError> {
+        cleanup_deleted_artifacts(&self.data_dir, &self.store, &self.guard, &self.artifacts)
+    }
+}
+
 pub(crate) fn delete_messages(
     state: &AppState,
     identity: &str,
     peer: Option<&str>,
-) -> Result<(), AdmissionDbError> {
+) -> Result<DeletedMessages, AdmissionDbError> {
     let guard = try_reserve_admission()?;
     let store = DurableInboundStore::from_pool(&state.db)?;
     let artifacts = store.delete_messages_guarded(&guard, identity, peer, now())?;
-    cleanup_deleted_artifacts(&state.config.data_dir, &store, &guard, &artifacts)
+    // A list read before the commit is stale now, whatever happens to the files.
+    state.invalidate_conversation_lists();
+    Ok(DeletedMessages {
+        guard,
+        store,
+        artifacts,
+        data_dir: state.config.data_dir.clone(),
+    })
 }
 fn reconcile_intents(
     store: &DurableInboundStore,
@@ -1730,7 +1753,10 @@ mod tests {
         });
         ready_rx.await.unwrap();
         let deletion = crate::propagation_recovery::begin_download_deletion(state.clone()).await;
-        delete_messages(&state, &hex::encode(identity), None).unwrap();
+        delete_messages(&state, &hex::encode(identity), None)
+            .unwrap()
+            .remove_files()
+            .unwrap();
         drop(deletion);
         resume_tx.send(()).unwrap();
         task.await.unwrap();
@@ -1829,5 +1855,49 @@ mod tests {
                 .is_empty()
         );
         assert!(reopened.receipts(&identity, now()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_committed_delete_invalidates_conversation_lists_even_when_a_file_stays() {
+        let _serial = SERIAL.lock().await;
+        let (_temp, state) = fixture();
+        let identity = hex::encode([1; 16]);
+        let msg = message("a file that stays", true);
+        commit_message(
+            &state,
+            try_reserve_admission().unwrap(),
+            scope(3),
+            &msg,
+            Projection::prepare(&state, &msg, false).unwrap(),
+        )
+        .unwrap();
+        let media = {
+            let store = DurableInboundStore::from_pool(&state.db).unwrap();
+            let rows = store.receipts(&identity, now()).unwrap();
+            state
+                .config
+                .data_dir
+                .join("identities")
+                .join(&identity)
+                .join("files")
+                .join(&rows[0].2[0].name)
+        };
+        std::fs::remove_file(&media).unwrap();
+        std::fs::create_dir(&media).unwrap();
+        std::fs::write(media.join("held"), b"media").unwrap();
+        let before = state.conversation_list_revision();
+        let _ = delete_messages(&state, &identity, None);
+        let messages: i64 = state
+            .db
+            .get()
+            .unwrap()
+            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 0);
+        assert_ne!(
+            state.conversation_list_revision(),
+            before,
+            "a list read before the delete stays publishable"
+        );
     }
 }
