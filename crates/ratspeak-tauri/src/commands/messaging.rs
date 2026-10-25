@@ -1368,7 +1368,7 @@ pub(crate) async fn queue_prepared_audio(
     let mut clip = staged.take();
     let (response, returned_clip) = tokio::task::spawn_blocking(move || {
         let state = st;
-        let _identity = runtime.block_on(state.identity_switch_lock.lock());
+        let _identity = runtime.block_on(state.identity_switch_lock.lock_routine());
         if state.current_identity_session_generation()
             != activity_fence.identity_session_generation()
             || active_identity_id(&state) != identity_id
@@ -2479,7 +2479,7 @@ pub async fn delete_conversation(
     .map_err(|_| AppError::internal("message deletion worker failed"))?
     .map_err(|error| AppError::database_unavailable(error.to_string()))?;
 
-    let _lifecycle = state.identity_switch_lock.lock().await;
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
     if generation != state.current_identity_session_generation() {
         return Ok(json!({"hash":dest_hash}));
     }

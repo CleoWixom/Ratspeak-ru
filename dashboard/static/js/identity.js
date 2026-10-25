@@ -843,7 +843,10 @@ function switchToIdentity(hash) {
     }
     // Backend reloads LXMF manager + emits identity_switched, which drives
     // full state cleanup + re-emits initial state for the new identity.
-    RS.invoke('switch_identity', { hash: hash }).catch(function() {});
+    RS.invoke('switch_identity', { hash: hash }).catch(function(err) {
+        showToast((err && err.message) ? err.message : 'Could not switch identity', 'toast-error', 4000);
+        loadIdentities();
+    });
 }
 
 function openIdentitySwitcher() {
@@ -1824,6 +1827,13 @@ RS.listen('identity_switching', function() {
     }
     if (typeof _clearConnectTimeout === 'function') _clearConnectTimeout();
     if (typeof clearConnectPublicPending === 'function') clearConnectPublicPending();
+});
+
+// A switch that did not finish: the previous identity is back, or none is.
+RS.listen('identity_switch_failed', function() {
+    window._identitySwitchInProgress = false;
+    loadIdentities();
+    if (typeof loadConversations === 'function') loadConversations();
 });
 
 // Drop every cached conversation: after an identity switch or a bulk delete,

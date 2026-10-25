@@ -1001,6 +1001,8 @@ where
     // Reuse this exact lifecycle owner. A nested acquisition would deadlock,
     // while releasing it here would allow reset to erase the just-imported row.
     if active_missing {
+        // An activation: nothing begun before it may land in this identity.
+        state.bump_identity_session_generation();
         crate::shutdown_rns_lxmf(&state)
             .await
             .map_err(identity_activity_reset_error)?;
@@ -1369,8 +1371,93 @@ pub struct DisplayNameArgs {
     pub display_name: Option<String>,
 }
 
+/// A switch under way. One that does not finish closes with
+/// `identity_switch_failed`, so no window is left showing it.
+struct SwitchUnderWay {
+    state: Arc<AppState>,
+    target: String,
+    error: Option<String>,
+    finished: bool,
+}
+
+impl SwitchUnderWay {
+    fn begin(state: &Arc<AppState>, target: &str, generation: u64) -> Self {
+        state.emit_to_all(
+            "identity_switching",
+            json!({
+                "hash": target,
+                "generation": generation.to_string(),
+            }),
+        );
+        Self {
+            state: Arc::clone(state),
+            target: target.to_owned(),
+            error: None,
+            finished: false,
+        }
+    }
+
+    /// Call just before announcing the new identity.
+    fn finish(mut self) {
+        self.finished = true;
+    }
+
+    /// End the switch with `error`, which its closing event carries.
+    fn fail(mut self, error: AppError) -> AppError {
+        self.error = Some(error.message.clone());
+        error
+    }
+}
+
+impl Drop for SwitchUnderWay {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.state.emit_to_all(
+            "identity_switch_failed",
+            json!({
+                "hash": std::mem::take(&mut self.target),
+                "generation": self.state.current_identity_session_generation().to_string(),
+                "error": self
+                    .error
+                    .take()
+                    .unwrap_or_else(|| "The identity switch was interrupted.".to_string()),
+            }),
+        );
+    }
+}
+
+/// Bring the previous identity back up after a failed switch.
+async fn resume_previous(state: &Arc<AppState>, previous: Option<String>) {
+    let Some(old_hash) = previous else {
+        state.set_startup_stage("ready");
+        return;
+    };
+    let _ = db::spawn_db(state.db.clone(), move |p| {
+        db::set_active_identity(&p, &old_hash)
+    })
+    .await;
+    if let Ok(mut sig) = state.session_shutdown.write() {
+        *sig = rns_runtime::lifecycle::ShutdownSignal::new();
+    }
+    state.set_startup_stage("checking");
+    crate::init_rns_lxmf(Arc::clone(state), state.config.data_root.clone()).await;
+    crate::commands::ble::restore_ble_peer_if_requested(Arc::clone(state)).await;
+}
+
 async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppResult<Value> {
-    let _switch_guard = state.identity_switch_lock.lock().await;
+    let lifecycle = state.identity_switch_lock.lock_owned().await;
+    switch_identity_session_held(state, hash_hex, &lifecycle).await
+}
+
+/// The switch, inside a transition its caller holds: a removal re-activates
+/// through it without taking the lock again.
+async fn switch_identity_session_held(
+    state: Arc<AppState>,
+    hash_hex: String,
+    _lifecycle: &OwnedIdentitySwitchGuard,
+) -> AppResult<Value> {
     let _auto_ownership = state.auto_interface_lock.lock().await;
 
     let hash_for_lookup = hash_hex.clone();
@@ -1421,37 +1508,43 @@ async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppR
         return Ok(payload);
     }
 
+    // A refused reset here changes nothing. The shutdown repeats it under the
+    // switch's generation.
+    {
+        let _activity_control = state.activity_control_lock.lock().await;
+        state
+            .activity
+            .hard_reset()
+            .await
+            .map_err(identity_activity_reset_error)?;
+    }
     let generation = state.bump_identity_session_generation();
-    state.emit_to_all(
-        "identity_switching",
-        json!({
-            "hash": hash_hex,
-            "generation": generation.to_string(),
-        }),
-    );
+    let switching = SwitchUnderWay::begin(&state, &hash_hex, generation);
 
-    crate::shutdown_rns_lxmf(&state)
-        .await
-        .map_err(identity_activity_reset_error)?;
+    if let Err(error) = crate::shutdown_rns_lxmf(&state).await {
+        return Err(switching.fail(identity_activity_reset_error(error)));
+    }
     state.clear_identity_scoped_runtime_state();
 
     let hash_for_db = hash_hex.clone();
-    let set_result = db::spawn_db(state.db.clone(), move |p| {
+    let activation = match db::spawn_db(state.db.clone(), move |p| {
         db::set_active_identity(&p, &hash_for_db)
     })
     .await
-    .map_err(|_| {
-        tracing::error!(reason = "task_panicked", "activate db task panicked");
-        AppError::internal("db task panicked")
-    })?;
-    if let Err(e) = set_result {
-        if let Some(old_hash) = previous_active {
-            let _ = db::spawn_db(state.db.clone(), move |p| {
-                db::set_active_identity(&p, &old_hash)
-            })
-            .await;
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(AppError::internal(format!("Failed to activate: {e}"))),
+        Err(_) => {
+            tracing::error!(reason = "task_panicked", "activate db task panicked");
+            Err(AppError::internal("db task panicked"))
         }
-        return Err(AppError::internal(format!("Failed to activate: {e}")));
+    };
+    if let Err(error) = activation {
+        // The runtime is down: bring the previous identity back, in a session
+        // of its own.
+        state.bump_identity_session_generation();
+        resume_previous(&state, previous_active).await;
+        return Err(switching.fail(error));
     }
 
     if let Ok(mut sig) = state.session_shutdown.write() {
@@ -1465,19 +1558,14 @@ async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppR
     // intermediate state, not a failed switch. Keep it active and let the unlock
     // prompt (driven by the hardware_locked event) take over; do not roll back.
     if state.hw_locked_hash().as_deref() == Some(hash_hex.as_str()) {
-        state.emit_to_all(
-            "identity_switched",
-            json!({
-                "hash": hash_hex,
-                "locked": true,
-                "generation": generation.to_string(),
-            }),
-        );
-        return Ok(json!({
+        let payload = json!({
             "hash": hash_hex,
             "locked": true,
             "generation": generation.to_string(),
-        }));
+        });
+        switching.finish();
+        state.emit_to_all("identity_switched", payload.clone());
+        return Ok(payload);
     }
 
     let (loaded_identity, loaded_lxmf, loaded_display, loaded_status) = {
@@ -1505,30 +1593,18 @@ async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppR
         );
         // Target failed to load (e.g. a hardware key that was re-provisioned or
         // unplugged). Restore the previous identity + its runtime so the session
-        // is not left with a dead active row and no LXMF.
-        crate::shutdown_rns_lxmf(&state)
-            .await
-            .map_err(identity_activity_reset_error)?;
-        state.clear_identity_scoped_runtime_state();
-        if let Some(old_hash) = previous_active.clone() {
-            let old_for_db = old_hash.clone();
-            let _ = db::spawn_db(state.db.clone(), move |p| {
-                db::set_active_identity(&p, &old_for_db)
-            })
-            .await;
-            if let Ok(mut sig) = state.session_shutdown.write() {
-                *sig = rns_runtime::lifecycle::ShutdownSignal::new();
-            }
-            state.set_startup_stage("checking");
-            crate::init_rns_lxmf(Arc::clone(&state), state.config.data_root.clone()).await;
-            crate::commands::ble::restore_ble_peer_if_requested(Arc::clone(&state)).await;
-        } else {
-            state.set_startup_stage("ready");
+        // is not left with a dead active row and no LXMF. The restored session
+        // gets its own generation; it never reuses the failed target's.
+        state.bump_identity_session_generation();
+        if let Err(error) = crate::shutdown_rns_lxmf(&state).await {
+            return Err(switching.fail(identity_activity_reset_error(error)));
         }
-        return Err(AppError::bad_request(
+        state.clear_identity_scoped_runtime_state();
+        resume_previous(&state, previous_active).await;
+        return Err(switching.fail(AppError::bad_request(
             "Couldn't load this identity's key. If it's a hardware (YubiKey) identity, \
              the key may be unplugged or was re-provisioned.",
-        ));
+        )));
     }
 
     let payload = json!({
@@ -1540,9 +1616,44 @@ async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppR
     });
     let ifaces = crate::rns_config::get_all_interfaces(&active_rns_config_dir(&state));
     emit_hub_interfaces(&state, ifaces);
+    switching.finish();
     state.emit_to_all("identity_switched", payload.clone());
     state.request_poll_now();
     Ok(payload)
+}
+
+/// After the live identity is removed the most recently used one takes over,
+/// as at a cold start. The caller holds the lifecycle lock as a transition.
+#[cfg(feature = "hardware")]
+pub(super) async fn activate_most_recent_identity(
+    state: &Arc<AppState>,
+    lifecycle: &OwnedIdentitySwitchGuard,
+) {
+    let data_dir = state.config.data_dir.clone();
+    let next = db::spawn_db(state.db.clone(), move |p| {
+        ratspeak_runtime::most_recent_identity(&p, &data_dir)
+    })
+    .await;
+    match next {
+        Ok(Ok(Some(hash))) => {
+            if let Err(error) =
+                switch_identity_session_held(Arc::clone(state), hash, lifecycle).await
+            {
+                tracing::warn!(
+                    code = %error.code,
+                    "the most recently used identity could not take over"
+                );
+            }
+        }
+        Ok(Ok(None)) => state.set_startup_stage("ready"),
+        Ok(Err(_)) | Err(_) => {
+            tracing::error!(
+                reason = "identity_read_failed",
+                "could not choose an identity to take over"
+            );
+            state.set_startup_stage("error");
+        }
+    }
 }
 
 #[tauri::command]
@@ -1817,6 +1928,317 @@ mod tests {
         assert_eq!(active_hash(&state).as_deref(), Some(ACTIVE));
         assert_eq!(state.current_activity_boundary_generation(), boundary);
         assert_eq!(state.current_identity_session_generation(), generation);
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        events: std::sync::Mutex<Vec<(String, Value)>>,
+    }
+
+    impl ratspeak_core::Emitter for Recorder {
+        fn try_emit(&self, event: &str, payload: Value) -> Result<(), ratspeak_core::EmitError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push((event.to_owned(), payload));
+            Ok(())
+        }
+    }
+
+    impl Recorder {
+        fn last(&self, name: &str) -> Option<Value> {
+            let events = self.events.lock().unwrap();
+            events
+                .iter()
+                .rev()
+                .find(|(event, _)| event == name)
+                .map(|(_, payload)| payload.clone())
+        }
+
+        async fn wait_for(&self, name: &str) -> Value {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(payload) = self.last(name) {
+                    return payload;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "no {name}");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// No identity, with events recorded and a mock app holding the state, so
+    /// commands can take their `State`.
+    fn recorded_state() -> (
+        tempfile::TempDir,
+        Arc<AppState>,
+        Arc<Recorder>,
+        tauri::App<tauri::test::MockRuntime>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+        let pool = db::init_pool(root.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let state = Arc::new(AppState::new(
+            config,
+            pool,
+            Arc::clone(&recorder) as Arc<dyn ratspeak_core::Emitter>,
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        let app = tauri::test::mock_builder()
+            .manage(Arc::clone(&state))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        (root, state, recorder, app)
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Start an import whose preparation pauses until `release` is sent.
+    fn paused_import(
+        state: &Arc<AppState>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<AppResult<Value>>,
+    ) {
+        let request_fence = state.activity_request_fence();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let import = tokio::spawn(import_identity_after_parse(
+            Arc::clone(state),
+            None,
+            None,
+            request_fence,
+            async move {
+                ready_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok(parsed_key(private_key_bytes(), None))
+            },
+            persist_parsed_identity_import,
+        ));
+        (ready_rx, release_tx, import)
+    }
+
+    // B32: what the window does all the time must not fail an identity mutation.
+    #[test]
+    fn identity_mutation_survives_routine_work_during_preparation() {
+        use tauri::Manager;
+        let (_root, state, recorder, app) = recorded_state();
+        test_runtime().block_on(async {
+            let (ready, release, import) = paused_import(&state);
+            ready.await.unwrap();
+            super::super::activity::activity_status(app.state())
+                .await
+                .unwrap();
+            let _ = super::super::channels::api_channel_unread(app.state()).await;
+            let edge = state.begin_foreground_transition();
+            super::super::system::apply_foreground_transition(Arc::clone(&state), true, edge)
+                .await
+                .unwrap();
+            let unblock = super::super::contacts::UnblockContactArgs {
+                hash: "ab".repeat(16),
+                also_remove_blackhole: false,
+            };
+            super::super::contacts::unblock_contact(app.state(), unblock)
+                .await
+                .unwrap();
+            // The unblock re-sends the conversation list under the lifecycle lock.
+            recorder.wait_for("conversations_update").await;
+            release.send(()).unwrap();
+            let imported = import.await.unwrap().unwrap();
+            let hash = imported["hash"].as_str().unwrap();
+            assert!(db::get_identity(&state.db, hash).is_some());
+        });
+    }
+
+    #[test]
+    fn identity_mutation_refused_after_a_privacy_reset_during_preparation() {
+        use tauri::Manager;
+        let (_root, state, _recorder, app) = recorded_state();
+        test_runtime().block_on(async {
+            let (ready, release, import) = paused_import(&state);
+            ready.await.unwrap();
+            let _ = super::super::activity::activity_clear(app.state()).await;
+            release.send(()).unwrap();
+            assert_eq!(import.await.unwrap().unwrap_err().code, "conflict");
+            assert!(db::get_all_identities(&state.db).is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn import_with_none_active_starts_a_new_identity_session() {
+        let (_root, state) = mutation_state();
+        for activates in [true, false] {
+            let generation = state.current_identity_session_generation();
+            let imported = import_identity_after_parse(
+                Arc::clone(&state),
+                None,
+                None,
+                state.activity_request_fence(),
+                std::future::ready(Ok(parsed_key(private_key_bytes(), None))),
+                persist_parsed_identity_import,
+            )
+            .await
+            .unwrap();
+            assert_eq!(imported["activated"], activates);
+            assert_eq!(
+                state.current_identity_session_generation() > generation,
+                activates,
+                "only the import that activates starts a session"
+            );
+        }
+    }
+
+    /// A and B are plain identities on disk, A active and running. Reticulum
+    /// runs with no interfaces and shares no instance.
+    async fn running_pair() -> (
+        tempfile::TempDir,
+        Arc<AppState>,
+        Arc<Recorder>,
+        String,
+        String,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = root.path().to_path_buf();
+        crate::lxmf::initialize_storage_namespace(&data_root).unwrap();
+        let rns_dir = data_root.join("rns");
+        std::fs::create_dir_all(&rns_dir).unwrap();
+        std::fs::write(
+            rns_dir.join("config"),
+            "[reticulum]\nshare_instance = No\nenable_transport = No\n\n[interfaces]\n",
+        )
+        .unwrap();
+        let config = crate::config::DashboardConfig {
+            data_root: data_root.clone(),
+            data_dir: data_root.join(".ratspeak"),
+            rns_config_dir: rns_dir,
+            rns_config_dir_overridden: true,
+            max_log_entries: 20,
+        };
+        let pool = db::init_pool(&data_root).unwrap();
+        db::init_schema(&pool).unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let state = Arc::new(AppState::new(
+            config,
+            pool,
+            Arc::clone(&recorder) as Arc<dyn ratspeak_core::Emitter>,
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        let mut hashes = ["A", "B"].map(|nickname| {
+            crate::lxmf::LxmfManager::import_identity_to_data_dir(
+                &state.config.data_dir,
+                &private_key_bytes(),
+                nickname,
+                &state.db,
+            )
+            .unwrap()
+            .0
+        });
+        db::set_active_identity(&state.db, &hashes[0]).unwrap();
+        crate::init_rns_lxmf(Arc::clone(&state), state.config.data_root.clone()).await;
+        assert_eq!(loaded_identity(&state).as_deref(), Some(hashes[0].as_str()));
+        let b = std::mem::take(&mut hashes[1]);
+        let a = std::mem::take(&mut hashes[0]);
+        (root, state, recorder, a, b)
+    }
+
+    fn loaded_identity(state: &AppState) -> Option<String> {
+        state
+            .lxmf
+            .lock()
+            .ok()
+            .and_then(|lxmf| lxmf.as_ref().map(|mgr| mgr.identity_hash.clone()))
+    }
+
+    // B34: a switch whose activation fails ends with its closing event and
+    // leaves the previous identity running, in a session of its own (B3).
+    #[test]
+    fn a_failed_switch_ends_with_its_event_and_the_previous_identity_running() {
+        for failure in ["an unloadable key", "a refused activation"] {
+            test_runtime().block_on(async {
+                let (_root, state, recorder, a, b) = running_pair().await;
+                if failure == "an unloadable key" {
+                    let key = state.config.data_dir.join("identities").join(&b);
+                    std::fs::write(key.join("identity"), b"not a key").unwrap();
+                } else {
+                    state
+                        .db
+                        .get()
+                        .unwrap()
+                        .execute_batch(&format!(
+                            "CREATE TRIGGER refuse_b BEFORE UPDATE OF is_active ON identities \
+                             WHEN NEW.hash = '{b}' AND NEW.is_active = 1 \
+                             BEGIN SELECT RAISE(ABORT, 'refused'); END;"
+                        ))
+                        .unwrap();
+                }
+                let generation = state.current_identity_session_generation();
+                let result = switch_identity_session(Arc::clone(&state), b.clone()).await;
+                assert!(result.is_err(), "{failure}");
+                let closing = recorder
+                    .last("identity_switch_failed")
+                    .unwrap_or_else(|| panic!("{failure}: the switch never ended"));
+                assert_eq!(closing["hash"], b.as_str(), "{failure}");
+                assert!(
+                    closing["error"]
+                        .as_str()
+                        .is_some_and(|error| !error.is_empty()),
+                    "{failure}"
+                );
+                assert!(recorder.last("identity_switched").is_none(), "{failure}");
+                assert_eq!(
+                    active_hash(&state).as_deref(),
+                    Some(a.as_str()),
+                    "{failure}"
+                );
+                assert_eq!(
+                    loaded_identity(&state).as_deref(),
+                    Some(a.as_str()),
+                    "{failure}"
+                );
+                assert!(
+                    state.rns.read().unwrap().is_some(),
+                    "{failure}: the network stayed down"
+                );
+                let resumed = state.current_identity_session_generation();
+                assert!(
+                    resumed > generation + 1,
+                    "{failure}: the restored session reuses the failed switch's generation"
+                );
+                assert_eq!(closing["generation"], resumed.to_string(), "{failure}");
+                crate::shutdown_rns_lxmf(&state).await.unwrap();
+            });
+        }
+    }
+
+    // B34: the reset runs before the switch begins, so a refused one changes
+    // nothing: no new session, no switching state, the same identity running.
+    #[test]
+    fn a_switch_whose_activity_reset_is_refused_changes_nothing() {
+        test_runtime().block_on(async {
+            let (_root, state, recorder, a, b) = running_pair().await;
+            state.activity.shutdown().await.unwrap();
+            let generation = state.current_identity_session_generation();
+            let error = switch_identity_session(Arc::clone(&state), b)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "service_unavailable");
+            assert_eq!(state.current_identity_session_generation(), generation);
+            assert!(recorder.last("identity_switching").is_none());
+            assert!(recorder.last("identity_switch_failed").is_none());
+            assert_eq!(active_hash(&state).as_deref(), Some(a.as_str()));
+            assert_eq!(loaded_identity(&state).as_deref(), Some(a.as_str()));
+            assert!(state.rns.read().unwrap().is_some());
+        });
     }
 
     fn parsed_key(key_bytes: Vec<u8>, mnemonic: Option<String>) -> ParsedIdentityImport {

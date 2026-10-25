@@ -208,6 +208,7 @@ fn commands() -> impl Fn(tauri::ipc::Invoke<MockRuntime>) -> bool + Send + Sync 
     tauri::generate_handler![
         ratspeak_tauri::commands::system::api_version,
         ratspeak_tauri::commands::system::api_setup_complete,
+        ratspeak_tauri::commands::system::api_factory_reset,
         ratspeak_tauri::commands::system::api_clear_messages,
         ratspeak_tauri::commands::system::api_clear_contacts,
         ratspeak_tauri::commands::system::api_reset_database,
@@ -458,6 +459,37 @@ fn a_file_that_cannot_be_removed_does_not_hide_the_delete() {
         );
         assert!(stored.exists(), "{command}: the cleanup sweep owns it now");
     }
+}
+
+// B3: an activation starts a new identity session, so nothing begun before
+// it lands in the identity that took over.
+#[test]
+fn setup_and_factory_reset_start_a_new_identity_session() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::without_active_identity(false);
+    let generation = || fixture.state.current_identity_session_generation();
+    let before = generation();
+    let first = fixture
+        .invoke("api_setup_complete", json!({ "args": {} }))
+        .unwrap();
+    assert_eq!(first["ok"], true);
+    let created = generation();
+    assert!(created > before, "setup activated an identity");
+    fixture
+        .invoke(
+            "api_setup_complete",
+            json!({ "args": { "display_name": "Ann" } }),
+        )
+        .unwrap();
+    assert_eq!(
+        generation(),
+        created,
+        "naming the identity activates nothing"
+    );
+    fixture.invoke("api_factory_reset", json!({})).unwrap();
+    assert!(generation() > created, "factory reset ended the session");
 }
 
 #[test]

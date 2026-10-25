@@ -1905,6 +1905,17 @@ pub fn get_active_identity(pool: &DbPool) -> Result<Option<serde_json::Value>, S
         .map_err(|e| format!("active identity: {e}"))
 }
 
+/// Identity hashes, most recently used first.
+pub fn identity_hashes_by_last_use(pool: &DbPool) -> Result<Vec<String>, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let mut stmt = conn
+        .prepare("SELECT hash FROM identities ORDER BY last_used DESC, created_at DESC")
+        .map_err(|e| format!("prepare: {e}"))?;
+    stmt.query_map([], |row| row.get(0))
+        .and_then(|rows| rows.collect())
+        .map_err(|e| format!("identities: {e}"))
+}
+
 pub fn get_all_identities(pool: &DbPool) -> Vec<serde_json::Value> {
     let conn = match pool.get() {
         Ok(c) => c,

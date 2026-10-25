@@ -437,6 +437,11 @@ function createActivityBootstrap(dependencies) {
             state.identityGeneration = null;
             requestResync('identity_error', true);
         }],
+        // A switch that did not finish carries the restored session's generation.
+        ['identity_switch_failed', function() {
+            state.identityGeneration = null;
+            requestResync('identity_switch_failed', true);
+        }],
         ['activity_status_v1', handleStatusNotification],
         ['activity_boundary_v1', handleBoundary],
         ['activity_batch_v1', handleBatch]

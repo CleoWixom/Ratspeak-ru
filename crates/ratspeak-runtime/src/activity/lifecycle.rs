@@ -271,6 +271,12 @@ impl ActivityRecorder {
         self.inner.shared.status()
     }
 
+    /// Whether a limited Trace has run past its deadline.
+    pub fn trace_expiry_due(&self) -> bool {
+        self.trace_deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
     /// Allocation-free compatibility snapshot. It is intentionally weaker
     /// than an admission lease and must never authorize an emission by itself.
     pub fn capture_state_profile(

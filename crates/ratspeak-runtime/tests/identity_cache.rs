@@ -135,7 +135,7 @@ fn a_read_error_is_never_cached_as_no_identity() {
 async fn startup_does_not_take_a_failed_active_identity_read_for_no_identity() {
     let _serial = SERIAL.lock().await;
     let fixture = fixture(1);
-    // Protected material only: read as "no active row", startup returns to setup.
+    // Protected material only: read as "no active row", startup would open A locked.
     let profile = fixture.state.config.data_dir.join("identities").join(A);
     std::fs::create_dir_all(&profile).unwrap();
     std::fs::write(profile.join("identity.enc"), b"sealed").unwrap();

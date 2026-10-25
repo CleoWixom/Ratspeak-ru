@@ -113,8 +113,8 @@ pub async fn voice_memo_format(
         return Err(AppError::bad_request("Voice message format is automatic"));
     }
     let fence = state.activity_request_fence();
-    let _identity = state.identity_switch_lock.lock().await;
-    if !state.is_current_activity_request_fence_after_identity_lock(fence) {
+    let _identity = state.identity_switch_lock.lock_routine().await;
+    if !state.is_current_activity_origin_fence(fence) {
         return Err(AppError::conflict("Identity changed"));
     }
     let identity = active_identity_id(&state);
@@ -333,8 +333,8 @@ pub async fn voice_memo_start(
     args: Option<VoiceMemoStartArgs>,
 ) -> AppResult<Value> {
     let fence = state.activity_request_fence();
-    let _identity = state.identity_switch_lock.lock().await;
-    if !state.is_current_activity_request_fence_after_identity_lock(fence) {
+    let _identity = state.identity_switch_lock.lock_routine().await;
+    if !state.is_current_activity_origin_fence(fence) {
         return Err(AppError::conflict("Identity changed"));
     }
     let format = if let Some(args) = args {
@@ -544,7 +544,7 @@ pub async fn send_lxmf_voice_message(
     if let Err(error) = &result
         && let Some(clip) = staged.take()
     {
-        let _identity = state.identity_switch_lock.lock().await;
+        let _identity = state.identity_switch_lock.lock_routine().await;
         if state.current_identity_session_generation() == fence.identity_session_generation()
             && active_identity_id(&state) == identity_id
             && !matches!(error.code.as_str(), "bad_request" | "invalid_destination")
@@ -702,8 +702,8 @@ async fn load_stored_voice(
     stored_name: &str,
 ) -> AppResult<(Vec<u8>, MemoFormat)> {
     let fence = state.activity_request_fence();
-    let _identity = state.identity_switch_lock.lock().await;
-    if !state.is_current_activity_request_fence_after_identity_lock(fence) {
+    let _identity = state.identity_switch_lock.lock_routine().await;
+    if !state.is_current_activity_origin_fence(fence) {
         return Err(AppError::conflict("Identity changed"));
     }
     let identity = active_identity_id(state);

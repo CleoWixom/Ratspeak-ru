@@ -1225,11 +1225,7 @@ fn privacy_announce_usage_setting_is_wired() {
 
     let system_rs =
         read_source(root.join("crates/ratspeak-tauri/src/commands/system.rs")).expect("system");
-    let reset_body = system_rs
-        .split("pub async fn api_reset_database")
-        .nth(1)
-        .and_then(|tail| tail.split("pub async fn api_identity_reset").next())
-        .expect("reset database body");
+    let reset_body = rust_function_block(&system_rs, "api_reset_database");
     assert!(!reset_body.contains("\"settings\""));
 }
 
@@ -3882,6 +3878,168 @@ fn app_sources_do_not_write_direct_stdout_or_stderr_logs() {
     }
 }
 
+/// The function a line belongs to, and whether that function is a test.
+fn enclosing_fn(lines: &[&str], index: usize) -> Option<(String, bool)> {
+    let signature = |line: &str| {
+        let mut rest = line.trim_start();
+        for prefix in ["pub(crate) ", "pub(super) ", "pub ", "async "] {
+            rest = rest.strip_prefix(prefix).unwrap_or(rest);
+        }
+        rest = rest.strip_prefix("async ").unwrap_or(rest);
+        rest.strip_prefix("fn ").map(|tail| {
+            tail.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+    };
+    let (at, name) = lines[..=index]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(at, line)| signature(line).map(|name| (at, name)))?;
+    let is_test = lines[..at]
+        .iter()
+        .rev()
+        .take_while(|line| {
+            let line = line.trim_start();
+            line.starts_with("#[") || line.starts_with("//")
+        })
+        .any(|line| {
+            let line = line.trim_start();
+            line.starts_with("#[test]") || line.starts_with("#[tokio::test")
+        });
+    Some((name, is_test))
+}
+
+/// A fenced request is refused when a transition ran since it began, so only
+/// a real transition (identity, runtime or Activity capture) takes the
+/// lifecycle lock as one. Everything else takes `lock_routine`.
+#[test]
+fn only_real_transitions_take_the_lifecycle_lock_as_a_transition() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    for dir in [
+        "crates/ratspeak-runtime/src",
+        "crates/ratspeak-tauri/src",
+        "src-tauri/src",
+    ] {
+        collect_files(&root.join(dir), &mut files);
+    }
+    let mut transitions = Vec::new();
+    for path in files {
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = read_source(&path).expect("source file");
+        let lines: Vec<&str> = source.lines().collect();
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains("identity_switch_lock.lock()")
+                && !line.contains("identity_switch_lock.lock_owned()")
+            {
+                continue;
+            }
+            let (name, is_test) = enclosing_fn(&lines, index)
+                .unwrap_or_else(|| panic!("{rel}:{} is outside a function", index + 1));
+            if !is_test {
+                transitions.push(format!("{rel} {name}"));
+            }
+        }
+    }
+    transitions.sort();
+    assert_eq!(
+        transitions,
+        [
+            "crates/ratspeak-runtime/src/lib.rs lock_hardware_session",
+            "crates/ratspeak-runtime/src/lib.rs restart_rns_lxmf",
+            "crates/ratspeak-runtime/src/network_ownership.rs apply",
+            "crates/ratspeak-runtime/src/propagation_recovery.rs recover_host",
+            "crates/ratspeak-tauri/src/commands/activity.rs activity_clear",
+            "crates/ratspeak-tauri/src/commands/activity.rs activity_resume",
+            "crates/ratspeak-tauri/src/commands/activity.rs activity_set_profile",
+            "crates/ratspeak-tauri/src/commands/activity.rs activity_start",
+            "crates/ratspeak-tauri/src/commands/activity.rs activity_stop",
+            "crates/ratspeak-tauri/src/commands/identity.rs acquire_identity_mutation",
+            "crates/ratspeak-tauri/src/commands/identity.rs api_delete_identity",
+            "crates/ratspeak-tauri/src/commands/identity.rs remove_identity_passcode",
+            "crates/ratspeak-tauri/src/commands/identity.rs set_identity_passcode",
+            "crates/ratspeak-tauri/src/commands/identity.rs switch_identity_session",
+            "crates/ratspeak-tauri/src/commands/identity.rs unlock_protected_identity",
+            "crates/ratspeak-tauri/src/commands/network.rs enable_network_log",
+            "crates/ratspeak-tauri/src/commands/network.rs set_network_log_level",
+            "crates/ratspeak-tauri/src/commands/system.rs api_factory_reset",
+            "crates/ratspeak-tauri/src/commands/system.rs api_setup_complete",
+            "crates/ratspeak-tauri/src/commands/system.rs api_system_shutdown",
+            "crates/ratspeak-tauri/src/commands/system.rs apply_foreground_transition",
+            "crates/ratspeak-tauri/src/lib.rs init_core",
+            "src-tauri/src/lib.rs set_desktop_foreground",
+            "src-tauri/src/lib.rs shutdown_desktop_core_for_exit",
+        ],
+        "a new transition must be deliberate; routine work takes lock_routine"
+    );
+}
+
+/// Every activation starts a new identity session before its shutdown, so
+/// nothing begun under the previous one lands in the next; unlock reopens
+/// the same session. The hardware paths need a card to run, so this pins them.
+#[test]
+fn every_activation_starts_a_new_identity_session() {
+    let root = repo_root();
+    let read = |path: &str| read_source(root.join(path)).expect(path);
+    let identity = read("crates/ratspeak-tauri/src/commands/identity.rs");
+    let hardware = read("crates/ratspeak-tauri/src/commands/hardware.rs");
+    let system = read("crates/ratspeak-tauri/src/commands/system.rs");
+    let runtime = read("crates/ratspeak-runtime/src/lib.rs");
+    // A marker, not a name: the import's signature is generic.
+    for (source, function, shutdown) in [
+        (
+            &hardware,
+            "fn hw_activate_and_unlock(",
+            "shutdown_for_hardware_change(",
+        ),
+        (&hardware, "fn hw_remove(", "shutdown_for_hardware_change("),
+        (
+            &system,
+            "fn api_setup_complete(",
+            "crate::shutdown_rns_lxmf(",
+        ),
+        (
+            &system,
+            "fn api_factory_reset(",
+            "crate::shutdown_rns_lxmf(",
+        ),
+        (
+            &identity,
+            "fn import_identity_after_parse<",
+            "crate::shutdown_rns_lxmf(",
+        ),
+        (&runtime, "fn lock_hardware_session(", "shutdown_rns_lxmf("),
+    ] {
+        let body = rust_struct_literal_blocks(source, function)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing {function}"));
+        let bump = body
+            .find("bump_identity_session_generation()")
+            .unwrap_or_else(|| panic!("{function} starts no session"));
+        let stop = body.find(shutdown).expect("shutdown");
+        assert!(
+            bump < stop,
+            "{function} shuts down before its session starts"
+        );
+    }
+    assert!(
+        !rust_function_block(&identity, "unlock_protected_identity")
+            .contains("bump_identity_session_generation")
+    );
+}
+
 #[test]
 fn frontend_console_output_is_silent_by_default() {
     let root = repo_root();
@@ -4240,10 +4398,18 @@ fn frontend_ipc_waits_and_connect_errors_are_visible() {
         .expect("post-build current transport capture");
     assert!(packet_build < transport_capture);
     assert!(burst.contains("state.is_current_activity_origin_fence(activity_origin)"));
-    assert!(burst.contains("state.identity_switch_lock.lock().await"));
-    assert!(
-        burst.contains("is_current_activity_request_fence_after_identity_lock(activity_origin)")
-    );
+    // Sending is routine work: it excludes transitions and invalidates
+    // nothing. Only the admission span holds the lock; dispatch waits outside.
+    let admission = rust_struct_literal_blocks(&runtime_rs, "async fn admit_in_lifecycle<")
+        .into_iter()
+        .next()
+        .expect("lifecycle admission span");
+    assert!(admission.contains("state.identity_switch_lock.lock_routine().await"));
+    assert!(admission.contains("state.is_current_activity_origin_fence(activity_origin)"));
+    assert_eq!(admission.matches(".await").count(), 2);
+    assert!(burst.contains("admit_in_lifecycle(state, activity_origin, ||"));
+    assert!(!burst.contains("identity_switch_lock"));
+    assert!(!burst.contains("is_current_activity_request_fence_after_identity_lock"));
     assert!(burst.contains("any_interface_online_cached(state)"));
     assert!(!burst.contains("report.disposition = AnnounceSendDisposition::AlreadyQueued"));
     assert!(!runtime_rs.contains("announce waited on lxmf manager lock"));
@@ -9485,7 +9651,7 @@ fn android_text_sharing_is_narrow_durable_and_never_a_transport_command() {
     assert!(!native.contains("Log."));
     assert!(activity.contains("savedInstanceState?.getString(\"ratspeak.text_share_id\")"));
     assert!(activity.contains("shareIntakeId = RatspeakTextShares.receive(intent)"));
-    assert!(bridge.contains("identity_switch_lock.lock().await"));
+    assert!(bridge.contains("identity_switch_lock.lock_routine().await"));
     assert!(bridge.contains("current_identity_session_generation"));
     assert!(bridge.contains("owner(Some(&args.activity_generation))"));
     assert!(bridge.contains("readImageChunk"));
@@ -9509,7 +9675,6 @@ fn android_text_sharing_is_narrow_durable_and_never_a_transport_command() {
     let identities = read("crates/ratspeak-tauri/src/commands/identity.rs");
     let system = read("crates/ratspeak-tauri/src/commands/system.rs");
     assert!(identities.contains("forget_shared_text_drafts(&state, Some(hash_hex.clone()))"));
-    assert!(system.contains("forget_shared_text_drafts(&state, Some(identity_id.clone()))"));
     assert!(system.contains("forget_shared_text_drafts(&state, None)"));
     assert!(root.join("scripts/dashboard/test_text_shares.js").is_file());
     assert!(!root.join("dashboard/scripts/test_text_shares.js").exists());

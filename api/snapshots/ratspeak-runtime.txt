@@ -716,6 +716,7 @@ pub async fn ratspeak_runtime::activity::ActivityRecorder::shutdown(&self) -> co
 pub async fn ratspeak_runtime::activity::ActivityRecorder::start(&self) -> core::result::Result<ratspeak_runtime::activity::ActivityStatusV1, ratspeak_runtime::activity::ActivityRecorderError>
 pub fn ratspeak_runtime::activity::ActivityRecorder::status(&self) -> ratspeak_runtime::activity::ActivityStatusV1
 pub async fn ratspeak_runtime::activity::ActivityRecorder::stop(&self) -> core::result::Result<ratspeak_runtime::activity::ActivityStatusV1, ratspeak_runtime::activity::ActivityRecorderError>
+pub fn ratspeak_runtime::activity::ActivityRecorder::trace_expiry_due(&self) -> bool
 pub fn ratspeak_runtime::activity::ActivityRecorder::with_batch_sink(alloc::sync::Arc<dyn ratspeak_runtime::activity::ActivityBatchSink>) -> Self
 impl core::default::Default for ratspeak_runtime::activity::ActivityRecorder
 pub fn ratspeak_runtime::activity::ActivityRecorder::default() -> Self
@@ -2610,6 +2611,7 @@ pub fn ratspeak_runtime::generate_recoverable_key() -> core::result::Result<(all
 pub async fn ratspeak_runtime::init_rns_lxmf(alloc::sync::Arc<ratspeak_runtime::state::AppState>, std::path::PathBuf)
 pub async fn ratspeak_runtime::maybe_opportunistic_announce_before_user_send(&alloc::sync::Arc<ratspeak_runtime::state::AppState>, &str) -> ratspeak_runtime::AnnounceSendReport
 pub async fn ratspeak_runtime::maybe_opportunistic_announce_before_user_send_from_origin(&alloc::sync::Arc<ratspeak_runtime::state::AppState>, &str, ratspeak_runtime::state::ActivityRequestFence) -> ratspeak_runtime::AnnounceSendReport
+pub fn ratspeak_runtime::most_recent_identity(&ratspeak_db::db::DbPool, &std::path::Path) -> core::result::Result<core::option::Option<alloc::string::String>, alloc::string::String>
 pub async fn ratspeak_runtime::restart_rns_lxmf(alloc::sync::Arc<ratspeak_runtime::state::AppState>) -> core::result::Result<(), ratspeak_runtime::activity::ActivityRecorderError>
 pub async fn ratspeak_runtime::send_announce_from_origin(&alloc::sync::Arc<ratspeak_runtime::state::AppState>, ratspeak_runtime::state::ActivityRequestFence) -> ratspeak_runtime::AnnounceSendReport
 pub async fn ratspeak_runtime::send_announce_from_state(&alloc::sync::Arc<ratspeak_runtime::state::AppState>) -> ratspeak_runtime::AnnounceSendReport

@@ -1147,6 +1147,8 @@ async fn lock_hardware_session(state: Arc<AppState>, generation: u64) {
     });
     let Some(hash) = hash else { return };
     tracing::info!(identity = %short_id(&hash), "hardware session auto-lock timeout — locking");
+    // Nothing begun before the lock may land behind it.
+    state.bump_identity_session_generation();
     if let Err(error) = shutdown_rns_lxmf(&state).await {
         tracing::error!(
             %error,
@@ -1208,6 +1210,50 @@ fn profile_has_identity_material(dir: &std::path::Path) -> bool {
     dir.join("identity").exists()
         || dir.join("identity.enc").exists()
         || dir.join("identity.hwid").exists()
+}
+
+/// The most recently used identity whose key material is on disk.
+pub fn most_recent_identity(
+    pool: &db::DbPool,
+    data_dir: &std::path::Path,
+) -> Result<Option<String>, String> {
+    let identities = data_dir.join("identities");
+    Ok(db::identity_hashes_by_last_use(pool)?
+        .into_iter()
+        .find(|hash| {
+            helpers::is_protocol_hash_16(hash)
+                && profile_has_identity_material(&identities.join(hash))
+        }))
+}
+
+/// No active row: the most recently used identity becomes active, as after a
+/// removal. A protected one then opens to its lock sheet.
+async fn activate_most_recent_identity(state: &Arc<AppState>) -> Result<Option<String>, ()> {
+    let data_dir = state.config.data_dir.clone();
+    let activated = db::spawn_db(state.db.clone(), move |pool| {
+        let Some(hash) = most_recent_identity(&pool, &data_dir)? else {
+            return Ok(None);
+        };
+        db::set_active_identity(&pool, &hash)?;
+        Ok::<_, String>(Some(hash))
+    })
+    .await;
+    match activated {
+        Ok(Ok(hash)) => {
+            if hash.is_some() {
+                state.bump_identity_session_generation();
+            }
+            Ok(hash)
+        }
+        Ok(Err(_)) | Err(_) => {
+            tracing::error!(
+                reason = "activate_failed",
+                "could not activate the most recently used identity"
+            );
+            state.set_startup_stage("error");
+            Err(())
+        }
+    }
 }
 
 fn has_plain_identity_material(ratspeak_dir: &std::path::Path) -> bool {
@@ -1379,12 +1425,18 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
     let Ok(preferred_identity) = read_active_identity_for_startup(&state).await else {
         return;
     };
-    let preferred_identity_hash = preferred_identity.and_then(|identity| {
+    let mut preferred_identity_hash = preferred_identity.and_then(|identity| {
         identity
             .get("hash")
             .and_then(|v| v.as_str())
             .map(str::to_string)
     });
+    if preferred_identity_hash.is_none() {
+        let Ok(recent) = activate_most_recent_identity(&state).await else {
+            return;
+        };
+        preferred_identity_hash = recent;
+    }
     if preferred_identity_hash
         .as_deref()
         .is_some_and(|hash| !helpers::is_protocol_hash_16(hash))
@@ -1496,6 +1548,8 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 return;
             };
             if active.is_none() {
+                // An activation: nothing begun before it may land in this identity.
+                state.bump_identity_session_generation();
                 let id_hash = mgr.identity_hash.clone();
                 let lxmf_hash = mgr.lxmf_hash.clone();
                 // Match the default used by setup + identity creation paths
@@ -3679,25 +3733,7 @@ fn record_presence_lifecycle_activity(
     record_activity_if_current(state, activity_origin, || Ok(event));
 }
 
-/// Record while `identity_switch_lock` is held. This is the final wire-send
-/// ownership seam: the same fence that authorizes transport admission also
-/// authorizes the one correlated Activity result before the lock is released.
-fn record_presence_lifecycle_activity_after_identity_lock(
-    state: &AppState,
-    activity_origin: ActivityRequestFence,
-    leadership: &AnnounceLeadership,
-    report: &AnnounceSendReport,
-) {
-    let Some(event) = presence_lifecycle_activity_event(leadership, report) else {
-        return;
-    };
-    let _ = state.activity.record_event_fenced(
-        || state.is_current_activity_request_fence_after_identity_lock(activity_origin),
-        || Ok(event),
-    );
-}
-
-fn record_current_presence_lifecycle_activity_after_identity_lock(
+fn record_current_presence_lifecycle_activity(
     state: &AppState,
     activity_origin: ActivityRequestFence,
     leadership: &AnnounceLeadership,
@@ -3709,12 +3745,7 @@ fn record_current_presence_lifecycle_activity_after_identity_lock(
         .ok()
         .and_then(|coordinator| coordinator.leadership(leadership.correlation_id))
         .unwrap_or_else(|| leadership.clone());
-    record_presence_lifecycle_activity_after_identity_lock(
-        state,
-        activity_origin,
-        &completed_leadership,
-        report,
-    );
+    record_presence_lifecycle_activity(state, activity_origin, &completed_leadership, report);
 }
 
 fn presence_lifecycle_activity_event(
@@ -3825,6 +3856,25 @@ fn try_build_presence_announce_packets(
     }
 }
 
+/// Admit one presence component in a routine lifecycle span, unless a
+/// transition began or ended since `activity_origin`. Sending invalidates no
+/// other request, and callers await interface dispatch after the span, so
+/// inbound display, alerts and deletes never queue behind a slow interface.
+async fn admit_in_lifecycle<F, T>(
+    state: &AppState,
+    activity_origin: ActivityRequestFence,
+    admission: impl FnOnce() -> F,
+) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
+    if !state.is_current_activity_origin_fence(activity_origin) {
+        return None;
+    }
+    Some(admission().await)
+}
+
 async fn execute_announce_burst(
     state: &AppState,
     require_cached_online: bool,
@@ -3923,23 +3973,6 @@ async fn execute_announce_burst(
         };
     }
 
-    // Bind the prepared bytes and their final transport admission to the same
-    // exact identity/runtime lifecycle span. This covers same-identity RNS
-    // replacement as well as identity switches, and the guard remains held
-    // through the bounded channel admissions and correlated Activity record.
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
-    if !state.is_current_activity_request_fence_after_identity_lock(activity_origin) {
-        tracing::info!(
-            correlation_id = leadership.correlation_id,
-            "stale presence announce suppressed before transport admission"
-        );
-        report.failed = 1;
-        report.disposition = AnnounceSendDisposition::Failed;
-        return AnnounceBurstExecution {
-            report,
-            activity_recorded: false,
-        };
-    }
     if matches!(any_interface_online_cached(state), Some(false)) {
         tracing::warn!(
             correlation_id = leadership.correlation_id,
@@ -3947,12 +3980,7 @@ async fn execute_announce_burst(
         );
         report.failed = 1;
         report.disposition = AnnounceSendDisposition::Failed;
-        record_current_presence_lifecycle_activity_after_identity_lock(
-            state,
-            activity_origin,
-            leadership,
-            &report,
-        );
+        record_current_presence_lifecycle_activity(state, activity_origin, leadership, &report);
         return AnnounceBurstExecution {
             report,
             activity_recorded: true,
@@ -3966,12 +3994,7 @@ async fn execute_announce_burst(
     let Some(tx) = transport_tx else {
         report.failed = 1;
         report.disposition = AnnounceSendDisposition::Failed;
-        record_current_presence_lifecycle_activity_after_identity_lock(
-            state,
-            activity_origin,
-            leadership,
-            &report,
-        );
+        record_current_presence_lifecycle_activity(state, activity_origin, leadership, &report);
         return AnnounceBurstExecution {
             report,
             activity_recorded: true,
@@ -3982,19 +4005,31 @@ async fn execute_announce_burst(
         let packet_len = raw.len();
         let fingerprint = hex::encode(&rns_crypto::sha::sha256(&raw)[..6]);
         let (dispatch_tx, dispatch_rx) = tokio::sync::oneshot::channel();
-        let admitted = tokio::time::timeout(
-            ANNOUNCE_QUEUE_ADMISSION_WAIT,
-            tx.send(rns_transport::messages::TransportMessage::SendPacket {
-                request: rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash,
-                },
-                attached_interface: None,
-                receipt: None,
-                result_tx: dispatch_tx,
-            }),
-        )
-        .await;
+        let packet = rns_transport::messages::TransportMessage::SendPacket {
+            request: rns_transport::messages::OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash,
+            },
+            attached_interface: None,
+            receipt: None,
+            result_tx: dispatch_tx,
+        };
+        let Some(admitted) = admit_in_lifecycle(state, activity_origin, || {
+            tokio::time::timeout(ANNOUNCE_QUEUE_ADMISSION_WAIT, tx.send(packet))
+        })
+        .await
+        else {
+            tracing::info!(
+                correlation_id = leadership.correlation_id,
+                "stale presence announce suppressed before transport admission"
+            );
+            report.failed += 1;
+            report.disposition = AnnounceSendDisposition::Failed;
+            return AnnounceBurstExecution {
+                report,
+                activity_recorded: false,
+            };
+        };
         let dispatch = if matches!(admitted, Ok(Ok(()))) {
             tokio::time::timeout(ANNOUNCE_INTERFACE_DISPATCH_WAIT, dispatch_rx)
                 .await
@@ -4057,22 +4092,24 @@ async fn execute_announce_burst(
 
     #[cfg(feature = "lxst-voice")]
     if report.lxmf_delivery_queued {
-        match tokio::time::timeout(
-            ANNOUNCE_QUEUE_ADMISSION_WAIT,
-            voice::announce_if_running(state),
-        )
+        match admit_in_lifecycle(state, activity_origin, || {
+            tokio::time::timeout(
+                ANNOUNCE_QUEUE_ADMISSION_WAIT,
+                voice::announce_if_running(state),
+            )
+        })
         .await
         {
-            Ok(Ok(true)) => {
+            Some(Ok(Ok(true))) => {
                 report.packets += 1;
                 report.queued += 1;
                 report.lxst_queued = true;
                 tracing::info!("LXST telephony announce queued");
             }
-            Ok(Ok(false)) => {
+            Some(Ok(Ok(false))) => {
                 tracing::debug!("LXST telephony announce skipped: voice service is not running");
             }
-            Ok(Err(_)) | Err(_) => {
+            Some(Ok(Err(_)) | Err(_)) | None => {
                 report.packets += 1;
                 report.failed += 1;
                 tracing::warn!(
@@ -4101,12 +4138,7 @@ async fn execute_announce_burst(
         disposition = ?report.disposition,
         "presence announce burst completed"
     );
-    record_current_presence_lifecycle_activity_after_identity_lock(
-        state,
-        activity_origin,
-        leadership,
-        &report,
-    );
+    record_current_presence_lifecycle_activity(state, activity_origin, leadership, &report);
     AnnounceBurstExecution {
         report,
         activity_recorded: true,
@@ -8826,6 +8858,115 @@ mod identity_material_tests {
 }
 
 #[cfg(test)]
+mod identity_session_tests {
+    use super::*;
+
+    /// Startup stops at Reticulum, which has no configuration here: these
+    /// tests need only its identity half, and start no runtime.
+    fn identity_state() -> (tempfile::TempDir, Arc<AppState>) {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = root.path().to_path_buf();
+        lxmf::initialize_storage_namespace(&data_root).unwrap();
+        let rns_dir = data_root.join("rns");
+        let config = crate::config::DashboardConfig {
+            data_root: data_root.clone(),
+            data_dir: data_root.join(".ratspeak"),
+            rns_config_dir: rns_dir,
+            rns_config_dir_overridden: true,
+            max_log_entries: 20,
+        };
+        let pool = db::init_pool(&data_root).unwrap();
+        db::init_schema(&pool).unwrap();
+        let state = AppState::new(
+            config,
+            pool,
+            Arc::new(ratspeak_core::NoopEmitter),
+            Arc::new(ratspeak_core::NoopNotifier),
+        );
+        (root, Arc::new(state))
+    }
+
+    fn import(state: &AppState, nickname: &str) -> String {
+        let key = rns_identity::identity::Identity::new()
+            .get_private_key()
+            .unwrap()
+            .to_vec();
+        lxmf::LxmfManager::import_identity_to_data_dir(
+            &state.config.data_dir,
+            &key,
+            nickname,
+            &state.db,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn active(state: &AppState) -> Option<String> {
+        db::get_active_identity(&state.db)
+            .unwrap()
+            .and_then(|row| row.get("hash").and_then(|v| v.as_str()).map(str::to_owned))
+    }
+
+    // Locking ends the session: nothing begun under it may land behind the lock.
+    #[tokio::test]
+    async fn auto_lock_starts_a_new_identity_session() {
+        let (_root, state) = identity_state();
+        let identity = rns_identity::identity::Identity::new();
+        let manager =
+            lxmf::LxmfManager::from_loaded_identity(&state.config.data_root, identity, true)
+                .unwrap();
+        let hash = manager.identity_hash.clone();
+        state.set_lxmf(manager);
+        let generation = state.current_identity_session_generation();
+        let lock_generation = state.hw_lock_gen.load(std::sync::atomic::Ordering::SeqCst);
+        lock_hardware_session(Arc::clone(&state), lock_generation).await;
+        assert_eq!(state.hw_locked_hash().as_deref(), Some(hash.as_str()));
+        assert!(state.current_identity_session_generation() > generation);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_starts_a_new_identity_session() {
+        let (_root, state) = identity_state();
+        let hash = import(&state, "Found");
+        state
+            .db
+            .get()
+            .unwrap()
+            .execute("DELETE FROM identities", [])
+            .unwrap();
+        let generation = state.current_identity_session_generation();
+        init_rns_lxmf(Arc::clone(&state), state.config.data_root.clone()).await;
+        assert_eq!(active(&state).as_deref(), Some(hash.as_str()));
+        assert!(state.current_identity_session_generation() > generation);
+    }
+
+    // With no active row the most recently used identity opens, as after a
+    // removal; a protected one opens to its lock sheet.
+    #[tokio::test]
+    async fn a_cold_start_without_an_active_row_opens_the_most_recent_identity() {
+        let (_root, state) = identity_state();
+        let older = import(&state, "Older");
+        let newer = import(&state, "Newer");
+        let profile = state.config.data_dir.join("identities").join(&newer);
+        std::fs::rename(profile.join("identity"), profile.join("identity.enc")).unwrap();
+        let conn = state.db.get().unwrap();
+        for (hash, last_used) in [(&older, 1.0), (&newer, 2.0)] {
+            conn.execute(
+                "UPDATE identities SET last_used = ?1 WHERE hash = ?2",
+                rusqlite::params![last_used, hash],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let generation = state.current_identity_session_generation();
+        init_rns_lxmf(Arc::clone(&state), state.config.data_root.clone()).await;
+        assert_eq!(active(&state).as_deref(), Some(newer.as_str()));
+        assert_eq!(state.hw_locked_hash().as_deref(), Some(newer.as_str()));
+        assert!(state.current_identity_session_generation() > generation);
+    }
+}
+
+#[cfg(test)]
 mod transport_startup_tests {
     use super::*;
     use crate::config::DashboardConfig;
@@ -8990,6 +9131,56 @@ mod notification_tests {
         let pool = r2d2::Pool::builder().max_size(2).build(mgr).unwrap();
         db::init_schema(&pool).unwrap();
         AppState::new(config, pool, Arc::new(ratspeak_core::NoopEmitter), notifier)
+    }
+
+    fn announce_state() -> Arc<AppState> {
+        let state = Arc::new(make_state(Arc::new(RecordingNotifier::default())));
+        let unique = TEMP_NOTIFICATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!(
+            "ratspeak-announce-fence-test-{}-{unique}",
+            std::process::id()
+        ));
+        crate::lxmf::initialize_storage_namespace(&tmp).unwrap();
+        *state.lxmf.lock().unwrap() =
+            Some(crate::lxmf::LxmfManager::load_or_create(&tmp, None, None).unwrap());
+        state
+    }
+
+    fn manual_leadership(state: &AppState) -> crate::announce::AnnounceLeadership {
+        crate::announce::AnnounceLeadership {
+            correlation_id: 1,
+            activity_correlation_id: crate::activity::CorrelationId::random(),
+            revisions: state.announce_semantic_revision(),
+            origins: vec![crate::announce::AnnounceOrigin::Manual],
+        }
+    }
+
+    // A burst past its fence fails later here for want of a transport, and
+    // records its result; a stale one is suppressed without a record.
+    #[tokio::test]
+    async fn only_a_transition_suppresses_an_announce_and_sending_suppresses_none() {
+        let state = announce_state();
+        let origin = state.activity_request_fence();
+        drop(crate::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await);
+        let bystander = state.activity_request_fence();
+        let burst = execute_announce_burst(&state, false, origin, &manual_leadership(&state)).await;
+        assert!(
+            burst.activity_recorded,
+            "routine work suppressed the announce"
+        );
+        assert!(
+            state.is_current_activity_origin_fence(bystander),
+            "sending the announce invalidated another request"
+        );
+
+        let state = announce_state();
+        let origin = state.activity_request_fence();
+        drop(state.identity_switch_lock.lock().await);
+        let burst = execute_announce_burst(&state, false, origin, &manual_leadership(&state)).await;
+        assert!(
+            !burst.activity_recorded,
+            "a transition must suppress the announce"
+        );
     }
 
     #[test]

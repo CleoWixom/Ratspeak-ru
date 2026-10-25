@@ -1218,7 +1218,6 @@ pub fn run() {
                 ratspeak_tauri::commands::system::api_clear_messages,
                 ratspeak_tauri::commands::system::api_clear_contacts,
                 ratspeak_tauri::commands::system::api_reset_database,
-                ratspeak_tauri::commands::system::api_identity_reset,
                 ratspeak_tauri::commands::system::api_factory_reset,
                 ratspeak_tauri::commands::games::send_game_action,
                 ratspeak_tauri::commands::games::resend_last_game_action,
@@ -1710,10 +1709,13 @@ fn set_desktop_foreground(app: &tauri::AppHandle, foreground: bool) {
         state.set_notification_foreground(foreground);
         if foreground {
             tauri::async_runtime::spawn(async move {
-                let expiry = {
+                // Ending a Trace is a profile change; most foreground edges have none.
+                let expiry = if state.activity.trace_expiry_due() {
                     let _identity_lifecycle = state.identity_switch_lock.lock().await;
                     let _activity_control = state.activity_control_lock.lock().await;
-                    state.activity.expire_trace_if_due().await
+                    state.activity.expire_trace_if_due().await.map(drop)
+                } else {
+                    Ok(())
                 };
                 if expiry.is_ok() {
                     let _ = ratspeak_tauri::commands::system::set_foreground_state_if_current(

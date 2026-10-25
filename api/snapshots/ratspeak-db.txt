@@ -343,6 +343,7 @@ pub fn ratspeak_db::db::has_game_nonce(&ratspeak_db::DbPool, &str, &str, &[u8]) 
 pub fn ratspeak_db::db::hide_conversation(&ratspeak_db::DbPool, &str, &str)
 pub fn ratspeak_db::db::identity_generation() -> u64
 pub fn ratspeak_db::db::identity_hash_for_dest(&ratspeak_db::DbPool, &str) -> core::option::Option<alloc::string::String>
+pub fn ratspeak_db::db::identity_hashes_by_last_use(&ratspeak_db::DbPool) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, alloc::string::String>
 pub fn ratspeak_db::db::identity_hashes_for_dests(&ratspeak_db::DbPool, &[alloc::string::String]) -> std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>
 pub fn ratspeak_db::db::init_pool(&std::path::Path) -> core::result::Result<ratspeak_db::DbPool, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
 pub fn ratspeak_db::db::init_schema(&ratspeak_db::DbPool) -> core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
@@ -693,6 +694,7 @@ pub fn ratspeak_db::has_game_nonce(&ratspeak_db::DbPool, &str, &str, &[u8]) -> b
 pub fn ratspeak_db::hide_conversation(&ratspeak_db::DbPool, &str, &str)
 pub fn ratspeak_db::identity_generation() -> u64
 pub fn ratspeak_db::identity_hash_for_dest(&ratspeak_db::DbPool, &str) -> core::option::Option<alloc::string::String>
+pub fn ratspeak_db::identity_hashes_by_last_use(&ratspeak_db::DbPool) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, alloc::string::String>
 pub fn ratspeak_db::identity_hashes_for_dests(&ratspeak_db::DbPool, &[alloc::string::String]) -> std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>
 pub fn ratspeak_db::init_pool(&std::path::Path) -> core::result::Result<ratspeak_db::DbPool, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
 pub fn ratspeak_db::init_schema(&ratspeak_db::DbPool) -> core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>

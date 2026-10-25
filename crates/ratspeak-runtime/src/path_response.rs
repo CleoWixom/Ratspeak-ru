@@ -490,7 +490,9 @@ mod tests {
             rx,
             f.shutdown.clone(),
         ));
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // The credit stays held, so an ingress that awaited it would never
+        // finish; the bounds only absorb a loaded parallel suite.
+        tokio::time::timeout(Duration::from_secs(30), async {
             // Observe the post-commit event instead of continuously reading the
             // shared-memory SQLite table while the blocking worker writes it.
             // The observer must not introduce table-lock contention itself.
@@ -502,7 +504,7 @@ mod tests {
         .expect("inbound processing cannot await path-response transport credit");
         assert_eq!(message_rows(&f.state), 1);
         assert!(raw(&f.outbound.try_recv().unwrap()).is_empty());
-        let response = tokio::time::timeout(Duration::from_secs(3), f.outbound.recv())
+        let response = tokio::time::timeout(Duration::from_secs(30), f.outbound.recv())
             .await
             .unwrap()
             .unwrap();

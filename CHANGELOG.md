@@ -18,6 +18,9 @@ changes that materially affect how an artifact is reproduced.
 - Bounded background announcements at flow-controlled radio writers.
 - Ratspeak warns at startup when its data is on a network drive or in temporary memory, where messages and keys may not survive a crash or restart.
 - Deleting all messages or contacts now clears them from every screen at once, and blocked users stay blocked.
+- Creating, importing or restoring an identity no longer fails at random while the app is busy, and reading a channel or bringing the app forward no longer drops an announce.
+- A failed identity switch brings the previous identity back online and shows why, instead of leaving the app offline mid-switch.
+- Removing the active hardware identity, or starting with no identity selected, opens the most recently used one; a protected one asks for its PIN.
 
 ### Build and compatibility
 

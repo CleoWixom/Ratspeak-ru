@@ -78,7 +78,7 @@ pub fn invalidate_downloads(state: &AppState) {
 /// inside one lifecycle span, even when its awaiting command is cancelled.
 pub struct DownloadDeletionGuard {
     state: Arc<AppState>,
-    _lifecycle: crate::state::OwnedIdentitySwitchGuard,
+    _lifecycle: crate::state::OwnedRoutineGuard,
 }
 impl Drop for DownloadDeletionGuard {
     fn drop(&mut self) {
@@ -86,7 +86,7 @@ impl Drop for DownloadDeletionGuard {
     }
 }
 pub async fn begin_download_deletion(state: Arc<AppState>) -> DownloadDeletionGuard {
-    let lifecycle = state.identity_switch_lock.lock_owned().await;
+    let lifecycle = state.identity_switch_lock.lock_routine_owned().await;
     invalidate_downloads(&state);
     DownloadDeletionGuard {
         state,
@@ -108,7 +108,7 @@ pub fn delete_messages(
 pub async fn retry_deferred_downloads(state: Arc<AppState>) -> Result<(), String> {
     let generation = state.current_identity_session_generation();
     tokio::spawn(async move {
-        let _lifecycle = state.identity_switch_lock.lock_owned().await;
+        let _lifecycle = state.identity_switch_lock.lock_routine_owned().await;
         if state.current_identity_session_generation() != generation {
             return Err("Selected identity changed".into());
         }

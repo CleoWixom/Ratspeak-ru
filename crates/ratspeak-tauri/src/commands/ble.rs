@@ -1710,10 +1710,10 @@ pub async fn apply_ble_rnode_bridge_ready(
     {
         tokio::spawn(async move {
             // The opaque operation token gates product work independently of
-            // Activity capture. Hold the identity transition lock only across
+            // Activity capture. Hold the identity lifecycle lock only across
             // the runtime spawn so a consumed token cannot race a teardown.
             let spawn_result = {
-                let _identity_guard = state_arc.identity_switch_lock.lock().await;
+                let _identity_guard = state_arc.identity_switch_lock.lock_routine().await;
                 if state_arc.current_identity_session_generation()
                     != activity_fence.identity_session_generation()
                 {

@@ -162,6 +162,7 @@ pub async fn api_setup_complete(
         };
         // Persisting an identity is inactive. The acknowledged privacy/runtime
         // boundary must complete before this first identity becomes active.
+        state.bump_identity_session_generation();
         let app_state = Arc::clone(state.inner());
         crate::shutdown_rns_lxmf(&app_state)
             .await
@@ -268,7 +269,8 @@ pub async fn apply_foreground_transition(
             "could not release voice memo capture while backgrounding"
         );
     }
-    if fg {
+    // Ending a Trace is a profile change; most foreground edges have none.
+    if fg && state.activity.trace_expiry_due() {
         let _identity_lifecycle = state.identity_switch_lock.lock().await;
         let _activity_control = state.activity_control_lock.lock().await;
         state
@@ -693,94 +695,6 @@ pub async fn api_reset_database(state: State<'_, Arc<AppState>>) -> AppResult<Va
 }
 
 #[tauri::command]
-#[tracing::instrument(level = "debug", name = "command.api_identity_reset", skip_all)]
-pub async fn api_identity_reset(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
-    let identity_lifecycle = Arc::new(state.identity_switch_lock.lock_owned().await);
-    let identity_id = active_identity_id(&state);
-    if !identity_id.is_empty() {
-        super::shared::forget_shared_text_drafts(&state, Some(identity_id.clone())).await?;
-    }
-    let reset_data_dir = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|lxmf| lxmf.as_ref().map(|manager| manager.data_dir.clone()));
-    let app_state = Arc::clone(state.inner());
-    crate::shutdown_rns_lxmf(&app_state)
-        .await
-        .map_err(|_| AppError::internal("identity reset lifecycle boundary unavailable"))?;
-
-    if !identity_id.is_empty() {
-        let id1 = identity_id.clone();
-        let worker_state = Arc::clone(&state);
-        db::spawn_db_with_lease(
-            state.db.clone(),
-            Arc::clone(&identity_lifecycle),
-            move |_p| {
-                ratspeak_runtime::propagation_recovery::delete_messages(&worker_state, &id1, None)
-                    .and_then(|deleted| deleted.remove_files())
-            },
-        )
-        .await
-        .map_err(|_| AppError::internal("message deletion worker failed"))?
-        .map_err(|error| AppError::database_unavailable(error.to_string()))?;
-        let id2 = identity_id.clone();
-        db::spawn_db_with_lease(
-            state.db.clone(),
-            Arc::clone(&identity_lifecycle),
-            move |p| db::clear_all_contacts(&p, &id2),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(
-                reason = "task_panicked",
-                "identity_reset clear_contacts panicked"
-            );
-            Default::default()
-        });
-        let id3 = identity_id.clone();
-        let del_res = db::spawn_db_with_lease(
-            state.db.clone(),
-            Arc::clone(&identity_lifecycle),
-            move |p| db::delete_identity(&p, &id3, true),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(reason = "task_panicked", "identity_reset delete panicked");
-            Err("db task panicked".to_string())
-        });
-        if del_res.is_err() {
-            tracing::error!(
-                reason = "delete_failed",
-                "Failed to delete identity during reset"
-            );
-        }
-    }
-
-    if let Some(data_dir) = reset_data_dir {
-        let lifecycle = Arc::clone(&identity_lifecycle);
-        tokio::task::spawn_blocking(move || {
-            let _lifecycle = lifecycle;
-            crate::lxmf::clear_identity_storage_namespace(&data_dir)?;
-            std::fs::remove_dir_all(data_dir.join("ratchets")).ok();
-            std::fs::remove_file(data_dir.join("identity")).ok();
-            // Hub keys are identity-scoped key material; a surviving keyfile
-            // would resurrect the hub on its old destination hash.
-            std::fs::remove_dir_all(data_dir.join("channel_hub")).ok();
-            Ok::<(), std::io::Error>(())
-        })
-        .await
-        .map_err(reset_identity_storage_error)?
-        .map_err(reset_identity_storage_error)?;
-    }
-
-    state.set_startup_stage("ready");
-    state.emit_to_all("identity_reset", json!({ "restarting": true }));
-
-    Ok(json!({ "message": "Identity deleted. Returning to setup..." }))
-}
-
-#[tauri::command]
 pub async fn dismiss_alert(state: State<'_, Arc<AppState>>, index: i64) -> AppResult<Value> {
     if index < 0 {
         return Err(AppError::bad_request("invalid index"));
@@ -809,6 +723,7 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
         .uses_app_private_rns_config_dir()
         .then(|| state.config.rns_config_dir.clone());
 
+    state.bump_identity_session_generation();
     let app_state = Arc::clone(state.inner());
     crate::shutdown_rns_lxmf(&app_state)
         .await

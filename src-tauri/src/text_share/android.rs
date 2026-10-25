@@ -170,7 +170,7 @@ fn owner(expected: Option<&str>) -> Result<String, String> {
 }
 
 pub(super) async fn list(state: Arc<AppState>) -> Result<Value, String> {
-    let _identity = state.identity_switch_lock.lock().await;
+    let _identity = state.identity_switch_lock.lock_routine().await;
     let activity = owner(None)?;
     let identity = identity(&state)?;
     let generation = state.current_identity_session_generation().to_string();
@@ -194,7 +194,7 @@ pub(super) async fn list(state: Arc<AppState>) -> Result<Value, String> {
 }
 
 pub(super) async fn edit(state: Arc<AppState>, args: TextShareEdit) -> Result<Value, String> {
-    let _identity = state.identity_switch_lock.lock().await;
+    let _identity = state.identity_switch_lock.lock_routine().await;
     let identity = identity(&state)?;
     if state.current_identity_session_generation().to_string() != args.identity_generation {
         return Err("The identity changed. Open the shared draft again.".into());

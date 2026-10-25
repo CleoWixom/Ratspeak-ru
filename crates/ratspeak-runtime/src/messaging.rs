@@ -251,7 +251,7 @@ async fn publish_conversations_for_generation(
     revision: u64,
     payload: Value,
 ) -> bool {
-    let _identity = state.identity_switch_lock.lock().await;
+    let _identity = state.identity_switch_lock.lock_routine().await;
     if state.current_identity_session_generation() != generation
         || state.conversation_list_revision() != revision
     {
@@ -333,6 +333,21 @@ mod tests {
             Arc::new(ratspeak_core::NoopEmitter),
             Arc::new(ratspeak_core::NoopNotifier),
         )
+    }
+
+    #[tokio::test]
+    async fn conversation_publication_invalidates_no_request() {
+        let state = make_state();
+        let prepared = state.activity_request_fence();
+        let generation = state.current_identity_session_generation();
+        let revision = state.conversation_list_revision();
+        assert!(
+            publish_conversations_for_generation(&state, generation, revision, json!([])).await
+        );
+        assert!(state.is_current_activity_origin_fence(prepared));
+        let mutation = state.identity_switch_lock.lock().await;
+        assert!(state.is_current_activity_request_fence_after_identity_lock(prepared));
+        drop(mutation);
     }
 
     #[tokio::test]
