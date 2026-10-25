@@ -1626,6 +1626,7 @@ async fn switch_identity_session_held(
         .await
         .map_err(identity_activity_reset_error)?;
     let generation = state.bump_identity_session_generation();
+    state.withdraw_native_notifications();
     let switching = SwitchUnderWay::begin(&state, &hash_hex, generation);
     crate::finish_shutdown(&state, &reset).await;
     state.clear_identity_scoped_runtime_state();

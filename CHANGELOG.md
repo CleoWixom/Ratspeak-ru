@@ -32,6 +32,7 @@ changes that materially affect how an artifact is reproduced.
 - While an identity is locked, its messages, contacts and other data stay out of the app until you unlock it.
 - Ratspeak keeps its data folder and desktop diagnostic logs private to your user account, and copying the shared-instance access configuration asks for your identity's PIN, or a confirmation when it has none.
 - The Linux packages' USB radio rule gives access to the user signed in at the computer, and applies to radios that are already plugged in.
+- Notification previews can show the sender and message, only the sender, or neither; a call always shows who is calling. On Android and iOS, switching identities or a lock removes the identity's alerts, and a call that rings during a switch no longer alerts under the next identity.
 
 ### Build and compatibility
 

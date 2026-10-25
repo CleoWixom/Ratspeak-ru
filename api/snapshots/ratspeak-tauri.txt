@@ -491,6 +491,7 @@ pub async fn ratspeak_tauri::commands::interfaces::set_hardware_lock_timeout(tau
 pub async fn ratspeak_tauri::commands::interfaces::set_hide_known_spam_peers(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, bool) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::set_lxmf_limit_1mb(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, bool) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub fn ratspeak_tauri::commands::interfaces::set_native_theme(tauri::webview::webview_window::WebviewWindow, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
+pub async fn ratspeak_tauri::commands::interfaces::set_notification_preview(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::set_peers_sort(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::set_text_scale(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, u16) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::set_transport_mode(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::interfaces::TransportModeArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
@@ -815,6 +816,7 @@ impl ratspeak_tauri::notifier::TauriNotifier
 pub fn ratspeak_tauri::notifier::TauriNotifier::new(tauri::app::AppHandle) -> Self
 impl ratspeak_core::notification::NativeNotifier for ratspeak_tauri::notifier::TauriNotifier
 pub fn ratspeak_tauri::notifier::TauriNotifier::notify(&self, ratspeak_core::notification::NativeNotification)
+pub fn ratspeak_tauri::notifier::TauriNotifier::withdraw_all(&self)
 pub mod ratspeak_tauri::window_prefs
 pub enum ratspeak_tauri::window_prefs::DecorationsPref
 pub ratspeak_tauri::window_prefs::DecorationsPref::Auto

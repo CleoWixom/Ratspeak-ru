@@ -1161,6 +1161,7 @@ pub fn run() {
                 ratspeak_tauri::commands::interfaces::set_text_scale,
                 ratspeak_tauri::commands::interfaces::api_notification_settings,
                 ratspeak_tauri::commands::interfaces::set_desktop_notifications,
+                ratspeak_tauri::commands::interfaces::set_notification_preview,
                 open_mobile_app_settings,
                 ratspeak_tauri::commands::interfaces::add_lora_interface,
                 ratspeak_tauri::commands::interfaces::update_lora_interface,

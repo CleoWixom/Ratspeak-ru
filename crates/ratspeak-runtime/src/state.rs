@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
-use ratspeak_core::{Emitter, NativeNotification, NativeNotifier};
+use ratspeak_core::{Emitter, NativeNotification, NativeNotifier, NotificationPreview};
 /// The suspend-counting clock an [`AutoLock`] deadline runs on.
 pub use rns_link::clock::ContinuousInstant;
 use rns_runtime::lifecycle::ShutdownSignal;
@@ -780,6 +780,8 @@ pub struct AppState {
     /// Lifetime count of `lxmf.propagation` announces with unparseable app_data.
     pub pn_parse_failures: AtomicU64,
     pub native_notifications_enabled: AtomicBool,
+    /// What alerts show, as stored in `notification_preview`.
+    notification_preview: Mutex<NotificationPreview>,
     /// Sideband-compatible receive policy: enabled limits complete inbound
     /// Direct LXMF Resources to one decimal megabyte; disabled retains the
     /// 128 MB application maximum below Reticulum's structural ceiling.
@@ -903,6 +905,9 @@ impl AppState {
                 .and_then(|v| v.parse::<u8>().ok())
                 .map(|v| v != 0)
                 .unwrap_or(true);
+        let initial_notification_preview = crate::db::get_setting(&db, "notification_preview")
+            .and_then(|value| NotificationPreview::parse(&value))
+            .unwrap_or_default();
         let initial_lxmf_limit_1mb =
             crate::db::get_setting(&db, "lxmf_limit_1mb").is_none_or(|value| value != "false");
         let activity = ActivityRecorder::with_batch_sink(Arc::new(EmitterBatchSink::new(
@@ -1018,6 +1023,7 @@ impl AppState {
             auto_failure_counts: Mutex::new(HashMap::new()),
             pn_parse_failures: AtomicU64::new(0),
             native_notifications_enabled: AtomicBool::new(initial_notifications_enabled),
+            notification_preview: Mutex::new(initial_notification_preview),
             lxmf_limit_1mb: AtomicBool::new(initial_lxmf_limit_1mb),
             rns_config_lock: Mutex::new(()),
             identity_switch_lock: IdentitySwitchLock::new(),
@@ -1183,6 +1189,27 @@ impl AppState {
     pub fn set_native_notifications_enabled(&self, enabled: bool) {
         self.native_notifications_enabled
             .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn notification_preview(&self) -> NotificationPreview {
+        *self
+            .notification_preview
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_notification_preview(&self, preview: NotificationPreview) {
+        *self
+            .notification_preview
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = preview;
+    }
+
+    /// Withdraws the alerts of the identity session that is ending. Call in
+    /// its transition, after the generation bump: alerts are posted under
+    /// the routine lock against the generation, so none of it can follow.
+    pub fn withdraw_native_notifications(&self) {
+        self.notifier.withdraw_all();
     }
 
     pub fn lxmf_limit_1mb_enabled(&self) -> bool {
@@ -2801,7 +2828,11 @@ impl AppState {
         // asynchronous work after their initial lifecycle check, so recheck
         // here to prevent a foreground transition from racing an OS alert.
         if self.should_surface_native_notification() {
-            self.notifier.notify(notification);
+            self.notifier
+                .notify(ratspeak_core::notification::with_preview(
+                    notification,
+                    self.notification_preview(),
+                ));
         }
     }
 

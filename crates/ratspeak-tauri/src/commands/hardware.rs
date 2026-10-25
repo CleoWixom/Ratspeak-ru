@@ -373,6 +373,7 @@ pub async fn hw_remove(state: State<'_, Arc<AppState>>, hash: String) -> AppResu
     if live {
         let reset = reset_for_hardware_change(&state, "hardware_identity_remove").await?;
         state.bump_identity_session_generation();
+        state.withdraw_native_notifications();
         crate::finish_shutdown(&state, &reset).await;
         state.clear_identity_scoped_runtime_state();
     }
@@ -474,6 +475,7 @@ pub async fn hw_activate_and_unlock(
         .and_then(|row| row.get("hash").and_then(|v| v.as_str()).map(str::to_owned));
     let reset = reset_for_hardware_change(&state, "hardware_identity_activate").await?;
     state.bump_identity_session_generation();
+    state.withdraw_native_notifications();
     crate::finish_shutdown(&state, &reset).await;
 
     let hash_for_active = hash.clone();

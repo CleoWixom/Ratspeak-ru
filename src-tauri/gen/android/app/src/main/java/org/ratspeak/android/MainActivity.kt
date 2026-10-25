@@ -361,16 +361,11 @@ class MainActivity : TauriActivity() {
         // A user returning to the app is the moment a waiting radio is most
         // likely back (powered on, released by another host); retry now.
         RatspeakBleRnodeSupervisor.wake()
-        // ACTION_REFRESH clears per-sender notifications in RatspeakService
-        // and kicks the poll loop so lastKnownUnread is current before the
-        // user reads messages to zero.
-        refreshServicePoll()
     }
 
     override fun onPause() {
         RatspeakNativeBridge.activityResumed(activityGeneration, false)
         super.onPause()
-        refreshServicePoll()
     }
 
     override fun onStop() {
@@ -378,19 +373,6 @@ class MainActivity : TauriActivity() {
         // Home or another app only backgrounds a task; a failed start closes.
         if (RatspeakNativeBridge.coreStartupFailed && !isChangingConfigurations) {
             finishAndRemoveTask()
-        }
-    }
-
-    private fun refreshServicePoll() {
-        if (RatspeakNativeBridge.coreStartupFailed) return
-        try {
-            val intent = Intent(this, RatspeakService::class.java).apply {
-                action = RatspeakService.ACTION_REFRESH
-            }
-            startService(intent)
-        } catch (_: Exception) {
-            // Service not running yet (first onCreate hasn't finished) — safe
-            // to skip; the service will do its first poll as soon as it's up.
         }
     }
 

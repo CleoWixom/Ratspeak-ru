@@ -1652,6 +1652,30 @@ pub async fn api_notification_settings(state: State<'_, Arc<AppState>>) -> AppRe
     Ok(json!({
         "enabled": state.native_notifications_enabled(),
         "ios_stubbed": false,
+        "preview": state.notification_preview().as_str(),
+    }))
+}
+
+/// What alerts show: `name_and_message`, `name_only` or `neither`. A call
+/// always names the caller.
+#[tauri::command]
+pub async fn set_notification_preview(
+    state: State<'_, Arc<AppState>>,
+    preview: String,
+) -> AppResult<Value> {
+    let preview = ratspeak_core::NotificationPreview::parse(&preview)
+        .ok_or_else(|| AppError::bad_request("Unknown notification preview"))?;
+    db::spawn_db(state.db.clone(), move |p| {
+        db::try_set_setting(&p, "notification_preview", preview.as_str())
+    })
+    .await
+    .map_err(|_| AppError::internal("set_notification_preview db task panicked"))?
+    .map_err(|e| AppError::database_unavailable(format!("Failed to save previews: {e}")))?;
+    state.set_notification_preview(preview);
+    Ok(json!({
+        "enabled": state.native_notifications_enabled(),
+        "ios_stubbed": false,
+        "preview": preview.as_str(),
     }))
 }
 

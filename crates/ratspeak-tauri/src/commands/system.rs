@@ -734,6 +734,7 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
         .await
         .map_err(|_| AppError::internal("factory reset lifecycle boundary unavailable"))?;
     state.bump_identity_session_generation();
+    state.withdraw_native_notifications();
     crate::finish_shutdown(state.inner(), &reset).await;
     // Every identity goes, and every unlock with it.
     state.release_retained_identity_except("");

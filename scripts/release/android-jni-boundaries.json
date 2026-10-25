@@ -26,7 +26,8 @@
       "name": "org.ratspeak.android.RatspeakNotifications",
       "methods": [
         ["nativeInitialize", "(Landroid/content/Context;)V"],
-        ["show", "(Landroid/content/Context;Ljava/lang/String;)I"]
+        ["show", "(Landroid/content/Context;Ljava/lang/String;)I"],
+        ["withdrawAll", "(Landroid/content/Context;)I"]
       ]
     },
     {

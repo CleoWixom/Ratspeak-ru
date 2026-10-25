@@ -31,6 +31,7 @@ object RatspeakNotifications {
     private val hashPattern = Regex("^[0-9a-f]{32}$")
     private val sessionPattern = Regex("^[0-9a-f]{16}$")
     private val roomPattern = Regex("^(?:[0-9a-f]{2}){1,256}$")
+    private val alertChannels = setOf(RatspeakService.MSG_CHANNEL_ID, RatspeakService.CALL_CHANNEL_ID)
 
     @JvmStatic
     fun initialize(context: Context) {
@@ -50,6 +51,23 @@ object RatspeakNotifications {
     @JvmStatic
     fun show(context: Context, serialized: String): Int =
         deliver(context.applicationContext, serialized, AndroidDelivery)
+
+    /** Cancels the message and call alerts still shown; the service's own card stays. */
+    @JvmStatic
+    fun withdrawAll(context: Context): Int = try {
+        val manager = context.applicationContext.getSystemService(NotificationManager::class.java)
+        for (shown in manager.activeNotifications) {
+            val alert = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                shown.notification.channelId in alertChannels
+            } else {
+                shown.id != RatspeakService.NOTIFICATION_ID
+            }
+            if (alert) manager.cancel(shown.tag, shown.id)
+        }
+        SENT
+    } catch (_: Exception) {
+        DELIVERY_FAILED
+    }
 
     internal data class Payload(
         val title: String,

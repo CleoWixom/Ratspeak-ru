@@ -8,6 +8,7 @@ impl ratspeak_core::NativeNotifier for ContentNotifier {
     fn notify(&self, notification: ratspeak_core::NativeNotification) {
         self.0.lock().unwrap().push(notification);
     }
+    fn withdraw_all(&self) {}
 }
 
 fn content_pipeline_state() -> (Arc<AppState>, Arc<RecordingEmitter>, Arc<ContentNotifier>) {

@@ -1228,6 +1228,7 @@ async fn lock_protected_session(state: Arc<AppState>, lock: state::AutoLock) {
     };
     // Nothing begun before the lock may land behind it.
     state.bump_identity_session_generation();
+    state.withdraw_native_notifications();
     finish_shutdown(&state, &reset).await;
     state.release_retained_identity_except("");
     state.clear_pending_hw_pin();
@@ -9128,10 +9129,20 @@ mod identity_session_tests {
         }
     }
 
+    #[derive(Default)]
+    struct Withdrawals(std::sync::atomic::AtomicUsize);
+
+    impl ratspeak_core::NativeNotifier for Withdrawals {
+        fn notify(&self, _notification: ratspeak_core::NativeNotification) {}
+        fn withdraw_all(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     // Locking ends the session: nothing begun under it may land behind the
-    // lock. A passcode identity locks as a hardware one does, and its unlock
-    // goes with the session. The lock is private, so this stays in the
-    // library's tests.
+    // lock, and its alerts go. A passcode identity locks as a hardware one
+    // does, and its unlock goes with the session. The lock is private, so
+    // this stays in the library's tests.
     #[tokio::test]
     async fn auto_lock_locks_either_kind_and_starts_a_new_identity_session() {
         for kind in ["hardware", "passcode"] {
@@ -9148,11 +9159,12 @@ mod identity_session_tests {
             let pool = db::init_pool(&data_root).unwrap();
             db::init_schema(&pool).unwrap();
             let recorder = Arc::new(Recorder::default());
+            let withdrawals = Arc::new(Withdrawals::default());
             let state = Arc::new(AppState::new(
                 config,
                 pool,
                 Arc::clone(&recorder) as Arc<dyn ratspeak_core::Emitter>,
-                Arc::new(ratspeak_core::NoopNotifier),
+                Arc::clone(&withdrawals) as Arc<dyn ratspeak_core::NativeNotifier>,
             ));
             let identity = rns_identity::identity::Identity::new();
             let hash = hex::encode(identity.hash);
@@ -9192,6 +9204,11 @@ mod identity_session_tests {
                     .retained_identity
                     .is_none(),
                 "{kind}: the unlock outlived the lock"
+            );
+            assert_eq!(
+                withdrawals.0.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{kind}: the locked identity's alerts stayed"
             );
             let events = recorder.0.lock().unwrap();
             let (_, locked) = events
@@ -9375,6 +9392,7 @@ mod notification_tests {
         fn notify(&self, notification: NativeNotification) {
             self.notifications.lock().unwrap().push(notification);
         }
+        fn withdraw_all(&self) {}
     }
 
     fn make_state(notifier: Arc<RecordingNotifier>) -> AppState {
@@ -9602,6 +9620,50 @@ mod notification_tests {
         state.set_notification_foreground(true);
         state.emit_native_notification(notification);
         assert_eq!(notifier.notifications.lock().unwrap().len(), 1);
+    }
+
+    // What alerts show is one stored setting, applied where every alert
+    // passes; the route stays.
+    #[test]
+    fn every_alert_shows_what_the_stored_preview_allows() {
+        for (preview, title, body) in [
+            ("name_only", "Message from Alice", "New message"),
+            ("neither", "Ratspeak", "New message"),
+        ] {
+            let notifier = Arc::new(RecordingNotifier::default());
+            let unique = TEMP_NOTIFICATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let config = DashboardConfig::from_env_and_defaults(std::env::temp_dir().join(
+                format!("ratspeak-preview-test-{}-{unique}", std::process::id()),
+            ));
+            let pool = r2d2::Pool::builder()
+                .max_size(2)
+                .build(SqliteConnectionManager::memory())
+                .unwrap();
+            db::init_schema(&pool).unwrap();
+            db::set_setting(&pool, "notification_preview", preview);
+            let state = AppState::new(
+                config,
+                pool,
+                Arc::new(ratspeak_core::NoopEmitter),
+                notifier.clone(),
+            );
+            state.set_notification_foreground(false);
+
+            state.emit_native_notification(ratspeak_core::NativeNotification::message(
+                "Message from Alice",
+                "meet at noon",
+                "lxmf:abcd1234abcd1234",
+                42,
+            ));
+
+            let shown = notifier.notifications.lock().unwrap().pop().expect(preview);
+            assert_eq!(
+                (shown.title.as_str(), shown.body.as_str()),
+                (title, body),
+                "{preview}"
+            );
+            assert_eq!(shown.thread_id.as_deref(), Some("lxmf:abcd1234abcd1234"));
+        }
     }
 
     #[test]

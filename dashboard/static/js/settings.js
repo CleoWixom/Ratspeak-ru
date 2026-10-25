@@ -1740,6 +1740,47 @@ function _settingsNotificationPresentation(enabled, state) {
     return _settingsNotificationActionForState(state);
 }
 
+var NOTIFICATION_PREVIEW_LABELS = {
+    name_and_message: 'Name and message',
+    name_only: 'Name only',
+    neither: 'Neither'
+};
+
+// What message alerts show. Returns the row's controls.
+function _initNotificationPreview(row, badge) {
+    function show(value) {
+        var known = Object.prototype.hasOwnProperty.call(NOTIFICATION_PREVIEW_LABELS, value);
+        var preview = known ? value : 'name_and_message';
+        badge.textContent = NOTIFICATION_PREVIEW_LABELS[preview];
+        badge.setAttribute('data-value', preview);
+    }
+    badge.addEventListener('click', function() {
+        var previous = badge.getAttribute('data-value') || 'name_and_message';
+        rsChoice({
+            title: 'Previews',
+            message: 'What message alerts show. A call always shows who is calling.',
+            choices: [
+                { label: 'Name and message', value: 'name_and_message' },
+                { label: 'Name only', value: 'name_only', hint: '“Message from Alice”, without the text.' },
+                { label: 'Neither', value: 'neither', hint: 'Just “New message”.' }
+            ]
+        }).then(function(value) {
+            if (!value || value === previous) return;
+            show(value);
+            return RS.invoke('set_notification_preview', { preview: value }).then(function(settings) {
+                show(settings && settings.preview);
+            }, function(err) {
+                show(previous);
+                showToast(toastErrorCopy(err, 'Could not change previews'), 'toast-error', 4000);
+            });
+        });
+    });
+    return {
+        show: show,
+        visible: function(enabled) { row.style.display = enabled ? '' : 'none'; }
+    };
+}
+
 function _settingsBatteryPresentation(state) {
     if (state === 'exempt') return {
         label: 'Review',
@@ -1770,6 +1811,11 @@ function _settingsBatteryPresentation(state) {
     var _notifAuthorization = 'unavailable';
     var _notifPreferenceEnabled = true;
     _notifRow.style.display = '';
+    var _previewRow = document.getElementById('settings-row-notification-preview');
+    var _previewBadge = document.getElementById('notification-preview-select');
+    var _preview = _previewRow && _previewBadge
+        ? _initNotificationPreview(_previewRow, _previewBadge)
+        : { show: function() {}, visible: function() {} };
 
     function _refreshNotificationAuthorization() {
         if (!_isMobile || typeof rsNotify === 'undefined') return;
@@ -1802,6 +1848,8 @@ function _settingsBatteryPresentation(state) {
         if (!data || data.enabled === undefined) return;
         _notifPreferenceEnabled = !!data.enabled;
         _notifToggle.checked = _notifPreferenceEnabled;
+        _preview.show(data.preview);
+        _preview.visible(_notifPreferenceEnabled);
         if (typeof rsNotify !== 'undefined') rsNotify.setEnabled(_notifPreferenceEnabled);
         if (_notifPreferenceEnabled && typeof rsNotify !== 'undefined' && rsNotify.available()) {
             _refreshNotificationAuthorization();
@@ -1813,6 +1861,7 @@ function _settingsBatteryPresentation(state) {
     _notifToggle.addEventListener('change', function() {
         var enabled = !!_notifToggle.checked;
         _notifPreferenceEnabled = enabled;
+        _preview.visible(enabled);
         if (typeof rsNotify !== 'undefined') rsNotify.setEnabled(enabled);
         RS.invoke('set_desktop_notifications', { enabled: enabled }).catch(function() {});
         if (enabled && typeof rsNotify !== 'undefined' && rsNotify.available()) {

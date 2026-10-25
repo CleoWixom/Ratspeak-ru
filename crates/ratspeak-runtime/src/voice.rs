@@ -190,10 +190,12 @@ pub async fn start_voice_service(state: &Arc<AppState>) -> VoiceResult<()> {
 
     let event_state = Arc::clone(state);
     let event_control_tx = control_tx.clone();
+    let event_session = VoiceSession::current(state);
     let runtime = tokio::runtime::Handle::current();
     let event_task = tokio::task::spawn_blocking(move || {
         runtime.block_on(drive_voice_events(
             event_state,
+            event_session,
             event_control_tx,
             event_rx,
             audio_control_rx,
@@ -572,20 +574,60 @@ async fn contact_call_state(state: &AppState, remote_lxmf_destination: &str) -> 
     .unwrap_or((false, false))
 }
 
-fn notify_incoming_call_if_background(
-    state: &AppState,
-    remote_lxmf_destination: &str,
+/// The identity session and runtime session a voice service started in.
+#[derive(Clone)]
+struct VoiceSession {
+    generation: u64,
+    session: rns_runtime::lifecycle::ShutdownSignal,
+}
+
+impl VoiceSession {
+    fn current(state: &AppState) -> Self {
+        Self {
+            generation: state.current_identity_session_generation(),
+            session: state
+                .session_shutdown
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        }
+    }
+
+    fn is_current(&self, state: &AppState) -> bool {
+        !self.session.is_triggered()
+            && state.current_identity_session_generation() == self.generation
+    }
+}
+
+/// An incoming call's alert, raised beside the voice event loop: a transition
+/// joins that loop under the lifecycle lock, so the loop must never wait for
+/// it. The alert waits instead, and is dropped once its session has ended.
+fn raise_incoming_call_alert(
+    state: &Arc<AppState>,
+    service: &VoiceSession,
+    remote_lxmf_destination: String,
     link_id: [u8; 16],
-) {
+) -> JoinHandle<()> {
+    let state = Arc::clone(state);
+    let service = service.clone();
+    tokio::spawn(async move {
+        let identity_id = crate::helpers::active_identity_id(&state);
+        let label = if identity_id.is_empty() {
+            remote_lxmf_destination
+        } else {
+            crate::read_contact_label(&state, &remote_lxmf_destination, &identity_id).await
+        };
+        let _lifecycle = state.identity_switch_lock.lock_routine().await;
+        if service.is_current(&state) {
+            notify_incoming_call_if_background(&state, &label, link_id);
+        }
+    })
+}
+
+fn notify_incoming_call_if_background(state: &AppState, label: &str, link_id: [u8; 16]) {
     if !state.should_surface_native_notification() {
         return;
     }
-    let identity_id = crate::helpers::active_identity_id(state);
-    let label = if identity_id.is_empty() {
-        remote_lxmf_destination.to_string()
-    } else {
-        crate::contact_label_from_db(&state.db, remote_lxmf_destination, &identity_id)
-    };
     let link_hex = hex::encode(link_id);
     // TODO(call menu): this only fires for an *incoming* call and the tap just
     // focuses Ratspeak. Once the dedicated call menu lands, (1) emit an ongoing
@@ -850,6 +892,7 @@ fn voice_runtime_inputs(
 
 async fn drive_voice_events(
     state: Arc<AppState>,
+    service: VoiceSession,
     control_tx: mpsc::Sender<TelephonyControl>,
     mut event_rx: mpsc::Receiver<TelephonyServiceEvent>,
     mut audio_control_rx: mpsc::Receiver<VoiceAudioControl>,
@@ -969,7 +1012,7 @@ async fn drive_voice_events(
                     "remote_identity": hex::encode(remote_identity),
                     "remote_lxmf_destination": remote_lxmf_destination.clone(),
                 });
-                notify_incoming_call_if_background(&state, &remote_lxmf_destination, link_id);
+                raise_incoming_call_alert(&state, &service, remote_lxmf_destination, link_id);
                 state.emit_to_all("voice_incoming_call", payload.clone());
                 state.emit_to_all("voice_call_update", payload);
                 record_lxst_activity(
@@ -4684,6 +4727,7 @@ mod tests {
         fn notify(&self, notification: NativeNotification) {
             self.notifications.lock().unwrap().push(notification);
         }
+        fn withdraw_all(&self) {}
     }
 
     fn make_notification_state(notifier: Arc<RecordingNotifier>) -> AppState {
@@ -4702,10 +4746,13 @@ mod tests {
         AppState::new(config, pool, Arc::new(ratspeak_core::NoopEmitter), notifier)
     }
 
-    #[test]
-    fn incoming_call_native_notification_uses_contact_label_and_call_kind() {
+    // An incoming call's alert names the caller from the contacts. It is
+    // raised beside the voice loop: a transition under way holds it, and an
+    // alert whose identity session ended meanwhile is dropped.
+    #[tokio::test]
+    async fn an_incoming_call_alert_names_the_caller_within_its_session_only() {
         let notifier = Arc::new(RecordingNotifier::default());
-        let state = make_notification_state(notifier.clone());
+        let state = Arc::new(make_notification_state(notifier.clone()));
         state.is_foreground.store(false, Ordering::Relaxed);
         state.set_notification_foreground(false);
         db::save_identity(&state.db, "identity-a", "lxmf-a", "Me", "Me");
@@ -4720,8 +4767,16 @@ mod tests {
             "trusted",
             "identity-a",
         );
+        let service = VoiceSession::current(&state);
 
-        notify_incoming_call_if_background(&state, &remote_lxmf_destination, [0x77; 16]);
+        raise_incoming_call_alert(
+            &state,
+            &service,
+            remote_lxmf_destination.clone(),
+            [0x77; 16],
+        )
+        .await
+        .unwrap();
 
         let seen = notifier.notifications.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
@@ -4731,6 +4786,18 @@ mod tests {
         assert_eq!(
             seen[0].thread_id.as_deref(),
             Some("lxst:77777777777777777777777777777777")
+        );
+
+        let transition = state.identity_switch_lock.lock().await;
+        let alert =
+            raise_incoming_call_alert(&state, &service, remote_lxmf_destination, [0x78; 16]);
+        state.bump_identity_session_generation();
+        drop(transition);
+        alert.await.unwrap();
+        assert_eq!(
+            notifier.notifications.lock().unwrap().len(),
+            1,
+            "an ended session's call alerted"
         );
     }
 

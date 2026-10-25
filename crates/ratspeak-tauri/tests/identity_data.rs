@@ -33,11 +33,23 @@ impl ratspeak_core::Emitter for Recorder {
     }
 }
 
+/// Counts how often the shown alerts were withdrawn.
+#[derive(Default)]
+struct Withdrawals(std::sync::atomic::AtomicUsize);
+
+impl ratspeak_core::NativeNotifier for Withdrawals {
+    fn notify(&self, _notification: ratspeak_core::NativeNotification) {}
+    fn withdraw_all(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 struct Fixture {
     window: tauri::WebviewWindow<MockRuntime>,
     app: tauri::App<MockRuntime>,
     state: Arc<AppState>,
     recorder: Arc<Recorder>,
+    withdrawals: Arc<Withdrawals>,
     _dir: tempfile::TempDir,
 }
 
@@ -113,11 +125,12 @@ impl Fixture {
             db::set_active_identity(&pool, active).unwrap();
         }
         let recorder = Arc::new(Recorder::default());
+        let withdrawals = Arc::new(Withdrawals::default());
         let state = Arc::new(AppState::new(
             config,
             pool,
             Arc::clone(&recorder) as Arc<dyn ratspeak_core::Emitter>,
-            Arc::new(ratspeak_core::NoopNotifier),
+            Arc::clone(&withdrawals) as Arc<dyn ratspeak_core::NativeNotifier>,
         ));
         let builder = mock_builder().manage(Arc::clone(&state));
         let builder = if gated {
@@ -134,6 +147,7 @@ impl Fixture {
             app,
             state,
             recorder,
+            withdrawals,
             _dir: dir,
         }
     }
@@ -224,6 +238,8 @@ fn commands() -> impl Fn(tauri::ipc::Invoke<MockRuntime>) -> bool + Send + Sync 
         ratspeak_tauri::commands::contact_card::import_contact_card,
         ratspeak_tauri::commands::identity::api_set_display_name,
         ratspeak_tauri::commands::identity::set_identity_status,
+        ratspeak_tauri::commands::interfaces::api_notification_settings,
+        ratspeak_tauri::commands::interfaces::set_notification_preview,
     ]
 }
 
@@ -519,8 +535,68 @@ fn setup_and_factory_reset_start_a_new_identity_session() {
         created,
         "naming the identity activates nothing"
     );
+    let withdrawn = fixture
+        .withdrawals
+        .0
+        .load(std::sync::atomic::Ordering::SeqCst);
     fixture.invoke("api_factory_reset", json!({})).unwrap();
     assert!(generation() > created, "factory reset ended the session");
+    assert_eq!(
+        fixture
+            .withdrawals
+            .0
+            .load(std::sync::atomic::Ordering::SeqCst),
+        withdrawn + 1,
+        "the reset identity's alerts stayed"
+    );
+}
+
+// What alerts show is an app setting, kept across restarts, and it answers
+// with no identity active.
+#[test]
+fn notification_previews_are_a_kept_setting() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::without_active_identity(true);
+    let settings = fixture
+        .invoke("api_notification_settings", json!({}))
+        .unwrap();
+    assert_eq!(settings["preview"], "name_and_message", "the default");
+    let changed = fixture
+        .invoke(
+            "set_notification_preview",
+            json!({ "preview": "name_only" }),
+        )
+        .unwrap();
+    assert_eq!(changed["preview"], "name_only");
+    assert_eq!(
+        db::get_setting(&fixture.state.db, "notification_preview").as_deref(),
+        Some("name_only")
+    );
+    let restarted = AppState::new(
+        fixture.state.config.clone(),
+        fixture.state.db.clone(),
+        Arc::new(ratspeak_core::NoopEmitter),
+        Arc::new(ratspeak_core::NoopNotifier),
+    );
+    assert_eq!(
+        restarted.notification_preview(),
+        ratspeak_core::NotificationPreview::NameOnly
+    );
+    let refused = fixture
+        .invoke(
+            "set_notification_preview",
+            json!({ "preview": "everything" }),
+        )
+        .unwrap_err();
+    assert_eq!(refused["code"], "bad_request");
+    assert_eq!(
+        fixture
+            .invoke("api_notification_settings", json!({}))
+            .unwrap()["preview"],
+        "name_only"
+    );
 }
 
 #[test]

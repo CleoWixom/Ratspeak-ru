@@ -2317,6 +2317,7 @@ pub fn ratspeak_runtime::state::AppState::mobile_hardware_state_snapshot(&self) 
 pub fn ratspeak_runtime::state::AppState::mobile_platform_bridge(&self) -> alloc::sync::Arc<dyn ratspeak_runtime::mobile_platform::MobilePlatformBridge>
 pub fn ratspeak_runtime::state::AppState::native_notifications_enabled(&self) -> bool
 pub fn ratspeak_runtime::state::AppState::new(ratspeak_core::config::DashboardConfig, ratspeak_db::db::DbPool, alloc::sync::Arc<dyn ratspeak_core::emitter::Emitter>, alloc::sync::Arc<dyn ratspeak_core::notification::NativeNotifier>) -> Self
+pub fn ratspeak_runtime::state::AppState::notification_preview(&self) -> ratspeak_core::notification::NotificationPreview
 pub fn ratspeak_runtime::state::AppState::propagation_host_ready(&self) -> bool
 pub fn ratspeak_runtime::state::AppState::publish_mobile_hardware_state(&self, &'static str, &'static str, core::option::Option<&'static str>)
 pub fn ratspeak_runtime::state::AppState::publish_ready_rnode_interface_stats(&self, rns_interface::traits::InterfaceId, ratspeak_runtime::state::RNodeActivityOrigin, rns_runtime::reticulum::InstanceMode, &[rns_transport::messages::InterfaceStatRpcEntry]) -> bool
@@ -2342,6 +2343,7 @@ pub fn ratspeak_runtime::state::AppState::set_lxmf(&self, ratspeak_runtime::lxmf
 pub fn ratspeak_runtime::state::AppState::set_lxmf_limit_1mb_enabled(&self, bool)
 pub fn ratspeak_runtime::state::AppState::set_native_notifications_enabled(&self, bool)
 pub fn ratspeak_runtime::state::AppState::set_notification_foreground(&self, bool)
+pub fn ratspeak_runtime::state::AppState::set_notification_preview(&self, ratspeak_core::notification::NotificationPreview)
 pub fn ratspeak_runtime::state::AppState::set_propagation_host_readiness(&self, alloc::string::String, u64, ratspeak_runtime::state::PropagationHostReadiness, core::option::Option<alloc::string::String>) -> bool
 pub fn ratspeak_runtime::state::AppState::set_propagation_quarantine_summary(&self, u64, core::option::Option<lxmf_core::propagation_store_v2::migration::QuarantineSummary>)
 pub fn ratspeak_runtime::state::AppState::set_rnode_product_readiness(&self, rns_interface::traits::InterfaceId, ratspeak_runtime::state::RNodeActivityOrigin, bool) -> bool
@@ -2365,6 +2367,7 @@ pub fn ratspeak_runtime::state::AppState::take_pending_hw_pin(&self) -> core::op
 pub fn ratspeak_runtime::state::AppState::take_retryable_attachment_staging(&self, &str) -> core::option::Option<ratspeak_runtime::state::StagedAttachment>
 pub fn ratspeak_runtime::state::AppState::trim_propagation_nodes(&self)
 pub async fn ratspeak_runtime::state::AppState::wait_for_mobile_platform_bridge(&self)
+pub fn ratspeak_runtime::state::AppState::withdraw_native_notifications(&self)
 pub struct ratspeak_runtime::state::AttachmentTransferLease
 impl core::ops::drop::Drop for ratspeak_runtime::state::AttachmentTransferLease
 pub fn ratspeak_runtime::state::AttachmentTransferLease::drop(&mut self)

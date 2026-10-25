@@ -49,10 +49,28 @@ impl Recorder {
     }
 }
 
+/// Counts how often the shown alerts were withdrawn.
+#[derive(Default)]
+struct Withdrawals(std::sync::atomic::AtomicUsize);
+
+impl ratspeak_core::NativeNotifier for Withdrawals {
+    fn notify(&self, _notification: ratspeak_core::NativeNotification) {}
+    fn withdraw_all(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Withdrawals {
+    fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 struct Fixture {
     app: tauri::App<MockRuntime>,
     state: Arc<AppState>,
     recorder: Arc<Recorder>,
+    withdrawals: Arc<Withdrawals>,
     runtime: tokio::runtime::Runtime,
     _root: tempfile::TempDir,
 }
@@ -79,11 +97,12 @@ impl Fixture {
         let pool = db::init_pool(&data_root).unwrap();
         db::init_schema(&pool).unwrap();
         let recorder = Arc::new(Recorder::default());
+        let withdrawals = Arc::new(Withdrawals::default());
         let state = Arc::new(AppState::new(
             config,
             pool,
             Arc::clone(&recorder) as Arc<dyn ratspeak_core::Emitter>,
-            Arc::new(ratspeak_core::NoopNotifier),
+            Arc::clone(&withdrawals) as Arc<dyn ratspeak_core::NativeNotifier>,
         ));
         let app = mock_builder()
             .manage(Arc::clone(&state))
@@ -98,6 +117,7 @@ impl Fixture {
             app,
             state,
             recorder,
+            withdrawals,
             runtime,
             _root: root,
         }
@@ -340,6 +360,25 @@ fn a_failed_switch_ends_with_its_event_and_the_previous_identity_running() {
     }
 }
 
+// A switch ends the previous identity's session, and its alerts go as it
+// begins.
+#[test]
+fn a_switch_withdraws_the_previous_identitys_alerts() {
+    let f = Fixture::new();
+    let a = f.import("A");
+    let b = f.import("B");
+    f.start(&a);
+    assert_eq!(f.withdrawals.count(), 0);
+    f.runtime
+        .block_on(ratspeak_tauri::commands::identity::switch_identity(
+            f.app.state(),
+            b.clone(),
+        ))
+        .unwrap();
+    assert_eq!(f.loaded().as_deref(), Some(b.as_str()));
+    assert_eq!(f.withdrawals.count(), 1);
+}
+
 // The reset runs before the switch begins, so a refused one changes
 // nothing: no new session, no switching state, the same identity running.
 #[test]
@@ -447,6 +486,11 @@ fn a_failed_hardware_activation_resumes_the_previous_identity() {
             "123456".into(),
         ));
     assert!(result.is_err());
+    assert_eq!(
+        f.withdrawals.count(),
+        1,
+        "the previous identity's alerts stayed"
+    );
     let closing = f
         .recorder
         .last("identity_switch_failed")
@@ -527,6 +571,7 @@ fn removing_the_live_hardware_identity_activates_the_most_recent_one() {
             ))
             .unwrap();
         assert_eq!(removed["needs_setup"], false, "{case:?}");
+        assert!(f.withdrawals.count() >= 1, "{case:?}: H's alerts stayed");
         assert!(db::get_identity(&f.state.db, &h).is_none(), "{case:?}");
         assert!(
             f.state.current_identity_session_generation() > generation,

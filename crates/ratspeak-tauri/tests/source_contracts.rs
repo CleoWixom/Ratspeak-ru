@@ -3912,12 +3912,9 @@ fn a_failed_start_leaves_no_android_session_or_service() {
         .find("ContextCompat.startForegroundService(this, serviceIntent)")
         .unwrap();
     assert!(activity[..start].contains("if (!RatspeakNativeBridge.coreStartupFailed)"));
-    let refresh = activity
-        .split("private fun refreshServicePoll()")
-        .nth(1)
-        .and_then(|tail| tail.split("startService(intent)").next())
-        .expect("service refresh");
-    assert!(refresh.contains("if (RatspeakNativeBridge.coreStartupFailed) return"));
+    // That guarded start is the Activity's only way to start the service.
+    assert_eq!(activity.matches("startForegroundService(").count(), 1);
+    assert!(!activity.contains("startService("));
 }
 
 /// On Android 12+ Back and Home only move a task to the background. A failed
@@ -10245,4 +10242,78 @@ fn linux_radio_rule_reaches_only_the_seat_user() {
     let modals = read_source(root.join("dashboard/static/js/modals.js")).expect("modals");
     assert!(modals.contains("/etc/udev/rules.d/70-ratspeak.rules"));
     assert!(modals.contains("99-ratspeak.rules"));
+}
+
+/// An identity's alerts go with its session: each transition that ends one
+/// withdraws them right after its generation bump, so no alert of that
+/// session, checked under the routine lock, can follow.
+#[test]
+fn ending_an_identity_session_withdraws_its_alerts() {
+    let root = repo_root();
+    let read = |path: &str| read_source(root.join(path)).expect(path);
+    let identity = read("crates/ratspeak-tauri/src/commands/identity.rs");
+    let hardware = read("crates/ratspeak-tauri/src/commands/hardware.rs");
+    let system = read("crates/ratspeak-tauri/src/commands/system.rs");
+    let runtime = read("crates/ratspeak-runtime/src/lib.rs");
+    for (source, function) in [
+        (&identity, "switch_identity_session_held"),
+        (&hardware, "hw_remove"),
+        (&hardware, "hw_activate_and_unlock"),
+        (&system, "api_factory_reset"),
+        (&runtime, "lock_protected_session"),
+    ] {
+        let block = rust_function_block(source, function);
+        let bump = block
+            .find("bump_identity_session_generation()")
+            .unwrap_or_else(|| panic!("{function} ends no session"));
+        let withdraw = block
+            .find("withdraw_native_notifications()")
+            .unwrap_or_else(|| panic!("{function} leaves its alerts"));
+        assert!(bump < withdraw, "{function} withdraws before its bump");
+    }
+
+    let notifier = read("crates/ratspeak-tauri/src/notifier.rs");
+    assert!(notifier.contains("fn withdraw_all(&self)"));
+    assert!(
+        notifier.contains("remove_all_active()"),
+        "iOS withdraws through the plugin"
+    );
+    assert!(notifier.contains("\"withdrawAll\""));
+    let android = read(
+        "src-tauri/gen/android/app/src/main/java/org/ratspeak/android/RatspeakNotifications.kt",
+    );
+    let withdraw = android
+        .split("fun withdrawAll(")
+        .nth(1)
+        .and_then(|tail| tail.split("\n    }\n").next())
+        .expect("Android withdrawal");
+    assert!(withdraw.contains("activeNotifications"));
+    assert!(withdraw.contains("alertChannels"));
+    assert!(
+        !android.contains("cancelAll"),
+        "the service's own card stays"
+    );
+    let service =
+        read("src-tauri/gen/android/app/src/main/java/org/ratspeak/android/RatspeakService.kt");
+    let activity =
+        read("src-tauri/gen/android/app/src/main/java/org/ratspeak/android/MainActivity.kt");
+    for source in [&service, &activity] {
+        assert!(!source.contains("ACTION_REFRESH"));
+        assert!(!source.contains("clearAllMessageNotifications"));
+    }
+}
+
+/// The call alert is raised beside the voice event loop, which a transition
+/// joins under the lifecycle lock: the loop never waits for that lock.
+#[test]
+fn the_call_alert_never_holds_up_the_voice_loop() {
+    let voice =
+        read_source(repo_root().join("crates/ratspeak-runtime/src/voice.rs")).expect("voice");
+    let events = rust_function_block(&voice, "drive_voice_events");
+    assert!(events.contains("raise_incoming_call_alert("));
+    assert!(!events.contains("notify_incoming_call_if_background("));
+    assert!(!events.contains("identity_switch_lock"));
+    let alert = rust_function_block(&voice, "raise_incoming_call_alert");
+    assert!(alert.contains("tokio::spawn("));
+    assert!(alert.contains("lock_routine()"));
 }
