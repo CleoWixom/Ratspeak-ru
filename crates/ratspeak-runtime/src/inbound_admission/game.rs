@@ -421,10 +421,15 @@ impl PreparedGame {
         self._transaction.take();
         Ok(())
     }
+    /// The sender an emitted action alerts about, if any.
+    pub(super) fn alert_sender(&self) -> Option<&str> {
+        (self.published && !self.replay && self.remote_error.is_none())
+            .then_some(self.sender.as_str())
+    }
     /// The caller has already checked the current identity generation and
     /// accepted the matching durable download token before emitting effects.
-    /// `receiver` is the Reticulum identity the download was admitted for.
-    pub(super) fn emit(&self, state: &AppState, receiver: &str) {
+    /// `label` names the alert's sender, read before the lifecycle lock.
+    pub(super) fn emit(&self, state: &AppState, label: String) {
         if !self.published || self.replay {
             return;
         }
@@ -436,8 +441,8 @@ impl PreparedGame {
                 db::list_game_sessions(&state.db, &self.identity, Some(&self.sender), None);
             crate::notify_game_if_background(
                 state,
-                receiver,
                 &crate::GameAlert {
+                    label,
                     sender_hash: self.sender.clone(),
                     session_id: self.sid.clone(),
                     app_id: self.app.clone(),

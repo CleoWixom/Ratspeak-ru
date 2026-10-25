@@ -805,3 +805,85 @@ fn a_block_or_unblock_that_waited_out_a_switch_changes_nothing() {
         assert_eq!(result.unwrap_err().code, "conflict", "{command}");
     }
 }
+
+// A block holds the lifecycle lock only to read its identity and that
+// runtime's transport: a switch never waits on its network queries, and once
+// one lands, the block still applies to the identity it was asked for but
+// tells the next session's window nothing.
+#[test]
+fn a_block_waiting_on_the_network_holds_no_lifecycle_lock() {
+    use ratspeak_tauri::commands::contacts::{BlockContactArgs, block_contact};
+    use rns_transport::messages::{TransportMessage, TransportQueryResponse};
+    use tauri::Manager;
+    const NEW: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::new(Some(A), false);
+    let network_root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        network_root.path().join("config"),
+        "[reticulum]\nshare_instance = No\nenable_transport = No\n[interfaces]\n",
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = runtime.block_on(async {
+        let mut manager = ratspeak_tauri::rns::RnsManager::init(
+            network_root.path().to_str().unwrap(),
+            Some(network_root.path().join("cache")),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .await
+        .unwrap();
+        let network = manager.handle.clone();
+        let (transport, mut queries) = tokio::sync::mpsc::channel(4);
+        manager.handle.transport_tx = transport;
+        *fixture.state.rns.write().unwrap() = Some(manager);
+        let managed = fixture.app.state::<Arc<AppState>>();
+        let block = block_contact(
+            managed,
+            BlockContactArgs {
+                hash: NEW.into(),
+                escalate_to_blackhole: true,
+            },
+        );
+        let switch = async {
+            let Some(TransportMessage::Rpc { response_tx, .. }) = queries.recv().await else {
+                panic!("no network query");
+            };
+            let transition = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                fixture.state.identity_switch_lock.lock(),
+            )
+            .await
+            .expect("the block held the lifecycle lock across a network query");
+            db::set_active_identity(&fixture.state.db, B).unwrap();
+            fixture.state.bump_identity_session_generation();
+            drop(transition);
+            let _ = response_tx.send(TransportQueryResponse::HashResult(None));
+            while let Ok(Some(query)) =
+                tokio::time::timeout(std::time::Duration::from_millis(300), queries.recv()).await
+            {
+                if let TransportMessage::Rpc { response_tx, .. } = query {
+                    let _ = response_tx.send(TransportQueryResponse::BlackholeList(Vec::new()));
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(block, switch);
+        network.shutdown.trigger();
+        result
+    });
+    result.expect("the block applies to the identity it was asked for");
+    assert!(db::is_blocked(&fixture.state.db, NEW, A));
+    assert!(!db::is_blocked(&fixture.state.db, NEW, B));
+    for event in ["contact_blocked", "contacts_update", "peer_removed"] {
+        assert!(
+            fixture.last_event(event).is_none(),
+            "{event} reached the next session"
+        );
+    }
+}

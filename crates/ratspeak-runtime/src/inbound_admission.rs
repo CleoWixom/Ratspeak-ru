@@ -1279,6 +1279,17 @@ pub(crate) async fn admit_download(
     };
     let (output, token, message_id, source_hash, destination_hash, wire_len, _lease, ticket) =
         completed;
+    // Taken once the message is stored: a bulk delete after it moves it, so
+    // the chat refresh then publishes no lists and checks the row again.
+    let revision = state.conversation_list_revision();
+    // A game alert names its sender from the receiver's contacts, read now.
+    let game_label = match &output.projection {
+        Projection::Game(game) => match game.alert_sender() {
+            Some(sender) => crate::read_contact_label(state, sender, &identity).await,
+            None => String::new(),
+        },
+        _ => String::new(),
+    };
     // The worker has exited and released quiescence ownership before waiting
     // for this lock. Shutdown can therefore never deadlock on UI publication.
     let _lifecycle = state.identity_switch_lock.lock_routine().await;
@@ -1339,19 +1350,19 @@ pub(crate) async fn admit_download(
             if let Some(fields) = event.as_object_mut() {
                 fields.extend(output.display_media);
             }
-            // A bulk delete that committed after the admission hides it.
-            if crate::inbound_message_stored(state, &message_id, &identity).await {
-                state.emit_to_all("lxmf_message", event);
-                chat_refresh = Some(ChatRefresh {
-                    generation,
-                    shutdown: shutdown.clone(),
-                    message_id,
-                    source,
-                    identity: identity.clone(),
-                    preview: notification,
-                    attachment: has_attachment,
-                });
-            }
+            // A bulk delete that committed since the admission revoked the
+            // token checked above, so the row is still there.
+            state.emit_to_all("lxmf_message", event);
+            chat_refresh = Some(ChatRefresh {
+                generation,
+                shutdown: shutdown.clone(),
+                revision,
+                message_id,
+                source,
+                identity: identity.clone(),
+                preview: notification,
+                attachment: has_attachment,
+            });
             crate::record_activity_if_current(state, activity, || {
                 Ok(crate::producer::lxmf_inbound_accepted(
                     crate::producer::LxmfInboundAccepted {
@@ -1371,7 +1382,7 @@ pub(crate) async fn admit_download(
             );
         }
         Projection::Service => {}
-        Projection::Game(game) => game.emit(state, &identity),
+        Projection::Game(game) => game.emit(state, game_label),
     }
     drop(ticket);
     drop(_lease);
@@ -1392,9 +1403,11 @@ pub(crate) fn decode_game(
 }
 
 /// A committed download's chat refresh, for the sessions it was admitted in.
+/// `revision` is the list revision taken once the message was stored.
 struct ChatRefresh {
     generation: u64,
     shutdown: rns_runtime::lifecycle::ShutdownSignal,
+    revision: u64,
     message_id: String,
     source: String,
     identity: String,
@@ -1406,38 +1419,38 @@ async fn refresh_chat(state: Arc<AppState>, refresh: ChatRefresh) {
     let ChatRefresh {
         generation,
         shutdown,
+        revision,
         message_id,
         source,
         identity,
         preview,
         attachment,
     } = refresh;
-    // A bulk delete that commits after this read makes the lists stale.
-    let revision = state.conversation_list_revision();
-    let pool = state.db.clone();
-    let identity_db = identity.clone();
-    let source_db = source.clone();
-    let result = db::spawn_db(pool, move |pool| {
-        let label = crate::contact_label_from_db(&pool, &source_db, &identity_db);
-        let contacts = crate::contact_list_payload(db::get_all_contacts(&pool, &identity_db));
-        let unread: i64 = db::get_all_unread_counts(&pool, &identity_db)
-            .values()
-            .sum();
-        (label, contacts, unread)
-    })
-    .await;
+    let lists = crate::read_inbound_lists(&state, &source, &identity, &message_id).await;
     let _lifecycle = state.identity_switch_lock.lock_routine().await;
     if state.current_identity_session_generation() != generation || shutdown.is_triggered() {
         return;
     }
-    if let Ok((label, contacts, unread)) = result {
-        if state.conversation_list_revision() == revision {
-            state.emit_to_all("contacts_update", contacts.into());
-            state.emit_to_all("unread_total", json!({"count":unread}));
+    if let Some(lists) = lists {
+        // Only a bulk delete since the admission moves the revision; its own
+        // lists replace these, and the row is checked again before an alert.
+        let current = state.conversation_list_revision() == revision;
+        if current {
+            state.emit_to_all("contacts_update", lists.contacts.into());
+            state.emit_to_all("unread_total", json!({"count":lists.unread}));
         }
-        if crate::inbound_message_stored(&state, &message_id, &identity).await {
+        let stored = if current {
+            lists.stored
+        } else {
+            crate::inbound_message_stored(&state, &message_id, &identity).await
+        };
+        if stored {
             crate::notify_inbound_message_if_background(
-                &state, &source, &label, &preview, attachment,
+                &state,
+                &source,
+                &lists.label,
+                &preview,
+                attachment,
             );
         }
     }
@@ -1958,6 +1971,7 @@ mod tests {
         ChatRefresh {
             generation: state.current_identity_session_generation(),
             shutdown: state.session_shutdown.read().unwrap().clone(),
+            revision: state.conversation_list_revision(),
             message_id: "e5".repeat(32),
             source,
             identity,
@@ -1966,19 +1980,12 @@ mod tests {
         }
     }
 
-    // Lists read before a bulk delete are stale once it commits; the
-    // delete re-sends its own.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Lists read after a bulk delete that followed the admission are not
+    // published: the delete re-sends its own.
+    #[tokio::test]
     async fn lists_read_before_a_delete_are_not_published() {
         let (state, emitter, source, identity) = unread_download();
-        let deletion =
-            crate::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await;
-        let refresh = tokio::spawn(refresh_chat(
-            state.clone(),
-            chat_refresh(&state, source, identity.clone()),
-        ));
-        // Its lists are read by now, and it waits on the deletion's lock.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let refresh = chat_refresh(&state, source, identity.clone());
         state
             .db
             .get()
@@ -1986,14 +1993,39 @@ mod tests {
             .execute("DELETE FROM messages WHERE identity_id = ?1", [&identity])
             .unwrap();
         state.invalidate_conversation_lists();
-        drop(deletion);
-        refresh.await.unwrap();
+        refresh_chat(state.clone(), refresh).await;
         assert_eq!(
             emitter.count("unread_total"),
             0,
             "an unread count from before the delete"
         );
         assert_eq!(emitter.count("contacts_update"), 0);
+    }
+
+    // While its lists are current, a refresh is published without the
+    // database under the lifecycle lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_current_refresh_is_published_without_the_database() {
+        let (state, emitter, source, identity) = unread_download();
+        let lifecycle = state.identity_switch_lock.lock_routine_owned().await;
+        let mut refresh = Box::pin(refresh_chat(
+            state.clone(),
+            chat_refresh(&state, source, identity),
+        ));
+        crate::inbound_pipeline_tests::drive_until_parked(&mut refresh).await;
+        let held: Vec<_> = (0..2).map(|_| state.db.get().unwrap()).collect();
+        drop(lifecycle);
+        let published = crate::inbound_pipeline_tests::finish_within(
+            &mut refresh,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        drop(held);
+        assert!(
+            published,
+            "the refresh waited on the database under the lock"
+        );
+        assert_eq!(emitter.count("unread_total"), 1);
     }
 
     // A refresh belongs to the runtime session its download was admitted

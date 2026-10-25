@@ -637,6 +637,21 @@ async fn next_chat_observed_timestamp(
     .unwrap_or(observed_at)
 }
 
+/// The label `contact_label_from_db` gives, read off the lifecycle lock.
+pub(crate) async fn read_contact_label(
+    state: &AppState,
+    source_hash: &str,
+    identity_id: &str,
+) -> String {
+    let source = source_hash.to_string();
+    let identity = identity_id.to_string();
+    db::spawn_db(state.db.clone(), move |p| {
+        contact_label_from_db(&p, &source, &identity)
+    })
+    .await
+    .unwrap_or_else(|_| compact_hash_label(source_hash))
+}
+
 pub(crate) fn contact_label_from_db(
     pool: &db::DbPool,
     source_hash: &str,
@@ -707,7 +722,9 @@ pub(crate) fn notify_inbound_message_if_background(
 }
 
 /// A game action's alert, raised once its session's publication is due.
+/// `label` names the sender from the receiver's contacts, read off the lock.
 pub(crate) struct GameAlert {
+    pub(crate) label: String,
     pub(crate) sender_hash: String,
     pub(crate) session_id: String,
     pub(crate) app_id: String,
@@ -728,9 +745,16 @@ impl LrgpOutcome {
         self.events.push((event, payload));
     }
 
-    fn publish(self, state: &AppState, identity_id: &str) {
+    /// Names the alert's sender, off the lifecycle lock.
+    async fn label_alert(&mut self, state: &AppState, identity_id: &str) {
+        if let Some(alert) = self.alert.as_mut() {
+            alert.label = read_contact_label(state, &alert.sender_hash, identity_id).await;
+        }
+    }
+
+    fn publish(self, state: &AppState) {
         if let Some(alert) = &self.alert {
-            notify_game_if_background(state, identity_id, alert);
+            notify_game_if_background(state, alert);
         }
         for (event, payload) in self.events {
             state.emit_to_all(event, payload);
@@ -746,13 +770,12 @@ fn game_name(state: &AppState, app_id: &str) -> String {
         .unwrap_or_else(|| "a game".to_string())
 }
 
-/// `identity_id` is the receiving identity, whose contacts name the sender.
-fn notify_game_if_background(state: &AppState, identity_id: &str, alert: &GameAlert) {
+fn notify_game_if_background(state: &AppState, alert: &GameAlert) {
     if !state.should_surface_native_notification() {
         return;
     }
 
-    let label = contact_label_from_db(&state.db, &alert.sender_hash, identity_id);
+    let label = &alert.label;
     let game = game_name(state, &alert.app_id);
     let command = alert.command.as_str();
     let session_id = alert.session_id.as_str();
@@ -5142,24 +5165,31 @@ impl InboundFence {
     }
 }
 
-/// A stored message's sender label and the lists it changed.
-struct InboundLists {
-    label: String,
-    contacts: Vec<Value>,
-    unread: i64,
+/// A stored message's sender label, the lists it changed, and whether its row
+/// was still there. Read off the lifecycle lock, after the list revision was
+/// taken: only a bulk delete moves it, and only then is the row read again,
+/// under the lock (`inbound_message_stored`).
+pub(crate) struct InboundLists {
+    pub(crate) label: String,
+    pub(crate) contacts: Vec<Value>,
+    pub(crate) unread: i64,
+    pub(crate) stored: bool,
 }
 
-async fn read_inbound_lists(
+pub(crate) async fn read_inbound_lists(
     state: &AppState,
     source_hash: &str,
     identity_id: &str,
+    msg_id: &str,
 ) -> Option<InboundLists> {
     let source = source_hash.to_string();
     let identity = identity_id.to_string();
+    let msg_id = msg_id.to_string();
     db::spawn_db(state.db.clone(), move |p| InboundLists {
         label: contact_label_from_db(&p, &source, &identity),
         contacts: contact_list_payload(db::get_all_contacts(&p, &identity)),
         unread: db::get_all_unread_counts(&p, &identity).values().sum(),
+        stored: db::message_exists_for_identity(&p, &msg_id, &identity),
     })
     .await
     .ok()
@@ -5183,7 +5213,7 @@ pub(crate) fn contact_list_payload(contacts: Vec<Value>) -> Vec<Value> {
 }
 
 /// Whether `msg_id` is still stored: a bulk delete that committed after the
-/// save removed it, and it must not reach a window after that.
+/// lists were read removed it, and it must not reach a window after that.
 async fn inbound_message_stored(state: &AppState, msg_id: &str, identity_id: &str) -> bool {
     let msg_id = msg_id.to_string();
     let identity_id = identity_id.to_string();
@@ -5361,7 +5391,7 @@ async fn process_inbound_lxmf(
     if !matches!(
         chat_extension,
         Some(lxmf::RatspeakChatExtension::Reply { .. })
-    ) && let Some(outcome) = try_handle_inbound_lrgp(
+    ) && let Some(mut outcome) = try_handle_inbound_lrgp(
         state,
         &msg,
         &source_hash,
@@ -5372,9 +5402,8 @@ async fn process_inbound_lxmf(
     {
         // Published once its game transaction is released, in identity-then-
         // game lock order.
-        fence
-            .publish(state, || outcome.publish(state, &identity_id))
-            .await;
+        outcome.label_alert(state, &identity_id).await;
+        fence.publish(state, || outcome.publish(state)).await;
         return;
     }
 
@@ -5481,9 +5510,8 @@ async fn process_inbound_lxmf(
         ))
     });
 
-    // Lists read before a bulk delete commits are stale once it has.
     let revision = state.conversation_list_revision();
-    let lists = read_inbound_lists(state, &source_hash, &identity_id).await;
+    let lists = read_inbound_lists(state, &source_hash, &identity_id, &msg_id).await;
 
     let source_display_name = lists.as_ref().map_or_else(
         || compact_hash_label(&source_hash),
@@ -5523,7 +5551,16 @@ async fn process_inbound_lxmf(
     }
 
     let _lifecycle = state.identity_switch_lock.lock_routine().await;
-    if !fence.is_current(state) || !inbound_message_stored(state, &msg_id, &identity_id).await {
+    if !fence.is_current(state) {
+        return;
+    }
+    let current = state.conversation_list_revision() == revision;
+    let stored = match &lists {
+        Some(lists) if current => lists.stored,
+        Some(_) => inbound_message_stored(state, &msg_id, &identity_id).await,
+        None => false,
+    };
+    if !stored {
         return;
     }
     notify_inbound_message_if_background(
@@ -5535,17 +5572,9 @@ async fn process_inbound_lxmf(
     );
     state.emit_to_all("lxmf_message", event_data);
     messaging::broadcast_conversations(Arc::clone(state));
-    match lists {
-        Some(lists) if state.conversation_list_revision() == revision => {
-            state.emit_to_all("contacts_update", lists.contacts.into());
-            state.emit_to_all("unread_total", json!({"count": lists.unread}));
-        }
-        Some(_) => {}
-        // Post-emit UI refresh failures only mean stale sidebar counts.
-        None => tracing::error!(
-            reason = "refresh_failed",
-            "list refresh after inbound message failed"
-        ),
+    if let Some(lists) = lists.filter(|_| current) {
+        state.emit_to_all("contacts_update", lists.contacts.into());
+        state.emit_to_all("unread_total", json!({"count": lists.unread}));
     }
 }
 
@@ -7505,6 +7534,7 @@ async fn try_handle_inbound_lrgp(
     };
 
     outcome.alert = Some(GameAlert {
+        label: String::new(),
         sender_hash: sender_hash.to_string(),
         session_id: session_id.clone(),
         app_id: app_id.clone(),
@@ -9490,14 +9520,15 @@ mod notification_tests {
         );
 
         let alert = GameAlert {
+            label: contact_label_from_db(&state.db, "feedfacefeedface", "identity-a"),
             sender_hash: "feedfacefeedface".into(),
             session_id: "session-1".into(),
             app_id: "chess".into(),
             command: "move".into(),
             is_new_session: false,
         };
-        notify_game_if_background(&state, "identity-a", &alert);
-        notify_game_if_background(&state, "identity-a", &alert);
+        notify_game_if_background(&state, &alert);
+        notify_game_if_background(&state, &alert);
 
         let seen = notifier.notifications.lock().unwrap().clone();
         assert_eq!(seen.len(), 2);

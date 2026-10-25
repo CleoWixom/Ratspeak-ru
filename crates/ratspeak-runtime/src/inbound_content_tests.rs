@@ -533,6 +533,77 @@ async fn a_stamped_message_stays_with_its_receiver_across_a_switch() {
     assert_eq!(emitter.count("lxmf_message"), 0);
 }
 
+struct WakeFlag(std::sync::atomic::AtomicBool);
+
+impl std::task::Wake for WakeFlag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Polls `future` until nothing it waits on wakes it any more: once its reads
+/// are done, it waits on the lifecycle lock the test holds.
+pub(super) async fn drive_until_parked<F: std::future::Future + ?Sized>(
+    future: &mut std::pin::Pin<Box<F>>,
+) {
+    let flag = Arc::new(WakeFlag(std::sync::atomic::AtomicBool::new(true)));
+    let waker = std::task::Waker::from(Arc::clone(&flag));
+    let mut cx = std::task::Context::from_waker(&waker);
+    loop {
+        if flag.0.swap(false, Ordering::SeqCst) {
+            assert!(
+                future.as_mut().poll(&mut cx).is_pending(),
+                "it finished without waiting for the lock"
+            );
+            continue;
+        }
+        let quiet = tokio::time::Instant::now() + Duration::from_millis(500);
+        while !flag.0.load(Ordering::SeqCst) && tokio::time::Instant::now() < quiet {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if !flag.0.load(Ordering::SeqCst) {
+            return;
+        }
+    }
+}
+
+/// Polls `future` to completion within `within`; false if it is still waiting.
+pub(super) async fn finish_within<F: std::future::Future + ?Sized>(
+    future: &mut std::pin::Pin<Box<F>>,
+    within: Duration,
+) -> bool {
+    let flag = Arc::new(WakeFlag(std::sync::atomic::AtomicBool::new(true)));
+    let waker = std::task::Waker::from(Arc::clone(&flag));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        if flag.0.swap(false, Ordering::SeqCst) && future.as_mut().poll(&mut cx).is_ready() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    false
+}
+
+// While its lists are current, a message reaches the window without the
+// database under the lifecycle lock, so a switch never waits on the pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_with_current_lists_is_published_without_the_database() {
+    let (state, emitter, _notifier) = content_pipeline_state();
+    let lifecycle = state.identity_switch_lock.lock_routine_owned().await;
+    let data = packed_inbound(local_dest(&state), [0xE4; 16], "published off the pool");
+    // Propagated: no sender touch, whose emit would also wait on the lock.
+    let mut pipeline = Box::pin(handle_decrypted_lxmf(&state, data, content_source(1)));
+    drive_until_parked(&mut pipeline).await;
+    assert_eq!(message_rows(&state), 1);
+    let held: Vec<_> = (0..2).map(|_| state.db.get().unwrap()).collect();
+    drop(lifecycle);
+    let published = finish_within(&mut pipeline, Duration::from_secs(2)).await;
+    drop(held);
+    assert!(published, "the publication waited on the database under the lock");
+    assert_eq!(emitter.count("lxmf_message"), 1);
+}
+
 // A message is for the live identity's destination or it is dropped: Link
 // and propagated deliveries never checked.
 #[tokio::test]

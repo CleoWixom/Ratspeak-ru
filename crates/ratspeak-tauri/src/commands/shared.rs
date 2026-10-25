@@ -216,13 +216,23 @@ pub(crate) fn remove_stored_file_refs(
     }
 }
 
+pub(crate) type TransportSender =
+    tokio::sync::mpsc::Sender<rns_transport::messages::TransportMessage>;
+
 pub(crate) async fn transport_query(
     state: &AppState,
     query: rns_transport::messages::TransportQuery,
 ) -> Option<rns_transport::messages::TransportQueryResponse> {
-    let tx = transport_sender(state)?;
+    transport_query_on(transport_sender(state).as_ref(), query).await
+}
+
+/// As `transport_query`, on a runtime's transport captured earlier.
+pub(crate) async fn transport_query_on(
+    tx: Option<&TransportSender>,
+    query: rns_transport::messages::TransportQuery,
+) -> Option<rns_transport::messages::TransportQueryResponse> {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    tx.send(rns_transport::messages::TransportMessage::Rpc {
+    tx?.send(rns_transport::messages::TransportMessage::Rpc {
         query,
         response_tx: resp_tx,
     })
@@ -241,8 +251,12 @@ pub(crate) fn blackhole_reason_display(
 // Each entry: `hash`, `reason`, `created`, `expires_in` (null = permanent),
 // `verified` (false means we have no announce backing this identity).
 pub(crate) async fn snapshot_blackhole(state: &AppState) -> Vec<Value> {
+    snapshot_blackhole_on(transport_sender(state).as_ref()).await
+}
+
+pub(crate) async fn snapshot_blackhole_on(tx: Option<&TransportSender>) -> Vec<Value> {
     use rns_transport::messages::{TransportQuery, TransportQueryResponse};
-    let entries = match transport_query(state, TransportQuery::GetBlackholedIdentities).await {
+    let entries = match transport_query_on(tx, TransportQuery::GetBlackholedIdentities).await {
         Some(TransportQueryResponse::BlackholeList(v)) => v,
         _ => return Vec::new(),
     };
@@ -269,9 +283,12 @@ pub(crate) async fn snapshot_blackhole(state: &AppState) -> Vec<Value> {
 /// Resolve a 16-byte hex blob (LXMF dest hash OR identity hash) to the canonical
 /// identity hash via rsReticulum's `recent_announces`. Returns `None` when the
 /// input is neither a known destination nor a known identity.
-pub(crate) async fn resolve_identity_hash(state: &AppState, input: [u8; 16]) -> Option<[u8; 16]> {
+pub(crate) async fn resolve_identity_hash(
+    tx: Option<&TransportSender>,
+    input: [u8; 16],
+) -> Option<[u8; 16]> {
     use rns_transport::messages::{TransportQuery, TransportQueryResponse};
-    match transport_query(state, TransportQuery::ResolveIdentityHash { input }).await {
+    match transport_query_on(tx, TransportQuery::ResolveIdentityHash { input }).await {
         Some(TransportQueryResponse::HashResult(opt)) => opt,
         _ => None,
     }
@@ -281,12 +298,14 @@ pub(crate) async fn resolve_identity_hash(state: &AppState, input: [u8; 16]) -> 
 /// The transport announce cache is preferred, but blackholing deliberately
 /// drops paths and future announces, so contact unblock also needs the
 /// persistent `identity_activity` mapping learned before the block.
+/// `tx` is the transport of the runtime the contact's identity is resolved in.
 pub(crate) async fn resolve_contact_identity_hash(
     state: &AppState,
+    tx: Option<&TransportSender>,
     dest_hash_hex: &str,
     input: [u8; 16],
 ) -> Option<[u8; 16]> {
-    if let Some(identity_hash) = resolve_identity_hash(state, input).await {
+    if let Some(identity_hash) = resolve_identity_hash(tx, input).await {
         return Some(identity_hash);
     }
 

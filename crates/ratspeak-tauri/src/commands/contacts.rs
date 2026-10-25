@@ -7,8 +7,9 @@ use serde_json::{Value, json};
 use tauri::State;
 
 use crate::commands::shared::{
-    broadcast_blackhole_update, filter_blackholed_dests, format_contacts_list, hex_to_array16,
-    resolve_contact_identity_hash, snapshot_blackhole, transport_query,
+    TransportSender, broadcast_blackhole_update, filter_blackholed_dests, format_contacts_list,
+    hex_to_array16, resolve_contact_identity_hash, snapshot_blackhole, snapshot_blackhole_on,
+    transport_query, transport_query_on, transport_sender,
 };
 use crate::db;
 use crate::error::{AppError, AppResult};
@@ -149,15 +150,29 @@ pub struct AddContactArgs {
 
 /// Emit single-row `peers_updated` if visible, else `peer_removed`.
 pub(crate) async fn emit_peer_delta_for(state: &Arc<AppState>, dest_hash: &str) {
-    let pool = state.db.clone();
-    let key = dest_hash.to_string();
     let identity_id = crate::helpers::active_identity_id(state);
-    let resolved = db::spawn_db(pool, move |p| {
+    let row = read_peer_delta(state, &identity_id, dest_hash).await;
+    emit_peer_delta(state, dest_hash, row);
+}
+
+async fn read_peer_delta(
+    state: &AppState,
+    identity_id: &str,
+    dest_hash: &str,
+) -> Option<db::PeerRow> {
+    let key = dest_hash.to_string();
+    let identity_id = identity_id.to_string();
+    db::spawn_db(state.db.clone(), move |p| {
         db::get_peers_by_hashes(&p, &[key], &identity_id)
     })
     .await
-    .unwrap_or_default();
-    if let Some(row) = resolved.into_iter().next() {
+    .unwrap_or_default()
+    .into_iter()
+    .next()
+}
+
+fn emit_peer_delta(state: &AppState, dest_hash: &str, row: Option<db::PeerRow>) {
+    if let Some(row) = row {
         state.emit_to_all(
             "peers_updated",
             json!({
@@ -263,6 +278,22 @@ pub struct BlockContactArgs {
     pub escalate_to_blackhole: bool,
 }
 
+/// The identity a block or unblock is for, with its runtime's transport and
+/// identity session, read together under the lifecycle lock. A switch waits
+/// for this, and one asked for before a switch is refused; the network
+/// queries then run off the lock, on that runtime's transport.
+async fn contact_change_identity(
+    state: &AppState,
+    request_fence: crate::state::ActivityRequestFence,
+) -> AppResult<(String, Option<TransportSender>, u64)> {
+    let _identity = super::identity::acquire_identity_routine(state, request_fence).await?;
+    Ok((
+        active_identity_id(state),
+        transport_sender(state),
+        state.current_identity_session_generation(),
+    ))
+}
+
 #[tauri::command]
 pub async fn block_contact(
     state: State<'_, Arc<AppState>>,
@@ -273,11 +304,8 @@ pub async fn block_contact(
     if !validate_hex(&dest_hash, 16, 64) {
         return Err(AppError::bad_request("Invalid hash for blocking."));
     }
-    // A switch waits for the block, so its rows and its network block land
-    // on the identity it was asked for, through that identity's runtime.
-    let _identity = super::identity::acquire_identity_routine(&state, request_fence).await?;
-
-    let identity_id = active_identity_id(&state);
+    let (identity_id, transport, generation) =
+        contact_change_identity(&state, request_fence).await?;
     if identity_id.is_empty() {
         return Err(AppError::conflict("no active identity"));
     }
@@ -325,13 +353,14 @@ pub async fn block_contact(
     // announce-handler escalate on first sighting.
     let mut blackholed = false;
     let mut blackhole_pending = false;
+    let mut blackhole_entries = None;
     if let Some(input_bytes) = hex_to_array16(&dest_hash).filter(|_| args.escalate_to_blackhole) {
         use rns_transport::messages::{TransportQuery, TransportQueryResponse};
         if let Some(identity_hash) =
-            resolve_contact_identity_hash(&state, &dest_hash, input_bytes).await
+            resolve_contact_identity_hash(&state, transport.as_ref(), &dest_hash, input_bytes).await
         {
-            let resp = transport_query(
-                &state,
+            let resp = transport_query_on(
+                transport.as_ref(),
                 TransportQuery::BlackholeIdentity {
                     hash: identity_hash,
                     ttl: None,
@@ -350,7 +379,7 @@ pub async fn block_contact(
                 })
                 .await
                 .ok();
-                broadcast_blackhole_update(&state).await;
+                blackhole_entries = Some(snapshot_blackhole_on(transport.as_ref()).await);
             }
         } else {
             let dest_c = dest_hash.clone();
@@ -363,19 +392,27 @@ pub async fn block_contact(
         }
     }
 
-    state.emit_to_all("contacts_update", json!(contacts_list));
-    state.emit_to_all(
-        "contact_blocked",
-        json!({
-            "ok": true,
-            "hash": dest_hash,
-            "display_name": display_name,
-            "blackholed": blackholed,
-            "blackhole_pending": blackhole_pending,
-        }),
-    );
-    state.emit_to_all("peer_removed", json!({ "hash": dest_hash }));
-    crate::commands::messaging::broadcast_conversations(Arc::clone(&state));
+    // The block holds for its identity; once a switch has landed, the next
+    // session's window hears nothing of it.
+    let _identity = state.identity_switch_lock.lock_routine().await;
+    if state.current_identity_session_generation() == generation {
+        if let Some(entries) = blackhole_entries {
+            state.emit_to_all("blackhole_update", json!({ "entries": entries }));
+        }
+        state.emit_to_all("contacts_update", json!(contacts_list));
+        state.emit_to_all(
+            "contact_blocked",
+            json!({
+                "ok": true,
+                "hash": dest_hash,
+                "display_name": display_name,
+                "blackholed": blackholed,
+                "blackhole_pending": blackhole_pending,
+            }),
+        );
+        state.emit_to_all("peer_removed", json!({ "hash": dest_hash }));
+        crate::commands::messaging::broadcast_conversations(Arc::clone(&state));
+    }
     Ok(json!({
         "hash": dest_hash,
         "display_name": display_name,
@@ -402,9 +439,8 @@ pub async fn unblock_contact(
     if !validate_hex(&dest_hash, 16, 64) {
         return Err(AppError::bad_request("Invalid hash for unblocking."));
     }
-    let _identity = super::identity::acquire_identity_routine(&state, request_fence).await?;
-
-    let identity_id = active_identity_id(&state);
+    let (identity_id, transport, generation) =
+        contact_change_identity(&state, request_fence).await?;
     let dh = dest_hash.clone();
     let id_c = identity_id.clone();
     let contacts_list = db::spawn_db(state.db.clone(), move |p| {
@@ -425,6 +461,7 @@ pub async fn unblock_contact(
 
     let mut unblackholed = false;
     let mut pending_cleared = false;
+    let mut blackhole_entries = None;
     if let Some(input_bytes) = hex_to_array16(&dest_hash).filter(|_| args.also_remove_blackhole) {
         use rns_transport::messages::{TransportQuery, TransportQueryResponse};
 
@@ -439,10 +476,10 @@ pub async fn unblock_contact(
         .unwrap_or(false);
 
         if let Some(identity_hash) =
-            resolve_contact_identity_hash(&state, &dest_hash, input_bytes).await
+            resolve_contact_identity_hash(&state, transport.as_ref(), &dest_hash, input_bytes).await
         {
-            let resp = transport_query(
-                &state,
+            let resp = transport_query_on(
+                transport.as_ref(),
                 TransportQuery::UnblackholeIdentity {
                     hash: identity_hash,
                 },
@@ -454,8 +491,8 @@ pub async fn unblock_contact(
         // Legacy cleanup: pre-fix builds stored the LXMF dest-hash bytes as if
         // they were an identity hash. Try removing under the raw input too —
         // harmless no-op when no such entry exists.
-        let legacy_resp = transport_query(
-            &state,
+        let legacy_resp = transport_query_on(
+            transport.as_ref(),
             TransportQuery::UnblackholeIdentity { hash: input_bytes },
         )
         .await;
@@ -463,22 +500,30 @@ pub async fn unblock_contact(
             unblackholed || matches!(legacy_resp, Some(TransportQueryResponse::BoolResult(true)));
 
         if unblackholed || pending_cleared {
-            broadcast_blackhole_update(&state).await;
+            blackhole_entries = Some(snapshot_blackhole_on(transport.as_ref()).await);
         }
     }
+    let peer = read_peer_delta(&state, &identity_id, &dest_hash).await;
 
-    state.emit_to_all("contacts_update", json!(contacts_list));
-    state.emit_to_all(
-        "contact_unblocked",
-        json!({
-            "ok": true,
-            "hash": dest_hash,
-            "unblackholed": unblackholed,
-            "pending_cleared": pending_cleared,
-        }),
-    );
-    emit_peer_delta_for(&state, &dest_hash).await;
-    crate::commands::messaging::broadcast_conversations(Arc::clone(&state));
+    // As a block: nothing reaches the next session's window.
+    let _identity = state.identity_switch_lock.lock_routine().await;
+    if state.current_identity_session_generation() == generation {
+        if let Some(entries) = blackhole_entries {
+            state.emit_to_all("blackhole_update", json!({ "entries": entries }));
+        }
+        state.emit_to_all("contacts_update", json!(contacts_list));
+        state.emit_to_all(
+            "contact_unblocked",
+            json!({
+                "ok": true,
+                "hash": dest_hash,
+                "unblackholed": unblackholed,
+                "pending_cleared": pending_cleared,
+            }),
+        );
+        emit_peer_delta(&state, &dest_hash, peer);
+        crate::commands::messaging::broadcast_conversations(Arc::clone(&state));
+    }
     Ok(json!({
         "hash": dest_hash,
         "unblackholed": unblackholed,
