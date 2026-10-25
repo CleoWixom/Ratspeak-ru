@@ -701,7 +701,16 @@ pub(crate) fn delete_messages(
 ) -> Result<DeletedMessages, AdmissionDbError> {
     let guard = try_reserve_admission()?;
     let store = DurableInboundStore::from_pool(&state.db)?;
-    let artifacts = store.delete_messages_guarded(&guard, identity, peer, now())?;
+    let artifacts = match store.delete_messages_guarded(&guard, identity, peer, now()) {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            // An uncertain commit may have deleted them all the same.
+            if matches!(error, AdmissionDbError::CommitUncertain(_)) {
+                state.invalidate_conversation_lists();
+            }
+            return Err(error);
+        }
+    };
     // A list read before the commit is stale now, whatever happens to the files.
     state.invalidate_conversation_lists();
     Ok(DeletedMessages {
@@ -1282,13 +1291,22 @@ pub(crate) async fn admit_download(
     // Taken once the message is stored: a bulk delete after it moves it, so
     // the chat refresh then publishes no lists and checks the row again.
     let revision = state.conversation_list_revision();
-    // A game alert names its sender from the receiver's contacts, read now.
-    let game_label = match &output.projection {
-        Projection::Game(game) => match game.alert_sender() {
-            Some(sender) => crate::read_contact_label(state, sender, &identity).await,
-            None => String::new(),
-        },
-        _ => String::new(),
+    // What the publication shows is read now, off the lifecycle lock.
+    let reactions = match &output.projection {
+        Projection::Reaction { target, .. } => {
+            let target = target.clone();
+            let identity = identity.clone();
+            db::spawn_db(state.db.clone(), move |p| {
+                db::get_reactions_for_message(&p, &target, &identity)
+            })
+            .await
+            .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let game_publication = match &output.projection {
+        Projection::Game(game) => game.read_publication(state, &identity).await,
+        _ => None,
     };
     // The worker has exited and released quiescence ownership before waiting
     // for this lock. Shutdown can therefore never deadlock on UI publication.
@@ -1374,15 +1392,17 @@ pub(crate) async fn admit_download(
             });
         }
         Projection::Reaction { target, .. } => {
-            let reactions =
-                db::get_reactions_for_message(&state.db, &target, &hex::encode(scope.identity));
             state.emit_to_all(
                 "reaction_update",
                 json!({"message_id":target,"reactions":reactions}),
             );
         }
         Projection::Service => {}
-        Projection::Game(game) => game.emit(state, game_label),
+        Projection::Game(game) => {
+            if let Some(publication) = game_publication {
+                game.emit(state, publication);
+            }
+        }
     }
     drop(ticket);
     drop(_lease);
@@ -1927,6 +1947,46 @@ mod tests {
         );
     }
 
+    // A delete whose commit is uncertain may have happened: lists read before
+    // it are stale either way.
+    #[tokio::test]
+    async fn an_uncertain_delete_still_makes_lists_stale() {
+        let _serial = SERIAL.lock().await;
+        let (_temp, state) = fixture();
+        let identity = hex::encode([1; 16]);
+        db::try_save_message(
+            &state.db, "m1", "src", "dst", "kept?", "", 1.0, "received", "inbound", &identity, "",
+            "", "", "", "", "", None,
+        )
+        .unwrap();
+        // A deferred reference fails the delete's commit, not its statements.
+        state
+            .db
+            .get()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE commit_guard(id TEXT, identity_id TEXT, \
+                 FOREIGN KEY(id, identity_id) REFERENCES messages(id, identity_id) \
+                 DEFERRABLE INITIALLY DEFERRED); \
+                 INSERT INTO commit_guard VALUES('m1', '{identity}');"
+            ))
+            .unwrap();
+        let before = state.conversation_list_revision();
+        let error = match delete_messages(&state, &identity, None) {
+            Err(error) => error,
+            Ok(_) => panic!("the delete committed"),
+        };
+        assert!(
+            matches!(error, AdmissionDbError::CommitUncertain(_)),
+            "{error}"
+        );
+        assert_ne!(
+            state.conversation_list_revision(),
+            before,
+            "a list read before an uncertain delete stays publishable"
+        );
+    }
+
     /// A downloaded message's sender, its unread row, and the identity it is for.
     fn unread_download() -> (
         Arc<AppState>,
@@ -1980,10 +2040,10 @@ mod tests {
         }
     }
 
-    // Lists read after a bulk delete that followed the admission are not
-    // published: the delete re-sends its own.
+    // A refresh admitted before a bulk delete publishes no lists: the delete
+    // re-sends its own.
     #[tokio::test]
-    async fn lists_read_before_a_delete_are_not_published() {
+    async fn a_refresh_admitted_before_a_delete_publishes_no_lists() {
         let (state, emitter, source, identity) = unread_download();
         let refresh = chat_refresh(&state, source, identity.clone());
         state
@@ -1997,7 +2057,7 @@ mod tests {
         assert_eq!(
             emitter.count("unread_total"),
             0,
-            "an unread count from before the delete"
+            "lists published after the delete"
         );
         assert_eq!(emitter.count("contacts_update"), 0);
     }

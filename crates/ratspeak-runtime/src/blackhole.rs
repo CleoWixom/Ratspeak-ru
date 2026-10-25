@@ -39,6 +39,142 @@ async fn blackhole_identity(
     resp_rx.await.ok()
 }
 
+/// A runtime's transport, captured with the identity it runs.
+pub type TransportSender = tokio::sync::mpsc::Sender<TransportMessage>;
+
+/// One query to a runtime's transport; `None` once that runtime is gone.
+pub async fn query_transport(
+    transport: Option<&TransportSender>,
+    query: TransportQuery,
+) -> Option<TransportQueryResponse> {
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    transport?
+        .send(TransportMessage::Rpc {
+            query,
+            response_tx: resp_tx,
+        })
+        .await
+        .ok()?;
+    resp_rx.await.ok()
+}
+
+/// Resolve a 16-byte LXMF destination or identity hash to the canonical
+/// identity hash from the transport's recent announces.
+pub async fn resolve_identity_hash(
+    transport: Option<&TransportSender>,
+    input: [u8; 16],
+) -> Option<[u8; 16]> {
+    match query_transport(transport, TransportQuery::ResolveIdentityHash { input }).await {
+        Some(TransportQueryResponse::HashResult(hash)) => hash,
+        _ => None,
+    }
+}
+
+/// Resolve a contact's LXMF destination hash to its Reticulum identity hash.
+/// The transport announce cache is preferred, but blackholing deliberately
+/// drops paths and future announces, so contact unblock also needs the
+/// persistent `identity_activity` mapping learned before the block.
+pub async fn resolve_contact_identity_hash(
+    state: &AppState,
+    transport: Option<&TransportSender>,
+    dest_hex: &str,
+    input: [u8; 16],
+) -> Option<[u8; 16]> {
+    if let Some(identity_hash) = resolve_identity_hash(transport, input).await {
+        return Some(identity_hash);
+    }
+    let dest = dest_hex.to_string();
+    let identity_hex = db::spawn_db(state.db.clone(), move |p| {
+        db::identity_hash_for_dest(&p, &dest)
+    })
+    .await
+    .ok()
+    .flatten()?;
+    hex::decode(identity_hex).ok()?.try_into().ok()
+}
+
+/// Lift `dest_hex`'s network block through `transport`, by its identity and by
+/// the raw destination older builds stored. Whether anything was lifted, or
+/// `None` if that runtime answered nothing.
+pub async fn lift_network_block(
+    state: &AppState,
+    transport: Option<&TransportSender>,
+    dest_hex: &str,
+    input: [u8; 16],
+) -> Option<bool> {
+    let lifted = |response: &Option<TransportQueryResponse>| {
+        matches!(response, Some(TransportQueryResponse::BoolResult(true)))
+    };
+    let by_identity = match resolve_contact_identity_hash(state, transport, dest_hex, input).await {
+        Some(hash) => {
+            query_transport(transport, TransportQuery::UnblackholeIdentity { hash }).await
+        }
+        None => None,
+    };
+    // Older builds stored the LXMF destination bytes as if they were an
+    // identity hash; removing that too is a no-op when nothing is there.
+    let legacy = query_transport(
+        transport,
+        TransportQuery::UnblackholeIdentity { hash: input },
+    )
+    .await;
+    (by_identity.is_some() || legacy.is_some()).then(|| lifted(&by_identity) || lifted(&legacy))
+}
+
+/// Lifts the network blocks `identity_id` was asked to remove while its
+/// runtime was gone, through the runtime now up for it.
+pub async fn apply_pending_network_lifts(state: &AppState, identity_id: &str) {
+    let generation = state.current_identity_session_generation();
+    if crate::helpers::active_identity_id(state) != identity_id {
+        return;
+    }
+    let transport = state
+        .rns
+        .read()
+        .ok()
+        .and_then(|rns| rns.as_ref().map(|mgr| mgr.handle.transport_tx.clone()));
+    let identity = identity_id.to_string();
+    let lifts = db::spawn_db(state.db.clone(), move |p| {
+        db::pending_network_lifts(&p, &identity)
+    })
+    .await
+    .unwrap_or_default();
+    for dest in lifts {
+        if state.current_identity_session_generation() != generation {
+            return;
+        }
+        let Some(input) = hex::decode(&dest)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+        else {
+            continue;
+        };
+        // A block made since the list was read keeps its network block.
+        let identity = identity_id.to_string();
+        let contact = dest.clone();
+        let wanted = db::spawn_db(state.db.clone(), move |p| {
+            db::pending_network_lifts(&p, &identity).contains(&contact)
+                && !db::is_blocked(&p, &contact, &identity)
+        })
+        .await
+        .unwrap_or(false);
+        if !wanted {
+            continue;
+        }
+        if lift_network_block(state, transport.as_ref(), &dest, input)
+            .await
+            .is_some()
+        {
+            let identity = identity_id.to_string();
+            db::spawn_db(state.db.clone(), move |p| {
+                db::clear_pending_network_lift(&p, &identity, &dest)
+            })
+            .await
+            .ok();
+        }
+    }
+}
+
 /// On every `lxmf.delivery` announce, sweep `pending_blackholes` for the
 /// announced dest hash. Each match is escalated using the identity hash
 /// recovered from the announce (no extra RPC). Successful escalations clear

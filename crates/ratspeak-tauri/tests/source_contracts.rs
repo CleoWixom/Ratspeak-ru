@@ -4138,6 +4138,49 @@ fn only_real_transitions_take_the_lifecycle_lock_as_a_transition() {
     );
 }
 
+/// An unblock whose runtime stopped before its network lift lifts it through
+/// the next runtime of its identity, once that runtime is up.
+#[test]
+fn a_runtime_lifts_its_identitys_pending_network_unblocks_once_up() {
+    let runtime =
+        read_source(repo_root().join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime lib");
+    let start = rust_function_block(&runtime, "init_rns_lxmf_inner");
+    let ready = start
+        .find("tracing::info!(\"Startup complete\");")
+        .expect("startup completes");
+    let lifts = start
+        .find("blackhole::apply_pending_network_lifts(")
+        .expect("pending network lifts are applied at startup");
+    assert!(
+        ready < lifts,
+        "pending lifts are applied before the runtime is up"
+    );
+}
+
+/// A poll reads announced names and presence under one identity session and
+/// publishes them only while that session is current, under the lifecycle
+/// lock: a switch that lands in between, even to an identity that comes up
+/// locked, never leaves the previous identity's lists in its window.
+#[test]
+fn announced_names_and_presence_reach_only_their_session() {
+    let runtime =
+        read_source(repo_root().join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime lib");
+    let poll = rust_function_block(&runtime, "poll_stats_loop");
+    for emit in [
+        "emit_peers_batch(&state, &rows)",
+        "state.emit_to_all(\"contacts_update\"",
+    ] {
+        let at = poll.find(emit).unwrap_or_else(|| panic!("missing {emit}"));
+        let gate = poll[..at]
+            .rfind("publish_in_session(&state, poll_generation")
+            .unwrap_or_else(|| panic!("{emit} is published outside its session"));
+        assert!(
+            !poll[gate..at].contains(".await;"),
+            "{emit} is published outside its session"
+        );
+    }
+}
+
 /// Every activation starts a new identity session before its shutdown, so
 /// nothing begun under the previous one lands in the next; unlock reopens
 /// the same session. The Activity reset, the one step that can refuse, comes

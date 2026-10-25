@@ -216,8 +216,7 @@ pub(crate) fn remove_stored_file_refs(
     }
 }
 
-pub(crate) type TransportSender =
-    tokio::sync::mpsc::Sender<rns_transport::messages::TransportMessage>;
+pub(crate) use ratspeak_runtime::blackhole::TransportSender;
 
 pub(crate) async fn transport_query(
     state: &AppState,
@@ -231,14 +230,7 @@ pub(crate) async fn transport_query_on(
     tx: Option<&TransportSender>,
     query: rns_transport::messages::TransportQuery,
 ) -> Option<rns_transport::messages::TransportQueryResponse> {
-    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    tx?.send(rns_transport::messages::TransportMessage::Rpc {
-        query,
-        response_tx: resp_tx,
-    })
-    .await
-    .ok()?;
-    resp_rx.await.ok()
+    ratspeak_runtime::blackhole::query_transport(tx, query).await
 }
 
 pub(crate) fn blackhole_reason_display(
@@ -250,21 +242,22 @@ pub(crate) fn blackhole_reason_display(
 
 // Each entry: `hash`, `reason`, `created`, `expires_in` (null = permanent),
 // `verified` (false means we have no announce backing this identity).
-pub(crate) async fn snapshot_blackhole(state: &AppState) -> Vec<Value> {
+// `None` if the runtime sent no list.
+pub(crate) async fn snapshot_blackhole(state: &AppState) -> Option<Vec<Value>> {
     snapshot_blackhole_on(transport_sender(state).as_ref()).await
 }
 
-pub(crate) async fn snapshot_blackhole_on(tx: Option<&TransportSender>) -> Vec<Value> {
+pub(crate) async fn snapshot_blackhole_on(tx: Option<&TransportSender>) -> Option<Vec<Value>> {
     use rns_transport::messages::{TransportQuery, TransportQueryResponse};
     let entries = match transport_query_on(tx, TransportQuery::GetBlackholedIdentities).await {
         Some(TransportQueryResponse::BlackholeList(v)) => v,
-        _ => return Vec::new(),
+        _ => return None,
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    entries
+    let entries = entries
         .into_iter()
         .map(|e| {
             let expires_in = e.ttl.map(|t| (e.created + t - now).max(0.0));
@@ -277,46 +270,11 @@ pub(crate) async fn snapshot_blackhole_on(tx: Option<&TransportSender>) -> Vec<V
                 "verified": e.verified,
             })
         })
-        .collect()
+        .collect();
+    Some(entries)
 }
 
-/// Resolve a 16-byte hex blob (LXMF dest hash OR identity hash) to the canonical
-/// identity hash via rsReticulum's `recent_announces`. Returns `None` when the
-/// input is neither a known destination nor a known identity.
-pub(crate) async fn resolve_identity_hash(
-    tx: Option<&TransportSender>,
-    input: [u8; 16],
-) -> Option<[u8; 16]> {
-    use rns_transport::messages::{TransportQuery, TransportQueryResponse};
-    match transport_query_on(tx, TransportQuery::ResolveIdentityHash { input }).await {
-        Some(TransportQueryResponse::HashResult(opt)) => opt,
-        _ => None,
-    }
-}
-
-/// Resolve a contact's LXMF destination hash to its Reticulum identity hash.
-/// The transport announce cache is preferred, but blackholing deliberately
-/// drops paths and future announces, so contact unblock also needs the
-/// persistent `identity_activity` mapping learned before the block.
-/// `tx` is the transport of the runtime the contact's identity is resolved in.
-pub(crate) async fn resolve_contact_identity_hash(
-    state: &AppState,
-    tx: Option<&TransportSender>,
-    dest_hash_hex: &str,
-    input: [u8; 16],
-) -> Option<[u8; 16]> {
-    if let Some(identity_hash) = resolve_identity_hash(tx, input).await {
-        return Some(identity_hash);
-    }
-
-    let dest = dest_hash_hex.to_string();
-    let db = state.db.clone();
-    let identity_hex = db::spawn_db(db, move |p| db::identity_hash_for_dest(&p, &dest))
-        .await
-        .ok()
-        .flatten()?;
-    hex_to_array16(&identity_hex)
-}
+pub(crate) use ratspeak_runtime::blackhole::resolve_contact_identity_hash;
 
 /// Batch lookup: which of the given LXMF dest hashes belong to a currently
 /// blackholed identity? Returns the set of hex-encoded dest hashes that are
@@ -339,9 +297,11 @@ pub(crate) async fn filter_blackholed_dests(
 }
 
 /// Broadcast `blackhole_update` after any mutation.
+/// Only a list the runtime sent is published.
 pub(crate) async fn broadcast_blackhole_update(state: &AppState) {
-    let entries = snapshot_blackhole(state).await;
-    state.emit_to_all("blackhole_update", json!({ "entries": entries }));
+    if let Some(entries) = snapshot_blackhole(state).await {
+        state.emit_to_all("blackhole_update", json!({ "entries": entries }));
+    }
 }
 
 pub(crate) fn normalize_transport_mode(mode: &str) -> Option<&'static str> {

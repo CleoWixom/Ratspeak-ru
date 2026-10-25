@@ -2253,6 +2253,11 @@ pub fn delete_identity(pool: &DbPool, hash_hex: &str, cascade: bool) -> Result<(
             tx.execute(sql, params![hash_hex])
                 .map_err(|e| format!("delete {label}: {e}"))?;
         }
+        tx.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params![pending_network_lifts_key(hash_hex)],
+        )
+        .map_err(|e| format!("delete pending network lifts: {e}"))?;
     }
     tx.execute("DELETE FROM identities WHERE hash = ?1", params![hash_hex])
         .map_err(|e| format!("delete identity: {e}"))?;
@@ -2695,6 +2700,69 @@ pub fn clear_pending_blackhole(pool: &DbPool, dest_hash: &str, identity_id: &str
     )
     .map(|n| n > 0)
     .unwrap_or(false)
+}
+
+/// Unblocks whose network lift the identity's runtime never took, because it
+/// stopped. Lifted when that identity's runtime is next up. A setting, so the
+/// schema stays as it is.
+fn pending_network_lifts_key(identity_id: &str) -> String {
+    format!("pending_network_lifts:{identity_id}")
+}
+
+/// The destinations whose network block `identity_id` still has to lift.
+pub fn pending_network_lifts(pool: &DbPool, identity_id: &str) -> Vec<String> {
+    get_setting(pool, &pending_network_lifts_key(identity_id))
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+/// Adds (`lift`) or removes a pending network lift; false if it was not stored.
+fn update_pending_network_lifts(
+    pool: &DbPool,
+    identity_id: &str,
+    dest_hash: &str,
+    lift: bool,
+) -> bool {
+    if identity_id.is_empty() {
+        return false;
+    }
+    let key = pending_network_lifts_key(identity_id);
+    let Ok(mut conn) = pool.get() else {
+        return false;
+    };
+    let Ok(tx) = conn.transaction() else {
+        return false;
+    };
+    let mut lifts: Vec<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default();
+    lifts.retain(|dest| dest != dest_hash);
+    if lift {
+        lifts.push(dest_hash.to_string());
+    }
+    let written = if lifts.is_empty() {
+        tx.execute("DELETE FROM settings WHERE key = ?1", params![key])
+    } else {
+        tx.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![key, serde_json::to_string(&lifts).unwrap_or_default()],
+        )
+    };
+    written.is_ok() && tx.commit().is_ok()
+}
+
+pub fn queue_pending_network_lift(pool: &DbPool, identity_id: &str, dest_hash: &str) -> bool {
+    update_pending_network_lifts(pool, identity_id, dest_hash, true)
+}
+
+pub fn clear_pending_network_lift(pool: &DbPool, identity_id: &str, dest_hash: &str) -> bool {
+    update_pending_network_lifts(pool, identity_id, dest_hash, false)
 }
 
 pub fn get_message_delivery_method(

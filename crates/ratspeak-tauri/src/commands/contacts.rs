@@ -93,6 +93,7 @@ pub async fn api_blocked_contacts(state: State<'_, Arc<AppState>>) -> AppResult<
     if !identity_by_dest.is_empty() {
         let blackholed_ids: std::collections::HashSet<String> = snapshot_blackhole(&state)
             .await
+            .unwrap_or_default()
             .into_iter()
             .filter_map(|entry| {
                 entry
@@ -337,6 +338,9 @@ pub async fn block_contact(
 
         let contacts = db::get_all_contacts_conn(&conn, &id_c);
         let contacts_list = format_contacts_list(&contacts);
+        drop(conn);
+        // An earlier unblock's network lift must not undo this block.
+        db::clear_pending_network_lift(&p, &id_c, &dh);
         Some((display_name, contacts_list))
     })
     .await
@@ -379,7 +383,17 @@ pub async fn block_contact(
                 })
                 .await
                 .ok();
-                blackhole_entries = Some(snapshot_blackhole_on(transport.as_ref()).await);
+                blackhole_entries = snapshot_blackhole_on(transport.as_ref()).await;
+            } else if resp.is_none() {
+                // Its runtime stopped first: the network block waits for that
+                // identity's next sighting of the contact.
+                let dest_c = dest_hash.clone();
+                let id_c = identity_id.clone();
+                blackhole_pending = db::spawn_db(state.db.clone(), move |p| {
+                    db::enqueue_pending_blackhole(&p, &dest_c, &id_c, None, None)
+                })
+                .await
+                .unwrap_or(false);
             }
         } else {
             let dest_c = dest_hash.clone();
@@ -459,12 +473,11 @@ pub async fn unblock_contact(
     .await
     .map_err(|_| AppError::internal("unblock_contact db task panicked"))?;
 
-    let mut unblackholed = false;
     let mut pending_cleared = false;
+    let mut lift = None;
     let mut blackhole_entries = None;
-    if let Some(input_bytes) = hex_to_array16(&dest_hash).filter(|_| args.also_remove_blackhole) {
-        use rns_transport::messages::{TransportQuery, TransportQueryResponse};
-
+    let lift_input = hex_to_array16(&dest_hash).filter(|_| args.also_remove_blackhole);
+    if let Some(input_bytes) = lift_input {
         // Always clear the pending row first so the announce-handler retry
         // does not re-escalate after we just lifted.
         let dest_c = dest_hash.clone();
@@ -474,39 +487,52 @@ pub async fn unblock_contact(
         })
         .await
         .unwrap_or(false);
-
-        if let Some(identity_hash) =
-            resolve_contact_identity_hash(&state, transport.as_ref(), &dest_hash, input_bytes).await
-        {
-            let resp = transport_query_on(
-                transport.as_ref(),
-                TransportQuery::UnblackholeIdentity {
-                    hash: identity_hash,
-                },
-            )
-            .await;
-            unblackholed = matches!(resp, Some(TransportQueryResponse::BoolResult(true)));
-        }
-
-        // Legacy cleanup: pre-fix builds stored the LXMF dest-hash bytes as if
-        // they were an identity hash. Try removing under the raw input too —
-        // harmless no-op when no such entry exists.
-        let legacy_resp = transport_query_on(
+        lift = ratspeak_runtime::blackhole::lift_network_block(
+            &state,
             transport.as_ref(),
-            TransportQuery::UnblackholeIdentity { hash: input_bytes },
+            &dest_hash,
+            input_bytes,
         )
         .await;
-        unblackholed =
-            unblackholed || matches!(legacy_resp, Some(TransportQueryResponse::BoolResult(true)));
-
-        if unblackholed || pending_cleared {
-            blackhole_entries = Some(snapshot_blackhole_on(transport.as_ref()).await);
+        if lift == Some(true) || pending_cleared {
+            blackhole_entries = snapshot_blackhole_on(transport.as_ref()).await;
         }
     }
     let peer = read_peer_delta(&state, &identity_id, &dest_hash).await;
 
-    // As a block: nothing reaches the next session's window.
     let _identity = state.identity_switch_lock.lock_routine().await;
+    if let Some(input_bytes) = lift_input.filter(|_| lift.is_none()) {
+        // Its runtime stopped first. While the identity is still the active
+        // one, lift through its live runtime; otherwise once one is up.
+        let live = (active_identity_id(&state) == identity_id)
+            .then(|| transport_sender(&state))
+            .flatten();
+        if let Some(live) = live {
+            lift = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                ratspeak_runtime::blackhole::lift_network_block(
+                    &state,
+                    Some(&live),
+                    &dest_hash,
+                    input_bytes,
+                ),
+            )
+            .await
+            .ok()
+            .flatten();
+        }
+        if lift.is_none() {
+            let dest_c = dest_hash.clone();
+            let id_c = identity_id.clone();
+            db::spawn_db(state.db.clone(), move |p| {
+                db::queue_pending_network_lift(&p, &id_c, &dest_c)
+            })
+            .await
+            .ok();
+        }
+    }
+    let unblackholed = lift == Some(true);
+    // As a block: nothing reaches the next session's window.
     if state.current_identity_session_generation() == generation {
         if let Some(entries) = blackhole_entries {
             state.emit_to_all("blackhole_update", json!({ "entries": entries }));
@@ -534,7 +560,7 @@ pub async fn unblock_contact(
 /// Same shape as `blackhole_update` broadcast.
 #[tauri::command]
 pub async fn get_blackhole(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
-    let entries = snapshot_blackhole(&state).await;
+    let entries = snapshot_blackhole(&state).await.unwrap_or_default();
     Ok(json!({ "entries": entries }))
 }
 

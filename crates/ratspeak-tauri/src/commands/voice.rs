@@ -9,12 +9,13 @@ use serde_json::{Value, json};
 use tauri::State;
 use tokio::io::AsyncReadExt as _;
 
-use crate::commands::shared::{hex_to_array16, resolve_identity_hash, transport_sender};
+use crate::commands::shared::{hex_to_array16, transport_sender};
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::helpers::{active_identity_id, sanitize_text, validate_hex};
 use crate::state::{AppState, AttachmentTransferAdmissionError};
 use crate::voice_memo::MemoFormat;
+use ratspeak_runtime::blackhole::resolve_identity_hash;
 
 const VOICE_MEMO_START_UNAVAILABLE: &str = "Ratspeak couldn't start recording. Check microphone access and the selected input device, then try again.";
 const VOICE_MEMO_AUDIO_BUSY: &str =

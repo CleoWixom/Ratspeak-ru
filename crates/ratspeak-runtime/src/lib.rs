@@ -3254,6 +3254,19 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
     state.emit_to_all("system_status", json!({"status": "ready"}));
     tracing::info!("Startup complete");
     schedule_startup_auto_announce(state.clone());
+    // Unblocks whose runtime stopped before they lifted their network block
+    // lift it through this one.
+    if let Some(identity) = state
+        .lxmf
+        .lock()
+        .ok()
+        .and_then(|lxmf| lxmf.as_ref().map(|mgr| mgr.identity_hash.clone()))
+    {
+        let lift_state = state.clone();
+        tokio::spawn(async move {
+            blackhole::apply_pending_network_lifts(&lift_state, &identity).await;
+        });
+    }
 
     // Schedule identity pruning after ready so it doesn't block cold-start.
     let prune_state = state.clone();
@@ -5557,8 +5570,7 @@ async fn process_inbound_lxmf(
     let current = state.conversation_list_revision() == revision;
     let stored = match &lists {
         Some(lists) if current => lists.stored,
-        Some(_) => inbound_message_stored(state, &msg_id, &identity_id).await,
-        None => false,
+        _ => inbound_message_stored(state, &msg_id, &identity_id).await,
     };
     if !stored {
         return;
@@ -5572,9 +5584,17 @@ async fn process_inbound_lxmf(
     );
     state.emit_to_all("lxmf_message", event_data);
     messaging::broadcast_conversations(Arc::clone(state));
-    if let Some(lists) = lists.filter(|_| current) {
-        state.emit_to_all("contacts_update", lists.contacts.into());
-        state.emit_to_all("unread_total", json!({"count": lists.unread}));
+    match lists {
+        Some(lists) if current => {
+            state.emit_to_all("contacts_update", lists.contacts.into());
+            state.emit_to_all("unread_total", json!({"count": lists.unread}));
+        }
+        Some(_) => {}
+        // Post-emit UI refresh failures only mean stale sidebar counts.
+        None => tracing::error!(
+            reason = "refresh_failed",
+            "list refresh after inbound message failed"
+        ),
     }
 }
 
@@ -5809,6 +5829,16 @@ fn record_poll_activity(
             }),
         ),
     });
+}
+
+/// Runs `publish` under the lifecycle lock while `generation` is still the
+/// identity session: what a poll read under one never reaches the next, even
+/// when the next comes up locked and sends no lists of its own.
+async fn publish_in_session(state: &AppState, generation: u64, publish: impl FnOnce()) {
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
+    if state.current_identity_session_generation() == generation {
+        publish();
+    }
 }
 
 // Always emits, including backgrounded — first paint on resume.
@@ -6302,7 +6332,8 @@ async fn poll_stats_loop(
                     })
                     .await
                     .unwrap_or_default();
-                    emit_peers_batch(&state, &rows);
+                    publish_in_session(&state, poll_generation, || emit_peers_batch(&state, &rows))
+                        .await;
                 }
 
                 // Peers who messaged us before they announced have no real
@@ -6363,7 +6394,10 @@ async fn poll_stats_loop(
                                 })
                             })
                             .collect();
-                        state.emit_to_all("contacts_update", serde_json::json!(contacts_list));
+                        publish_in_session(&state, poll_generation, || {
+                            state.emit_to_all("contacts_update", serde_json::json!(contacts_list))
+                        })
+                        .await;
                     }
                 }
             }

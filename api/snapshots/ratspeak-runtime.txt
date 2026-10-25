@@ -808,7 +808,13 @@ pub async fn ratspeak_runtime::announce_handlers::spawn_lxmf_delivery_handler(al
 pub async fn ratspeak_runtime::announce_handlers::spawn_lxmf_propagation_handler(alloc::sync::Arc<ratspeak_runtime::state::AppState>, &rns_runtime::reticulum::ReticulumHandle, rns_runtime::lifecycle::ShutdownSignal)
 pub async fn ratspeak_runtime::announce_handlers::spawn_lxst_telephony_handler(alloc::sync::Arc<ratspeak_runtime::state::AppState>, &rns_runtime::reticulum::ReticulumHandle, rns_runtime::lifecycle::ShutdownSignal)
 pub mod ratspeak_runtime::blackhole
+pub async fn ratspeak_runtime::blackhole::apply_pending_network_lifts(&ratspeak_runtime::state::AppState, &str)
 pub async fn ratspeak_runtime::blackhole::escalate_pending_if_present(&alloc::sync::Arc<ratspeak_runtime::state::AppState>, [u8; 16], [u8; 16])
+pub async fn ratspeak_runtime::blackhole::lift_network_block(&ratspeak_runtime::state::AppState, core::option::Option<&ratspeak_runtime::blackhole::TransportSender>, &str, [u8; 16]) -> core::option::Option<bool>
+pub async fn ratspeak_runtime::blackhole::query_transport(core::option::Option<&ratspeak_runtime::blackhole::TransportSender>, rns_transport::messages::TransportQuery) -> core::option::Option<rns_transport::messages::TransportQueryResponse>
+pub async fn ratspeak_runtime::blackhole::resolve_contact_identity_hash(&ratspeak_runtime::state::AppState, core::option::Option<&ratspeak_runtime::blackhole::TransportSender>, &str, [u8; 16]) -> core::option::Option<[u8; 16]>
+pub async fn ratspeak_runtime::blackhole::resolve_identity_hash(core::option::Option<&ratspeak_runtime::blackhole::TransportSender>, [u8; 16]) -> core::option::Option<[u8; 16]>
+pub type ratspeak_runtime::blackhole::TransportSender = tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>
 pub mod ratspeak_runtime::channel_hub
 pub enum ratspeak_runtime::channel_hub::ChannelHubAdminKeyChange
 pub ratspeak_runtime::channel_hub::ChannelHubAdminKeyChange::Clear
