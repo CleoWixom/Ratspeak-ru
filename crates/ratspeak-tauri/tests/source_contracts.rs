@@ -10085,3 +10085,29 @@ fn active_identity_read_errors_are_not_taken_for_a_missing_identity() {
     let hub = rust_function_block(&runtime, "start_channel_hub_service");
     assert!(hub.contains("reason = \"query_failed\""));
 }
+
+/// Auto-lock runs from the unlock, not from the last interaction, and its
+/// copy says so.
+#[test]
+fn auto_lock_copy_counts_from_the_unlock() {
+    let root = repo_root();
+    let index = read_source(root.join("dashboard/index.html")).expect("dashboard index");
+    let settings = read_source(root.join("dashboard/static/js/settings.js")).expect("settings js");
+    let row = index
+        .split(r#"id="hw-lock-row""#)
+        .nth(1)
+        .and_then(|tail| tail.split(r#"id="hw-lock-timeout-select""#).next())
+        .expect("auto-lock row");
+    let choice = settings
+        .split("function _initHwLockSetting(")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}\n").next())
+        .expect("auto-lock choice");
+    for copy in [row, choice] {
+        assert!(copy.contains("since you unlocked it"), "{copy}");
+        assert!(
+            !copy.contains("inactivity") && !copy.contains("idle"),
+            "{copy}"
+        );
+    }
+}

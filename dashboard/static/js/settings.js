@@ -1646,7 +1646,7 @@ function _initHwLockSetting() {
     function open() {
         rsChoice({
             title: 'Hardware Key Auto-Lock',
-            message: 'Lock your hardware identity after this much idle time. You’ll re-enter the PIN to resume.',
+            message: 'Lock your hardware identity once this long has passed since you unlocked it. You’ll re-enter the PIN to resume.',
             choices: [
                 { label: 'OFF', value: '0', hint: 'Only locks when you quit Ratspeak.' },
                 { label: '5 minutes', value: '300', hint: 'Tightest; frequent PIN prompts.' },
