@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use ratspeak_runtime::Zeroizing;
 use serde_json::Value;
 use tauri::State;
 
@@ -119,7 +120,8 @@ async fn prepare_destructive_hardware_operation(
 fn clear_hardware_lock_state(state: &AppState) {
     state.set_hw_locked(None);
     state.set_hw_last_error(None);
-    state.set_pending_hw_pin(None);
+    state.clear_pending_hw_pin();
+    state.release_retained_identity_except("");
 }
 
 #[tauri::command]
@@ -139,6 +141,7 @@ pub async fn hw_provision_recoverable(
     nickname: String,
     force: bool,
 ) -> AppResult<Value> {
+    let (pin, current_pin) = (Zeroizing::new(pin), current_pin.map(Zeroizing::new));
     check_pin(&pin)?;
     if let Some(current_pin) = current_pin.as_deref() {
         check_pin(current_pin)?;
@@ -163,7 +166,7 @@ pub async fn hw_provision_recoverable(
             ratspeak_runtime::hardware::PinnedProvisionRequest {
                 expected_serial,
                 pin: &pin,
-                current_pin: current_pin.as_deref(),
+                current_pin: current_pin.as_deref().map(String::as_str),
                 nickname: &nickname,
                 force,
             },
@@ -186,6 +189,7 @@ pub async fn hw_provision_hardware_only(
     nickname: String,
     force: bool,
 ) -> AppResult<Value> {
+    let (pin, current_pin) = (Zeroizing::new(pin), current_pin.map(Zeroizing::new));
     check_pin(&pin)?;
     if let Some(current_pin) = current_pin.as_deref() {
         check_pin(current_pin)?;
@@ -210,7 +214,7 @@ pub async fn hw_provision_hardware_only(
             ratspeak_runtime::hardware::PinnedProvisionRequest {
                 expected_serial,
                 pin: &pin,
-                current_pin: current_pin.as_deref(),
+                current_pin: current_pin.as_deref().map(String::as_str),
                 nickname: &nickname,
                 force,
             },
@@ -253,6 +257,7 @@ pub async fn hw_restore(
     nickname: String,
     force: bool,
 ) -> AppResult<Value> {
+    let (pin, current_pin) = (Zeroizing::new(pin), current_pin.map(Zeroizing::new));
     check_pin(&pin)?;
     if let Some(current_pin) = current_pin.as_deref() {
         check_pin(current_pin)?;
@@ -270,6 +275,7 @@ pub async fn hw_restore(
     .await?;
     let data_dir = state.config.data_dir.clone();
     let db = state.db.clone();
+    let phrase = Zeroizing::new(phrase);
     let res = run_identity_mutation(Arc::clone(&identity_lifecycle), move || {
         ratspeak_runtime::hardware::restore(
             &data_dir,
@@ -278,7 +284,7 @@ pub async fn hw_restore(
             ratspeak_runtime::hardware::PinnedProvisionRequest {
                 expected_serial,
                 pin: &pin,
-                current_pin: current_pin.as_deref(),
+                current_pin: current_pin.as_deref().map(String::as_str),
                 nickname: &nickname,
                 force,
             },
@@ -291,18 +297,6 @@ pub async fn hw_restore(
         clear_hardware_lock_state(&state);
     }
     to_value(res)
-}
-
-/// Stage the PIN the user already entered during first-run hardware setup so
-/// the setup restart can load the just-provisioned identity once. The runtime
-/// consumes and clears this value via `take_pending_hw_pin`.
-#[tauri::command]
-pub async fn hw_stage_unlock(state: State<'_, Arc<AppState>>, pin: String) -> AppResult<Value> {
-    check_pin(&pin)?;
-    let request_fence = state.activity_request_fence();
-    let _identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
-    state.set_pending_hw_pin(Some(pin));
-    to_value(serde_json::json!({ "ok": true }))
 }
 
 #[tauri::command]
@@ -336,6 +330,7 @@ pub async fn hw_change_pin(
     if !validate_hex(&hash, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
+    let (current_pin, new_pin) = (Zeroizing::new(current_pin), Zeroizing::new(new_pin));
     check_piv_code("Current PIN", &current_pin)?;
     check_piv_code("New PIN", &new_pin)?;
     let request_fence = state.activity_request_fence();
@@ -381,6 +376,13 @@ pub async fn hw_remove(state: State<'_, Arc<AppState>>, hash: String) -> AppResu
         crate::finish_shutdown(&state, &reset).await;
         state.clear_identity_scoped_runtime_state();
     }
+    // Nothing of the removed identity stays unlocked.
+    let keep = if live {
+        String::new()
+    } else {
+        crate::helpers::active_identity_id(&state)
+    };
+    state.release_retained_identity_except(&keep);
     let data_dir = state.config.data_dir.clone();
     let db = state.db.clone();
     let hash_for_remove = hash.clone();
@@ -402,7 +404,7 @@ pub async fn hw_remove(state: State<'_, Arc<AppState>>, hash: String) -> AppResu
     if live {
         state.set_hw_locked(None);
         state.set_hw_last_error(None);
-        state.set_pending_hw_pin(None);
+        state.clear_pending_hw_pin();
         if remaining == 0 {
             state.set_startup_stage("ready");
         } else {
@@ -425,10 +427,8 @@ pub async fn hw_unlock(state: State<'_, Arc<AppState>>, pin: String) -> AppResul
     crate::commands::identity::unlock_protected_identity(Arc::clone(&state), pin).await
 }
 
-/// First-run hardware setup completion needs a stronger guarantee than
-/// `hw_stage_unlock` + async restart: activate this exact hardware identity,
-/// unlock it with the provided PIN, and only report success if that identity is
-/// what the runtime loaded.
+/// Activate this exact hardware identity, unlock it with the provided PIN, and
+/// report success only if that identity is what the runtime loaded.
 #[tauri::command]
 pub async fn hw_activate_and_unlock(
     state: State<'_, Arc<AppState>>,
@@ -438,6 +438,7 @@ pub async fn hw_activate_and_unlock(
     if !validate_hex(&hash, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
+    let pin = Zeroizing::new(pin);
     check_pin(&pin)?;
     let state = Arc::clone(&state);
     let request_fence = state.activity_request_fence();
@@ -491,15 +492,17 @@ pub async fn hw_activate_and_unlock(
         // The runtime is down: bring the previous identity back, in a session
         // of its own, and end the switch as a failed one does.
         state.bump_identity_session_generation();
-        super::identity::resume_previous(&state, previous_active).await;
+        super::identity::resume_previous(&state, previous_active, &hash).await;
         super::identity::emit_switch_failed(&state, &hash, &error.message);
         return Err(error);
     }
 
     state.clear_identity_scoped_runtime_state();
+    // No way back to the previous identity from here: its unlock goes.
+    state.release_retained_identity_except(&hash);
     state.set_hw_last_error(None);
     state.set_hw_locked(None);
-    state.set_pending_hw_pin(Some(pin));
+    state.stage_pending_hw_pin(&hash, pin);
     if let Ok(mut sig) = state.session_shutdown.write() {
         *sig = rns_runtime::lifecycle::ShutdownSignal::new();
     }

@@ -12,6 +12,7 @@ use indexmap::IndexMap;
 use ratspeak_core::{Emitter, NativeNotification, NativeNotifier};
 use rns_runtime::lifecycle::ShutdownSignal;
 use tokio::sync::watch;
+use zeroize::Zeroizing;
 
 use crate::activity::ActivityRecorder;
 use crate::activity::emitter::EmitterBatchSink;
@@ -788,9 +789,10 @@ pub struct AppState {
     pub auto_interface_lock: Arc<tokio::sync::Mutex<()>>,
     pub ble_peer_enable_lock: tokio::sync::Mutex<()>,
     pub identity_session_generation: AtomicU64,
-    /// Secret handed to the next protected-identity load (hardware PIN or
-    /// software passcode, consumed by `init_rns_lxmf`). Never persisted.
-    pub hw_pending_pin: Mutex<Option<String>>,
+    /// Secret handed to the next load of one protected identity (hardware PIN
+    /// or software passcode), with that identity's hash. Taken once by
+    /// `init_rns_lxmf`; never persisted.
+    pub hw_pending_pin: Mutex<Option<(String, Zeroizing<String>)>>,
     /// Hash of a protected identity that is active but locked (awaiting PIN).
     pub hw_locked: RwLock<Option<String>>,
     /// Last protected-identity unlock failure message.
@@ -1004,14 +1006,21 @@ impl AppState {
         }
     }
 
-    /// Take the PIN staged for the next hardware-identity load (one-shot).
-    pub fn take_pending_hw_pin(&self) -> Option<String> {
+    /// Take the staged secret and the hash it was staged for (one-shot).
+    pub fn take_pending_hw_pin(&self) -> Option<(String, Zeroizing<String>)> {
         self.hw_pending_pin.lock().ok().and_then(|mut p| p.take())
     }
 
-    pub fn set_pending_hw_pin(&self, pin: Option<String>) {
+    /// Stage `secret` for the next load of `hash`, and of no other identity.
+    pub fn stage_pending_hw_pin(&self, hash: &str, secret: Zeroizing<String>) {
         if let Ok(mut p) = self.hw_pending_pin.lock() {
-            *p = pin;
+            *p = Some((hash.to_owned(), secret));
+        }
+    }
+
+    pub fn clear_pending_hw_pin(&self) {
+        if let Ok(mut p) = self.hw_pending_pin.lock() {
+            *p = None;
         }
     }
 
@@ -1239,6 +1248,24 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner())
             .retained_identity = Some((identity, false));
         true
+    }
+
+    /// Drop a retained unlock that belongs to any identity other than `keep`, so
+    /// switching away and back costs the secret again. A hardware token is
+    /// relocked. Restarts of the same identity keep it.
+    pub fn release_retained_identity_except(&self, keep: &str) {
+        let mut session = self
+            .network_session
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let stale = session
+            .retained_identity
+            .as_ref()
+            .is_some_and(|(identity, _)| hex::encode(identity.hash) != keep);
+        // Taking it drops a software unlock; a hardware token is relocked.
+        if stale && let Some((identity, true)) = session.retained_identity.take() {
+            identity.lock();
+        }
     }
 
     pub fn announce_semantic_revision(&self) -> AnnounceSemanticRevision {
@@ -3385,6 +3412,31 @@ mod tests {
 
     fn make_state() -> AppState {
         make_state_with_emitter(Arc::new(ratspeak_core::NoopEmitter))
+    }
+
+    #[test]
+    fn switching_identity_releases_another_identitys_retained_unlock() {
+        let state = make_state();
+        let unlocked = rns_identity::identity::Identity::new();
+        let hash = hex::encode(unlocked.hash);
+        let generation = state.current_identity_session_generation();
+        assert!(state.retain_unlocked_identity(unlocked, &hash, generation));
+        let retained = |state: &AppState| {
+            state
+                .network_session
+                .read()
+                .unwrap()
+                .retained_identity
+                .is_some()
+        };
+
+        // Restarting the same identity keeps its unlock.
+        state.release_retained_identity_except(&hash);
+        assert!(retained(&state));
+
+        // Switching to another identity drops it.
+        state.release_retained_identity_except(&"ab".repeat(16));
+        assert!(!retained(&state));
     }
 
     #[test]

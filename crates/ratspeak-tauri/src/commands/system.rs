@@ -735,6 +735,11 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
         .map_err(|_| AppError::internal("factory reset lifecycle boundary unavailable"))?;
     state.bump_identity_session_generation();
     crate::finish_shutdown(state.inner(), &reset).await;
+    // Every identity goes, and every unlock with it.
+    state.release_retained_identity_except("");
+    state.clear_pending_hw_pin();
+    state.set_hw_locked(None);
+    state.set_hw_last_error(None);
 
     db::spawn_db_with_lease(state.db.clone(), Arc::clone(&identity_lifecycle), |pool| {
         if let Ok(conn) = pool.get() {

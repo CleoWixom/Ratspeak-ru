@@ -2013,13 +2013,18 @@ impl LxmfManager {
         preferred_identity_hash: Option<&str>,
         hw_pin: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::load_or_create_with_vault_job(data_dir, preferred_identity_hash, hw_pin, None)
+        Self::load_or_create_with_vault_job(
+            data_dir,
+            preferred_identity_hash,
+            hw_pin.as_deref(),
+            None,
+        )
     }
 
     pub(crate) fn load_or_create_with_vault_job(
         data_dir: &Path,
         preferred_identity_hash: Option<&str>,
-        hw_pin: Option<String>,
+        hw_pin: Option<&str>,
         job: Option<&crate::vault::VaultJob>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if preferred_identity_hash
@@ -2041,10 +2046,10 @@ impl LxmfManager {
             let enc_file = identities_dir.join(hash).join("identity.enc");
             if hwid_file.exists() {
                 is_hardware = true;
-                load_hwid_identity(&hwid_file, hash, hw_pin.as_deref())?
+                load_hwid_identity(&hwid_file, hash, hw_pin)?
             } else if enc_file.exists() {
                 // Passcode-protected software identity; `hw_pin` carries the passcode.
-                load_encrypted_identity(&enc_file, hash, hw_pin.as_deref(), job)?
+                load_encrypted_identity(&enc_file, hash, hw_pin, job)?
             } else if id_file.exists() {
                 tracing::info!(identity = %crate::short_id(hash), "Loading active identity from profile");
                 bounded_plain_identity_from_file(&id_file)?

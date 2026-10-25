@@ -2499,21 +2499,12 @@ function _hwFinish(result) {
             completeSetupAfterHardwareIdentity(result, pinForSetup);
             return;
         }
-        var finishSetup = function() {
-            if (typeof completeSetupAfterIdentityImport === 'function') {
-                completeSetupAfterIdentityImport(result);
-            } else {
-                reloadToAppLanding();
-            }
-        };
-        if (pinForSetup) {
-            RS.invoke('hw_stage_unlock', { pin: pinForSetup })
-                .catch(function(err) {
-                    window.RS.diag('warn', '[hardware] could not stage first-run unlock PIN:', err && err.message ? err.message : String(err));
-                })
-                .finally(finishSetup);
+        // Without the new identity's hash its PIN can't be staged; it opens
+        // to the unlock prompt instead.
+        if (typeof completeSetupAfterIdentityImport === 'function') {
+            completeSetupAfterIdentityImport(result);
         } else {
-            finishSetup();
+            reloadToAppLanding();
         }
         return;
     }

@@ -119,6 +119,28 @@ impl Fixture {
         .0
     }
 
+    /// Protect `identity` with `passcode`; from then on it opens locked.
+    fn protect(&self, identity: &str, passcode: &str) {
+        self.runtime
+            .block_on(ratspeak_tauri::commands::identity::set_identity_passcode(
+                self.app.state(),
+                ratspeak_tauri::commands::identity::SetPasscodeArgs {
+                    hash: identity.to_owned(),
+                    passcode: passcode.to_owned(),
+                    current: None,
+                },
+            ))
+            .unwrap();
+    }
+
+    /// Start whichever identity is active, as the app does at launch.
+    fn launch(&self) {
+        self.runtime.block_on(ratspeak_runtime::init_rns_lxmf(
+            Arc::clone(&self.state),
+            self.state.config.data_root.clone(),
+        ));
+    }
+
     fn start(&self, identity: &str) {
         db::set_active_identity(&self.state.db, identity).unwrap();
         self.runtime.block_on(ratspeak_runtime::init_rns_lxmf(
@@ -171,6 +193,96 @@ impl Drop for Fixture {
             .runtime
             .block_on(ratspeak_runtime::shutdown_rns_lxmf(&self.state));
     }
+}
+
+const PASSCODE: &str = "correct horse";
+
+/// The vault runs one encryption job per process: tests that use it take turns.
+static VAULT: Mutex<()> = Mutex::new(());
+
+// A passcode identity unlocked once asks for its passcode again after a
+// switch away and back; a restart of the same identity keeps the unlock.
+#[test]
+fn switching_back_to_an_unlocked_passcode_identity_asks_for_its_passcode() {
+    let _vault = VAULT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let f = Fixture::new();
+    let a = f.import("A");
+    let b = f.import("B");
+    f.protect(&a, PASSCODE);
+    db::set_active_identity(&f.state.db, &a).unwrap();
+    f.launch();
+    assert_eq!(f.state.hw_locked_hash().as_deref(), Some(a.as_str()));
+    let unlocked = f
+        .runtime
+        .block_on(ratspeak_tauri::commands::identity::unlock_identity(
+            f.app.state(),
+            PASSCODE.into(),
+        ))
+        .unwrap();
+    assert_eq!(unlocked["ok"], true, "{unlocked}");
+    assert_eq!(f.loaded().as_deref(), Some(a.as_str()));
+
+    f.runtime
+        .block_on(ratspeak_runtime::restart_rns_lxmf(Arc::clone(&f.state)))
+        .unwrap();
+    assert_eq!(
+        f.loaded().as_deref(),
+        Some(a.as_str()),
+        "a restart asked for the passcode"
+    );
+
+    f.runtime
+        .block_on(ratspeak_tauri::commands::identity::switch_identity(
+            f.app.state(),
+            b.clone(),
+        ))
+        .unwrap();
+    assert_eq!(f.loaded().as_deref(), Some(b.as_str()));
+    let back = f
+        .runtime
+        .block_on(ratspeak_tauri::commands::identity::switch_identity(
+            f.app.state(),
+            a.clone(),
+        ))
+        .unwrap();
+
+    assert_eq!(back["locked"], true, "A opened without its passcode");
+    assert_eq!(f.state.hw_locked_hash().as_deref(), Some(a.as_str()));
+    assert!(f.loaded().is_none());
+    let locked = f.recorder.last("hardware_locked").unwrap();
+    assert_eq!(locked["hash"], a.as_str());
+    assert_eq!(locked["kind"], "passcode");
+}
+
+// A secret staged for one identity never opens another, and serves a single
+// load.
+#[test]
+fn a_staged_secret_opens_only_the_identity_it_was_staged_for() {
+    let _vault = VAULT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let f = Fixture::new();
+    let a = f.import("A");
+    let b = f.import("B");
+    f.protect(&a, PASSCODE);
+    f.protect(&b, PASSCODE);
+    let secret = || ratspeak_runtime::Zeroizing::new(PASSCODE.to_owned());
+
+    f.state.stage_pending_hw_pin(&a, secret());
+    db::set_active_identity(&f.state.db, &b).unwrap();
+    f.launch();
+    assert_eq!(f.state.hw_locked_hash().as_deref(), Some(b.as_str()));
+    assert!(f.loaded().is_none(), "B opened with A's secret");
+    db::set_active_identity(&f.state.db, &a).unwrap();
+    f.launch();
+    assert_eq!(f.state.hw_locked_hash().as_deref(), Some(a.as_str()));
+    assert!(f.loaded().is_none(), "the secret served a second load");
+
+    f.state.stage_pending_hw_pin(&a, secret());
+    f.launch();
+    assert_eq!(f.loaded().as_deref(), Some(a.as_str()));
 }
 
 // A switch whose activation fails ends with its closing event and leaves
@@ -433,4 +545,49 @@ fn removing_the_live_hardware_identity_activates_the_most_recent_one() {
             assert!(f.running(), "{case:?}: {expected} is not running");
         }
     }
+}
+
+// When the identity taking over from a removed live hardware identity can't
+// load, no identity is left active without a runtime.
+#[cfg(feature = "hardware")]
+#[test]
+fn a_takeover_that_cannot_load_leaves_no_identity_active() {
+    let f = Fixture::new();
+    let s = f.import("S");
+    // Its key loads, but its ratchet store cannot open.
+    let ratchets = f.profile(&s).join("ratchets");
+    std::fs::remove_dir_all(&ratchets).unwrap();
+    std::fs::write(&ratchets, b"not a directory").unwrap();
+    let h = "cccccccccccccccccccccccccccccccc".to_string();
+    std::fs::create_dir_all(f.profile(&h)).unwrap();
+    std::fs::write(f.profile(&h).join("identity.hwid"), b"{}").unwrap();
+    db::save_identity(
+        &f.state.db,
+        &h,
+        "dddddddddddddddddddddddddddddddd",
+        "H",
+        "H",
+    );
+    db::set_active_identity(&f.state.db, &h).unwrap();
+    f.state.set_hw_locked(Some(h.clone()));
+    f.state.set_startup_stage("hw_locked");
+
+    let removed = f
+        .runtime
+        .block_on(ratspeak_tauri::commands::hardware::hw_remove(
+            f.app.state(),
+            h.clone(),
+        ))
+        .unwrap();
+
+    assert_eq!(removed["needs_setup"], false);
+    let failed = f
+        .recorder
+        .last("identity_switch_failed")
+        .expect("the takeover never ended");
+    assert_eq!(failed["hash"], s.as_str());
+    assert_eq!(f.active(), None, "S was left active with no runtime");
+    assert!(f.loaded().is_none());
+    assert!(!f.running());
+    assert_eq!(f.state.get_startup_stage(), "ready");
 }

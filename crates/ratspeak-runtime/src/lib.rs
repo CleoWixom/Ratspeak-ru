@@ -51,6 +51,8 @@ pub mod platform_ios;
 pub use ratspeak_core::config;
 pub use ratspeak_db as db;
 pub use ratspeak_db::static_nodes;
+/// The wrapper the staged unlock secret and other held secrets use.
+pub use zeroize::Zeroizing;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -1234,6 +1236,8 @@ async fn lock_hardware_session(state: Arc<AppState>, generation: u64) {
     // Nothing begun before the lock may land behind it.
     state.bump_identity_session_generation();
     finish_shutdown(&state, &reset).await;
+    state.release_retained_identity_except("");
+    state.clear_pending_hw_pin();
     state.set_hw_locked(Some(hash.clone()));
     state.set_startup_stage("hw_locked");
     state.emit_to_all(
@@ -1491,6 +1495,9 @@ fn startup_future_keeps_callers_stack_small() {
 }
 
 async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf) {
+    // A staged secret serves this load only, and only the identity it was
+    // staged for.
+    let staged_secret = state.take_pending_hw_pin();
     state
         .network_session
         .write()
@@ -1545,7 +1552,9 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
     // Protected identities need a secret to unlock. If the active identity is
     // hardware or passcode-encrypted and no secret is staged, enter the locked
     // state and wait for `unlock_identity` rather than coming up with no identity.
-    let hw_pin = state.take_pending_hw_pin();
+    let hw_pin = staged_secret.and_then(|(hash, secret)| {
+        (preferred_identity_hash.as_deref() == Some(hash.as_str())).then_some(secret)
+    });
     // Detect whether the active identity is protected (needs a secret to unlock):
     // hardware (.hwid → YubiKey PIN) or passcode-encrypted (.enc → passcode).
     let lock_kind = preferred_identity_hash.as_deref().and_then(|h| {
@@ -1604,7 +1613,7 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
         None => lxmf::LxmfManager::load_or_create_with_vault_job(
             &load_dir,
             load_hash.as_deref(),
-            hw_pin,
+            hw_pin.as_deref().map(String::as_str),
             vault_job.as_ref(),
         ),
     })

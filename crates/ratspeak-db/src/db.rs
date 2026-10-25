@@ -2118,6 +2118,18 @@ pub fn set_active_identity(pool: &DbPool, hash_hex: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Leave `hash_hex` inactive if it is the active identity.
+pub fn deactivate_identity(pool: &DbPool, hash_hex: &str) -> Result<(), String> {
+    let _write = IdentityTablesWrite;
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    conn.execute(
+        "UPDATE identities SET is_active = 0 WHERE hash = ?1",
+        params![hash_hex],
+    )
+    .map_err(|e| format!("deactivate: {e}"))?;
+    Ok(())
+}
+
 pub fn update_identity(
     pool: &DbPool,
     hash_hex: &str,

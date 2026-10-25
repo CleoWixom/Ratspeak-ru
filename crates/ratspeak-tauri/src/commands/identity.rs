@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use ratspeak_runtime::Zeroizing;
 use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
 use serde::{Deserialize, Serialize};
@@ -114,7 +115,7 @@ struct EncryptedIdentityBackupV2 {
     exported_at: f64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 struct LegacyIdentityBackupV1 {
     format: String,
     kind: String,
@@ -130,11 +131,10 @@ struct LegacyIdentityBackupV1 {
     exported_at: f64,
 }
 
-#[derive(Debug)]
 struct ParsedIdentityImport {
-    key_bytes: Vec<u8>,
+    key_bytes: Zeroizing<Vec<u8>>,
     format: &'static str,
-    mnemonic: Option<String>,
+    mnemonic: Option<Zeroizing<String>>,
 }
 
 fn now_ts() -> f64 {
@@ -228,7 +228,7 @@ fn parse_private_identity_bytes_with_job(
     }
     if bytes.len() == 64 {
         return Ok(ParsedIdentityImport {
-            key_bytes: bytes.to_vec(),
+            key_bytes: Zeroizing::new(bytes.to_vec()),
             format: "raw-private-key",
             mnemonic: None,
         });
@@ -263,8 +263,8 @@ fn parse_private_identity_bytes_with_job(
                     }
                     _ => e.to_string(),
                 })?;
-            let mnemonic = unlocked.mnemonic().map(str::to_string);
-            let key_bytes = unlocked.key().to_vec();
+            let mnemonic = unlocked.mnemonic().map(|m| Zeroizing::new(m.to_owned()));
+            let key_bytes = Zeroizing::new(unlocked.key().to_vec());
             let identity = Identity::from_private_key(&key_bytes)
                 .map_err(|e| format!("Invalid identity backup key: {e}"))?;
             let hash_hex = hex::encode(identity.hash);
@@ -284,9 +284,10 @@ fn parse_private_identity_bytes_with_job(
             if backup.kind != "private" {
                 return Err("Public identity backups are not activatable identities".into());
             }
-            let key_bytes = B64
-                .decode(backup.private_key.trim())
-                .map_err(|_| "Invalid identity backup key data")?;
+            let key_bytes = Zeroizing::new(
+                B64.decode(backup.private_key.trim())
+                    .map_err(|_| "Invalid identity backup key data")?,
+            );
             if key_bytes.len() != 64 {
                 return Err("Identity backup key must be exactly 64 bytes".into());
             }
@@ -312,7 +313,7 @@ fn parse_private_identity_bytes_with_job(
             .filter(|key_bytes| key_bytes.len() == 64)
     {
         return Ok(ParsedIdentityImport {
-            key_bytes,
+            key_bytes: Zeroizing::new(key_bytes),
             format: "hex-private-key",
             mnemonic: None,
         });
@@ -325,7 +326,7 @@ fn parse_private_identity_bytes_with_job(
             .filter(|key_bytes| key_bytes.len() == 64)
     {
         return Ok(ParsedIdentityImport {
-            key_bytes,
+            key_bytes: Zeroizing::new(key_bytes),
             format: "base64-private-key",
             mnemonic: None,
         });
@@ -337,7 +338,7 @@ fn parse_private_identity_bytes_with_job(
             .filter(|key_bytes| key_bytes.len() == 64)
     {
         return Ok(ParsedIdentityImport {
-            key_bytes,
+            key_bytes: Zeroizing::new(key_bytes),
             format: "base32-private-key",
             mnemonic: None,
         });
@@ -365,10 +366,11 @@ fn bounded_encoded_input(text: &str, encoded_limit: usize) -> AppResult<&str> {
     }
     Ok(text)
 }
-fn decode_identity_base64(text: &str) -> AppResult<Vec<u8>> {
-    let bytes = B64
-        .decode(bounded_encoded_input(text, vault::MAX_BASE64_IMPORT_BYTES)?)
-        .map_err(|_| AppError::bad_request("Invalid base64 identity data"))?;
+fn decode_identity_base64(text: &str) -> AppResult<Zeroizing<Vec<u8>>> {
+    let bytes = Zeroizing::new(
+        B64.decode(bounded_encoded_input(text, vault::MAX_BASE64_IMPORT_BYTES)?)
+            .map_err(|_| AppError::bad_request("Invalid base64 identity data"))?,
+    );
     if bytes.len() > vault::MAX_IDENTITY_IMPORT_BYTES {
         return Err(AppError::bad_request(
             "Identity import exceeds the 1 MiB limit",
@@ -377,8 +379,8 @@ fn decode_identity_base64(text: &str) -> AppResult<Vec<u8>> {
     Ok(bytes)
 }
 async fn parse_identity_import_async(
-    bytes: Vec<u8>,
-    passcode: Option<String>,
+    bytes: Zeroizing<Vec<u8>>,
+    passcode: Option<Zeroizing<String>>,
 ) -> AppResult<ParsedIdentityImport> {
     if bytes.len() > vault::MAX_IDENTITY_IMPORT_BYTES {
         return Err(AppError::bad_request(
@@ -390,7 +392,7 @@ async fn parse_identity_import_async(
     }
     let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     tokio::task::spawn_blocking(move || {
-        parse_private_identity_bytes_with_job(&bytes, passcode.as_deref(), &job)
+        parse_private_identity_bytes_with_job(&bytes, passcode.as_deref().map(String::as_str), &job)
     })
     .await
     .map_err(|_| AppError::internal("identity parsing task panicked"))?
@@ -520,9 +522,10 @@ pub async fn api_create_identity(
     // duplicate-check, on-disk write, and activation.
     let (mnemonic, key) =
         ratspeak_runtime::generate_recoverable_key().map_err(AppError::internal)?;
+    let (mnemonic, key) = (Zeroizing::new(mnemonic), Zeroizing::new(key));
     let mut resp = import_identity_request(
         Arc::clone(&state),
-        key.to_vec(),
+        Zeroizing::new(key.to_vec()),
         Some(nickname),
         None,
         Some(mnemonic.clone()),
@@ -530,7 +533,7 @@ pub async fn api_create_identity(
     )
     .await?;
     if let Some(obj) = resp.as_object_mut() {
-        obj.insert("mnemonic".to_string(), json!(mnemonic));
+        obj.insert("mnemonic".to_string(), json!(mnemonic.as_str()));
     }
     Ok(resp)
 }
@@ -549,11 +552,11 @@ pub async fn api_import_identity(
     state: State<'_, Arc<AppState>>,
     args: ImportIdentityArgs,
 ) -> AppResult<Value> {
-    let key_bytes = hex::decode(bounded_encoded_input(
-        &args.key,
-        vault::MAX_HEX_IMPORT_BYTES,
-    )?)
-    .map_err(|_| AppError::bad_request("Invalid hex key data"))?;
+    let key = Zeroizing::new(args.key);
+    let key_bytes = Zeroizing::new(
+        hex::decode(bounded_encoded_input(&key, vault::MAX_HEX_IMPORT_BYTES)?)
+            .map_err(|_| AppError::bad_request("Invalid hex key data"))?,
+    );
     import_identity_shared(state, key_bytes, args.nickname).await
 }
 
@@ -562,8 +565,14 @@ pub async fn api_import_identity_base64(
     state: State<'_, Arc<AppState>>,
     args: ImportIdentityArgs,
 ) -> AppResult<Value> {
-    let key_bytes = decode_identity_base64(&args.key)?;
-    import_identity_shared_with_passcode(state, key_bytes, args.nickname, args.passcode).await
+    let key_bytes = decode_identity_base64(&Zeroizing::new(args.key))?;
+    import_identity_shared_with_passcode(
+        state,
+        key_bytes,
+        args.nickname,
+        args.passcode.map(Zeroizing::new),
+    )
+    .await
 }
 
 #[cfg(feature = "seed")]
@@ -585,12 +594,15 @@ pub async fn restore_seed_identity(
     args: RestoreSeedArgs,
 ) -> AppResult<Value> {
     let request_fence = state.activity_request_fence();
-    let phrase = args.phrase.trim().to_string();
-    let key = ratspeak_runtime::derive_identity_key_from_phrase(&phrase)
-        .map_err(AppError::bad_request)?;
+    let phrase = Zeroizing::new(args.phrase);
+    let phrase = Zeroizing::new(phrase.trim().to_owned());
+    let key = Zeroizing::new(
+        ratspeak_runtime::derive_identity_key_from_phrase(&phrase)
+            .map_err(AppError::bad_request)?,
+    );
     import_identity_request(
         Arc::clone(&state),
-        key.to_vec(),
+        Zeroizing::new(key.to_vec()),
         args.nickname,
         None,
         Some(phrase),
@@ -618,15 +630,18 @@ pub async fn set_identity_passcode(
     if !validate_hex(&args.hash, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
-    if args.passcode.len() < 6 || args.passcode.len() > vault::MAX_PASSCODE_BYTES {
+    let (passcode, current) = (
+        Zeroizing::new(args.passcode),
+        args.current.map(Zeroizing::new),
+    );
+    if passcode.len() < 6 || passcode.len() > vault::MAX_PASSCODE_BYTES {
         return Err(AppError::bad_request("PIN must be at least 6 characters"));
     }
     let generation = state.current_identity_session_generation();
     let id_dir = state.config.data_dir.join("identities").join(&args.hash);
-    let (passcode, current) = (args.passcode, args.current);
     let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     let (job, prepared) = tokio::task::spawn_blocking(move || {
-        job.prepare_protection(&id_dir, &passcode, current.as_deref())
+        job.prepare_protection(&id_dir, &passcode, current.as_deref().map(String::as_str))
             .map(|prepared| (job, prepared))
             .map_err(|e| e.to_string())
     })
@@ -666,7 +681,7 @@ pub async fn remove_identity_passcode(
     }
     let generation = state.current_identity_session_generation();
     let id_dir = state.config.data_dir.join("identities").join(&args.hash);
-    let passcode = args.passcode;
+    let passcode = Zeroizing::new(args.passcode);
     let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     let (job, prepared) = tokio::task::spawn_blocking(move || {
         job.prepare_unprotection(&id_dir, &passcode)
@@ -712,17 +727,16 @@ pub async fn reveal_identity_mnemonic(
         return Err(AppError::bad_request("Invalid hash"));
     }
     let id_dir = state.config.data_dir.join("identities").join(&args.hash);
-    let passcode = args.passcode;
+    let passcode = args.passcode.map(Zeroizing::new);
     let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     let phrase = tokio::task::spawn_blocking(move || {
-        job.reveal_mnemonic(&id_dir, passcode.as_deref())
-            .map(|z| z.as_str().to_string())
+        job.reveal_mnemonic(&id_dir, passcode.as_deref().map(String::as_str))
             .map_err(|e| e.to_string())
     })
     .await
     .map_err(|_| AppError::internal("reveal_mnemonic task panicked"))?
     .map_err(AppError::bad_request)?;
-    Ok(json!({ "mnemonic": phrase }))
+    Ok(json!({ "mnemonic": phrase.as_str() }))
 }
 
 fn protected_identity_kind(state: &AppState, hash: &str) -> Option<&'static str> {
@@ -767,19 +781,19 @@ pub(crate) async fn unlock_protected_identity(
     state: Arc<AppState>,
     secret: String,
 ) -> AppResult<Value> {
+    let secret = Zeroizing::new(secret);
     let generation = state.current_identity_session_generation();
-    let expected_hash = state.hw_locked_hash();
-    let kind = expected_hash
-        .as_deref()
-        .and_then(|hash| protected_identity_kind(&state, hash));
+    // The secret is staged for the locked identity alone.
+    let expected_hash = state
+        .hw_locked_hash()
+        .ok_or_else(|| AppError::bad_request("No locked identity"))?;
+    let kind = protected_identity_kind(&state, &expected_hash);
     check_unlock_secret(kind, &secret)?;
 
     // Validate the candidate before stopping a usable runtime. The job permit
     // lives in the actual worker if this awaiting command is cancelled.
     let unlocked = if kind == Some("passcode") {
-        let hash = expected_hash
-            .clone()
-            .ok_or_else(|| AppError::bad_request("No locked identity"))?;
+        let hash = expected_hash.clone();
         let path = state
             .config
             .data_dir
@@ -816,7 +830,7 @@ pub(crate) async fn unlock_protected_identity(
     };
     let _guard = state.identity_switch_lock.lock().await;
     if generation != state.current_identity_session_generation()
-        || expected_hash != state.hw_locked_hash()
+        || state.hw_locked_hash().as_deref() != Some(expected_hash.as_str())
     {
         return Err(AppError::conflict(
             "Selected identity changed during unlock; retry",
@@ -829,18 +843,14 @@ pub(crate) async fn unlock_protected_identity(
     state.clear_identity_scoped_runtime_state();
     state.set_hw_last_error(None);
     if let Some(identity) = unlocked {
-        if !state.retain_unlocked_identity(
-            identity,
-            expected_hash.as_deref().unwrap_or(""),
-            generation,
-        ) {
+        if !state.retain_unlocked_identity(identity, &expected_hash, generation) {
             return Err(AppError::conflict(
                 "Selected identity changed during unlock",
             ));
         }
-        state.set_pending_hw_pin(None);
+        state.clear_pending_hw_pin();
     } else {
-        state.set_pending_hw_pin(Some(secret));
+        state.stage_pending_hw_pin(&expected_hash, secret);
     }
     if let Ok(mut sig) = state.session_shutdown.write() {
         *sig = rns_runtime::lifecycle::ShutdownSignal::new();
@@ -854,10 +864,7 @@ pub(crate) async fn unlock_protected_identity(
         .lock()
         .ok()
         .and_then(|lxmf| lxmf.as_ref().map(|mgr| mgr.identity_hash.clone()));
-    let unlocked = loaded_identity.is_some()
-        && expected_hash
-            .as_deref()
-            .is_none_or(|expected| loaded_identity.as_deref() == Some(expected));
+    let unlocked = loaded_identity.as_deref() == Some(expected_hash.as_str());
     if unlocked {
         state.set_hw_locked(None);
         state.set_hw_last_error(None);
@@ -871,10 +878,8 @@ pub(crate) async fn unlock_protected_identity(
         Some("passcode") => "Could not unlock the identity.".to_string(),
         _ => "Could not unlock the hardware identity.".to_string(),
     });
-    if let Some(expected) = expected_hash {
-        state.set_hw_locked(Some(expected));
-        state.set_startup_stage("hw_locked");
-    }
+    state.set_hw_locked(Some(expected_hash));
+    state.set_startup_stage("hw_locked");
     let locked = kind == Some("hardware") && msg.contains("PIN locked");
     Ok(json!({
         "ok": false,
@@ -894,7 +899,7 @@ pub async fn unlock_identity(state: State<'_, Arc<AppState>>, secret: String) ->
 
 async fn import_identity_shared(
     state: State<'_, Arc<AppState>>,
-    key_bytes: Vec<u8>,
+    key_bytes: Zeroizing<Vec<u8>>,
     nickname: Option<String>,
 ) -> AppResult<Value> {
     import_identity_shared_with_passcode(state, key_bytes, nickname, None).await
@@ -902,9 +907,9 @@ async fn import_identity_shared(
 
 async fn import_identity_shared_with_passcode(
     state: State<'_, Arc<AppState>>,
-    key_bytes: Vec<u8>,
+    key_bytes: Zeroizing<Vec<u8>>,
     nickname: Option<String>,
-    passcode: Option<String>,
+    passcode: Option<Zeroizing<String>>,
 ) -> AppResult<Value> {
     let request_fence = state.activity_request_fence();
     import_identity_request(
@@ -920,10 +925,10 @@ async fn import_identity_shared_with_passcode(
 
 async fn import_identity_request(
     state: Arc<AppState>,
-    key_bytes: Vec<u8>,
+    key_bytes: Zeroizing<Vec<u8>>,
     nickname: Option<String>,
-    passcode: Option<String>,
-    explicit_mnemonic: Option<String>,
+    passcode: Option<Zeroizing<String>>,
+    explicit_mnemonic: Option<Zeroizing<String>>,
     request_fence: ActivityRequestFence,
 ) -> AppResult<Value> {
     import_identity_after_parse(
@@ -941,7 +946,7 @@ fn persist_parsed_identity_import(
     state: Arc<AppState>,
     parsed: ParsedIdentityImport,
     nickname: String,
-    mnemonic: Option<String>,
+    mnemonic: Option<Zeroizing<String>>,
 ) -> Result<(String, String), String> {
     let result = {
         let lxmf = state.lxmf.lock().map_err(|_| "Lock error".to_string())?;
@@ -957,7 +962,7 @@ fn persist_parsed_identity_import(
         }
         .map_err(|error| error.to_string())?
     };
-    if let Some(phrase) = mnemonic.as_deref() {
+    if let Some(phrase) = mnemonic.as_deref().map(String::as_str) {
         let seed_dir = state.config.data_dir.join("identities").join(&result.0);
         if ratspeak_runtime::vault::store_plaintext_seed(&seed_dir, phrase).is_err() {
             tracing::warn!(
@@ -974,7 +979,7 @@ fn persist_parsed_identity_import(
 async fn import_identity_after_parse<P, W>(
     state: Arc<AppState>,
     nickname: Option<String>,
-    explicit_mnemonic: Option<String>,
+    explicit_mnemonic: Option<Zeroizing<String>>,
     request_fence: ActivityRequestFence,
     parse: P,
     persist: W,
@@ -985,7 +990,7 @@ where
             Arc<AppState>,
             ParsedIdentityImport,
             String,
-            Option<String>,
+            Option<Zeroizing<String>>,
         ) -> Result<(String, String), String>
         + Send
         + 'static,
@@ -1055,8 +1060,8 @@ where
 
 #[tauri::command]
 pub async fn api_preview_identity_import_base64(args: ImportIdentityArgs) -> AppResult<Value> {
-    let bytes = decode_identity_base64(&args.key)?;
-    let parsed = parse_identity_import_async(bytes, args.passcode).await?;
+    let bytes = decode_identity_base64(&Zeroizing::new(args.key))?;
+    let parsed = parse_identity_import_async(bytes, args.passcode.map(Zeroizing::new)).await?;
     identity_preview_payload(&parsed.key_bytes, parsed.format).map_err(AppError::bad_request)
 }
 
@@ -1110,9 +1115,10 @@ pub async fn api_export_identity_base64(
         .lxmf
         .lock()
         .ok()
-        .and_then(|l| l.as_ref().and_then(|mgr| mgr.export_identity(&hash_hex)));
+        .and_then(|l| l.as_ref().and_then(|mgr| mgr.export_identity(&hash_hex)))
+        .map(Zeroizing::new);
     match key_bytes {
-        Some(bytes) => Ok(json!({ "key": B64.encode(&bytes) })),
+        Some(bytes) => Ok(json!({ "key": B64.encode(&*bytes) })),
         None => Err(AppError::not_found("Identity file not found")),
     }
 }
@@ -1143,7 +1149,10 @@ fn is_hardware_identity(state: &AppState, hash_hex: &str) -> bool {
         .exists()
 }
 
-pub(crate) fn export_identity_key_bytes(state: &AppState, hash_hex: &str) -> AppResult<Vec<u8>> {
+pub(crate) fn export_identity_key_bytes(
+    state: &AppState,
+    hash_hex: &str,
+) -> AppResult<Zeroizing<Vec<u8>>> {
     if !validate_hex(hash_hex, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
@@ -1157,6 +1166,7 @@ pub(crate) fn export_identity_key_bytes(state: &AppState, hash_hex: &str) -> App
         .lock()
         .ok()
         .and_then(|l| l.as_ref().and_then(|mgr| mgr.export_identity(hash_hex)))
+        .map(Zeroizing::new)
         .ok_or_else(|| AppError::not_found("Identity file not found"))?;
 
     let identity =
@@ -1184,7 +1194,7 @@ pub async fn api_export_identity_reticulum_base64(
     let key_bytes = export_identity_key_bytes(&state, &hash_hex)?;
     let (identity_hash, lxmf_hash) = identity_export_hashes(&key_bytes)?;
     Ok(json!({
-        "data_base64": B64.encode(&key_bytes),
+        "data_base64": B64.encode(&*key_bytes),
         "file_name": format!("{}-reticulum-identity.identity", &identity_hash[..16]),
         "identity_hash": identity_hash,
         "lxmf_hash": lxmf_hash,
@@ -1199,10 +1209,10 @@ pub async fn api_export_identity_reticulum_base32(
 ) -> AppResult<Value> {
     let key_bytes = export_identity_key_bytes(&state, &hash_hex)?;
     let (identity_hash, lxmf_hash) = identity_export_hashes(&key_bytes)?;
-    let text = base32_encode_padded(&key_bytes);
+    let text = Zeroizing::new(base32_encode_padded(&key_bytes));
     Ok(json!({
         "data_base64": B64.encode(text.as_bytes()),
-        "text": text,
+        "text": text.as_str(),
         "file_name": format!("{}-reticulum-identity-key-base32.txt", &identity_hash[..16]),
         "identity_hash": identity_hash,
         "lxmf_hash": lxmf_hash,
@@ -1216,7 +1226,8 @@ pub async fn api_export_identity_backup_base64(
     hash_hex: String,
     passcode: String,
 ) -> AppResult<Value> {
-    let passcode = passcode.trim().to_string();
+    let passcode = Zeroizing::new(passcode);
+    let passcode = Zeroizing::new(passcode.trim().to_owned());
     if passcode.len() < 6 || passcode.len() > vault::MAX_PASSCODE_BYTES {
         return Err(AppError::bad_request(
             "Backup PIN must be at least 6 characters",
@@ -1224,10 +1235,12 @@ pub async fn api_export_identity_backup_base64(
     }
     let key_bytes = export_identity_key_bytes(&state, &hash_hex)?;
     let (identity_hash, lxmf_hash) = identity_export_hashes(&key_bytes)?;
-    let key_array: [u8; 64] = key_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| AppError::internal("identity key length mismatch"))?;
+    let key_array: Zeroizing<[u8; 64]> = Zeroizing::new(
+        key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| AppError::internal("identity key length mismatch"))?,
+    );
 
     let row_hash = hash_hex.clone();
     let identity_row = db::spawn_db(state.db.clone(), move |p| db::get_identity(&p, &row_hash))
@@ -1252,14 +1265,14 @@ pub async fn api_export_identity_backup_base64(
 
     // Argon2id KDF — off the async worker like the other vault paths.
     let identity_dir = state.config.data_dir.join("identities").join(&hash_hex);
-    let passcode_for_kdf = passcode.clone();
     let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     let vault = tokio::task::spawn_blocking(move || {
-        let mnemonic = job
-            .reveal_mnemonic(&identity_dir, None)
-            .ok()
-            .map(|m| m.as_str().to_string());
-        job.encrypt_identity(&passcode_for_kdf, &key_array, mnemonic.as_deref())
+        let mnemonic = job.reveal_mnemonic(&identity_dir, None).ok();
+        job.encrypt_identity(
+            &passcode,
+            &key_array,
+            mnemonic.as_deref().map(String::as_str),
+        )
     })
     .await
     .map_err(|_| AppError::internal("identity backup task panicked"))?
@@ -1387,6 +1400,7 @@ pub async fn api_delete_identity(
     }
     crate::lxmf::LxmfManager::purge_identity_profile(&state.config.data_root, &hash_hex, cascade)
         .map_err(|e| AppError::internal(format!("Failed to remove identity files: {e}")))?;
+    state.release_retained_identity_except(&active);
     state.forget_local_identity_public_key(&hash_hex);
     ratspeak_runtime::network_ownership::forget_deleted_profile(&state, &hash_hex)
         .await
@@ -1466,9 +1480,15 @@ pub(super) fn emit_switch_failed(state: &AppState, target: &str, error: &str) {
     );
 }
 
-/// Bring the previous identity back up after a failed switch.
-pub(super) async fn resume_previous(state: &Arc<AppState>, previous: Option<String>) {
+/// Bring the previous identity back up after a failed switch to `target`.
+/// With none before it, no identity is left active without a runtime.
+pub(super) async fn resume_previous(state: &Arc<AppState>, previous: Option<String>, target: &str) {
     let Some(old_hash) = previous else {
+        let target = target.to_owned();
+        let _ = db::spawn_db(state.db.clone(), move |p| {
+            db::deactivate_identity(&p, &target)
+        })
+        .await;
         state.set_startup_stage("ready");
         return;
     };
@@ -1573,7 +1593,7 @@ async fn switch_identity_session_held(
         // The runtime is down: bring the previous identity back, in a session
         // of its own.
         state.bump_identity_session_generation();
-        resume_previous(&state, previous_active).await;
+        resume_previous(&state, previous_active, &hash_hex).await;
         return Err(switching.fail(error));
     }
 
@@ -1588,6 +1608,7 @@ async fn switch_identity_session_held(
     // intermediate state, not a failed switch. Keep it active and let the unlock
     // prompt (driven by the hardware_locked event) take over; do not roll back.
     if state.hw_locked_hash().as_deref() == Some(hash_hex.as_str()) {
+        state.release_retained_identity_except(&hash_hex);
         let payload = json!({
             "hash": hash_hex,
             "locked": true,
@@ -1629,13 +1650,16 @@ async fn switch_identity_session_held(
         state.bump_identity_session_generation();
         crate::finish_shutdown(&state, &reset).await;
         state.clear_identity_scoped_runtime_state();
-        resume_previous(&state, previous_active).await;
+        resume_previous(&state, previous_active, &hash_hex).await;
         return Err(switching.fail(AppError::bad_request(
             "Couldn't load this identity's key. If it's a hardware (YubiKey) identity, \
              the key may be unplugged or was re-provisioned.",
         )));
     }
 
+    // Switched away for good: the previous identity's unlock goes. A failed
+    // switch kept it to bring that identity back as it was.
+    state.release_retained_identity_except(&hash_hex);
     let payload = json!({
         "hash": hash_hex,
         "lxmf_hash": loaded_lxmf,
@@ -2136,9 +2160,9 @@ mod tests {
 
     fn parsed_key(key_bytes: Vec<u8>, mnemonic: Option<String>) -> ParsedIdentityImport {
         ParsedIdentityImport {
-            key_bytes,
+            key_bytes: Zeroizing::new(key_bytes),
             format: "test-private-key",
-            mnemonic,
+            mnemonic: mnemonic.map(Zeroizing::new),
         }
     }
 
@@ -2157,7 +2181,7 @@ mod tests {
             import_identity_after_parse(
                 worker_state,
                 None,
-                Some(phrase),
+                Some(Zeroizing::new(phrase)),
                 request_fence,
                 std::future::ready(Ok(parsed_key(key.to_vec(), None))),
                 move |state, parsed, nickname, mnemonic| {
@@ -2292,7 +2316,7 @@ mod tests {
                 import_identity_after_parse(
                     Arc::clone(&state),
                     None,
-                    explicit.then_some(phrase),
+                    explicit.then(|| Zeroizing::new(phrase)),
                     state.activity_request_fence(),
                     std::future::ready(Ok(parsed)),
                     |state, parsed, nickname, mnemonic| {
@@ -2352,7 +2376,7 @@ mod tests {
         let key = private_key_bytes();
         let parsed = parse_private_identity_bytes(&key, None).unwrap();
         assert_eq!(parsed.format, "raw-private-key");
-        assert_eq!(parsed.key_bytes, key);
+        assert_eq!(*parsed.key_bytes, key);
     }
 
     #[test]
@@ -2386,7 +2410,7 @@ mod tests {
 
         let parsed = parse_private_identity_bytes(&encoded, Some("123456")).unwrap();
         assert_eq!(parsed.format, IDENTITY_BACKUP_FORMAT);
-        assert_eq!(parsed.key_bytes, key);
+        assert_eq!(*parsed.key_bytes, key);
         assert!(parsed.mnemonic.is_some());
     }
 
@@ -2418,7 +2442,9 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&backup).unwrap();
 
-        let err = parse_private_identity_bytes(&encoded, None).unwrap_err();
+        let err = parse_private_identity_bytes(&encoded, None)
+            .err()
+            .expect("refused");
         assert!(err.contains("Backup PIN required"));
     }
 
@@ -2450,7 +2476,7 @@ mod tests {
 
         let parsed = parse_private_identity_bytes(&encoded, None).unwrap();
         assert_eq!(parsed.format, LEGACY_IDENTITY_BACKUP_FORMAT);
-        assert_eq!(parsed.key_bytes, key);
+        assert_eq!(*parsed.key_bytes, key);
     }
 
     #[test]
@@ -2461,7 +2487,7 @@ mod tests {
 
         let parsed = parse_private_identity_bytes(encoded.as_bytes(), None).unwrap();
         assert_eq!(parsed.format, "base32-private-key");
-        assert_eq!(parsed.key_bytes, key);
+        assert_eq!(*parsed.key_bytes, key);
     }
 
     #[test]
@@ -2478,7 +2504,7 @@ mod tests {
 
         let parsed = parse_private_identity_bytes(wrapped.as_bytes(), None).unwrap();
         assert_eq!(parsed.format, "base32-private-key");
-        assert_eq!(parsed.key_bytes, key);
+        assert_eq!(*parsed.key_bytes, key);
     }
 
     #[test]
@@ -2498,7 +2524,9 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&backup).unwrap();
 
-        let err = parse_private_identity_bytes(&encoded, None).unwrap_err();
+        let err = parse_private_identity_bytes(&encoded, None)
+            .err()
+            .expect("refused");
         assert!(err.contains("Public identity backups are not activatable"));
     }
 
@@ -2519,7 +2547,9 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&backup).unwrap();
 
-        let err = parse_private_identity_bytes(&encoded, None).unwrap_err();
+        let err = parse_private_identity_bytes(&encoded, None)
+            .err()
+            .expect("refused");
         assert!(err.contains("hash does not match"));
     }
 }

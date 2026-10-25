@@ -298,6 +298,7 @@ pub fn ratspeak_db::db::clear_channel_room_history(&ratspeak_db::DbPool, &str, &
 pub fn ratspeak_db::db::clear_discovered_identity_activity(&ratspeak_db::DbPool) -> usize
 pub fn ratspeak_db::db::clear_pending_blackhole(&ratspeak_db::DbPool, &str, &str) -> bool
 pub fn ratspeak_db::db::clear_pending_network_lift(&ratspeak_db::DbPool, &str, &str) -> bool
+pub fn ratspeak_db::db::deactivate_identity(&ratspeak_db::DbPool, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::db::delete_connection_history(&ratspeak_db::DbPool, i64)
 pub fn ratspeak_db::db::delete_contact(&ratspeak_db::DbPool, &str, &str)
 pub fn ratspeak_db::db::delete_conversation(&ratspeak_db::DbPool, &str, &str) -> alloc::vec::Vec<alloc::string::String>
@@ -656,6 +657,7 @@ pub fn ratspeak_db::clear_channel_room_history(&ratspeak_db::DbPool, &str, &str,
 pub fn ratspeak_db::clear_discovered_identity_activity(&ratspeak_db::DbPool) -> usize
 pub fn ratspeak_db::clear_pending_blackhole(&ratspeak_db::DbPool, &str, &str) -> bool
 pub fn ratspeak_db::clear_pending_network_lift(&ratspeak_db::DbPool, &str, &str) -> bool
+pub fn ratspeak_db::deactivate_identity(&ratspeak_db::DbPool, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::delete_connection_history(&ratspeak_db::DbPool, i64)
 pub fn ratspeak_db::delete_contact(&ratspeak_db::DbPool, &str, &str)
 pub fn ratspeak_db::delete_conversation(&ratspeak_db::DbPool, &str, &str) -> alloc::vec::Vec<alloc::string::String>

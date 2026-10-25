@@ -77,7 +77,6 @@ pub(crate) const IDENTITY_FREE: &[&str] = &[
     "hw_provision_hardware_only",
     "hw_import_existing",
     "hw_restore",
-    "hw_stage_unlock",
     "hw_reset_piv",
     "hw_change_pin",
     "hw_remove",
