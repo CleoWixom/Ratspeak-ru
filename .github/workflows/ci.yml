@@ -157,7 +157,7 @@ jobs:
         run: bash dashboard/build-css.sh
         working-directory: Ratspeak
       - name: Test Rust workspace
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --features ratspeak-tauri/hardware --locked
         working-directory: Ratspeak
       - name: Test voice-enabled runtime and IPC
         run: cargo test -p ratspeak-runtime -p ratspeak-tauri --features ratspeak-tauri/lxst-voice --locked
