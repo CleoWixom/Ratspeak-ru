@@ -5981,7 +5981,9 @@ async fn resolve_rnode_public_map_update(
 async fn active_identity_display_name_for_public_map(state: &Arc<AppState>) -> AppResult<String> {
     let active = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
         .await
-        .map_err(|_| AppError::internal("active identity db task panicked"))?;
+        .map_err(|_| AppError::internal("active identity db task panicked"))?
+        .ok()
+        .flatten();
     let display_name = active
         .as_ref()
         .and_then(|identity| identity.get("display_name"))

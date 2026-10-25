@@ -9543,3 +9543,131 @@ fn native_codec2_distribution_notices_match_selected_rs_lxst() {
         );
     }
 }
+
+#[test]
+fn factory_reset_invalidates_the_identity_cache_after_its_wipe() {
+    let system = read_source(repo_root().join("crates/ratspeak-tauri/src/commands/system.rs"))
+        .expect("system commands");
+    let reset = rust_function_block(&system, "api_factory_reset");
+    let wipe = reset
+        .find("for table in db::RESET_TABLES")
+        .expect("factory reset wipe");
+    let bump = reset
+        .find("db::note_identity_tables_changed()")
+        .expect("identity generation bump");
+    assert!(
+        wipe < bump,
+        "bumped before the wipe, a reader can cache the old identity under the new generation"
+    );
+}
+
+#[test]
+fn startup_never_reads_a_failed_active_identity_lookup_as_none() {
+    let runtime = read_source(repo_root().join("crates/ratspeak-runtime/src/lib.rs"))
+        .expect("runtime source");
+    let startup = rust_function_block(&runtime, "init_rns_lxmf_inner");
+    // The preferred-identity read and the recovery read both decide which
+    // identity starts; a failed lookup there must stop startup.
+    assert_eq!(
+        startup
+            .matches("read_active_identity_for_startup(&state).await")
+            .count(),
+        2
+    );
+    let read = rust_function_block(&runtime, "read_active_identity_for_startup");
+    assert!(read.contains("state.set_startup_stage(\"error\")"));
+}
+
+#[test]
+fn every_ipc_command_passes_the_invoke_gate() {
+    let shell = read_source(repo_root().join("src-tauri/src/lib.rs")).expect("Tauri shell");
+    let compact: String = shell.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(compact.matches("generate_handler!").count(), 1);
+    assert!(
+        compact.contains(
+            ".invoke_handler(ratspeak_tauri::invoke_gate::gated(tauri::generate_handler!["
+        )
+    );
+    let registered: Vec<&str> = shell
+        .lines()
+        .skip_while(|line| !line.contains("generate_handler!["))
+        .skip(1)
+        .map(str::trim)
+        .take_while(|line| !line.starts_with(']'))
+        .filter(|line| !line.is_empty() && !line.starts_with("//") && !line.starts_with("#["))
+        .filter_map(|line| line.trim_end_matches(',').rsplit("::").next())
+        .collect();
+    assert!(registered.len() > 200, "command registry not found");
+    let gate = read_source(repo_root().join("crates/ratspeak-tauri/src/invoke_gate.rs"))
+        .expect("invoke gate");
+    let free = gate
+        .split("const IDENTITY_FREE: &[&str] = &[")
+        .nth(1)
+        .and_then(|tail| tail.split("];").next())
+        .expect("IDENTITY_FREE list");
+    let free: Vec<&str> = free
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix('"')?.strip_suffix("\","))
+        .collect();
+    assert!(free.len() > 40, "IDENTITY_FREE not parsed");
+    for command in free {
+        assert!(registered.contains(&command), "{command} is not registered");
+    }
+}
+
+#[test]
+fn startup_never_hands_identity_less_rows_to_the_active_identity() {
+    let root = repo_root();
+    let db_path = root.join("crates/ratspeak-db/src/db.rs");
+    let db = read_source(&db_path).expect("db source");
+    let runtime =
+        read_source(root.join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime source");
+    assert!(!db.contains("fn backfill_identity_id"));
+    assert!(!runtime.contains("backfill_identity_id"));
+
+    // Nothing may claim or rewrite identity-less rows.
+    let mut files = vec![db_path];
+    collect_files(&root.join("crates/ratspeak-runtime/src"), &mut files);
+    for path in files
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+    {
+        let source = read_source(path).expect("source");
+        for statement in source.split("UPDATE ").skip(1) {
+            let statement: String = statement
+                .split('"')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(
+                !statement.contains("identity_id=''"),
+                "{}: UPDATE {statement}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn active_identity_read_errors_are_not_taken_for_a_missing_identity() {
+    let root = repo_root();
+    let ble = read_source(root.join("crates/ratspeak-tauri/src/commands/ble.rs")).expect("ble");
+    let enable = rust_function_block(&ble, "spawn_enable_ble_peer_task");
+    // Saving Bluetooth Peer as off is for a missing identity, not a failed read.
+    assert!(!enable.contains("get_active_identity(&p).ok().flatten()"));
+    let unreadable = enable
+        .find("reason = \"query_failed\"")
+        .expect("read-failure branch");
+    let saved_off = enable
+        .find("db::set_setting(&p, BLE_PEER_ENABLED_SETTING, \"0\")")
+        .expect("missing-identity branch");
+    assert!(unreadable < saved_off);
+
+    let runtime =
+        read_source(root.join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime source");
+    let hub = rust_function_block(&runtime, "start_channel_hub_service");
+    assert!(hub.contains("reason = \"query_failed\""));
+}

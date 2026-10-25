@@ -194,6 +194,9 @@ pub async fn add_contact(
     }
 
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let dh = dest_hash.clone();
     let dn = display_name.clone();
     let id_c = identity_id.clone();
@@ -271,6 +274,9 @@ pub async fn block_contact(
     }
 
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let dh = dest_hash.clone();
     let id_c = identity_id.clone();
     let result = db::spawn_db(state.db.clone(), move |p| {

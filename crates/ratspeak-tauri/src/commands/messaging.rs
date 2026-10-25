@@ -573,6 +573,9 @@ pub async fn send_lxmf_message(
     }
     propagation_readiness?;
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let st: Arc<AppState> = Arc::clone(&state);
     let dh = dest_hash.clone();
     let ct = content.clone();
@@ -714,6 +717,9 @@ pub async fn send_reaction(
     }
 
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let st: Arc<AppState> = Arc::clone(&state);
     let dh = dest_hash.clone();
     let mid = message_id.clone();
@@ -837,6 +843,9 @@ pub async fn send_lxmf_reply(
     }
     propagation_readiness?;
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let st: Arc<AppState> = Arc::clone(&state);
     let dh = dest_hash.clone();
     let ct = content.clone();
@@ -965,6 +974,9 @@ pub async fn send_lxmf_propagated(
     }
     propagation_readiness?;
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let st: Arc<AppState> = Arc::clone(&state);
     let dh = dest_hash.clone();
     let ct = content.clone();
@@ -1108,6 +1120,9 @@ async fn queue_prepared_attachment(
     }
     propagation_readiness?;
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let st = Arc::clone(&state);
     let dh = dest_hash.clone();
     let ct = content.clone();
@@ -2396,6 +2411,9 @@ pub async fn hide_conversation(state: State<'_, Arc<AppState>>, hash: String) ->
         return Err(AppError::bad_request("Invalid identity hash"));
     }
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let dh = dest_hash.clone();
     let id_c = identity_id.clone();
     let total = db::spawn_db(state.db.clone(), move |p| {
@@ -2433,10 +2451,17 @@ pub async fn delete_conversation(
     if !validate_hex(&dest_hash, 16, 64) {
         return Err(AppError::bad_request("Invalid identity hash"));
     }
+    // Bound to the identity the user saw, not to one that took over meanwhile.
+    let generation = state.current_identity_session_generation();
     let deletion =
         ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await;
-    let generation = state.current_identity_session_generation();
+    if state.current_identity_session_generation() != generation {
+        return Err(AppError::conflict("Identity changed"));
+    }
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
 
     // One blocking task so the lxmf MutexGuard never crosses an .await.
     let st: Arc<AppState> = Arc::clone(&state);
@@ -2446,6 +2471,7 @@ pub async fn delete_conversation(
         tokio::task::spawn_blocking(move || -> Result<i64, db::admission::AdmissionDbError> {
             let _deletion = deletion;
             ratspeak_runtime::propagation_recovery::delete_messages(&st, &id_c, Some(&dh))?;
+            st.invalidate_conversation_lists();
             let counts = db::get_all_unread_counts(&st.db, &id_c);
             Ok(counts.values().sum())
         })

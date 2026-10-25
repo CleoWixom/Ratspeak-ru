@@ -394,8 +394,10 @@ pub async fn api_identity(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
         .await
         .unwrap_or_else(|_| {
             tracing::error!(reason = "task_panicked", "db task panicked");
-            Default::default()
-        });
+            Ok(None)
+        })
+        .ok()
+        .flatten();
     let is_hardware = state
         .lxmf
         .lock()
@@ -970,13 +972,21 @@ where
     let parsed_identity = Identity::from_private_key(&parsed.key_bytes)
         .map_err(|error| AppError::bad_request(format!("Invalid identity key: {error}")))?;
     let import_hash = hex::encode(parsed_identity.hash);
-    let already_exists = db::spawn_db_with_lease(
+    let (already_exists, active) = db::spawn_db_with_lease(
         state.db.clone(),
         Arc::clone(&identity_lifecycle),
-        move |pool| db::get_identity(&pool, &import_hash).is_some(),
+        move |pool| {
+            (
+                db::get_identity(&pool, &import_hash).is_some(),
+                db::get_active_identity(&pool),
+            )
+        },
     )
     .await
     .map_err(|_| AppError::internal("identity duplicate check db task panicked"))?;
+    // Read before anything is written: a failed read is not "none active", and
+    // activating the import on it would switch identity.
+    let active_missing = active.map_err(AppError::database_unavailable)?.is_none();
     if already_exists {
         return Err(AppError::conflict("Identity already exists"));
     }
@@ -990,12 +1000,6 @@ where
 
     // Reuse this exact lifecycle owner. A nested acquisition would deadlock,
     // while releasing it here would allow reset to erase the just-imported row.
-    let active_missing =
-        db::spawn_db_with_lease(state.db.clone(), Arc::clone(&identity_lifecycle), |pool| {
-            db::get_active_identity(&pool).is_none()
-        })
-        .await
-        .map_err(|_| AppError::internal("active identity db task panicked"))?;
     if active_missing {
         crate::shutdown_rns_lxmf(&state)
             .await
@@ -1387,9 +1391,11 @@ async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppR
         return Err(AppError::not_found("Identity file not found"));
     }
 
+    // Without the previous identity a failed switch could not restore it.
     let previous_active = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
         .await
         .map_err(|_| AppError::internal("db task panicked"))?
+        .map_err(AppError::database_unavailable)?
         .and_then(|identity| {
             identity
                 .get("hash")
@@ -1703,6 +1709,116 @@ mod tests {
         (root, state)
     }
 
+    const ACTIVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// ACTIVE and OTHER exist, ACTIVE is active. One pooled connection, so
+    /// holding it fails every read for 200 ms.
+    fn single_connection_state() -> (tempfile::TempDir, Arc<AppState>) {
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+        let manager = r2d2_sqlite::SqliteConnectionManager::file(config.db_path())
+            .with_init(|c| c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;"));
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_timeout(std::time::Duration::from_millis(200))
+            .build(manager)
+            .unwrap();
+        db::init_schema(&pool).unwrap();
+        for hash in [ACTIVE, OTHER] {
+            db::save_identity(&pool, hash, &hash[..16], "", "");
+        }
+        db::set_active_identity(&pool, ACTIVE).unwrap();
+        let state = Arc::new(AppState::new(
+            config,
+            pool,
+            Arc::new(ratspeak_core::NoopEmitter),
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        (root, state)
+    }
+
+    fn active_hash(state: &AppState) -> Option<String> {
+        state
+            .db
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT hash FROM identities WHERE is_active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    fn identity_dirs(state: &AppState) -> Vec<String> {
+        let mut dirs: Vec<String> = std::fs::read_dir(state.config.data_dir.join("identities"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        dirs.sort();
+        dirs
+    }
+
+    #[tokio::test]
+    async fn import_refuses_when_the_active_identity_cannot_be_read() {
+        let (_root, state) = single_connection_state();
+        let boundary = state.current_activity_boundary_generation();
+        let dirs = identity_dirs(&state);
+        let held = state.db.get().unwrap();
+        let result = import_identity_after_parse(
+            Arc::clone(&state),
+            None,
+            None,
+            state.activity_request_fence(),
+            std::future::ready(Ok(parsed_key(private_key_bytes(), None))),
+            persist_parsed_identity_import,
+        )
+        .await;
+        drop(held);
+        assert_eq!(result.unwrap_err().code, "database_unavailable");
+        assert_eq!(identity_dirs(&state), dirs, "no identity was created");
+        assert_eq!(db::get_all_identities(&state.db).len(), 2);
+        assert_eq!(active_hash(&state).as_deref(), Some(ACTIVE));
+        assert_eq!(
+            state.current_activity_boundary_generation(),
+            boundary,
+            "nothing was shut down"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_refuses_when_the_active_identity_cannot_be_read() {
+        let (_root, state) = single_connection_state();
+        let target = state.config.data_dir.join("identities").join(OTHER);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("identity.enc"), b"sealed").unwrap();
+        // The target lookup reads another row first, so the active row itself
+        // is made unreadable instead of holding the only connection.
+        state
+            .db
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE identities SET created_at = 'unreadable' WHERE hash = ?1",
+                [ACTIVE],
+            )
+            .unwrap();
+        assert!(db::get_active_identity(&state.db).is_err());
+        let boundary = state.current_activity_boundary_generation();
+        let generation = state.current_identity_session_generation();
+        let result = switch_identity_session(Arc::clone(&state), OTHER.to_string()).await;
+        assert_eq!(result.unwrap_err().code, "database_unavailable");
+        assert_eq!(active_hash(&state).as_deref(), Some(ACTIVE));
+        assert_eq!(state.current_activity_boundary_generation(), boundary);
+        assert_eq!(state.current_identity_session_generation(), generation);
+    }
+
     fn parsed_key(key_bytes: Vec<u8>, mnemonic: Option<String>) -> ParsedIdentityImport {
         ParsedIdentityImport {
             key_bytes,
@@ -1768,7 +1884,7 @@ mod tests {
         );
         assert!(db::get_identity(&state.db, &hash).is_none());
         assert!(
-            db::get_active_identity(&state.db).is_none(),
+            db::get_active_identity(&state.db).unwrap().is_none(),
             "cancelled import must not later activate or resurrect its row"
         );
     }
@@ -1810,7 +1926,7 @@ mod tests {
             0
         );
         assert!(db::get_all_identities(&state.db).is_empty());
-        assert!(db::get_active_identity(&state.db).is_none());
+        assert!(db::get_active_identity(&state.db).unwrap().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1885,7 +2001,10 @@ mod tests {
                     .is_file()
             );
             assert!(db::get_identity(&state.db, &hash).is_some());
-            assert_eq!(db::get_active_identity(&state.db).unwrap()["hash"], hash);
+            assert_eq!(
+                db::get_active_identity(&state.db).unwrap().unwrap()["hash"],
+                hash
+            );
         }
     }
 

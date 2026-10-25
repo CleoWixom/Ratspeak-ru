@@ -1892,14 +1892,17 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, rusqlite::Error>
     .map(|count| count > 0)
 }
 
-pub fn get_active_identity(pool: &DbPool) -> Option<serde_json::Value> {
-    let conn = pool.get().ok()?;
+/// `Ok(None)` only when no identity is active; a failed read is an error.
+pub fn get_active_identity(pool: &DbPool) -> Result<Option<serde_json::Value>, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {IDENTITY_SELECT_COLUMNS} FROM identities WHERE is_active = 1 LIMIT 1"
         ))
-        .ok()?;
-    stmt.query_row([], row_to_identity).ok()
+        .map_err(|e| format!("prepare: {e}"))?;
+    stmt.query_row([], row_to_identity)
+        .optional()
+        .map_err(|e| format!("active identity: {e}"))
 }
 
 pub fn get_all_identities(pool: &DbPool) -> Vec<serde_json::Value> {
@@ -1931,7 +1934,9 @@ pub fn get_identity(pool: &DbPool, hash_hex: &str) -> Option<serde_json::Value> 
 /// Process-wide identity-table generation. Bumped by every db-layer write
 /// that can change which identity is active (or its lxmf hash) so runtime
 /// caches invalidate without each caller remembering to — see
-/// `ratspeak_runtime::helpers::active_identity_id`.
+/// `ratspeak_runtime::helpers::active_identity_id`. Always after the write
+/// commits or rolls back: bumped first, a reader could cache the old row under
+/// the new generation and keep it.
 static IDENTITY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn identity_generation() -> u64 {
@@ -1939,9 +1944,19 @@ pub fn identity_generation() -> u64 {
 }
 
 /// For identity-table writes that bypass the helpers in this module
-/// (factory reset's raw table wipe).
+/// (factory reset's raw table wipe), once the write is done.
 pub fn note_identity_tables_changed() {
     IDENTITY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Bumps the identity-table generation when dropped. Declared before the
+/// connection, so it drops after the write has committed or rolled back.
+struct IdentityTablesWrite;
+
+impl Drop for IdentityTablesWrite {
+    fn drop(&mut self) {
+        note_identity_tables_changed();
+    }
 }
 
 pub fn save_identity(
@@ -1951,7 +1966,7 @@ pub fn save_identity(
     nickname: &str,
     display_name: &str,
 ) {
-    note_identity_tables_changed();
+    let _write = IdentityTablesWrite;
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return,
@@ -1988,7 +2003,7 @@ pub fn set_identity_propagation_node(
 }
 
 pub fn set_active_identity(pool: &DbPool, hash_hex: &str) -> Result<(), String> {
-    note_identity_tables_changed();
+    let _write = IdentityTablesWrite;
     let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
     let now = now_ts();
     let tx = conn.transaction().map_err(|e| format!("begin: {e}"))?;
@@ -2177,7 +2192,7 @@ const IDENTITY_CASCADE: &[(&str, &str)] = &[
 ];
 
 pub fn delete_identity(pool: &DbPool, hash_hex: &str, cascade: bool) -> Result<(), String> {
-    note_identity_tables_changed();
+    let _write = IdentityTablesWrite;
     let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
     let tx = conn.transaction().map_err(|e| format!("begin: {e}"))?;
     if cascade {
@@ -2210,6 +2225,11 @@ pub fn save_contact_with_identity_pubkey(
     trust: &str,
     identity_id: &str,
 ) {
+    // A row without an identity belongs to no one.
+    if identity_id.is_empty() {
+        tracing::warn!(reason = "no_identity", "save_contact refused");
+        return;
+    }
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return,
@@ -2364,6 +2384,10 @@ pub fn get_contact(pool: &DbPool, dest_hash: &str, identity_id: &str) -> Option<
 }
 
 pub fn block_contact(pool: &DbPool, dest_hash: &str, display_name: &str, identity_id: &str) {
+    if identity_id.is_empty() {
+        tracing::warn!(reason = "no_identity", "block_contact refused");
+        return;
+    }
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => {
@@ -2517,6 +2541,10 @@ pub fn enqueue_pending_blackhole(
     reason_label: Option<&str>,
     ttl_seconds: Option<f64>,
 ) -> bool {
+    if identity_id.is_empty() {
+        tracing::warn!(reason = "no_identity", "enqueue_pending_blackhole refused");
+        return false;
+    }
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => {
@@ -2891,6 +2919,9 @@ pub fn try_save_message_with_audio_conn(
     audio_mode: Option<u8>,
     audio_stored_name: &str,
 ) -> Result<(), String> {
+    if identity_id.is_empty() {
+        return Err("no active identity".into());
+    }
     let exists: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE id = ?1 AND identity_id = ?2",
@@ -3242,6 +3273,10 @@ pub fn cleanup_stale_outbound(pool: &DbPool, identity_id: &str) {
 }
 
 pub fn hide_conversation(pool: &DbPool, dest_hash: &str, identity_id: &str) {
+    if identity_id.is_empty() {
+        tracing::warn!(reason = "no_identity", "hide_conversation refused");
+        return;
+    }
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return,
@@ -8256,36 +8291,6 @@ pub fn save_connection_history(pool: &DbPool, host: &str, port: i64, name: &str)
     }
 }
 
-pub fn clear_all_messages(pool: &DbPool, identity_id: &str) -> Vec<String> {
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let file_refs = if identity_id.is_empty() {
-        query_message_file_refs(
-            &conn,
-            "SELECT attachment_stored_name, image_stored_name, audio_stored_name FROM messages",
-            [],
-        )
-    } else {
-        query_message_file_refs(
-            &conn,
-            "SELECT attachment_stored_name, image_stored_name, audio_stored_name FROM messages WHERE identity_id = ?1",
-            params![identity_id],
-        )
-    };
-    if identity_id.is_empty() {
-        conn.execute("DELETE FROM messages", []).ok();
-    } else {
-        conn.execute(
-            "DELETE FROM messages WHERE identity_id = ?1",
-            params![identity_id],
-        )
-        .ok();
-    }
-    file_refs
-}
-
 pub fn get_identity_file_refs(pool: &DbPool, identity_id: &str) -> Vec<String> {
     let conn = match pool.get() {
         Ok(c) => c,
@@ -8302,35 +8307,20 @@ pub fn get_identity_file_refs(pool: &DbPool, identity_id: &str) -> Vec<String> {
 }
 
 pub fn clear_all_contacts(pool: &DbPool, identity_id: &str) {
+    // An empty identity must never widen a clear to every identity.
+    if identity_id.is_empty() {
+        tracing::warn!(reason = "no_identity", "clear_all_contacts refused");
+        return;
+    }
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return,
     };
-    if identity_id.is_empty() {
-        conn.execute("DELETE FROM contacts", []).ok();
-    } else {
-        conn.execute(
-            "DELETE FROM contacts WHERE identity_id = ?1",
-            params![identity_id],
-        )
-        .ok();
-    }
-}
-
-pub fn clear_all_blocked(pool: &DbPool, identity_id: &str) {
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    if identity_id.is_empty() {
-        conn.execute("DELETE FROM blocked_contacts", []).ok();
-    } else {
-        conn.execute(
-            "DELETE FROM blocked_contacts WHERE identity_id = ?1",
-            params![identity_id],
-        )
-        .ok();
-    }
+    conn.execute(
+        "DELETE FROM contacts WHERE identity_id = ?1",
+        params![identity_id],
+    )
+    .ok();
 }
 
 pub fn get_database_stats(pool: &DbPool) -> serde_json::Value {
@@ -8354,24 +8344,6 @@ pub fn get_database_stats(pool: &DbPool) -> serde_json::Value {
         "contacts": contact_count,
         "connection_history": history_count,
     })
-}
-
-pub fn backfill_identity_id(pool: &DbPool, identity_hash: &str) {
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    conn.execute(
-        "UPDATE contacts SET identity_id = ?1 WHERE identity_id = ''",
-        params![identity_hash],
-    )
-    .ok();
-    conn.execute(
-        "UPDATE messages SET identity_id = ?1 WHERE identity_id = ''",
-        params![identity_hash],
-    )
-    .ok();
-    tracing::info!("Backfilled identity_id on existing contacts/messages");
 }
 
 pub fn save_game_session(pool: &DbPool, session: &lrgp::session::Session) -> bool {
@@ -9596,7 +9568,6 @@ mod audio_message_tests {
             delete_conversation(&pool, "peer-a", "identity-a"),
             vec!["one.opus"]
         );
-        assert_eq!(clear_all_messages(&pool, "identity-a"), vec!["two.opus"]);
         assert_eq!(
             get_identity_file_refs(&pool, "identity-b"),
             vec!["three.opus"]
@@ -10268,55 +10239,52 @@ mod unread_breakdown_tests {
     }
 
     #[test]
-    fn clear_all_messages_returns_attachment_file_refs_for_identity() {
+    fn identity_rows_are_never_written_without_an_identity() {
         let pool = test_pool();
-        save_message(
-            &pool,
-            "with-file",
-            "me",
-            "peer",
-            "content",
-            "",
-            10.0,
-            "sent",
-            "outbound",
-            "me",
-            "note.txt",
-            "123_note.txt",
-            "",
-            "456_image.png",
-            "",
-            "",
-            Some("direct"),
+        save_contact(&pool, "peer", Some("Peer"), "trusted", "");
+        block_contact(&pool, "spammer", "Spammer", "");
+        assert!(!enqueue_pending_blackhole(&pool, "spammer", "", None, None));
+        hide_conversation(&pool, "peer", "");
+        assert!(
+            try_save_message(
+                &pool, "orphan", "local", "peer", "hi", "", 1.0, "sent", "outbound", "", "", "",
+                "", "", "", "", None,
+            )
+            .is_err()
         );
-        save_message(
-            &pool,
-            "other-identity",
-            "me",
-            "peer",
-            "content",
-            "",
-            10.0,
-            "sent",
-            "outbound",
-            "other",
-            "other.txt",
-            "789_other.txt",
-            "",
-            "",
-            "",
-            "",
-            Some("direct"),
-        );
+        let conn = pool.get().unwrap();
+        for table in [
+            "contacts",
+            "blocked_contacts",
+            "pending_blackholes",
+            "hidden_conversations",
+            "messages",
+        ] {
+            let rows: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE identity_id = ''"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+    }
 
-        let refs = clear_all_messages(&pool, "me");
+    #[test]
+    fn clearing_without_an_identity_keeps_every_identity() {
+        let pool = test_pool();
+        for identity in ["me", "other"] {
+            save_contact(&pool, "peer", Some("Peer"), "unknown", identity);
+            block_contact(&pool, "spammer", "Spammer", identity);
+        }
 
-        assert_eq!(
-            refs,
-            vec!["123_note.txt".to_string(), "456_image.png".to_string()]
-        );
-        assert_eq!(get_conversation(&pool, "peer", "me", 10).len(), 0);
-        assert_eq!(get_conversation(&pool, "peer", "other", 10).len(), 1);
+        clear_all_contacts(&pool, "");
+
+        for identity in ["me", "other"] {
+            assert_eq!(get_all_contacts(&pool, identity).len(), 1);
+            assert!(is_blocked(&pool, "spammer", identity));
+        }
     }
 
     #[test]
@@ -11866,7 +11834,7 @@ mod identity_tests {
         let err = set_active_identity(&pool, "missing").unwrap_err();
         assert!(err.contains("identity not found"));
 
-        let active = get_active_identity(&pool).unwrap();
+        let active = get_active_identity(&pool).unwrap().unwrap();
         assert_eq!(
             active.get("hash").and_then(|v| v.as_str()),
             Some("identity-a")
@@ -12571,7 +12539,9 @@ mod pending_blackhole_tests {
         assert_eq!(version, SCHEMA_VERSION);
         drop(conn);
 
-        let active = get_active_identity(&pool).expect("active identity remains readable");
+        let active = get_active_identity(&pool)
+            .unwrap()
+            .expect("active identity remains readable");
         assert_eq!(
             active.get("hash").and_then(|v| v.as_str()),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")

@@ -424,10 +424,16 @@ impl ActivityRequestFence {
     }
 }
 
-/// Async identity/runtime transition lock with a span epoch. The epoch is odd
-/// while any holder owns the lock and advances again when that holder drops,
-/// allowing Activity commands to distinguish a request born during a
-/// transition from one that was merely queued before a point-in-time reset.
+/// Async identity/runtime lifecycle lock with a transition epoch.
+///
+/// A transition (`lock`, `lock_owned`) changes what a fenced request may rely
+/// on: the active identity's session, the identity set or its keys, the
+/// runtime, or Activity capture. The epoch is odd while a transition holds the
+/// lock and advances again when it drops, so a request born during a
+/// transition is told apart from one merely queued before it. Routine work
+/// (`lock_routine`, `lock_routine_owned`) publishes, reads, sends or edits the
+/// current identity's data: it still excludes transitions, but leaves the
+/// epoch alone, so fenced requests prepared meanwhile stay valid.
 pub struct IdentitySwitchLock {
     inner: Arc<tokio::sync::Mutex<()>>,
     epoch: Arc<AtomicU64>,
@@ -453,14 +459,18 @@ impl IdentitySwitchLock {
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
-    /// Publish a result for the current identity without announcing a new
-    /// identity/privacy transition. The same mutex still excludes real changes.
-    pub(crate) async fn lock_publication(&self) -> tokio::sync::MutexGuard<'_, ()> {
+    /// Routine work for the current identity; see the type's documentation.
+    pub async fn lock_routine(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.inner.lock().await
     }
 
-    /// Retain a short identity publication transition inside its actual blocking
-    /// closure, even when the awaiting command is cancelled.
+    /// As `lock_routine`, retained by a blocking worker or a moved guard.
+    pub async fn lock_routine_owned(&self) -> OwnedRoutineGuard {
+        self.inner.clone().lock_owned().await
+    }
+
+    /// As `lock`, retained by a blocking worker even when the awaiting command
+    /// is cancelled.
     pub async fn lock_owned(&self) -> OwnedIdentitySwitchGuard {
         let guard = self.inner.clone().lock_owned().await;
         self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -476,6 +486,9 @@ impl Default for IdentitySwitchLock {
         Self::new()
     }
 }
+
+/// A routine span of the identity lifecycle: it excludes transitions only.
+pub type OwnedRoutineGuard = tokio::sync::OwnedMutexGuard<()>;
 
 pub struct IdentitySwitchGuard<'a> {
     _guard: tokio::sync::MutexGuard<'a, ()>,
@@ -750,6 +763,9 @@ pub struct AppState {
     rnode_lifecycle_generation: AtomicU64,
     /// Coalesces conversation-list broadcasts; spawned task debounces 100ms.
     pub conversations_broadcast_pending: AtomicBool,
+    /// Advanced after a bulk delete commits: a conversation list built from
+    /// the rows before it must not be published after it.
+    conversation_list_revision: AtomicU64,
     /// 10s session-local throttle on Refresh button. `None` = never throttled.
     pub last_refresh_request_at: Mutex<Option<Instant>>,
     /// Low-rate background probing throttle for bundled Ratspeak relays.
@@ -967,6 +983,7 @@ impl AppState {
             rnode_lifecycle_operations: Mutex::new(HashMap::new()),
             rnode_lifecycle_generation: AtomicU64::new(0),
             conversations_broadcast_pending: AtomicBool::new(false),
+            conversation_list_revision: AtomicU64::new(0),
             last_refresh_request_at: Mutex::new(None),
             last_static_probe_at: Mutex::new(None),
             auto_active_node: RwLock::new(None),
@@ -1138,6 +1155,16 @@ impl AppState {
         self.identity_session_generation
             .fetch_add(1, Ordering::SeqCst)
             + 1
+    }
+
+    pub(crate) fn conversation_list_revision(&self) -> u64 {
+        self.conversation_list_revision.load(Ordering::SeqCst)
+    }
+
+    /// Call after a bulk delete commits, before re-sending the list.
+    pub fn invalidate_conversation_lists(&self) {
+        self.conversation_list_revision
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn set_propagation_host_readiness(
@@ -1959,10 +1986,11 @@ impl AppState {
         }
     }
 
-    /// Validate only while the caller owns `identity_switch_lock`. A request
-    /// born while another transition held the lock observes at least a release
-    /// plus this acquisition and therefore cannot match the single expected
-    /// epoch advance.
+    /// Validate only while the caller holds `identity_switch_lock` as a
+    /// transition. A request born while another transition held the lock
+    /// observes at least a release plus this acquisition and therefore cannot
+    /// match the single expected epoch advance. Routine holders use
+    /// `is_current_activity_origin_fence` instead.
     pub fn is_current_activity_request_fence_after_identity_lock(
         &self,
         fence: ActivityRequestFence,
@@ -1979,7 +2007,9 @@ impl AppState {
     /// fence before starting an operation and pass this validation through
     /// `ActivityRecorder::record_event_fenced`. The recorder invokes it only
     /// after acquiring an admission lease, so a transition either makes the
-    /// origin stale first or waits for/purges the already-admitted draft.
+    /// origin stale first or waits for/purges the already-admitted draft. It is
+    /// also the check for a request fence while holding `lock_routine`: no
+    /// transition began or ended since the fence was taken.
     pub fn is_current_activity_origin_fence(&self, fence: ActivityRequestFence) -> bool {
         let current_epoch = self.identity_switch_lock.epoch();
         fence.identity_lock_epoch.is_multiple_of(2)
@@ -4098,21 +4128,36 @@ mod tests {
         drop(next);
     }
     #[tokio::test]
-    async fn result_publication_excludes_switches_without_invalidating_activity() {
+    async fn routine_work_excludes_transitions_without_invalidating_fences() {
         let state = make_state();
-        let fence = state.activity_request_fence();
-        let publication = state.identity_switch_lock.lock_publication().await;
-        assert!(state.is_current_activity_origin_fence(fence));
+        let queued = state.activity_request_fence();
+        let routine = state.identity_switch_lock.lock_routine().await;
+        let born_during_routine = state.activity_request_fence();
         assert!(
             tokio::time::timeout(Duration::from_millis(20), state.identity_switch_lock.lock())
                 .await
                 .is_err()
         );
-        drop(publication);
-        assert!(state.is_current_activity_origin_fence(fence));
-        let transition = state.identity_switch_lock.lock().await;
-        drop(transition);
-        assert!(!state.is_current_activity_origin_fence(fence));
+        drop(routine);
+        let owned = state.identity_switch_lock.lock_routine_owned().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), state.identity_switch_lock.lock())
+                .await
+                .is_err()
+        );
+        drop(owned);
+        for fence in [queued, born_during_routine] {
+            assert!(state.is_current_activity_origin_fence(fence));
+        }
+        // A transition holder, such as an identity mutation, still accepts both.
+        let mutation = state.identity_switch_lock.lock().await;
+        assert!(state.is_current_activity_request_fence_after_identity_lock(queued));
+        assert!(state.is_current_activity_request_fence_after_identity_lock(born_during_routine));
+        drop(mutation);
+        // A transition, that mutation included, ends them for everyone else.
+        for fence in [queued, born_during_routine] {
+            assert!(!state.is_current_activity_origin_fence(fence));
+        }
     }
 
     #[tokio::test]

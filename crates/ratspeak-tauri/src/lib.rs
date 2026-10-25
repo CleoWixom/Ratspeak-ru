@@ -14,6 +14,7 @@ pub mod diagnostic_writer;
 pub mod diagnostics;
 pub mod emitter;
 pub mod error;
+pub mod invoke_gate;
 pub mod notifier;
 pub mod window_prefs;
 

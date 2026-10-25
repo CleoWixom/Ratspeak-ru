@@ -98,11 +98,10 @@ enum StaticProbeKind {
     Manual,
 }
 
-/// Defaults to (Auto, true) if no active identity.
+/// Defaults to (Auto, true) when no identity is active or it cannot be read.
 pub fn read_settings(state: &AppState) -> (PropagationMode, bool) {
-    let identity = match db::get_active_identity(&state.db) {
-        Some(id) => id,
-        None => return (PropagationMode::Auto, true),
+    let Ok(Some(identity)) = db::get_active_identity(&state.db) else {
+        return (PropagationMode::Auto, true);
     };
     let mode = identity
         .get("propagation_mode")
@@ -1413,6 +1412,8 @@ pub fn get_status_payload(state: &AppState) -> serde_json::Value {
         .map(hex::encode);
     let manual_node = if mode == PropagationMode::Manual {
         db::get_active_identity(&state.db)
+            .ok()
+            .flatten()
             .and_then(|identity| {
                 identity
                     .get("propagation_node")
@@ -1713,10 +1714,12 @@ mod tests {
         apply_auto_selection(&state, auto_node).await;
 
         assert_eq!(
-            crate::db::get_active_identity(&state.db).and_then(|v| v
-                .get("propagation_node")
-                .and_then(|h| h.as_str())
-                .map(String::from)),
+            crate::db::get_active_identity(&state.db)
+                .unwrap()
+                .and_then(|v| v
+                    .get("propagation_node")
+                    .and_then(|h| h.as_str())
+                    .map(String::from)),
             Some(manual_node.to_string())
         );
         assert_eq!(
@@ -1733,10 +1736,12 @@ mod tests {
         clear_auto_selection(&state).await;
 
         assert_eq!(
-            crate::db::get_active_identity(&state.db).and_then(|v| v
-                .get("propagation_node")
-                .and_then(|h| h.as_str())
-                .map(String::from)),
+            crate::db::get_active_identity(&state.db)
+                .unwrap()
+                .and_then(|v| v
+                    .get("propagation_node")
+                    .and_then(|h| h.as_str())
+                    .map(String::from)),
             Some(manual_node.to_string())
         );
         assert_eq!(

@@ -74,6 +74,8 @@ pub enum AdmissionDbError {
     LedgerFull,
     #[error("retained message effect is missing or inconsistent")]
     MissingEffect,
+    #[error("no active identity")]
+    NoIdentity,
 }
 impl From<rusqlite::Error> for AdmissionDbError {
     fn from(error: rusqlite::Error) -> Self {
@@ -833,11 +835,15 @@ impl DurableInboundStore {
             }
             Ok(value.to_owned())
         }
+        // An empty identity must never widen deletion to every identity.
+        if identity.is_empty() {
+            return Err(AdmissionDbError::NoIdentity);
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut artifacts = MessageDeletionArtifacts::default();
         {
-            let mut stmt=tx.prepare("SELECT id,identity_id,attachment_stored_name,image_stored_name,audio_stored_name FROM messages WHERE (?1='' OR identity_id=?1) AND (?2 IS NULL OR source=?2 OR destination=?2)")?;
+            let mut stmt=tx.prepare("SELECT id,identity_id,attachment_stored_name,image_stored_name,audio_stored_name FROM messages WHERE identity_id=?1 AND (?2 IS NULL OR source=?2 OR destination=?2)")?;
             let rows = stmt.query_map(params![identity, peer], |row| {
                 Ok((
                     text(row, 0, 128)?,
@@ -885,7 +891,7 @@ impl DurableInboundStore {
         for artifact in &artifacts.archives {
             tx.execute("INSERT INTO lxmf_deleted_artifacts(identity_id,kind,path) VALUES(?1,'archive',?2) ON CONFLICT(identity_id,kind,path) DO NOTHING",params![artifact.identity,artifact.path])?;
         }
-        tx.execute("DELETE FROM messages WHERE (?1='' OR identity_id=?1) AND (?2 IS NULL OR source=?2 OR destination=?2)",params![identity,peer])?;
+        tx.execute("DELETE FROM messages WHERE identity_id=?1 AND (?2 IS NULL OR source=?2 OR destination=?2)",params![identity,peer])?;
         if let Some(peer) = peer {
             tx.execute(
                 "DELETE FROM hidden_conversations WHERE identity_id=?1 AND dest_hash=?2",
@@ -1216,6 +1222,38 @@ mod tests {
         assert!(try_reserve_admission().is_ok());
         drop(store);
         drop(pool);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn deleting_without_an_identity_is_refused() {
+        let _serial = SERIAL.lock().unwrap();
+        let (path, pool, store) = fixture();
+        let identity = "11".repeat(16);
+        let id = hex::encode([3; 32]);
+        crate::db::try_save_message(
+            &pool, &id, "peer", "local", "kept", "", 1.0, "received", "inbound", &identity, "", "",
+            "", "", "", "", None,
+        )
+        .unwrap();
+        for peer in [None, Some("peer")] {
+            assert!(matches!(
+                store.delete_messages("", peer, 1000),
+                Err(AdmissionDbError::NoIdentity)
+            ));
+        }
+        assert_eq!(
+            crate::db::get_conversation(&pool, "peer", &identity, 10).len(),
+            1
+        );
+        let tombstones: i64 = pool
+            .get()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM lxmf_user_deleted", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(tombstones, 0);
         let _ = std::fs::remove_dir_all(path);
     }
 

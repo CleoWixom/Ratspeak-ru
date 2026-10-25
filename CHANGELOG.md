@@ -17,6 +17,7 @@ changes that materially affect how an artifact is reproduced.
 - Preserved unknown interface locations and restored discovery announcements.
 - Bounded background announcements at flow-controlled radio writers.
 - Ratspeak warns at startup when its data is on a network drive or in temporary memory, where messages and keys may not survive a crash or restart.
+- Deleting all messages or contacts now clears them from every screen at once, and blocked users stay blocked.
 
 ### Build and compatibility
 

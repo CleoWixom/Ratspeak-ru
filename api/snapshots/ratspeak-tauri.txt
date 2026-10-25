@@ -805,6 +805,8 @@ impl core::error::Error for ratspeak_tauri::error::AppError
 impl core::fmt::Display for ratspeak_tauri::error::AppError
 pub fn ratspeak_tauri::error::AppError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub type ratspeak_tauri::error::AppResult<T> = core::result::Result<T, ratspeak_tauri::error::AppError>
+pub mod ratspeak_tauri::invoke_gate
+pub fn ratspeak_tauri::invoke_gate::gated<R: tauri::Runtime>(impl core::ops::function::Fn(tauri::ipc::Invoke<R>) -> bool + core::marker::Send + core::marker::Sync + 'static) -> impl core::ops::function::Fn(tauri::ipc::Invoke<R>) -> bool + core::marker::Send + core::marker::Sync + 'static
 pub mod ratspeak_tauri::notifier
 pub struct ratspeak_tauri::notifier::TauriNotifier
 impl ratspeak_tauri::notifier::TauriNotifier

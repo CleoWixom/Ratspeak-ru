@@ -243,14 +243,18 @@ pub async fn build_conversations_payload(state: &AppState) -> Option<Value> {
 }
 
 // Building the list must not block identity switching. Serialize only the
-// final publication and reject reads that completed after an identity change.
+// final publication and reject reads that completed after an identity change
+// or a bulk delete.
 async fn publish_conversations_for_generation(
     state: &AppState,
     generation: u64,
+    revision: u64,
     payload: Value,
 ) -> bool {
     let _identity = state.identity_switch_lock.lock().await;
-    if state.current_identity_session_generation() != generation {
+    if state.current_identity_session_generation() != generation
+        || state.conversation_list_revision() != revision
+    {
         return false;
     }
     state.emit_to_all("conversations_update", payload);
@@ -272,8 +276,9 @@ pub fn broadcast_conversations(state: Arc<AppState>) {
             .conversations_broadcast_pending
             .store(false, Ordering::Release);
         let generation = state.current_identity_session_generation();
+        let revision = state.conversation_list_revision();
         if let Some(payload) = build_conversations_payload(&state).await {
-            publish_conversations_for_generation(&state, generation, payload).await;
+            publish_conversations_for_generation(&state, generation, revision, payload).await;
         }
     });
 }
@@ -292,8 +297,9 @@ pub async fn broadcast_conversations_now(state: &AppState) {
         .conversations_broadcast_pending
         .store(false, Ordering::Release);
     let generation = state.current_identity_session_generation();
+    let revision = state.conversation_list_revision();
     if let Some(payload) = build_conversations_payload(state).await {
-        publish_conversations_for_generation(state, generation, payload).await;
+        publish_conversations_for_generation(state, generation, revision, payload).await;
     }
 }
 
@@ -340,6 +346,7 @@ mod tests {
             let mut publish = Box::pin(publish_conversations_for_generation(
                 &state,
                 generation,
+                state.conversation_list_revision(),
                 json!([]),
             ));
             poll_fn(|cx| {
@@ -359,11 +366,26 @@ mod tests {
                 publish_conversations_for_generation(
                     &state,
                     state.current_identity_session_generation(),
+                    state.conversation_list_revision(),
                     json!([])
                 )
                 .await
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_list_built_before_a_bulk_delete_is_never_published_after_it() {
+        let state = make_state();
+        let generation = state.current_identity_session_generation();
+        let built_before = state.conversation_list_revision();
+        state.invalidate_conversation_lists();
+        assert!(
+            !publish_conversations_for_generation(&state, generation, built_before, json!([]))
+                .await
+        );
+        let current = state.conversation_list_revision();
+        assert!(publish_conversations_for_generation(&state, generation, current, json!([])).await);
     }
 
     #[tokio::test]

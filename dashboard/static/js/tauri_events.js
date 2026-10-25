@@ -325,10 +325,12 @@ function _renderPathCacheCleared() {
     if (typeof renderNetworkContactList === 'function') renderNetworkContactList();
 }
 
-function _reloadPeersAfterCacheClear() {
+// keepOnFailure: the peers still exist (a bulk delete changed only their
+// flags), so a failed reload must not empty the list.
+function _reloadPeersAfterCacheClear(keepOnFailure) {
     if (typeof PeersCache === 'undefined' || !PeersCache) return;
     if (typeof RS === 'undefined' || typeof RS.invoke !== 'function') {
-        if (typeof PeersCache.clear === 'function') PeersCache.clear();
+        if (!keepOnFailure && typeof PeersCache.clear === 'function') PeersCache.clear();
         return;
     }
     RS.invoke('api_get_peers_snapshot').then(function(rows) {
@@ -339,7 +341,7 @@ function _reloadPeersAfterCacheClear() {
             if (typeof PeersCache.init === 'function') PeersCache.init().catch(function() {});
         }
     }).catch(function() {
-        if (typeof PeersCache.clear === 'function') PeersCache.clear();
+        if (!keepOnFailure && typeof PeersCache.clear === 'function') PeersCache.clear();
     });
 }
 

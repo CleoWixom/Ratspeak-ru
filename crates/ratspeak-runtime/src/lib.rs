@@ -1263,15 +1263,19 @@ pub async fn start_channel_hub_service(state: &Arc<AppState>) -> bool {
         .read()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
-    let active_identity = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
+    let Ok(active_identity) = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
         .await
         .expect("db task panicked")
-        .and_then(|identity| {
-            identity
-                .get("hash")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        });
+    else {
+        tracing::error!(reason = "query_failed", "channel hub not started");
+        return false;
+    };
+    let active_identity = active_identity.and_then(|identity| {
+        identity
+            .get("hash")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    });
     let Some(identity_hash) =
         active_identity.filter(|hash| helpers::is_protocol_hash_16(hash.as_str()))
     else {
@@ -1324,6 +1328,21 @@ pub async fn start_channel_hub_service(state: &Arc<AppState>) -> bool {
     }
 }
 
+/// A failed read is not "no active identity": startup would then pick
+/// another identity. It ends startup in the error stage instead.
+async fn read_active_identity_for_startup(state: &AppState) -> Result<Option<Value>, ()> {
+    db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
+        .await
+        .expect("db task panicked")
+        .map_err(|_| {
+            tracing::error!(
+                reason = "query_failed",
+                "active identity unreadable at startup"
+            );
+            state.set_startup_stage("error");
+        })
+}
+
 pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
     // Keep the large startup state machine out of every caller's future and
     // debug poll frame. Tokio's normal worker stack should remain sufficient.
@@ -1357,15 +1376,15 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
     }
 
     state.set_startup_stage("lxmf");
-    let preferred_identity_hash = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
-        .await
-        .expect("db task panicked")
-        .and_then(|identity| {
-            identity
-                .get("hash")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        });
+    let Ok(preferred_identity) = read_active_identity_for_startup(&state).await else {
+        return;
+    };
+    let preferred_identity_hash = preferred_identity.and_then(|identity| {
+        identity
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
     if preferred_identity_hash
         .as_deref()
         .is_some_and(|hash| !helpers::is_protocol_hash_16(hash))
@@ -1473,9 +1492,9 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 return;
             }
 
-            let active = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
-                .await
-                .expect("db task panicked");
+            let Ok(active) = read_active_identity_for_startup(&state).await else {
+                return;
+            };
             if active.is_none() {
                 let id_hash = mgr.identity_hash.clone();
                 let lxmf_hash = mgr.lxmf_hash.clone();
@@ -1502,9 +1521,10 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 }
             }
 
-            if let Some(identity) = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
-                .await
-                .expect("db task panicked")
+            if let Ok(Some(identity)) =
+                db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
+                    .await
+                    .expect("db task panicked")
             {
                 mgr.display_name = identity
                     .get("display_name")
@@ -1520,14 +1540,6 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
 
             apply_lxmf_settings_from_state(&state, &mut mgr);
 
-            // Backfill identity_id on pre-multi-identity rows.
-            let id_hash_for_backfill = mgr.identity_hash.clone();
-            db::spawn_db(state.db.clone(), move |p| {
-                db::backfill_identity_id(&p, &id_hash_for_backfill);
-            })
-            .await
-            .expect("db task panicked");
-
             // Clear in-flight outbound from previous session.
             let id_hash_for_cleanup = mgr.identity_hash.clone();
             db::spawn_db(state.db.clone(), move |p| {
@@ -1540,6 +1552,8 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
                     .await
                     .expect("db task panicked")
+                    .ok()
+                    .flatten()
                     .map(|i| {
                         (
                             i.get("display_name")
@@ -2104,6 +2118,8 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 let stored_pn = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
                     .await
                     .expect("db task panicked")
+                    .ok()
+                    .flatten()
                     .and_then(|i| {
                         i.get("propagation_node")
                             .and_then(|v| v.as_str())
@@ -6066,6 +6082,8 @@ async fn poll_stats_loop(
                     db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
                         .await
                         .expect("db task panicked")
+                        .ok()
+                        .flatten()
                         .and_then(|id| id.get("hash").and_then(|h| h.as_str()).map(String::from))
                         .unwrap_or_default();
                 if !announce_identity_id.is_empty() {

@@ -400,7 +400,7 @@ impl DownloadCoordinator {
             let _ = ready.send(());
             let _ = resume.await;
         }
-        let _lifecycle = state.identity_switch_lock.lock_publication().await;
+        let _lifecycle = state.identity_switch_lock.lock_routine().await;
         if state.current_identity_session_generation() != generation || shutdown.is_triggered() {
             return;
         }
@@ -1255,7 +1255,7 @@ pub(crate) async fn admit_download(
         completed;
     // The worker has exited and released quiescence ownership before waiting
     // for this lock. Shutdown can therefore never deadlock on UI publication.
-    let _lifecycle = state.identity_switch_lock.lock_publication().await;
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
     if shutdown.is_triggered()
         || !token.is_current()
         || state.current_identity_session_generation() != generation
@@ -1384,7 +1384,7 @@ async fn refresh_chat(
         let unread:i64=db::get_all_unread_counts(&pool,&identity_db).values().sum();
         (label,contacts,unread)
     }).await;
-    let _lifecycle = state.identity_switch_lock.lock_publication().await;
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
     if state.current_identity_session_generation() != generation
         || state
             .session_shutdown

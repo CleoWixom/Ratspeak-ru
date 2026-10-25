@@ -1951,7 +1951,7 @@ var clearContactsBtn = document.getElementById('settings-clear-contacts');
 if (clearContactsBtn) {
     clearContactsBtn.addEventListener('click', function() {
         clearWithConfirm('api_clear_contacts',
-            'Delete ALL contacts? This cannot be undone.',
+            'Delete ALL contacts? Blocked users stay blocked. This cannot be undone.',
             'All contacts deleted',
             'Could not delete contacts');
     });
@@ -1961,7 +1961,7 @@ var resetDatabaseBtn = document.getElementById('settings-reset-database');
 if (resetDatabaseBtn) {
     resetDatabaseBtn.addEventListener('click', function() {
         clearWithConfirm('api_reset_database',
-            'Clear ALL messages and contacts? This cannot be undone.',
+            'Clear ALL messages and contacts? Blocked users stay blocked. This cannot be undone.',
             'All messages and contacts cleared',
             'Could not clear messages and contacts');
     });
@@ -2130,13 +2130,13 @@ function confirmDangerAction(action, onClose) {
             fail: 'Could not delete messages'
         },
         'clear-contacts': {
-            msg: 'Delete ALL contacts? This cannot be undone.',
+            msg: 'Delete ALL contacts? Blocked users stay blocked. This cannot be undone.',
             command: 'api_clear_contacts',
             success: 'All contacts deleted',
             fail: 'Could not delete contacts'
         },
         'clear-all-data': {
-            msg: 'Clear ALL messages and contacts? This cannot be undone.',
+            msg: 'Clear ALL messages and contacts? Blocked users stay blocked. This cannot be undone.',
             command: 'api_reset_database',
             success: 'All messages and contacts cleared'
         },

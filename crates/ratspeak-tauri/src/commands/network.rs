@@ -324,7 +324,7 @@ pub async fn set_propagation_mode(
         }
         PropagationMode::Manual => {
             // Re-apply DB-stored hash; (re)creates the propagation client.
-            let identity = crate::db::get_active_identity(&st.db);
+            let identity = crate::db::get_active_identity(&st.db).ok().flatten();
             let stored_hash = identity
                 .as_ref()
                 .and_then(|id| id.get("propagation_node").and_then(|h| h.as_str()))

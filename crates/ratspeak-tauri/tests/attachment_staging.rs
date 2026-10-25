@@ -23,6 +23,9 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let pool = db::init_pool(dir.path()).unwrap();
         db::init_schema(&pool).unwrap();
+        // A send reaches the queue only for an active identity.
+        db::save_identity(&pool, "alice", &"11".repeat(16), "Alice", "Alice");
+        db::set_active_identity(&pool, "alice").unwrap();
         let state = Arc::new(AppState::new(
             DashboardConfig::from_env_and_defaults(dir.path().to_path_buf()),
             pool,

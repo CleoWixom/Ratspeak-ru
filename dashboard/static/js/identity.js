@@ -1826,6 +1826,34 @@ RS.listen('identity_switching', function() {
     if (typeof clearConnectPublicPending === 'function') clearConnectPublicPending();
 });
 
+// Drop every cached conversation: after an identity switch or a bulk delete,
+// nothing cached may be merged back into a fresh fetch.
+function resetConversationCaches() {
+    if (typeof lxmfConversation !== 'undefined') lxmfConversation = [];
+    if (typeof _conversationCache !== 'undefined') {
+        for (var k in _conversationCache) delete _conversationCache[k];
+    }
+    if (typeof _conversationCacheSizes !== 'undefined') _conversationCacheSizes = {};
+    if (typeof _conversationCacheBytes !== 'undefined') _conversationCacheBytes = 0;
+    if (typeof _cacheLru !== 'undefined') _cacheLru = [];
+}
+
+// A bulk delete announces what it removed before it re-sends the lists.
+// Events arrive in order, so this drops only what the window held before it.
+RS.listen('identity_data_cleared', function(data) {
+    if (data && data.messages) {
+        resetConversationCaches();
+        if (typeof clearReplyTarget === 'function') clearReplyTarget();
+        if (typeof _resetConversationList === 'function') _resetConversationList();
+    }
+    if (data && data.contacts && typeof lxmfContacts !== 'undefined') {
+        lxmfContacts = [];
+        if (typeof renderStandaloneContactList === 'function') renderStandaloneContactList();
+    }
+    if (typeof renderConversation === 'function') renderConversation();
+    if (typeof _reloadPeersAfterCacheClear === 'function') _reloadPeersAfterCacheClear(true);
+});
+
 RS.listen('identity_switched', function(data) {
     // Suppress the redundant loadConversations() that lxmf_identity triggers —
     // emit_initial_state fires lxmf_identity right after identity_switched.
@@ -1848,13 +1876,7 @@ RS.listen('identity_switched', function(data) {
     // doesn't leak. PeersCache rehydrates from the new snapshot on activation.
     if (typeof lxmfContacts !== 'undefined') lxmfContacts = [];
 
-    if (typeof lxmfConversation !== 'undefined') lxmfConversation = [];
-    if (typeof _conversationCache !== 'undefined') {
-        for (var k in _conversationCache) delete _conversationCache[k];
-    }
-    if (typeof _conversationCacheSizes !== 'undefined') _conversationCacheSizes = {};
-    if (typeof _conversationCacheBytes !== 'undefined') _conversationCacheBytes = 0;
-    if (typeof _cacheLru !== 'undefined') _cacheLru = [];
+    resetConversationCaches();
 
     if (typeof _resetConversationSession === 'function') _resetConversationSession('identity_replaced');
     else if (typeof lxmfActiveContact !== 'undefined') lxmfActiveContact = null;

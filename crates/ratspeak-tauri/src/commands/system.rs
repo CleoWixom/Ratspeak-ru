@@ -7,7 +7,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tauri::State;
 
-use crate::commands::shared::active_rns_config_dir;
+use crate::commands::messaging::broadcast_conversations;
+use crate::commands::shared::{active_rns_config_dir, format_contacts_list};
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::helpers::{active_identity_id, sanitize_announced_display_name};
@@ -114,10 +115,11 @@ pub async fn api_setup_complete(
     // the FIRST call; later calls load the existing one and just update the name.
     // The mnemonic is returned on the first call and persisted with the same
     // at-rest protection as the identity key for later re-display.
+    // A failed read is not "no identity": it would create a second one.
     let existing = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
         .await
-        .ok()
-        .flatten();
+        .map_err(|_| AppError::internal("setup identity read task failed"))?
+        .map_err(AppError::database_unavailable)?;
 
     let (identity_hash, lxmf_hash, mnemonic) = if let Some(identity) = existing {
         let hash = identity
@@ -536,12 +538,65 @@ pub async fn api_clear_announces(state: State<'_, Arc<AppState>>) -> AppResult<V
     }))
 }
 
+type IdentityLists = (Vec<Value>, i64);
+
+/// Tells the window what a bulk delete removed before the lists it re-sends:
+/// events arrive in order, so the window drops only what it held from before.
+/// Call with the lifecycle guard still held, once the delete has committed.
+fn announce_identity_data_cleared(state: &AppState, messages: bool, contacts: bool) {
+    state.invalidate_conversation_lists();
+    state.emit_to_all(
+        "identity_data_cleared",
+        json!({ "messages": messages, "contacts": contacts }),
+    );
+}
+
+/// The identity's contacts and unread total, read after a bulk delete.
+async fn read_identity_lists(state: &AppState, identity_id: String) -> Option<IdentityLists> {
+    db::spawn_db(state.db.clone(), move |p| {
+        let contacts = format_contacts_list(&db::get_all_contacts(&p, &identity_id));
+        let unread = db::get_all_unread_counts(&p, &identity_id).values().sum();
+        (contacts, unread)
+    })
+    .await
+    .inspect_err(|_| tracing::error!(reason = "task_panicked", "bulk delete list read panicked"))
+    .ok()
+}
+
+/// Re-send what a bulk delete changed, unless the identity changed since
+/// `generation`. The caller has released its lifecycle guard: the spawned
+/// conversation broadcast takes the lock itself.
+async fn publish_identity_lists(
+    state: &Arc<AppState>,
+    generation: u64,
+    lists: Option<IdentityLists>,
+) {
+    let Some((contacts, unread)) = lists else {
+        return;
+    };
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
+    if state.current_identity_session_generation() != generation {
+        return;
+    }
+    state.emit_to_all("contacts_update", json!(contacts));
+    state.emit_to_all("unread_total", json!({ "count": unread }));
+    broadcast_conversations(Arc::clone(state));
+}
+
 #[tauri::command]
 pub async fn api_clear_messages(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    // Bound to the identity the user saw, not to one that took over meanwhile.
+    let generation = state.current_identity_session_generation();
     let deletion = Arc::new(
         ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await,
     );
+    if state.current_identity_session_generation() != generation {
+        return Err(AppError::conflict("Identity changed"));
+    }
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let id_for_db = identity_id.clone();
     let worker_state = Arc::clone(&state);
     db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
@@ -550,12 +605,25 @@ pub async fn api_clear_messages(state: State<'_, Arc<AppState>>) -> AppResult<Va
     .await
     .map_err(|_| AppError::internal("message deletion worker failed"))?
     .map_err(|error| AppError::database_unavailable(error.to_string()))?;
+    announce_identity_data_cleared(&state, true, false);
+    let lists = read_identity_lists(&state, identity_id).await;
+    drop(deletion);
+    publish_identity_lists(state.inner(), generation, lists).await;
     Ok(json!(null))
 }
 
 #[tauri::command]
 pub async fn api_clear_contacts(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    let generation = state.current_identity_session_generation();
+    let lifecycle = state.identity_switch_lock.lock_routine().await;
+    if state.current_identity_session_generation() != generation {
+        return Err(AppError::conflict("Identity changed"));
+    }
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
+    // Blocks stay: their network blocks can only be lifted through them.
     let id1 = identity_id.clone();
     db::spawn_db(state.db.clone(), move |p| db::clear_all_contacts(&p, &id1))
         .await
@@ -563,23 +631,27 @@ pub async fn api_clear_contacts(state: State<'_, Arc<AppState>>) -> AppResult<Va
             tracing::error!(reason = "task_panicked", "clear_contacts db task panicked");
             Default::default()
         });
-    let id2 = identity_id;
-    db::spawn_db(state.db.clone(), move |p| db::clear_all_blocked(&p, &id2))
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(reason = "task_panicked", "clear_blocked db task panicked");
-            Default::default()
-        });
+    announce_identity_data_cleared(&state, false, true);
+    let lists = read_identity_lists(&state, identity_id).await;
+    drop(lifecycle);
+    publish_identity_lists(state.inner(), generation, lists).await;
     Ok(json!(null))
 }
 
 #[tauri::command]
 #[tracing::instrument(level = "debug", name = "command.api_reset_database", skip_all)]
 pub async fn api_reset_database(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    let generation = state.current_identity_session_generation();
     let deletion = Arc::new(
         ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await,
     );
+    if state.current_identity_session_generation() != generation {
+        return Err(AppError::conflict("Identity changed"));
+    }
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let id1 = identity_id.clone();
     let worker_state = Arc::clone(&state);
     db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
@@ -588,6 +660,7 @@ pub async fn api_reset_database(state: State<'_, Arc<AppState>>) -> AppResult<Va
     .await
     .map_err(|_| AppError::internal("message deletion worker failed"))?
     .map_err(|error| AppError::database_unavailable(error.to_string()))?;
+    // Blocks stay, as in api_clear_contacts.
     let id2 = identity_id.clone();
     db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |p| {
         db::clear_all_contacts(&p, &id2)
@@ -600,18 +673,10 @@ pub async fn api_reset_database(state: State<'_, Arc<AppState>>) -> AppResult<Va
         );
         Default::default()
     });
-    let id3 = identity_id;
-    db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |p| {
-        db::clear_all_blocked(&p, &id3)
-    })
-    .await
-    .unwrap_or_else(|_| {
-        tracing::error!(
-            reason = "task_panicked",
-            "reset_database clear_blocked panicked"
-        );
-        Default::default()
-    });
+    announce_identity_data_cleared(&state, true, true);
+    let lists = read_identity_lists(&state, identity_id).await;
+    drop(deletion);
+    publish_identity_lists(state.inner(), generation, lists).await;
     Ok(json!(null))
 }
 
@@ -737,11 +802,11 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
         .map_err(|_| AppError::internal("factory reset lifecycle boundary unavailable"))?;
 
     db::spawn_db_with_lease(state.db.clone(), Arc::clone(&identity_lifecycle), |pool| {
-        db::note_identity_tables_changed();
         if let Ok(conn) = pool.get() {
             for table in db::RESET_TABLES {
                 let _ = conn.execute(&format!("DELETE FROM {}", table), []);
             }
+            db::note_identity_tables_changed();
             let _ = conn.execute(
                 "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')",
                 [],
@@ -858,4 +923,44 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
     state.emit_to_all("identity_reset", json!({ "restarting": true }));
 
     Ok(json!({ "message": "Factory reset complete. Returning to setup..." }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<String>>);
+
+    impl ratspeak_core::Emitter for Recorder {
+        fn try_emit(&self, event: &str, _payload: Value) -> Result<(), ratspeak_core::EmitError> {
+            self.0.lock().unwrap().push(event.to_owned());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_lists_go_out_only_for_the_identity_they_were_read_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::init_pool(dir.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let state = Arc::new(AppState::new(
+            crate::config::DashboardConfig::from_env_and_defaults(dir.path().to_path_buf()),
+            pool,
+            Arc::clone(&recorder) as Arc<dyn ratspeak_core::Emitter>,
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        let read_for = state.current_identity_session_generation();
+        state.bump_identity_session_generation();
+        publish_identity_lists(&state, read_for, Some((Vec::new(), 0))).await;
+        assert!(recorder.0.lock().unwrap().is_empty());
+
+        let current = state.current_identity_session_generation();
+        publish_identity_lists(&state, current, Some((Vec::new(), 0))).await;
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            ["contacts_update", "unread_total"]
+        );
+    }
 }
