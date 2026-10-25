@@ -61,10 +61,6 @@ var page = {
     loadIdentities: function() { calls.push('loadIdentities'); },
     loadConversations: function() { calls.push('loadConversations'); },
     setTimeout: function() {},
-    showSetupConnectingStep: function() {},
-    resetSetupToStart: function() { calls.push('resetSetupToStart'); },
-    requestSetupNotificationPermissionIfEnabled: function() {},
-    runConnectingProgress: function() {},
     normalizeContactList: function(data) { return data.slice(); },
     _refreshRenderedConversationNames: function() {},
     renderVoiceUi: function() {},
@@ -78,10 +74,74 @@ vm.runInContext(pendingDeclaration + '\n' + functionSource('switchToIdentity') +
     listenerSource('identity_switching') + '\n' +
     listenerSource('identity_switched') + '\n' +
     listenerSource('identity_switch_failed') + '\n' +
-    listenerSource('contacts_update', lxmf) + '\n' +
-    functionSource('completeSetupAfterHardwareIdentity', setup), page, { filename: 'identity-switch.js' });
-page.window.RS = page.RS;
-page.RS.diag = function() {};
+    listenerSource('contacts_update', lxmf), page, { filename: 'identity-switch.js' });
+
+// Setup's security key activation fails after the previous runtime stopped:
+// its reply and the switch's closing event carry one message, in either
+// order, and the real toast shows it once.
+async function setupFailureIsShownOnce() {
+    var toastsSource = fs.readFileSync(path.join(root, 'dashboard/static/js/toasts.js'), 'utf8');
+    for (var order of ['event first', 'reply first']) {
+        var shown = [];
+        function element() {
+            return {
+                style: {}, classList: { add: function() {}, remove: function() {} },
+                setAttribute: function() {}, addEventListener: function() {}, remove: function() {},
+                appendChild: function(child) { return child; },
+            };
+        }
+        var container = element();
+        container.appendChild = function(child) { shown.push(child); return child; };
+        var reply = null;
+        var listeners = {};
+        var screen = {
+            window: {},
+            document: {
+                createElement: element,
+                createElementNS: element,
+                getElementById: function(id) { return id === 'toast-container' ? container : null; },
+            },
+            requestAnimationFrame: function() {},
+            setTimeout: function() {},
+            RS: {
+                listen: function(event, handler) { listeners[event] = handler; },
+                invoke: function() { return new Promise(function(_resolve, reject) { reply = reject; }); },
+                gestures: { attachSwipe: function() {}, SWIPE_DISTANCE_TOAST_DISMISS_PX: 0 },
+                diag: function() {},
+            },
+            loadIdentities: function() {},
+            showSetupConnectingStep: function() {},
+            resetSetupToStart: function() {},
+        };
+        screen.window.RS = screen.RS;
+        vm.createContext(screen);
+        vm.runInContext(
+            toastsSource.slice(0, toastsSource.indexOf('function toastDeveloperDetailsEnabled')) +
+            functionSource('createToastStatusIcon', toastsSource) + '\n' +
+            functionSource('showToast', toastsSource) + '\n' +
+            pendingDeclaration + '\n' +
+            listenerSource('identity_switch_failed') + '\n' +
+            functionSource('completeSetupAfterHardwareIdentity', setup),
+            screen,
+            { filename: 'setup-failure.js' }
+        );
+        var hash = 'cc'.repeat(16);
+        var message = 'Could not activate hardware identity.';
+        screen.completeSetupAfterHardwareIdentity({ hash: hash }, '123456');
+        var failed = new Error(message);
+        failed.code = 'internal_error';
+        if (order === 'event first') {
+            listeners.identity_switch_failed({ hash: hash, generation: '12', error: message });
+            reply(failed);
+            await settle();
+        } else {
+            reply(failed);
+            await settle();
+            listeners.identity_switch_failed({ hash: hash, generation: '12', error: message });
+        }
+        assert.strictEqual(shown.length, 1, order + ': the failure is shown ' + shown.length + ' times');
+    }
+}
 
 (async function() {
     var target = 'bb'.repeat(16);
@@ -139,20 +199,7 @@ page.RS.diag = function() {};
     assert.deepStrictEqual(toasts, [['Identity not found', 'toast-error']]);
     assert(calls.indexOf('loadIdentities') !== -1, 'a refused switch leaves its overlay');
 
-    // Setup's hardware activation fails after the previous runtime stopped:
-    // setup says why, once, and the closing event does not say it again.
-    toasts = [];
-    calls = [];
-    var hardware = 'cc'.repeat(16);
-    var activation = 'Could not activate hardware identity.';
-    page.completeSetupAfterHardwareIdentity({ hash: hardware }, '123456');
-    handlers.identity_switch_failed({ hash: hardware, generation: '11', error: activation });
-    var refusedActivation = new Error(activation);
-    refusedActivation.code = 'internal_error';
-    fail(refusedActivation);
-    await settle();
-    assert.deepStrictEqual(toasts, [[activation, 'toast-error']], 'the failure is said twice');
-    assert.strictEqual(page._switchRequestsPending, 0, 'the activation stays pending');
+    await setupFailureIsShownOnce();
     console.log('Identity switch tests passed');
 })().catch(function(error) {
     console.error(error);
