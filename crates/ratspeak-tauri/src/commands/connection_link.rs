@@ -26,12 +26,12 @@ use ratspeak_core::radio;
 use serde::Serialize;
 use url::Url;
 
-pub const CONNECTION_LINK_SCHEME: &str = "ratspeak";
-pub const CONNECTION_LINK_HOST_TCP: &str = "tcp";
-pub const CONNECTION_LINK_HOST_RADIO: &str = "radio";
-pub const CONNECTION_LINK_VERSION: &str = "1";
-pub const TCP_LINK_FORMAT: &str = "ratspeak.tcp.v1";
-pub const RADIO_LINK_FORMAT: &str = "ratspeak.radio.v1";
+const CONNECTION_LINK_SCHEME: &str = "ratspeak";
+const CONNECTION_LINK_HOST_TCP: &str = "tcp";
+const CONNECTION_LINK_HOST_RADIO: &str = "radio";
+const CONNECTION_LINK_VERSION: &str = "1";
+const TCP_LINK_FORMAT: &str = "ratspeak.tcp.v1";
+const RADIO_LINK_FORMAT: &str = "ratspeak.radio.v1";
 
 const CONNECTION_LINK_MAX_BYTES: usize = 512;
 const NAME_MAX_BYTES: usize = 64;
