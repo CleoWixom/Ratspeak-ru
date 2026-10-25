@@ -146,7 +146,8 @@ var actionRecord = {
 };
 var actionContext = {
     ICON_PLAY: 'play', ICON_PAUSE: 'pause', ICON_RADIO: 'radio',
-    ICON_PENCIL: 'pencil', ICON_TRASH: 'trash', ICON_INFO: 'info',
+    ICON_PENCIL: 'pencil', ICON_TRASH: 'trash', ICON_INFO: 'info', ICON_QR: 'qr',
+    openConnectionQrShare: function(type, name) { actionCalls.push(['qr', type, name]); },
     window: {
         RatspeakAndroid: {
             openBluetoothSettings: function() { androidCalls.push('bluetooth'); return true; },
@@ -198,6 +199,10 @@ assert.strictEqual(conflict.label, 'Radio conflict');
 assert.strictEqual(conflict.disabled, true);
 
 actionContext._cachedConfigIfaces.mobile_hardware.ble_rnode = { state: 'connected' };
+var qrItem = actionContext.buildIfaceActionItems('rnode', 'Radio').filter(function(item) { return item.label === 'Share QR code'; })[0];
+assert(qrItem, 'radio menu offers Share QR code');
+qrItem.onSelect();
+assert.deepStrictEqual(actionCalls.pop(), ['qr', 'rnode', 'Radio']);
 var pause = actionContext.buildIfaceActionItems('rnode', 'Radio')[0];
 assert.strictEqual(pause.label, 'Pause Interface');
 pause.onSelect();

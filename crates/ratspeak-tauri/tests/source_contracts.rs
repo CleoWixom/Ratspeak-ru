@@ -9576,6 +9576,15 @@ fn native_connection_links_prefill_forms_and_never_connect_on_their_own() {
         .expect("Android text share intake");
     assert!(text_share.contains("connection_deep_link::accept_shared_text"));
 
+    // "Share QR code" only offers links that Rust itself validated.
+    let qr = read_source(root.join("dashboard/static/js/connection_qr.js"))
+        .expect("connection QR sharing");
+    let health = read_source(root.join("dashboard/static/js/health.js")).expect("interface menu");
+    assert!(qr.contains("RS.invoke('validate_connection_link'"));
+    assert!(lib.contains("connection_deep_link::validate_connection_link"));
+    assert!(index.contains("/static/js/connection_qr.js"));
+    assert!(health.contains("openConnectionQrShare(ifaceType, ifaceName)"));
+
     // A link pre-fills the normal forms. It must not call an add command.
     let presenter = modals
         .split("function _openTcpConnectionLink")

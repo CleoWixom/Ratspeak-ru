@@ -279,6 +279,7 @@ var ICON_RADIO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" str
 var ICON_TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
 var ICON_PAUSE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>';
 var ICON_PLAY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>';
+var ICON_QR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3"/></svg>';
 var ICON_INFO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>';
 
 function buildIfaceActionItems(ifaceType, ifaceName) {
@@ -368,6 +369,9 @@ function buildIfaceActionItems(ifaceType, ifaceName) {
         items.push({ label: 'Edit', icon: ICON_RADIO, onSelect: function() { openInterfaceEdit(ifaceType, ifaceName); } });
     } else if (isTcpInterfaceType(ifaceType)) {
         items.push({ label: 'Edit', icon: ICON_PENCIL, onSelect: function() { openInterfaceEdit(ifaceType, ifaceName); } });
+    }
+    if (isLoraInterfaceType(ifaceType) || ifaceType === 'tcp_client' || ifaceType === 'backbone_client') {
+        items.push({ label: 'Share QR code', icon: ICON_QR, onSelect: function() { openConnectionQrShare(ifaceType, ifaceName); } });
     }
     items.push({ label: 'Rename', icon: ICON_PENCIL, onSelect: function() { openRenameInterfaceDialog(ifaceName); } });
     items.push({ label: 'Remove', icon: ICON_TRASH, danger: true, onSelect: function() { confirmRemoveInterface(ifaceType, ifaceName); } });

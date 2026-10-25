@@ -222,6 +222,13 @@ pub(crate) fn install(app: &mut tauri::App) {
     }
 }
 
+/// Lets the UI confirm that a link it built (for example for a QR code) is one
+/// this app will accept, using the same parser as every incoming link.
+#[tauri::command]
+pub(crate) fn validate_connection_link(payload: String) -> Result<(), String> {
+    parse_connection_link(&payload).map(|_| ())
+}
+
 #[tauri::command]
 pub(crate) fn peek_native_connection_link(
     inbox: State<'_, NativeConnectionLinkInbox>,

@@ -1030,6 +1030,7 @@ pub fn run() {
             channel_deep_link::ack_native_channel_share,
             connection_deep_link::peek_native_connection_link,
             connection_deep_link::ack_native_connection_link,
+            connection_deep_link::validate_connection_link,
             text_share::list_text_shares,
             text_share::edit_text_share,
             ratspeak_tauri::commands::system::api_version,
