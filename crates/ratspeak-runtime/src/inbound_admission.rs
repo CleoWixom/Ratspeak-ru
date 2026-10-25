@@ -1218,6 +1218,7 @@ pub(crate) async fn admit_download(
         return;
     }
     let scope = downloaded.scope();
+    let identity = hex::encode(scope.identity);
     let context = state.lxmf.lock().ok().and_then(|manager| {
         let manager = manager.as_ref()?;
         (manager.identity.hash == scope.identity).then(|| manager.propagation_decrypt_context())
@@ -1238,19 +1239,21 @@ pub(crate) async fn admit_download(
     };
     let worker_state = Arc::clone(state);
     let worker_shutdown = shutdown.clone();
+    let worker_identity = identity.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _job = job;
         let state = worker_state;
         let shutdown = worker_shutdown;
+        let identity = worker_identity;
         // Cancellation cannot free the raw image or processing reservation
         // while this actual worker still owns decrypted bytes and effects.
         let process = || -> Result<(LxMessage, CommitOutput, Option<lxmf_core::message::OwnedVerifiedLxMessage>), SuppressionReason> {
             if shutdown.is_triggered() || !token.is_current() || state.current_identity_session_generation() != generation { return Err(SuppressionReason::Cancelled); }
             let clear = context.decrypt(&raw).ok_or(SuppressionReason::DecryptionFailed)?;
             let msg = LxMessage::unpack_owned(Bytes::from(clear), MessageDecodeLimits::default()).map_err(|_| SuppressionReason::Malformed)?;
-            let key = state.lxmf.lock().ok().and_then(|manager| manager.as_ref().and_then(|manager| manager.inbound_source_public_key(&msg.source_hash())));
+            let key = crate::with_receiver(&state, &identity, |manager| manager.inbound_source_public_key(&msg.source_hash())).flatten();
             let verified = key.as_ref().map(|key| msg.verify(key)).transpose().map_err(|_| SuppressionReason::InvalidSignature)?;
-            if !crate::inbound_stamp_allowed(&state, &msg) { return Err(SuppressionReason::InvalidStamp); }
+            if !crate::inbound_stamp_allowed(&state, &identity, &msg) { return Err(SuppressionReason::InvalidStamp); }
             let guard = try_reserve_admission().map_err(|error| reason(&error))?;
             let projection = Projection::prepare(&state, &msg, key.is_some())?;
             let output = commit_message(&state, guard, scope, &msg, projection).map_err(|error| {
@@ -1286,9 +1289,7 @@ pub(crate) async fn admit_download(
         return;
     }
     let disposition = output.receipt.record().disposition;
-    if let Ok(mut manager) = state.lxmf.lock()
-        && let Some(manager) = manager.as_mut()
-    {
+    crate::with_receiver(state, &identity, |manager| {
         manager.remember_committed_download(&output.receipt);
         if matches!(
             disposition,
@@ -1299,7 +1300,7 @@ pub(crate) async fn admit_download(
                 .router
                 .learn_ticket_from_inbound(&ticket.as_verified());
         }
-    }
+    });
     if token
         .resolve(DownloadAdmissionOutcome::Accepted(output.receipt))
         .is_err()
@@ -1327,8 +1328,8 @@ pub(crate) async fn admit_download(
             .collect();
             let has_attachment = !output.display_media.is_empty();
             let source = hex::encode(source_hash);
-            let identity = hex::encode(scope.identity);
-            let mut event = json!({"id":hex::encode(message_id),"source":source,
+            let message_id = hex::encode(message_id);
+            let mut event = json!({"id":message_id,"source":source,
                 "destination":hex::encode(destination_hash),"timestamp":output.timestamp,
                 "state":"received","direction":"inbound"});
             event["content"] = serde_json::Value::String(content);
@@ -1338,8 +1339,19 @@ pub(crate) async fn admit_download(
             if let Some(fields) = event.as_object_mut() {
                 fields.extend(output.display_media);
             }
-            state.emit_to_all("lxmf_message", event);
-            chat_refresh = Some((source, identity, notification, has_attachment));
+            // A bulk delete that committed after the admission hides it.
+            if crate::inbound_message_stored(state, &message_id, &identity).await {
+                state.emit_to_all("lxmf_message", event);
+                chat_refresh = Some(ChatRefresh {
+                    generation,
+                    shutdown: shutdown.clone(),
+                    message_id,
+                    source,
+                    identity: identity.clone(),
+                    preview: notification,
+                    attachment: has_attachment,
+                });
+            }
             crate::record_activity_if_current(state, activity, || {
                 Ok(crate::producer::lxmf_inbound_accepted(
                     crate::producer::LxmfInboundAccepted {
@@ -1359,23 +1371,15 @@ pub(crate) async fn admit_download(
             );
         }
         Projection::Service => {}
-        Projection::Game(game) => game.emit(state),
+        Projection::Game(game) => game.emit(state, &identity),
     }
     drop(ticket);
     drop(_lease);
     drop(_lifecycle);
     // Keep presentation work bounded to this admitted job rather than spawning
     // an unbounded contact/FTS refresh for every item in a large download.
-    if let Some((source, identity, preview, attachment)) = chat_refresh {
-        refresh_chat(
-            state.clone(),
-            generation,
-            source,
-            identity,
-            preview,
-            attachment,
-        )
-        .await;
+    if let Some(refresh) = chat_refresh {
+        refresh_chat(state.clone(), refresh).await;
     }
 }
 
@@ -1387,45 +1391,54 @@ pub(crate) fn decode_game(
     game::decode(msg, authenticated)
 }
 
-async fn refresh_chat(
-    state: Arc<AppState>,
+/// A committed download's chat refresh, for the sessions it was admitted in.
+struct ChatRefresh {
     generation: u64,
+    shutdown: rns_runtime::lifecycle::ShutdownSignal,
+    message_id: String,
     source: String,
     identity: String,
     preview: String,
     attachment: bool,
-) {
+}
+
+async fn refresh_chat(state: Arc<AppState>, refresh: ChatRefresh) {
+    let ChatRefresh {
+        generation,
+        shutdown,
+        message_id,
+        source,
+        identity,
+        preview,
+        attachment,
+    } = refresh;
+    // A bulk delete that commits after this read makes the lists stale.
+    let revision = state.conversation_list_revision();
     let pool = state.db.clone();
     let identity_db = identity.clone();
     let source_db = source.clone();
-    let result=db::spawn_db(pool,move|pool| {
-        let label=crate::contact_label_from_db(&pool,&source_db,&identity_db);
-        let contacts=db::get_all_contacts(&pool,&identity_db).into_iter().map(|c|json!({
-            "hash":c.get("dest_hash"),"display_name":c.get("display_name"),"trust":c.get("trust"),
-            "notes":c.get("notes"),"first_seen":c.get("first_seen"),"last_seen":c.get("last_seen"),"services":c.get("services")
-        })).collect::<Vec<_>>();
-        let unread:i64=db::get_all_unread_counts(&pool,&identity_db).values().sum();
-        (label,contacts,unread)
-    }).await;
+    let result = db::spawn_db(pool, move |pool| {
+        let label = crate::contact_label_from_db(&pool, &source_db, &identity_db);
+        let contacts = crate::contact_list_payload(db::get_all_contacts(&pool, &identity_db));
+        let unread: i64 = db::get_all_unread_counts(&pool, &identity_db)
+            .values()
+            .sum();
+        (label, contacts, unread)
+    })
+    .await;
     let _lifecycle = state.identity_switch_lock.lock_routine().await;
-    if state.current_identity_session_generation() != generation
-        || state
-            .session_shutdown
-            .read()
-            .map_or(true, |s| s.is_triggered())
-    {
+    if state.current_identity_session_generation() != generation || shutdown.is_triggered() {
         return;
     }
     if let Ok((label, contacts, unread)) = result {
-        state.emit_to_all("contacts_update", contacts.into());
-        state.emit_to_all("unread_total", json!({"count":unread}));
-        if state.should_surface_native_notification() {
-            state.emit_native_notification(ratspeak_core::NativeNotification::message(
-                format!("Message from {label}"),
-                crate::notification_body(&preview, attachment),
-                format!("lxmf:{source}"),
-                crate::stable_notification_id(&source, 1000),
-            ));
+        if state.conversation_list_revision() == revision {
+            state.emit_to_all("contacts_update", contacts.into());
+            state.emit_to_all("unread_total", json!({"count":unread}));
+        }
+        if crate::inbound_message_stored(&state, &message_id, &identity).await {
+            crate::notify_inbound_message_if_background(
+                &state, &source, &label, &preview, attachment,
+            );
         }
     }
     crate::messaging::broadcast_conversations(state.clone());
@@ -1899,5 +1912,104 @@ mod tests {
             before,
             "a list read before the delete stays publishable"
         );
+    }
+
+    /// A downloaded message's sender, its unread row, and the identity it is for.
+    fn unread_download() -> (
+        Arc<AppState>,
+        Arc<crate::inbound_pipeline_tests::RecordingEmitter>,
+        String,
+        String,
+    ) {
+        let (state, emitter) = crate::inbound_pipeline_tests::pipeline_state();
+        let identity = state
+            .lxmf
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .identity_hash
+            .clone();
+        let source = "e4".repeat(16);
+        db::try_save_message(
+            &state.db,
+            &"e5".repeat(32),
+            &source,
+            &identity,
+            "downloaded",
+            "",
+            1.0,
+            "received",
+            "inbound",
+            &identity,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            Some("propagated"),
+        )
+        .unwrap();
+        (state, emitter, source, identity)
+    }
+
+    fn chat_refresh(state: &AppState, source: String, identity: String) -> ChatRefresh {
+        ChatRefresh {
+            generation: state.current_identity_session_generation(),
+            shutdown: state.session_shutdown.read().unwrap().clone(),
+            message_id: "e5".repeat(32),
+            source,
+            identity,
+            preview: "downloaded".into(),
+            attachment: false,
+        }
+    }
+
+    // Lists read before a bulk delete are stale once it commits; the
+    // delete re-sends its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lists_read_before_a_delete_are_not_published() {
+        let (state, emitter, source, identity) = unread_download();
+        let deletion =
+            crate::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await;
+        let refresh = tokio::spawn(refresh_chat(
+            state.clone(),
+            chat_refresh(&state, source, identity.clone()),
+        ));
+        // Its lists are read by now, and it waits on the deletion's lock.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        state
+            .db
+            .get()
+            .unwrap()
+            .execute("DELETE FROM messages WHERE identity_id = ?1", [&identity])
+            .unwrap();
+        state.invalidate_conversation_lists();
+        drop(deletion);
+        refresh.await.unwrap();
+        assert_eq!(
+            emitter.count("unread_total"),
+            0,
+            "an unread count from before the delete"
+        );
+        assert_eq!(emitter.count("contacts_update"), 0);
+    }
+
+    // A refresh belongs to the runtime session its download was admitted
+    // in, even when a restart keeps the identity session.
+    #[tokio::test]
+    async fn a_refresh_from_an_ended_runtime_session_is_not_published() {
+        let (state, emitter, source, identity) = unread_download();
+        let refresh = chat_refresh(&state, source, identity);
+        state.session_shutdown.read().unwrap().trigger();
+        *state.session_shutdown.write().unwrap() = rns_runtime::lifecycle::ShutdownSignal::new();
+        refresh_chat(state.clone(), refresh).await;
+        assert_eq!(
+            emitter.count("contacts_update"),
+            0,
+            "a refresh from the ended run"
+        );
+        assert_eq!(emitter.count("unread_total"), 0);
     }
 }

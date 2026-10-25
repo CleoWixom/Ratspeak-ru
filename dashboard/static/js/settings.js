@@ -1176,7 +1176,8 @@ function wireProfileStatusEditorTriggers() {
 }
 
 function saveIdentityStatus(nextStatus) {
-    return RS.invoke('set_identity_status', { status: nextStatus });
+    var identityId = typeof activeIdentityHash !== 'undefined' ? activeIdentityHash : null;
+    return RS.invoke('set_identity_status', { status: nextStatus, identityId: identityId });
 }
 
 function openIdentityStatusEditor() {

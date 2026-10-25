@@ -714,7 +714,7 @@ function renderActiveIdentityCard() {
             var newName = nameInput.value.trim();
             saveBtn.disabled = true;
             saveBtn.textContent = 'Saving...';
-            RS.invoke('api_set_display_name', { args: { display_name: newName } }).then(function() {
+            RS.invoke('api_set_display_name', { args: { display_name: newName, identity_id: activeIdentityHash } }).then(function() {
                 // Refresh the cached name so no consumer keeps offering the
                 // superseded one (channel nicknames, header, modals).
                 try { localStorage.setItem('ratspeak_identity_name', newName); } catch (_) {}
@@ -1829,6 +1829,11 @@ document.addEventListener('DOMContentLoaded', function() {
 
 RS.listen('identity_switching', function() {
     window._identitySwitchInProgress = true;
+    // The previous identity's contacts leave with it; the next start re-sends its own.
+    if (typeof lxmfContacts !== 'undefined') {
+        lxmfContacts = [];
+        if (typeof renderStandaloneContactList === 'function') renderStandaloneContactList();
+    }
     if (typeof clearNetworkInterfaceCaches === 'function') {
         clearNetworkInterfaceCaches({ render: true });
     }

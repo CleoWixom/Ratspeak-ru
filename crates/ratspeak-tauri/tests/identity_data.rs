@@ -222,6 +222,8 @@ fn commands() -> impl Fn(tauri::ipc::Invoke<MockRuntime>) -> bool + Send + Sync 
         ratspeak_tauri::commands::messaging::send_lxmf_reply,
         ratspeak_tauri::commands::messaging::send_lxmf_with_attachment,
         ratspeak_tauri::commands::contact_card::import_contact_card,
+        ratspeak_tauri::commands::identity::api_set_display_name,
+        ratspeak_tauri::commands::identity::set_identity_status,
     ]
 }
 
@@ -461,7 +463,7 @@ fn a_file_that_cannot_be_removed_does_not_hide_the_delete() {
     }
 }
 
-// B3: an activation starts a new identity session, so nothing begun before
+// An activation starts a new identity session, so nothing begun before
 // it lands in the identity that took over.
 #[test]
 fn setup_and_factory_reset_start_a_new_identity_session() {
@@ -483,7 +485,7 @@ fn setup_and_factory_reset_start_a_new_identity_session() {
             json!({ "args": { "display_name": "Ann" } }),
         )
         .unwrap();
-    // A guard, which passes without B3 too.
+    // A guard, which passes without the new session too.
     assert_eq!(
         generation(),
         created,
@@ -642,6 +644,164 @@ fn a_bulk_delete_that_waited_out_a_switch_deletes_nothing() {
             delete.await
         });
         fixture.assert_every_identity_intact();
+        assert_eq!(result.unwrap_err().code, "conflict", "{command}");
+    }
+}
+
+// A rename or status names the identity its window shows, and one that
+// is no longer active changes nothing; the active one still answers.
+#[test]
+fn rename_and_status_keep_to_the_callers_identity() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::new(Some(A), false);
+    let stale = [
+        fixture.invoke(
+            "api_set_display_name",
+            json!({ "args": { "display_name": "Renamed", "identity_id": B } }),
+        ),
+        fixture.invoke(
+            "set_identity_status",
+            json!({ "status": "away", "identityId": B }),
+        ),
+    ];
+    for refused in stale {
+        assert_eq!(refused.expect_err("refused")["code"], "conflict");
+    }
+    for identity in [A, B] {
+        let row = db::get_identity(&fixture.state.db, identity).unwrap();
+        assert_eq!(row["display_name"], "", "{identity}");
+        assert_eq!(row["status"], "", "{identity}");
+    }
+    fixture
+        .invoke(
+            "api_set_display_name",
+            json!({ "args": { "display_name": "Renamed", "identity_id": A } }),
+        )
+        .unwrap();
+    fixture
+        .invoke(
+            "set_identity_status",
+            json!({ "status": "away", "identityId": A }),
+        )
+        .unwrap();
+    let row = db::get_identity(&fixture.state.db, A).unwrap();
+    assert_eq!(
+        (row["display_name"].as_str(), row["status"].as_str()),
+        (Some("Renamed"), Some("away"))
+    );
+}
+
+// A rename asked for while A was active, and that waited out a switch,
+// is refused rather than renaming, and announcing, the next identity.
+#[test]
+fn a_rename_that_waited_out_a_switch_is_refused() {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+    use tauri::Manager;
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::new(Some(A), false);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = runtime.block_on(async {
+        let managed = fixture.app.state::<Arc<AppState>>();
+        let switch = fixture.state.identity_switch_lock.lock().await;
+        let args =
+            serde_json::from_value(json!({ "display_name": "Renamed", "identity_id": A })).unwrap();
+        let mut rename = Box::pin(ratspeak_tauri::commands::identity::api_set_display_name(
+            managed, args,
+        ));
+        poll_fn(|cx| {
+            let _ = rename.as_mut().poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+        db::set_active_identity(&fixture.state.db, B).unwrap();
+        fixture.state.bump_identity_session_generation();
+        drop(switch);
+        rename.await
+    });
+    assert_eq!(result.unwrap_err().code, "conflict");
+    for identity in [A, B] {
+        let row = db::get_identity(&fixture.state.db, identity).unwrap();
+        assert_eq!(row["display_name"], "", "{identity}");
+    }
+}
+
+// A block or unblock asked for while A was active, and that waited out a
+// switch, is refused: its rows and its network block would land on the
+// wrong identity's runtime.
+#[test]
+fn a_block_or_unblock_that_waited_out_a_switch_changes_nothing() {
+    use ratspeak_tauri::commands::contacts::{
+        BlockContactArgs, UnblockContactArgs, block_contact, unblock_contact,
+    };
+    use std::future::{Future, poll_fn};
+    use std::pin::Pin;
+    use std::task::Poll;
+    use tauri::Manager;
+    type Change<'a> =
+        Pin<Box<dyn Future<Output = ratspeak_tauri::error::AppResult<Value>> + Send + 'a>>;
+    const NEW: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for command in ["block_contact", "unblock_contact"] {
+        let fixture = Fixture::new(Some(A), false);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let managed = fixture.app.state::<Arc<AppState>>();
+            let switch = fixture.state.identity_switch_lock.lock().await;
+            let mut change: Change<'_> = if command == "block_contact" {
+                Box::pin(block_contact(
+                    managed,
+                    BlockContactArgs {
+                        hash: NEW.into(),
+                        escalate_to_blackhole: true,
+                    },
+                ))
+            } else {
+                Box::pin(unblock_contact(
+                    managed,
+                    UnblockContactArgs {
+                        hash: SPAM.into(),
+                        also_remove_blackhole: true,
+                    },
+                ))
+            };
+            poll_fn(|cx| {
+                let _ = change.as_mut().poll(cx);
+                Poll::Ready(())
+            })
+            .await;
+            db::set_active_identity(&fixture.state.db, B).unwrap();
+            fixture.state.bump_identity_session_generation();
+            drop(switch);
+            change.await
+        });
+        fixture.assert_every_identity_intact();
+        for identity in [A, B] {
+            assert!(
+                !db::is_blocked(&fixture.state.db, NEW, identity),
+                "{command}"
+            );
+            assert!(
+                db::list_pending_blackholes_for_identity(&fixture.state.db, identity)
+                    .iter()
+                    .all(|row| row.dest_hash != NEW),
+                "{command}"
+            );
+        }
         assert_eq!(result.unwrap_err().code, "conflict", "{command}");
     }
 }

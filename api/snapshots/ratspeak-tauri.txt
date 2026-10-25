@@ -1,4 +1,5 @@
 pub mod ratspeak_tauri
+pub use ratspeak_tauri::ActivityReset
 pub use ratspeak_tauri::AnnounceSendDisposition
 pub use ratspeak_tauri::announce
 pub use ratspeak_tauri::announce_handlers
@@ -7,6 +8,7 @@ pub use ratspeak_tauri::apply_lxmf_settings_from_state
 pub use ratspeak_tauri::channel_hub
 pub use ratspeak_tauri::channels
 pub use ratspeak_tauri::db
+pub use ratspeak_tauri::finish_shutdown
 pub use ratspeak_tauri::helpers
 pub use ratspeak_tauri::identity_prune
 pub use ratspeak_tauri::init_rns_lxmf
@@ -15,6 +17,7 @@ pub use ratspeak_tauri::maybe_opportunistic_announce_before_user_send
 pub use ratspeak_tauri::maybe_opportunistic_announce_before_user_send_from_origin
 pub use ratspeak_tauri::mobile_platform
 pub use ratspeak_tauri::propagation
+pub use ratspeak_tauri::reset_activity_for_shutdown
 pub use ratspeak_tauri::restart_rns_lxmf
 pub use ratspeak_tauri::rns
 pub use ratspeak_tauri::rns_config
@@ -309,6 +312,7 @@ pub struct ratspeak_tauri::commands::identity::CreateIdentityArgs
 pub ratspeak_tauri::commands::identity::CreateIdentityArgs::nickname: core::option::Option<alloc::string::String>
 pub struct ratspeak_tauri::commands::identity::DisplayNameArgs
 pub ratspeak_tauri::commands::identity::DisplayNameArgs::display_name: core::option::Option<alloc::string::String>
+pub ratspeak_tauri::commands::identity::DisplayNameArgs::identity_id: core::option::Option<alloc::string::String>
 pub struct ratspeak_tauri::commands::identity::ImportIdentityArgs
 pub ratspeak_tauri::commands::identity::ImportIdentityArgs::key: alloc::string::String
 pub ratspeak_tauri::commands::identity::ImportIdentityArgs::nickname: core::option::Option<alloc::string::String>
@@ -348,7 +352,7 @@ pub async fn ratspeak_tauri::commands::identity::remove_identity_passcode(tauri:
 pub async fn ratspeak_tauri::commands::identity::restore_seed_identity(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::identity::RestoreSeedArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::identity::reveal_identity_mnemonic(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::identity::RevealMnemonicArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::identity::set_identity_passcode(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::identity::SetPasscodeArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
-pub async fn ratspeak_tauri::commands::identity::set_identity_status(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, core::option::Option<alloc::string::String>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
+pub async fn ratspeak_tauri::commands::identity::set_identity_status(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, core::option::Option<alloc::string::String>, core::option::Option<alloc::string::String>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::identity::switch_identity(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::identity::unlock_identity(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub mod ratspeak_tauri::commands::interfaces

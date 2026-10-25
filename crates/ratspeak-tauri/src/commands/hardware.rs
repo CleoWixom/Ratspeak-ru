@@ -45,11 +45,13 @@ fn activity_reset_failed(
     )
 }
 
-async fn shutdown_for_hardware_change(
-    state: &Arc<AppState>,
+/// The refusable first step of a hardware change's shutdown; a refusal leaves
+/// everything as it was.
+async fn reset_for_hardware_change(
+    state: &AppState,
     operation: &'static str,
-) -> AppResult<()> {
-    crate::shutdown_rns_lxmf(state)
+) -> AppResult<crate::ActivityReset> {
+    crate::reset_activity_for_shutdown(state)
         .await
         .map_err(|error| activity_reset_failed(operation, error))
 }
@@ -108,7 +110,8 @@ async fn prepare_destructive_hardware_operation(
                 "This security key backs the active hardware identity. Confirm overwrite before replacing its keys.",
             ));
         }
-        shutdown_for_hardware_change(state, operation).await?;
+        let reset = reset_for_hardware_change(state, operation).await?;
+        crate::finish_shutdown(state, &reset).await;
     }
     Ok((expected_serial, shutdown_required))
 }
@@ -373,8 +376,9 @@ pub async fn hw_remove(state: State<'_, Arc<AppState>>, hash: String) -> AppResu
         .is_some_and(|row| row.get("hash").and_then(|v| v.as_str()) == Some(hash.as_str()));
     let live = was_loaded || was_locked || was_active;
     if live {
+        let reset = reset_for_hardware_change(&state, "hardware_identity_remove").await?;
         state.bump_identity_session_generation();
-        shutdown_for_hardware_change(&state, "hardware_identity_remove").await?;
+        crate::finish_shutdown(&state, &reset).await;
         state.clear_identity_scoped_runtime_state();
     }
     let data_dir = state.config.data_dir.clone();
@@ -458,8 +462,9 @@ pub async fn hw_activate_and_unlock(
         ));
     }
 
+    let reset = reset_for_hardware_change(&state, "hardware_identity_activate").await?;
     state.bump_identity_session_generation();
-    shutdown_for_hardware_change(&state, "hardware_identity_activate").await?;
+    crate::finish_shutdown(&state, &reset).await;
 
     let hash_for_active = hash.clone();
     db::spawn_db_with_lease(

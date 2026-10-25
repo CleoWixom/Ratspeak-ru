@@ -62,11 +62,22 @@ var pendingDeclaration = identity.slice(identity.indexOf('var _switchRequestsPen
     identity.indexOf(';', identity.indexOf('var _switchRequestsPending')) + 1);
 assert(pendingDeclaration, 'missing the pending-switch count');
 vm.runInContext(pendingDeclaration + '\n' + functionSource('switchToIdentity') + '\n' +
+    listenerSource('identity_switching') + '\n' +
     listenerSource('identity_switch_failed'), page, { filename: 'identity-switch.js' });
 
 (async function() {
     var target = 'bb'.repeat(16);
     var reason = "Couldn't load this identity's key.";
+
+    // The previous identity's contacts leave the window when a switch
+    // starts, not when it ends.
+    page.lxmfContacts = [{ hash: 'cc'.repeat(16), display_name: 'Previous' }];
+    var rendered = 0;
+    page.renderStandaloneContactList = function() { rendered += 1; };
+    handlers.identity_switching({ hash: target, generation: '8' });
+    assert.strictEqual(page.lxmfContacts.length, 0, 'the previous contacts stay while switching');
+    assert.strictEqual(rendered, 1, 'the contact list is not redrawn');
+    page.window._identitySwitchInProgress = false;
 
     // The switch began and failed: its closing event ends it.
     page.switchToIdentity(target);

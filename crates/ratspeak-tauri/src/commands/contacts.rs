@@ -268,10 +268,14 @@ pub async fn block_contact(
     state: State<'_, Arc<AppState>>,
     args: BlockContactArgs,
 ) -> AppResult<Value> {
+    let request_fence = state.activity_request_fence();
     let dest_hash = sanitize_text(&args.hash, 128).to_ascii_lowercase();
     if !validate_hex(&dest_hash, 16, 64) {
         return Err(AppError::bad_request("Invalid hash for blocking."));
     }
+    // A switch waits for the block, so its rows and its network block land
+    // on the identity it was asked for, through that identity's runtime.
+    let _identity = super::identity::acquire_identity_routine(&state, request_fence).await?;
 
     let identity_id = active_identity_id(&state);
     if identity_id.is_empty() {
@@ -393,10 +397,12 @@ pub async fn unblock_contact(
     state: State<'_, Arc<AppState>>,
     args: UnblockContactArgs,
 ) -> AppResult<Value> {
+    let request_fence = state.activity_request_fence();
     let dest_hash = sanitize_text(&args.hash, 128).to_ascii_lowercase();
     if !validate_hex(&dest_hash, 16, 64) {
         return Err(AppError::bad_request("Invalid hash for unblocking."));
     }
+    let _identity = super::identity::acquire_identity_routine(&state, request_fence).await?;
 
     let identity_id = active_identity_id(&state);
     let dh = dest_hash.clone();

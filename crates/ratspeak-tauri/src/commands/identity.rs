@@ -19,7 +19,7 @@ use crate::helpers::{
     active_identity_id, sanitize_announced_display_name, sanitize_announced_status, sanitize_text,
     validate_hex,
 };
-use crate::state::{ActivityRequestFence, AppState, OwnedIdentitySwitchGuard};
+use crate::state::{ActivityRequestFence, AppState, OwnedIdentitySwitchGuard, OwnedRoutineGuard};
 
 use ratspeak_core::LXMF_DELIVERY_APP_NAME as LXMF_APP_NAME;
 use ratspeak_runtime::activity::ActivityRecorderError;
@@ -50,6 +50,34 @@ pub(super) async fn acquire_identity_mutation(
         ));
     }
     Ok(lease)
+}
+
+/// As `acquire_identity_mutation`, for routine work on the active identity's
+/// data: it waits out transitions and is refused if one ran since the request,
+/// but invalidates no other request.
+pub(super) async fn acquire_identity_routine(
+    state: &AppState,
+    fence: ActivityRequestFence,
+) -> AppResult<OwnedRoutineGuard> {
+    let lease = state.identity_switch_lock.lock_routine_owned().await;
+    if !state.is_current_activity_origin_fence(fence) {
+        return Err(AppError::conflict(
+            "Identity changed while preparing this operation; retry",
+        ));
+    }
+    Ok(lease)
+}
+
+/// The active identity, refused unless it is the one the caller shows.
+fn callers_identity(state: &AppState, caller: Option<&str>) -> AppResult<String> {
+    let active = active_identity_id(state);
+    if active.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
+    if caller.is_some_and(|caller| caller != active) {
+        return Err(AppError::conflict("Identity changed; retry"));
+    }
+    Ok(active)
 }
 
 /// The actual blocking operation retains its lifecycle owner even if the
@@ -1001,11 +1029,12 @@ where
     // Reuse this exact lifecycle owner. A nested acquisition would deadlock,
     // while releasing it here would allow reset to erase the just-imported row.
     if active_missing {
-        // An activation: nothing begun before it may land in this identity.
-        state.bump_identity_session_generation();
-        crate::shutdown_rns_lxmf(&state)
+        let reset = crate::reset_activity_for_shutdown(&state)
             .await
             .map_err(identity_activity_reset_error)?;
+        // An activation: nothing begun before it may land in this identity.
+        state.bump_identity_session_generation();
+        crate::finish_shutdown(&state, &reset).await;
         let hash_for_active = hash.clone();
         db::spawn_db_with_lease(
             state.db.clone(),
@@ -1369,6 +1398,9 @@ pub async fn api_delete_identity(
 pub struct DisplayNameArgs {
     #[serde(default)]
     pub display_name: Option<String>,
+    /// The identity the caller shows; the rename is refused if another is active.
+    #[serde(default)]
+    pub identity_id: Option<String>,
 }
 
 /// A switch under way. One that does not finish closes with
@@ -1508,22 +1540,14 @@ async fn switch_identity_session_held(
         return Ok(payload);
     }
 
-    // A refused reset here changes nothing. The shutdown repeats it under the
-    // switch's generation.
-    {
-        let _activity_control = state.activity_control_lock.lock().await;
-        state
-            .activity
-            .hard_reset()
-            .await
-            .map_err(identity_activity_reset_error)?;
-    }
+    // Only the reset can refuse, and it comes first: a refused one changes
+    // nothing, and once it is acknowledged the previous runtime always stops.
+    let reset = crate::reset_activity_for_shutdown(&state)
+        .await
+        .map_err(identity_activity_reset_error)?;
     let generation = state.bump_identity_session_generation();
     let switching = SwitchUnderWay::begin(&state, &hash_hex, generation);
-
-    if let Err(error) = crate::shutdown_rns_lxmf(&state).await {
-        return Err(switching.fail(identity_activity_reset_error(error)));
-    }
+    crate::finish_shutdown(&state, &reset).await;
     state.clear_identity_scoped_runtime_state();
 
     let hash_for_db = hash_hex.clone();
@@ -1594,11 +1618,10 @@ async fn switch_identity_session_held(
         // Target failed to load (e.g. a hardware key that was re-provisioned or
         // unplugged). Restore the previous identity + its runtime so the session
         // is not left with a dead active row and no LXMF. The restored session
-        // gets its own generation; it never reuses the failed target's.
+        // gets its own generation; it never reuses the failed target's. The
+        // switch's reset still covers this teardown.
         state.bump_identity_session_generation();
-        if let Err(error) = crate::shutdown_rns_lxmf(&state).await {
-            return Err(switching.fail(identity_activity_reset_error(error)));
-        }
+        crate::finish_shutdown(&state, &reset).await;
         state.clear_identity_scoped_runtime_state();
         resume_previous(&state, previous_active).await;
         return Err(switching.fail(AppError::bad_request(
@@ -1676,23 +1699,24 @@ pub async fn api_set_display_name(
     if display_name.is_empty() {
         return Err(AppError::bad_request("display_name required"));
     }
-    let identity_id = active_identity_id(&state);
-    if identity_id.is_empty() {
-        return Err(AppError::conflict("no active identity"));
-    }
-
-    // Memory update under a short lock; the DB write happens after it drops
-    // (the mgr may be absent on a startup race — DB-only then).
+    // A switch lands before or after the check, the rename and its write,
+    // never between: the name stays with the identity the caller showed.
+    let lifecycle = acquire_identity_routine(&state, activity_origin).await?;
+    let identity_id = callers_identity(&state, args.identity_id.as_deref())?;
+    // The mgr may be absent on a startup race: DB-only then.
     let updated_in_memory = {
         let mut guard = state
             .lxmf
             .lock()
             .map_err(|_| AppError::internal("lxmf state lock poisoned"))?;
         match guard.as_mut() {
-            Some(mgr) => {
+            Some(mgr) if mgr.identity_hash == identity_id => {
                 mgr.set_display_name(&display_name);
+                // With the rename, so nothing built under the old name is sent.
+                state.bump_announce_content_revision();
                 true
             }
+            Some(_) => return Err(AppError::conflict("Identity changed; retry")),
             None => false,
         }
     };
@@ -1710,13 +1734,15 @@ pub async fn api_set_display_name(
         tracing::error!(reason = "update_failed", "display_name: rename failed");
         AppError::internal("failed to save display name")
     })?;
+    let channels = state.channels_handle();
+    drop(lifecycle);
 
     // A live channels session snapshots its nickname at connect, so without
     // this it would keep stamping the superseded name on every outbound
     // envelope for the rest of the session.
     if !rename.previous_name.is_empty()
         && rename.previous_name != display_name
-        && let Some(channels) = state.channels_handle()
+        && let Some(channels) = channels
     {
         channels
             .identity_renamed(&rename.previous_name, &display_name)
@@ -1724,7 +1750,6 @@ pub async fn api_set_display_name(
     }
 
     if updated_in_memory {
-        state.bump_announce_content_revision();
         crate::send_typed_announce_from_origin(
             &state,
             crate::announce::AnnounceOrigin::IdentityChanged,
@@ -1740,31 +1765,34 @@ pub async fn api_set_display_name(
 pub async fn set_identity_status(
     state: State<'_, Arc<AppState>>,
     status: Option<String>,
+    identity_id: Option<String>,
 ) -> AppResult<Value> {
     let activity_origin = state.activity_request_fence();
     let status = sanitize_announced_status(status.as_deref().unwrap_or(""))
         .map_err(AppError::bad_request)?;
-    let identity_id = active_identity_id(&state);
-    if identity_id.is_empty() {
-        return Err(AppError::conflict("no active identity"));
-    }
-
-    // Memory update under a short lock; the DB write happens after it drops
-    // (the mgr may be absent on a startup race — DB-only then).
+    // As a rename: one routine span for the check, the change and its write.
+    let lifecycle = acquire_identity_routine(&state, activity_origin).await?;
+    let identity_id = callers_identity(&state, identity_id.as_deref())?;
+    // The mgr may be absent on a startup race: DB-only then.
     let identity_payload: Option<Value> = {
         let mut guard = state
             .lxmf
             .lock()
             .map_err(|_| AppError::internal("lxmf state lock poisoned"))?;
-        guard.as_mut().map(|mgr| {
-            mgr.set_status(&status);
-            json!({
-                "hash": mgr.lxmf_hash.clone(),
-                "identity_hash": mgr.identity_hash.clone(),
-                "display_name": mgr.display_name.clone(),
-                "status": status.clone(),
-            })
-        })
+        match guard.as_mut() {
+            Some(mgr) if mgr.identity_hash == identity_id => {
+                mgr.set_status(&status);
+                state.bump_announce_content_revision();
+                Some(json!({
+                    "hash": mgr.lxmf_hash.clone(),
+                    "identity_hash": mgr.identity_hash.clone(),
+                    "display_name": mgr.display_name.clone(),
+                    "status": status.clone(),
+                }))
+            }
+            Some(_) => return Err(AppError::conflict("Identity changed; retry")),
+            None => None,
+        }
     };
 
     let id = identity_id.clone();
@@ -1784,7 +1812,7 @@ pub async fn set_identity_status(
 
     if let Some(payload) = identity_payload {
         state.emit_to_all("lxmf_identity", payload);
-        state.bump_announce_content_revision();
+        drop(lifecycle);
         crate::send_typed_announce_from_origin(
             &state,
             crate::announce::AnnounceOrigin::IdentityChanged,
@@ -2028,7 +2056,7 @@ mod tests {
         (ready_rx, release_tx, import)
     }
 
-    // B32: what the window does all the time must not fail an identity mutation.
+    // What the window does all the time must not fail an identity mutation.
     #[test]
     fn identity_mutation_survives_routine_work_during_preparation() {
         use tauri::Manager;
@@ -2060,7 +2088,8 @@ mod tests {
         });
     }
 
-    // A guard: it passes without B32b too. Transitions must still refuse.
+    // A guard, which passes even when every lifecycle holder is a transition:
+    // a privacy reset during preparation must still refuse.
     #[test]
     fn identity_mutation_refused_after_a_privacy_reset_during_preparation() {
         use tauri::Manager;

@@ -162,11 +162,11 @@ pub async fn api_setup_complete(
         };
         // Persisting an identity is inactive. The acknowledged privacy/runtime
         // boundary must complete before this first identity becomes active.
-        state.bump_identity_session_generation();
-        let app_state = Arc::clone(state.inner());
-        crate::shutdown_rns_lxmf(&app_state)
+        let reset = crate::reset_activity_for_shutdown(&state)
             .await
             .map_err(|_| AppError::internal("identity activation boundary unavailable"))?;
+        state.bump_identity_session_generation();
+        crate::finish_shutdown(state.inner(), &reset).await;
         let ih = hash.clone();
         db::spawn_db(state.db.clone(), move |p| db::set_active_identity(&p, &ih))
             .await
@@ -723,11 +723,11 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
         .uses_app_private_rns_config_dir()
         .then(|| state.config.rns_config_dir.clone());
 
-    state.bump_identity_session_generation();
-    let app_state = Arc::clone(state.inner());
-    crate::shutdown_rns_lxmf(&app_state)
+    let reset = crate::reset_activity_for_shutdown(&state)
         .await
         .map_err(|_| AppError::internal("factory reset lifecycle boundary unavailable"))?;
+    state.bump_identity_session_generation();
+    crate::finish_shutdown(state.inner(), &reset).await;
 
     db::spawn_db_with_lease(state.db.clone(), Arc::clone(&identity_lifecycle), |pool| {
         if let Ok(conn) = pool.get() {

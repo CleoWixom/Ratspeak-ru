@@ -31,12 +31,13 @@ pub use ratspeak_runtime::voice;
 #[cfg(feature = "lxst-voice")]
 pub use ratspeak_runtime::voice_memo;
 pub use ratspeak_runtime::{
-    AnnounceSendDisposition, any_interface_online_cached, apply_lxmf_settings_from_state,
-    init_rns_lxmf, maybe_opportunistic_announce_before_user_send,
-    maybe_opportunistic_announce_before_user_send_from_origin, restart_rns_lxmf,
-    send_announce_from_origin, send_announce_from_state, send_manual_announce_from_origin,
-    send_manual_announce_from_state, send_typed_announce_from_origin, shutdown_rns_lxmf,
-    start_channel_hub_service,
+    ActivityReset, AnnounceSendDisposition, any_interface_online_cached,
+    apply_lxmf_settings_from_state, finish_shutdown, init_rns_lxmf,
+    maybe_opportunistic_announce_before_user_send,
+    maybe_opportunistic_announce_before_user_send_from_origin, reset_activity_for_shutdown,
+    restart_rns_lxmf, send_announce_from_origin, send_announce_from_state,
+    send_manual_announce_from_origin, send_manual_announce_from_state,
+    send_typed_announce_from_origin, shutdown_rns_lxmf, start_channel_hub_service,
 };
 pub use ratspeak_runtime::{
     announce, announce_handlers, channel_hub, channels, helpers, identity_prune, lxmf,

@@ -423,7 +423,8 @@ impl PreparedGame {
     }
     /// The caller has already checked the current identity generation and
     /// accepted the matching durable download token before emitting effects.
-    pub(super) fn emit(&self, state: &AppState) {
+    /// `receiver` is the Reticulum identity the download was admitted for.
+    pub(super) fn emit(&self, state: &AppState, receiver: &str) {
         if !self.published || self.replay {
             return;
         }
@@ -435,11 +436,14 @@ impl PreparedGame {
                 db::list_game_sessions(&state.db, &self.identity, Some(&self.sender), None);
             crate::notify_game_if_background(
                 state,
-                &self.sender,
-                &self.sid,
-                &self.app,
-                &self.command,
-                !self.had_session,
+                receiver,
+                &crate::GameAlert {
+                    sender_hash: self.sender.clone(),
+                    session_id: self.sid.clone(),
+                    app_id: self.app.clone(),
+                    command: self.command.clone(),
+                    is_new_session: !self.had_session,
+                },
             );
             state.emit_to_all("active_games", json!({"hash":self.sender,"games":sessions}));
         }

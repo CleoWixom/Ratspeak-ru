@@ -13,6 +13,8 @@ use tauri::test::{MockRuntime, mock_builder, mock_context, noop_assets};
 #[derive(Default)]
 struct Recorder {
     events: Mutex<Vec<(String, Value)>>,
+    /// Holds the emitting thread at this event until the test lets it go.
+    hold: Mutex<Option<(&'static str, Arc<std::sync::Barrier>)>>,
 }
 
 impl ratspeak_core::Emitter for Recorder {
@@ -21,6 +23,17 @@ impl ratspeak_core::Emitter for Recorder {
             .lock()
             .unwrap()
             .push((event.to_owned(), payload));
+        let hold = self
+            .hold
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(held, _)| *held == event)
+            .map(|(_, barrier)| Arc::clone(barrier));
+        if let Some(barrier) = hold {
+            barrier.wait();
+            barrier.wait();
+        }
         Ok(())
     }
 }
@@ -160,8 +173,8 @@ impl Drop for Fixture {
     }
 }
 
-// B34: a switch whose activation fails ends with its closing event and
-// leaves the previous identity running, in a session of its own (B3).
+// A switch whose activation fails ends with its closing event and leaves
+// the previous identity running, in a session of its own.
 #[test]
 fn a_failed_switch_ends_with_its_event_and_the_previous_identity_running() {
     for failure in ["an unloadable key", "a refused activation"] {
@@ -215,7 +228,7 @@ fn a_failed_switch_ends_with_its_event_and_the_previous_identity_running() {
     }
 }
 
-// B34: the reset runs before the switch begins, so a refused one changes
+// The reset runs before the switch begins, so a refused one changes
 // nothing: no new session, no switching state, the same identity running.
 #[test]
 fn a_switch_whose_activity_reset_is_refused_changes_nothing() {
@@ -241,6 +254,49 @@ fn a_switch_whose_activity_reset_is_refused_changes_nothing() {
     assert!(f.running());
 }
 
+// The Activity reset comes before the switch's session. Activity going
+// away once the switch has begun cannot strand the previous runtime in that
+// session: nothing after the reset refuses, and the switch completes.
+#[test]
+fn a_switch_that_began_completes_when_activity_goes_away() {
+    let f = Fixture::new();
+    let a = f.import("A");
+    let b = f.import("B");
+    f.start(&a);
+    let previous_session = f.state.session_shutdown.read().unwrap().clone();
+    let generation = f.state.current_identity_session_generation();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    *f.recorder.hold.lock().unwrap() = Some(("identity_switching", Arc::clone(&barrier)));
+    let stopper = std::thread::spawn({
+        let state = Arc::clone(&f.state);
+        let runtime = f.runtime.handle().clone();
+        move || {
+            barrier.wait();
+            runtime.block_on(state.activity.shutdown()).unwrap();
+            barrier.wait();
+        }
+    });
+    let result = f
+        .runtime
+        .block_on(ratspeak_tauri::commands::identity::switch_identity(
+            f.app.state(),
+            b.clone(),
+        ));
+    stopper.join().unwrap();
+    *f.recorder.hold.lock().unwrap() = None;
+    let switched = result.expect("a switch that began was refused");
+    assert_eq!(switched["hash"], b.as_str());
+    assert!(
+        previous_session.is_triggered(),
+        "the previous runtime kept running"
+    );
+    assert!(f.state.current_identity_session_generation() > generation);
+    assert_eq!(f.active().as_deref(), Some(b.as_str()));
+    assert_eq!(f.loaded().as_deref(), Some(b.as_str()));
+    assert!(f.running());
+    assert!(f.recorder.last("identity_switch_failed").is_none());
+}
+
 /// What `hw_remove` finds: H, a hardware identity, is the active one.
 #[cfg(feature = "hardware")]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -255,7 +311,7 @@ enum Removal {
     ActiveOnly,
 }
 
-// N2: after hw_remove(H), a plain S is active and running; a passcode S is
+// After hw_remove(H), a plain S is active and running; a passcode S is
 // active and locked. An S whose key doesn't load is passed over, and H counts
 // as live while it is the active row.
 #[cfg(feature = "hardware")]

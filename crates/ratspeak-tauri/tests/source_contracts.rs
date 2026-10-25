@@ -2313,7 +2313,10 @@ fn profile_status_frontend_contract_is_wired() {
     assert!(settings_js.contains("profile_status"));
     assert!(settings_js.contains("function trimProfileStatusToByteLimit"));
     assert!(settings_js.contains("function openIdentityStatusEditor"));
-    assert!(settings_js.contains("RS.invoke('set_identity_status', { status: nextStatus })"));
+    // The status names the identity the window shows.
+    assert!(settings_js.contains(
+        "RS.invoke('set_identity_status', { status: nextStatus, identityId: identityId })"
+    ));
     assert!(settings_js.contains("counter.textContent = bytes + '/' + PROFILE_STATUS_MAX_BYTES;"));
 
     let lxmf_js = read_source(root.join("dashboard/static/js/lxmf.js")).expect("lxmf js");
@@ -3987,7 +3990,10 @@ fn only_real_transitions_take_the_lifecycle_lock_as_a_transition() {
 
 /// Every activation starts a new identity session before its shutdown, so
 /// nothing begun under the previous one lands in the next; unlock reopens
-/// the same session. The hardware paths need a card to run, so this pins them.
+/// the same session. The Activity reset, the one step that can refuse, comes
+/// first, so a refusal starts no session and leaves no runtime running in
+/// one it did not begin. The hardware paths need a card to run, so this
+/// pins them.
 #[test]
 fn every_activation_starts_a_new_identity_session() {
     let root = repo_root();
@@ -3997,41 +4003,61 @@ fn every_activation_starts_a_new_identity_session() {
     let system = read("crates/ratspeak-tauri/src/commands/system.rs");
     let runtime = read("crates/ratspeak-runtime/src/lib.rs");
     // A marker, not a name: the import's signature is generic.
-    for (source, function, shutdown) in [
+    for (source, function, reset) in [
         (
             &hardware,
             "fn hw_activate_and_unlock(",
-            "shutdown_for_hardware_change(",
+            "reset_for_hardware_change(",
         ),
-        (&hardware, "fn hw_remove(", "shutdown_for_hardware_change("),
+        (&hardware, "fn hw_remove(", "reset_for_hardware_change("),
         (
             &system,
             "fn api_setup_complete(",
-            "crate::shutdown_rns_lxmf(",
+            "crate::reset_activity_for_shutdown(",
         ),
         (
             &system,
             "fn api_factory_reset(",
-            "crate::shutdown_rns_lxmf(",
+            "crate::reset_activity_for_shutdown(",
         ),
         (
             &identity,
             "fn import_identity_after_parse<",
-            "crate::shutdown_rns_lxmf(",
+            "crate::reset_activity_for_shutdown(",
         ),
-        (&runtime, "fn lock_hardware_session(", "shutdown_rns_lxmf("),
+        (
+            &identity,
+            "fn switch_identity_session_held(",
+            "crate::reset_activity_for_shutdown(",
+        ),
+        (
+            &runtime,
+            "fn lock_hardware_session(",
+            "reset_activity_for_shutdown(",
+        ),
     ] {
         let body = rust_struct_literal_blocks(source, function)
             .into_iter()
             .next()
             .unwrap_or_else(|| panic!("missing {function}"));
+        let reset = body
+            .find(reset)
+            .unwrap_or_else(|| panic!("{function} resets nothing"));
         let bump = body
             .find("bump_identity_session_generation()")
             .unwrap_or_else(|| panic!("{function} starts no session"));
-        let stop = body.find(shutdown).expect("shutdown");
+        let finish = body.find("finish_shutdown(").expect("shutdown");
         assert!(
-            bump < stop,
+            reset < bump,
+            "{function} starts its session before the reset that can refuse"
+        );
+        assert!(
+            bump < finish,
             "{function} shuts down before its session starts"
+        );
+        assert!(
+            !body.contains("shutdown_rns_lxmf("),
+            "{function} has a shutdown that can refuse after its session started"
         );
     }
     assert!(

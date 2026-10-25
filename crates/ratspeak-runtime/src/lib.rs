@@ -685,10 +685,11 @@ fn notification_body(content: &str, has_attachment: bool) -> String {
     }
 }
 
-async fn notify_inbound_message_if_background(
+/// Call while the message's session is current and its row is stored.
+pub(crate) fn notify_inbound_message_if_background(
     state: &AppState,
     source_hash: &str,
-    identity_id: &str,
+    label: &str,
     content: &str,
     has_attachment: bool,
 ) {
@@ -696,21 +697,44 @@ async fn notify_inbound_message_if_background(
         return;
     }
 
-    let source_for_db = source_hash.to_string();
-    let identity_for_db = identity_id.to_string();
-    let pool = state.db.clone();
-    let label = db::spawn_db(pool, move |p| {
-        contact_label_from_db(&p, &source_for_db, &identity_for_db)
-    })
-    .await
-    .unwrap_or_else(|_| compact_hash_label(source_hash));
-
     state.emit_native_notification(ratspeak_core::NativeNotification::message(
         format!("Message from {label}"),
         notification_body(content, has_attachment),
         format!("lxmf:{source_hash}"),
         stable_notification_id(source_hash, 1_000),
     ));
+}
+
+/// A game action's alert, raised once its session's publication is due.
+pub(crate) struct GameAlert {
+    pub(crate) sender_hash: String,
+    pub(crate) session_id: String,
+    pub(crate) app_id: String,
+    pub(crate) command: String,
+    pub(crate) is_new_session: bool,
+}
+
+/// What an inbound game action shows. Gathered under the game transaction
+/// and published after it, in identity-then-game lock order.
+#[derive(Default)]
+struct LrgpOutcome {
+    events: Vec<(&'static str, Value)>,
+    alert: Option<GameAlert>,
+}
+
+impl LrgpOutcome {
+    fn emit(&mut self, event: &'static str, payload: Value) {
+        self.events.push((event, payload));
+    }
+
+    fn publish(self, state: &AppState, identity_id: &str) {
+        if let Some(alert) = &self.alert {
+            notify_game_if_background(state, identity_id, alert);
+        }
+        for (event, payload) in self.events {
+            state.emit_to_all(event, payload);
+        }
+    }
 }
 
 fn game_name(state: &AppState, app_id: &str) -> String {
@@ -721,22 +745,17 @@ fn game_name(state: &AppState, app_id: &str) -> String {
         .unwrap_or_else(|| "a game".to_string())
 }
 
-fn notify_game_if_background(
-    state: &AppState,
-    sender_hash: &str,
-    session_id: &str,
-    app_id: &str,
-    command: &str,
-    is_new_session: bool,
-) {
+/// `identity_id` is the receiving identity, whose contacts name the sender.
+fn notify_game_if_background(state: &AppState, identity_id: &str, alert: &GameAlert) {
     if !state.should_surface_native_notification() {
         return;
     }
 
-    let identity_id = helpers::active_identity_id(state);
-    let label = contact_label_from_db(&state.db, sender_hash, &identity_id);
-    let game = game_name(state, app_id);
-    let is_challenge = is_new_session
+    let label = contact_label_from_db(&state.db, &alert.sender_hash, identity_id);
+    let game = game_name(state, &alert.app_id);
+    let command = alert.command.as_str();
+    let session_id = alert.session_id.as_str();
+    let is_challenge = alert.is_new_session
         || command.eq_ignore_ascii_case("challenge")
         || command.eq_ignore_ascii_case("invite");
     let (title, body) = if is_challenge {
@@ -976,16 +995,47 @@ pub(crate) async fn shutdown_rns_lxmf_inner(
     state: &Arc<AppState>,
     relock_identity: bool,
 ) -> Result<(), ActivityRecorderError> {
+    let reset = reset_activity_for_shutdown(state).await?;
+    finish_shutdown_inner(state, &reset, relock_identity).await;
+    Ok(())
+}
+
+/// An acknowledged Activity reset, which a shutdown begins with.
+#[must_use = "finish the shutdown it began"]
+pub struct ActivityReset {
+    status: activity::ActivityStatusV1,
+}
+
+/// The first step of a shutdown and the only one that can be refused, which
+/// leaves the runtime as it was. An activation resets before it starts its
+/// session, so a runtime never outlives the session it ran in.
+pub async fn reset_activity_for_shutdown(
+    state: &AppState,
+) -> Result<ActivityReset, ActivityRecorderError> {
+    let _activity_control = state.activity_control_lock.lock().await;
+    state.bump_activity_boundary_generation();
+    state
+        .network_log_enabled
+        .store(false, std::sync::atomic::Ordering::Release);
+    if let Ok(mut level) = state.network_log_level.write() {
+        *level = "standard".to_string();
+    }
+    let status = state.activity.hard_reset().await?;
+    Ok(ActivityReset { status })
+}
+
+/// The rest of the shutdown `reset` began. Nothing here is refused.
+pub async fn finish_shutdown(state: &Arc<AppState>, reset: &ActivityReset) {
+    finish_shutdown_inner(state, reset, true).await;
+}
+
+async fn finish_shutdown_inner(
+    state: &Arc<AppState>,
+    reset: &ActivityReset,
+    relock_identity: bool,
+) {
     {
         let _activity_control = state.activity_control_lock.lock().await;
-        state.bump_activity_boundary_generation();
-        state
-            .network_log_enabled
-            .store(false, std::sync::atomic::Ordering::Release);
-        if let Ok(mut level) = state.network_log_level.write() {
-            *level = "standard".to_string();
-        }
-        let status = state.activity.hard_reset().await?;
         // The worker's status notification makes recovery observable. This
         // second boundary gives frontend privacy teardown one acknowledged,
         // cross-runtime fence for the temporary one-shot legacy broadcasts.
@@ -995,8 +1045,8 @@ pub(crate) async fn shutdown_rns_lxmf_inner(
                 "version": 1,
                 "kind": "hard_reset",
                 "identity_generation": state.current_identity_session_generation().to_string(),
-                "capture_generation": status.ingress_generation().to_string(),
-                "status": status,
+                "capture_generation": reset.status.ingress_generation().to_string(),
+                "status": reset.status,
             }),
         );
     }
@@ -1081,7 +1131,6 @@ pub(crate) async fn shutdown_rns_lxmf_inner(
     tokio::time::sleep(Duration::from_millis(300)).await;
     state.set_startup_stage("stopped");
     state.emit_to_all("system_status", json!({"status": "stopped"}));
-    Ok(())
 }
 
 async fn teardown_rns_runtime_interfaces(handle: &rns_runtime::reticulum::ReticulumHandle) {
@@ -1147,16 +1196,20 @@ async fn lock_hardware_session(state: Arc<AppState>, generation: u64) {
     });
     let Some(hash) = hash else { return };
     tracing::info!(identity = %short_id(&hash), "hardware session auto-lock timeout — locking");
+    let reset = match reset_activity_for_shutdown(&state).await {
+        Ok(reset) => reset,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                identity = %short_id(&hash),
+                "hardware session auto-lock aborted because Activity reset failed"
+            );
+            return;
+        }
+    };
     // Nothing begun before the lock may land behind it.
     state.bump_identity_session_generation();
-    if let Err(error) = shutdown_rns_lxmf(&state).await {
-        tracing::error!(
-            %error,
-            identity = %short_id(&hash),
-            "hardware session auto-lock aborted because Activity reset failed"
-        );
-        return;
-    }
+    finish_shutdown(&state, &reset).await;
     state.set_hw_locked(Some(hash.clone()));
     state.set_startup_stage("hw_locked");
     state.emit_to_all(
@@ -2400,6 +2453,7 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                                         .and_then(|identities| identities.get(&link_id).copied()),
                                 },
                                 activity_origin,
+                                link_inbound_shutdown.clone(),
                             )
                             .await;
                             // Keep completed attachment memory admitted through
@@ -4164,14 +4218,11 @@ struct ExtractedAttachment {
 }
 
 fn extract_and_save_attachment(
-    state: &AppState,
+    files_dir: &std::path::Path,
     msg: &lxmf_core::message_api::LxMessage,
 ) -> Option<ExtractedAttachment> {
-    if let Ok(Some((file_name, file_data))) = msg.first_file_attachment()
-        && let Ok(mut lxmf) = state.lxmf.lock()
-        && let Some(mgr) = lxmf.as_mut()
-    {
-        let stored = match mgr.save_attachment(&file_name, file_data) {
+    if let Ok(Some((file_name, file_data))) = msg.first_file_attachment() {
+        let stored = match lxmf::save_attachment_in(files_dir, &file_name, file_data) {
             Ok(stored) => stored,
             Err(error) => {
                 tracing::warn!(
@@ -4202,36 +4253,32 @@ fn extract_and_save_attachment(
     if let Ok(Some((mime_type, image_data))) = msg.image_attachment() {
         let ext = mime_type.rsplit('/').next().unwrap_or("png");
         let file_name = format!("image.{ext}");
-        if let Ok(mut lxmf) = state.lxmf.lock()
-            && let Some(mgr) = lxmf.as_mut()
-        {
-            let stored = match mgr.save_attachment(&file_name, image_data) {
-                Ok(stored) => stored,
-                Err(error) => {
-                    tracing::warn!(
-                        error_kind = ?error.kind(),
-                        size = image_data.len(),
-                        kind = "image",
-                        "failed to persist inbound attachment"
-                    );
-                    return Some(ExtractedAttachment {
-                        file_name,
-                        stored_name: db::ATTACHMENT_UNAVAILABLE_STORED_NAME.to_string(),
-                        is_image: true,
-                    });
-                }
-            };
-            tracing::info!(
-                size = image_data.len(),
-                kind = "image",
-                "extracted inbound attachment"
-            );
-            return Some(ExtractedAttachment {
-                file_name,
-                stored_name: stored,
-                is_image: true,
-            });
-        }
+        let stored = match lxmf::save_attachment_in(files_dir, &file_name, image_data) {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(
+                    error_kind = ?error.kind(),
+                    size = image_data.len(),
+                    kind = "image",
+                    "failed to persist inbound attachment"
+                );
+                return Some(ExtractedAttachment {
+                    file_name,
+                    stored_name: db::ATTACHMENT_UNAVAILABLE_STORED_NAME.to_string(),
+                    is_image: true,
+                });
+            }
+        };
+        tracing::info!(
+            size = image_data.len(),
+            kind = "image",
+            "extracted inbound attachment"
+        );
+        return Some(ExtractedAttachment {
+            file_name,
+            stored_name: stored,
+            is_image: true,
+        });
     }
 
     // A declared but malformed field is user media, not service traffic.
@@ -4283,7 +4330,7 @@ fn extracted_audio_json(audio: &ExtractedAudio) -> Value {
 /// authentication, policy and deduplication gates. Media errors are local to
 /// this optional field: they never reject the enclosing message or its proof.
 fn extract_and_save_audio(
-    state: &AppState,
+    files_dir: &std::path::Path,
     msg: &lxmf_core::message_api::LxMessage,
 ) -> Option<ExtractedAudio> {
     let audio = match msg.audio_field() {
@@ -4332,10 +4379,7 @@ fn extract_and_save_audio(
     } else {
         format!("Audio message {mode:02x}.bin")
     };
-    let stored_name = state.lxmf.lock().ok().and_then(|mut lxmf| {
-        lxmf.as_mut()
-            .and_then(|mgr| mgr.save_attachment(&file_name, audio.bytes).ok())
-    });
+    let stored_name = lxmf::save_attachment_in(files_dir, &file_name, audio.bytes).ok();
     match stored_name {
         Some(stored_name) => {
             tracing::info!(
@@ -4361,18 +4405,10 @@ fn extract_and_save_audio(
 }
 
 fn remove_inbound_media_after_persistence_failure(
-    state: &AppState,
+    files_dir: &std::path::Path,
     attachment: Option<&ExtractedAttachment>,
     audio: Option<&ExtractedAudio>,
 ) {
-    let files_dir = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|lxmf| lxmf.as_ref().map(lxmf::LxmfManager::files_dir));
-    let Some(files_dir) = files_dir else {
-        return;
-    };
     let stored_names = attachment
         .map(|attachment| attachment.stored_name.as_str())
         .into_iter()
@@ -4420,6 +4456,7 @@ fn inbound_reply_fields(ext: Option<&lxmf::RatspeakChatExtension>) -> (String, S
 
 async fn apply_inbound_ratspeak_reaction(
     state: &AppState,
+    fence: &InboundFence,
     source_hash: &str,
     identity_id: &str,
     target: &str,
@@ -4453,13 +4490,17 @@ async fn apply_inbound_ratspeak_reaction(
     .await
     .unwrap_or_default();
 
-    state.emit_to_all(
-        "reaction_update",
-        json!({
-            "message_id": target,
-            "reactions": reactions,
-        }),
-    );
+    fence
+        .publish(state, || {
+            state.emit_to_all(
+                "reaction_update",
+                json!({
+                    "message_id": target,
+                    "reactions": reactions,
+                }),
+            );
+        })
+        .await;
 }
 
 /// Build a signed response without erasing the durable ordering deferral.
@@ -4757,6 +4798,7 @@ async fn handle_inbound_lxmf(
             &lxmf_data,
             InboundLxmfSource::Opportunistic { raw },
             activity_origin,
+            shutdown.clone(),
         )
         .await;
     }
@@ -4832,7 +4874,11 @@ fn lrgp_sender_authenticated(
 /// Stamp PoW gate (T1-9): applies to every inbound source. Runs after
 /// signature validation and before the delivery-proof ACK; ticket-store
 /// entries bypass via `validate_stamp_with_tickets`.
-fn inbound_stamp_allowed(state: &AppState, msg: &lxmf_core::message_api::LxMessage) -> bool {
+fn inbound_stamp_allowed(
+    state: &AppState,
+    identity_id: &str,
+    msg: &lxmf_core::message_api::LxMessage,
+) -> bool {
     if !state
         .enforce_stamps
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -4849,21 +4895,26 @@ fn inbound_stamp_allowed(state: &AppState, msg: &lxmf_core::message_api::LxMessa
         msg.recipient_stamp().map(|stamp| stamp.as_bytes()),
         Some(msg.message_id()),
     ) {
-        (Some(stamp), Some(message_id)) => state
-            .lxmf
-            .lock()
-            .ok()
-            .and_then(|l| {
-                l.as_ref().map(|mgr| {
-                    mgr.router.validate_stamp_with_tickets(
-                        &message_id,
-                        stamp,
-                        required_cost,
-                        &msg.source_hash(),
-                    )
-                })
+        (Some(stamp), Some(message_id)) => with_receiver(state, identity_id, |mgr| {
+            mgr.router.validate_stamp_with_tickets(
+                &message_id,
+                stamp,
+                required_cost,
+                &msg.source_hash(),
+            )
+        })
+        // Once the receiver's manager is gone its tickets are too, but proof
+        // of work still counts: a switch alone never loses a message.
+        .unwrap_or_else(|| {
+            <&[u8; 32]>::try_from(stamp).is_ok_and(|stamp| {
+                lxmf_core::stamper::validate_stamp(
+                    &message_id,
+                    stamp,
+                    required_cost,
+                    lxmf_core::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS,
+                )
             })
-            .unwrap_or(false),
+        }),
         _ => false,
     };
     if !stamp_ok {
@@ -4930,6 +4981,7 @@ async fn handle_decrypted_lxmf_from_origin(
     data: Vec<u8>,
     source: InboundLxmfSource,
     activity_origin: ActivityRequestFence,
+    session: rns_runtime::lifecycle::ShutdownSignal,
 ) {
     if let InboundLxmfSource::Link { link_id, .. } = &source {
         let limit = state.lxmf_delivery_limit_bytes();
@@ -4967,12 +5019,18 @@ async fn handle_decrypted_lxmf_from_origin(
             return;
         }
     };
-    process_inbound_lxmf(state, msg, &data, source, activity_origin).await;
+    process_inbound_lxmf(state, msg, &data, source, activity_origin, session).await;
 }
 
 #[cfg(test)]
 async fn handle_decrypted_lxmf(state: &Arc<AppState>, data: Vec<u8>, source: InboundLxmfSource) {
-    handle_decrypted_lxmf_from_origin(state, data, source, state.activity_request_fence()).await;
+    let session = state
+        .session_shutdown
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    handle_decrypted_lxmf_from_origin(state, data, source, state.activity_request_fence(), session)
+        .await;
 }
 
 /// Presentation policy, not LXMF validity. Field presence preserves malformed
@@ -4991,6 +5049,150 @@ fn inbound_has_chat_content(
         || matches!(extension, Some(lxmf::RatspeakChatExtension::Reply { .. }))
 }
 
+/// The local identity a message is for: the live one when its processing
+/// began. What the message changes stays with it even when a switch replaces
+/// the live identity meanwhile, and its manager steps run only while it is
+/// still live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InboundReceiver {
+    identity_id: String,
+    lxmf_id: String,
+}
+
+/// What the receiver's manager knew of the sender when processing began.
+struct InboundSender {
+    identity: Option<[u8; 16]>,
+    public_key: Option<[u8; 64]>,
+    transport: Option<tokio::sync::mpsc::Sender<rns_transport::messages::TransportMessage>>,
+}
+
+impl InboundReceiver {
+    /// The live identity, when it owns `msg`'s destination and still runs in
+    /// `fence`'s sessions. A runtime session ends before its manager goes, so
+    /// the manager seen under its lock is that session's.
+    fn live(
+        state: &AppState,
+        msg: &lxmf_core::message_api::LxMessage,
+        fence: &InboundFence,
+    ) -> Option<(Self, InboundSender)> {
+        let lxmf = state.lxmf.lock().ok()?;
+        let mgr = lxmf.as_ref().filter(|mgr| {
+            mgr.lxmf_dest_hash == msg.destination_hash() && fence.is_current(state)
+        })?;
+        let source = msg.source_hash();
+        Some((
+            Self {
+                identity_id: mgr.identity_hash.clone(),
+                lxmf_id: mgr.lxmf_hash.clone(),
+            },
+            InboundSender {
+                identity: mgr.recall_identity_hash(&source),
+                public_key: mgr.inbound_source_public_key(&source),
+                transport: mgr.router.transport_tx.clone(),
+            },
+        ))
+    }
+}
+
+/// Runs `f` on the live manager only while it is `identity_id`'s.
+pub(crate) fn with_receiver<T>(
+    state: &AppState,
+    identity_id: &str,
+    f: impl FnOnce(&mut lxmf::LxmfManager) -> T,
+) -> Option<T> {
+    let mut lxmf = state.lxmf.lock().ok()?;
+    let mgr = lxmf
+        .as_mut()
+        .filter(|mgr| mgr.identity_hash == identity_id)?;
+    Some(f(mgr))
+}
+
+/// The identity session a message began in and the runtime session it came
+/// through. Nothing it shows reaches a window once either has ended.
+#[derive(Clone)]
+struct InboundFence {
+    generation: u64,
+    session: rns_runtime::lifecycle::ShutdownSignal,
+}
+
+impl InboundFence {
+    fn new(
+        activity_origin: ActivityRequestFence,
+        session: rns_runtime::lifecycle::ShutdownSignal,
+    ) -> Self {
+        Self {
+            generation: activity_origin.identity_session_generation(),
+            session,
+        }
+    }
+
+    fn is_current(&self, state: &AppState) -> bool {
+        !self.session.is_triggered()
+            && state.current_identity_session_generation() == self.generation
+    }
+
+    /// Runs `publish` under the routine lock while both sessions are current,
+    /// so no transition lands between the check and what it emits.
+    async fn publish(&self, state: &AppState, publish: impl FnOnce()) {
+        let _lifecycle = state.identity_switch_lock.lock_routine().await;
+        if self.is_current(state) {
+            publish();
+        }
+    }
+}
+
+/// A stored message's sender label and the lists it changed.
+struct InboundLists {
+    label: String,
+    contacts: Vec<Value>,
+    unread: i64,
+}
+
+async fn read_inbound_lists(
+    state: &AppState,
+    source_hash: &str,
+    identity_id: &str,
+) -> Option<InboundLists> {
+    let source = source_hash.to_string();
+    let identity = identity_id.to_string();
+    db::spawn_db(state.db.clone(), move |p| InboundLists {
+        label: contact_label_from_db(&p, &source, &identity),
+        contacts: contact_list_payload(db::get_all_contacts(&p, &identity)),
+        unread: db::get_all_unread_counts(&p, &identity).values().sum(),
+    })
+    .await
+    .ok()
+}
+
+pub(crate) fn contact_list_payload(contacts: Vec<Value>) -> Vec<Value> {
+    contacts
+        .into_iter()
+        .map(|c| {
+            json!({
+                "hash": c.get("dest_hash"),
+                "display_name": c.get("display_name"),
+                "trust": c.get("trust"),
+                "notes": c.get("notes"),
+                "first_seen": c.get("first_seen"),
+                "last_seen": c.get("last_seen"),
+                "services": c.get("services"),
+            })
+        })
+        .collect()
+}
+
+/// Whether `msg_id` is still stored: a bulk delete that committed after the
+/// save removed it, and it must not reach a window after that.
+async fn inbound_message_stored(state: &AppState, msg_id: &str, identity_id: &str) -> bool {
+    let msg_id = msg_id.to_string();
+    let identity_id = identity_id.to_string();
+    db::spawn_db(state.db.clone(), move |p| {
+        db::message_exists_for_identity(&p, &msg_id, &identity_id)
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// The one inbound LXMF pipeline. `fallback_id_material` is the unpacked
 /// wire material; its hash is the msg-id fallback when the message carries
 /// no hash — deterministic across sender retries so dedupe still works
@@ -5002,10 +5204,22 @@ async fn process_inbound_lxmf(
     fallback_id_material: &[u8],
     source: InboundLxmfSource,
     activity_origin: ActivityRequestFence,
+    session: rns_runtime::lifecycle::ShutdownSignal,
 ) {
     let source_hash = hex::encode(msg.source_hash());
     let dest_hash = hex::encode(msg.destination_hash());
     let inbound_method = source.activity_method();
+    let fence = InboundFence::new(activity_origin, session);
+    // Link and propagated deliveries name their destination only inside the
+    // message; one for no live local identity is dropped.
+    let Some((receiver, sender)) = InboundReceiver::live(state, &msg, &fence) else {
+        tracing::warn!(
+            reason = "not_for_us",
+            source = source.label(),
+            "inbound LXMF for no live local identity — dropping"
+        );
+        return;
+    };
 
     tracing::info!(
         from = %short_id(&source_hash),
@@ -5013,30 +5227,12 @@ async fn process_inbound_lxmf(
         source = source.label(),
         "inbound LXMF message received"
     );
-    let (source_identity, blackhole_tx) = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|l| {
-            l.as_ref().map(|mgr| {
-                (
-                    mgr.recall_identity_hash(&msg.source_hash()),
-                    mgr.router.transport_tx.clone(),
-                )
-            })
-        })
-        .unwrap_or((None, None));
-    if inbound_source_blackholed(source_identity, blackhole_tx).await {
+    if inbound_source_blackholed(sender.identity, sender.transport).await {
         tracing::debug!(from = %short_id(&source_hash), "Dropping LXM from blackholed identity");
         return;
     }
 
-    let source_key = state.lxmf.lock().ok().and_then(|manager| {
-        manager
-            .as_ref()
-            .and_then(|manager| manager.inbound_source_public_key(&msg.source_hash()))
-    });
-    let verification = source_key.as_ref().map(|key| msg.verify(key));
+    let verification = sender.public_key.as_ref().map(|key| msg.verify(key));
     let sig_valid = verification.as_ref().map(Result::is_ok);
     match sig_valid {
         Some(true) => tracing::debug!("inbound signature validated"),
@@ -5047,14 +5243,14 @@ async fn process_inbound_lxmf(
         None => tracing::debug!("sender unknown — signature not validated"),
     }
 
-    if !inbound_stamp_allowed(state, &msg) {
+    if !inbound_stamp_allowed(state, &receiver.identity_id, &msg) {
         return;
     }
 
     if let Some(Ok(verified)) = verification.as_ref()
-        && let Ok(mut lxmf) = state.lxmf.lock()
-        && let Some(mgr) = lxmf.as_mut()
-        && mgr.router.learn_ticket_from_inbound(verified)
+        && with_receiver(state, &receiver.identity_id, |mgr| {
+            mgr.router.learn_ticket_from_inbound(verified)
+        }) == Some(true)
     {
         tracing::debug!(
             from = %short_id(&hex::encode(msg.source_hash())),
@@ -5063,14 +5259,15 @@ async fn process_inbound_lxmf(
     }
 
     // Opportunistic ACK; runs before the blocked check on purpose so a
-    // blocked sender doesn't learn anything from a missing proof.
+    // blocked sender doesn't learn anything from a missing proof. Only the
+    // live receiver proves; a sender without a proof sends again.
     if let InboundLxmfSource::Opportunistic { ref raw } = source {
-        let proof_and_tx = state.lxmf.lock().ok().and_then(|l| {
-            let mgr = l.as_ref()?;
+        let proof_and_tx = with_receiver(state, &receiver.identity_id, |mgr| {
             let proof = mgr.create_delivery_proof(raw)?;
             let tx = mgr.router.transport_tx.clone()?;
             Some((proof, tx))
-        });
+        })
+        .flatten();
         if let Some((proof_raw, tx, proof_hdr)) = proof_and_tx.and_then(|(proof_raw, tx)| {
             rns_wire::header::PacketHeader::unpack(&proof_raw)
                 .ok()
@@ -5087,23 +5284,7 @@ async fn process_inbound_lxmf(
         }
     }
 
-    // Active identity comes from the running LXMF manager for every source
-    // (the old opportunistic path re-read the DB; the manager IS the active
-    // identity and inbound traffic only exists while it runs).
-    let (identity_id, lxmf_id) = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|l| {
-            l.as_ref()
-                .map(|m| (m.identity_hash.clone(), m.lxmf_hash.clone()))
-        })
-        .unwrap_or_default();
-    if identity_id.is_empty() {
-        tracing::warn!("No active LXMF identity — dropping inbound message");
-        return;
-    }
-
+    let identity_id = receiver.identity_id.clone();
     let msg_id = hex::encode(msg.message_id());
 
     // Senders retry on missing proofs; duplicates are scoped to the local
@@ -5139,26 +5320,18 @@ async fn process_inbound_lxmf(
         ..
     } = source
     {
-        let local_destination_matches = hex::decode(&lxmf_id)
-            .ok()
-            .and_then(|bytes| bytes.try_into().ok())
-            .is_some_and(|local_dest: [u8; 16]| local_dest == msg.destination_hash());
-        if local_destination_matches {
-            if let Ok(mut lxmf) = state.lxmf.lock()
-                && let Some(mgr) = lxmf.as_mut()
-            {
-                mgr.note_pending_direct_backchannel(msg.source_hash(), link_id);
-            }
-            tracing::debug!(
-                from = %short_id(&source_hash),
-                link_id = %short_id(&hex::encode(link_id)),
-                "Direct LXMF payload received; waiting for LINKIDENTIFY before backchannel reuse"
-            );
-        }
+        with_receiver(state, &identity_id, |mgr| {
+            mgr.note_pending_direct_backchannel(msg.source_hash(), link_id);
+        });
+        tracing::debug!(
+            from = %short_id(&source_hash),
+            link_id = %short_id(&hex::encode(link_id)),
+            "Direct LXMF payload received; waiting for LINKIDENTIFY before backchannel reuse"
+        );
     }
 
     if source.marks_sender_seen() {
-        touch_peer_last_heard(state, &source_hash).await;
+        touch_peer_last_heard(state, &fence, &identity_id, &source_hash).await;
     }
 
     let chat_extension = lxmf::decode_ratspeak_chat_extension(&msg);
@@ -5168,8 +5341,16 @@ async fn process_inbound_lxmf(
         action,
     }) = chat_extension.as_ref()
     {
-        apply_inbound_ratspeak_reaction(state, &source_hash, &identity_id, target, emoji, action)
-            .await;
+        apply_inbound_ratspeak_reaction(
+            state,
+            &fence,
+            &source_hash,
+            &identity_id,
+            target,
+            emoji,
+            action,
+        )
+        .await;
         return;
     }
 
@@ -5179,15 +5360,20 @@ async fn process_inbound_lxmf(
     if !matches!(
         chat_extension,
         Some(lxmf::RatspeakChatExtension::Reply { .. })
-    ) && try_handle_inbound_lrgp(
+    ) && let Some(outcome) = try_handle_inbound_lrgp(
         state,
         &msg,
         &source_hash,
-        &lxmf_id,
+        &receiver,
         lrgp_sender_authenticated,
     )
     .await
     {
+        // Published once its game transaction is released, in identity-then-
+        // game lock order.
+        fence
+            .publish(state, || outcome.publish(state, &identity_id))
+            .await;
         return;
     }
 
@@ -5206,82 +5392,79 @@ async fn process_inbound_lxmf(
     }
 
     let received_at = next_chat_observed_timestamp(state, &source_hash, &identity_id).await;
-    let attachment_file = extract_and_save_attachment(state, &msg);
-    let audio_file = extract_and_save_audio(state, &msg);
     let (reply_to_id, reply_to_preview) = inbound_reply_fields(chat_extension.as_ref());
-    {
-        let msg_id_for_save = msg_id.clone();
-        let source_hash_for_save = source_hash.clone();
-        let dest_hash_for_save = dest_hash.clone();
-        let content_for_save = msg.content_text().into_owned();
-        let title_for_save = msg.title_text().into_owned();
-        let timestamp_for_save = received_at;
-        let identity_id_for_save = identity_id.clone();
-        let reply_to_id_for_save = reply_to_id.clone();
-        let reply_to_preview_for_save = reply_to_preview.clone();
-        let audio_for_save = audio_file.clone();
-        let (att_name, att_stored, img_name, img_stored) = match attachment_file.as_ref() {
-            Some(a) if a.is_image => (
-                String::new(),
-                String::new(),
-                a.file_name.clone(),
-                a.stored_name.clone(),
-            ),
-            Some(a) => (
-                a.file_name.clone(),
-                a.stored_name.clone(),
-                String::new(),
-                String::new(),
-            ),
-            None => (String::new(), String::new(), String::new(), String::new()),
-        };
-        let save_result = db::spawn_db(state.db.clone(), move |p| {
-            db::try_save_message_with_audio(
+    // The receiver's media is written to its own files with the row that
+    // names it, in one blocking task off the manager lock.
+    let saved = {
+        let config = state.config.clone();
+        let msg_id = msg_id.clone();
+        let source_hash = source_hash.clone();
+        let dest_hash = dest_hash.clone();
+        let identity_id = identity_id.clone();
+        let reply_to_id = reply_to_id.clone();
+        let reply_to_preview = reply_to_preview.clone();
+        db::spawn_db(state.db.clone(), move |p| {
+            let files_dir = config.identity_files_dir(&identity_id);
+            let attachment = extract_and_save_attachment(&files_dir, &msg);
+            let audio = extract_and_save_audio(&files_dir, &msg);
+            let (att_name, att_stored, img_name, img_stored) = match attachment.as_ref() {
+                Some(a) if a.is_image => (
+                    String::new(),
+                    String::new(),
+                    a.file_name.clone(),
+                    a.stored_name.clone(),
+                ),
+                Some(a) => (
+                    a.file_name.clone(),
+                    a.stored_name.clone(),
+                    String::new(),
+                    String::new(),
+                ),
+                None => (String::new(), String::new(), String::new(), String::new()),
+            };
+            let saved = db::try_save_message_with_audio(
                 &p,
-                &msg_id_for_save,
-                &source_hash_for_save,
-                &dest_hash_for_save,
-                &content_for_save,
-                &title_for_save,
-                timestamp_for_save,
+                &msg_id,
+                &source_hash,
+                &dest_hash,
+                &msg.content_text(),
+                &msg.title_text(),
+                received_at,
                 "received",
                 "inbound",
-                &identity_id_for_save,
+                &identity_id,
                 &att_name,
                 &att_stored,
                 &img_name,
                 &img_stored,
-                &reply_to_id_for_save,
-                &reply_to_preview_for_save,
+                &reply_to_id,
+                &reply_to_preview,
                 None,
-                audio_for_save.as_ref().map(|audio| audio.mode),
-                audio_for_save
+                audio.as_ref().map(|audio| audio.mode),
+                audio
                     .as_ref()
                     .map(|audio| audio.stored_name.as_str())
                     .unwrap_or(""),
-            )
-        })
-        .await
-        .expect("db task panicked");
-        if let Err(error) = save_result {
-            tracing::warn!(%error, "failed to persist inbound LXMF message");
-            remove_inbound_media_after_persistence_failure(
-                state,
-                attachment_file.as_ref(),
-                audio_file.as_ref(),
             );
-            return;
-        }
-    }
-    {
-        // Inbound message un-hides the conversation.
-        let source_hash_for_unhide = source_hash.clone();
-        let identity_id_for_unhide = identity_id.clone();
-        db::spawn_db(state.db.clone(), move |p| {
-            db::unhide_conversation(&p, &source_hash_for_unhide, &identity_id_for_unhide);
+            if saved.is_err() {
+                remove_inbound_media_after_persistence_failure(
+                    &files_dir,
+                    attachment.as_ref(),
+                    audio.as_ref(),
+                );
+            } else {
+                // Inbound message un-hides the conversation.
+                db::unhide_conversation(&p, &source_hash, &identity_id);
+            }
+            (msg, attachment, audio, saved)
         })
         .await
-        .expect("db task panicked");
+        .expect("db task panicked")
+    };
+    let (msg, attachment_file, audio_file, save_result) = saved;
+    if let Err(error) = save_result {
+        tracing::warn!(%error, "failed to persist inbound LXMF message");
+        return;
     }
     // "Accepted" is intentionally recorded only after every authentication,
     // policy, duplicate, extension-routing, and persistence gate succeeds.
@@ -5296,16 +5479,15 @@ async fn process_inbound_lxmf(
             },
         ))
     });
-    notify_inbound_message_if_background(
-        state,
-        &source_hash,
-        &identity_id,
-        &messaging::message_display_text(&msg.title_text(), &msg.content_text()),
-        attachment_file.is_some() || audio_file.is_some(),
-    )
-    .await;
 
-    let source_display_name = contact_label_from_db(&state.db, &source_hash, &identity_id);
+    // Lists read before a bulk delete commits are stale once it has.
+    let revision = state.conversation_list_revision();
+    let lists = read_inbound_lists(state, &source_hash, &identity_id).await;
+
+    let source_display_name = lists.as_ref().map_or_else(
+        || compact_hash_label(&source_hash),
+        |lists| lists.label.clone(),
+    );
 
     // Frontend expects nested `image` / `attachments` matching history rows.
     let mut event_data = json!({
@@ -5338,55 +5520,31 @@ async fn process_inbound_lxmf(
             .unwrap()
             .insert("audio".to_string(), extracted_audio_json(audio));
     }
+
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
+    if !fence.is_current(state) || !inbound_message_stored(state, &msg_id, &identity_id).await {
+        return;
+    }
+    notify_inbound_message_if_background(
+        state,
+        &source_hash,
+        &source_display_name,
+        &messaging::message_display_text(&msg.title_text(), &msg.content_text()),
+        attachment_file.is_some() || audio_file.is_some(),
+    );
     state.emit_to_all("lxmf_message", event_data);
     messaging::broadcast_conversations(Arc::clone(state));
-
-    // Post-emit UI refresh failures only mean stale sidebar counts.
-    let identity_id_for_contacts = identity_id.clone();
-    match db::spawn_db(state.db.clone(), move |p| {
-        db::get_all_contacts(&p, &identity_id_for_contacts)
-    })
-    .await
-    {
-        Ok(contacts) => {
-            let contacts_list: Vec<serde_json::Value> = contacts
-                .into_iter()
-                .map(|c| {
-                    json!({
-                        "hash": c.get("dest_hash"),
-                        "display_name": c.get("display_name"),
-                        "trust": c.get("trust"),
-                        "notes": c.get("notes"),
-                        "first_seen": c.get("first_seen"),
-                        "last_seen": c.get("last_seen"),
-                        "services": c.get("services"),
-                    })
-                })
-                .collect();
-            state.emit_to_all("contacts_update", contacts_list.into());
+    match lists {
+        Some(lists) if state.conversation_list_revision() == revision => {
+            state.emit_to_all("contacts_update", lists.contacts.into());
+            state.emit_to_all("unread_total", json!({"count": lists.unread}));
         }
-        Err(_) => tracing::error!(
+        Some(_) => {}
+        // Post-emit UI refresh failures only mean stale sidebar counts.
+        None => tracing::error!(
             reason = "refresh_failed",
-            "contacts refresh after inbound message failed"
+            "list refresh after inbound message failed"
         ),
-    }
-
-    let identity_id_for_counts = identity_id.clone();
-    match db::spawn_db(state.db.clone(), move |p| {
-        db::get_all_unread_counts(&p, &identity_id_for_counts)
-    })
-    .await
-    {
-        Ok(counts) => {
-            let total: i64 = counts.values().sum();
-            state.emit_to_all("unread_total", json!({"count": total}));
-        }
-        Err(_) => {
-            tracing::error!(
-                reason = "refresh_failed",
-                "unread-total refresh after inbound message failed"
-            )
-        }
     }
 }
 
@@ -6819,20 +6977,27 @@ pub(crate) fn emit_peers_batch(state: &AppState, rows: &[db::PeerRow]) {
     state.emit_to_all("peers_updated", json!({ "peers": arr }));
 }
 
-async fn touch_peer_last_heard(state: &AppState, source_hash: &str) {
+async fn touch_peer_last_heard(
+    state: &AppState,
+    fence: &InboundFence,
+    identity_id: &str,
+    source_hash: &str,
+) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
     let hash = source_hash.to_string();
-    let identity_id = helpers::active_identity_id(state);
+    let identity_id = identity_id.to_string();
     let rows = db::spawn_db(state.db.clone(), move |p| {
         db::touch_identity_last_heard(&p, &hash, now);
         db::get_peers_by_hashes(&p, &[hash], &identity_id)
     })
     .await
     .unwrap_or_default();
-    emit_peers_batch(state, &rows);
+    fence
+        .publish(state, || emit_peers_batch(state, &rows))
+        .await;
 }
 
 // Three wire shapes: UTF-8 string, msgpack BIN/STR (NomadNet),
@@ -6861,6 +7026,8 @@ fn extract_name_from_msgpack(value: &rmpv::Value) -> Option<String> {
 }
 
 struct LrgpErrorReply<'a> {
+    /// The receiving identity: only its live manager answers.
+    receiver: &'a str,
     destination: &'a str,
     identity_id: &'a str,
     app_id: &'a str,
@@ -6873,6 +7040,7 @@ struct LrgpErrorReply<'a> {
 
 fn send_lrgp_error_best_effort(state: &AppState, reply: LrgpErrorReply<'_>) {
     let LrgpErrorReply {
+        receiver,
         destination,
         identity_id,
         app_id,
@@ -6917,42 +7085,40 @@ fn send_lrgp_error_best_effort(state: &AppState, reply: LrgpErrorReply<'_>) {
         return;
     };
     let fallback = format!("[LRGP] Action rejected: {message}");
-    let queued = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|mut manager| {
-            manager.as_mut().and_then(|manager| {
-                manager.send_message_with_lrgp_fields_preference(
-                    destination,
-                    &fallback,
-                    &fields,
-                    &state.db,
-                    identity_id,
-                    lxmf::DeliveryPreference::Opportunistic,
-                )
-            })
-        })
-        .is_some();
+    let queued = with_receiver(state, receiver, |manager| {
+        manager.send_message_with_lrgp_fields_preference(
+            destination,
+            &fallback,
+            &fields,
+            &state.db,
+            identity_id,
+            lxmf::DeliveryPreference::Opportunistic,
+        )
+    })
+    .flatten()
+    .is_some();
     if queued {
         state.lxmf_notify.notify_one();
     }
 }
 
-// Returns true if the envelope was LRGP (dispatched); false → fall through.
+// What an LRGP envelope shows once handled; `None` → not LRGP, fall through.
 async fn try_handle_inbound_lrgp(
     state: &AppState,
     msg: &lxmf_core::message_api::LxMessage,
     sender_hash: &str,
-    identity_id: &str,
+    receiver: &InboundReceiver,
     sender_authenticated: bool,
-) -> bool {
+) -> Option<LrgpOutcome> {
+    // Game sessions belong to the receiver's LXMF destination.
+    let identity_id = receiver.lxmf_id.as_str();
+    let mut outcome = LrgpOutcome::default();
     let envelope = match inbound_admission::decode_game(msg, sender_authenticated) {
         Ok(Some(envelope)) => envelope,
-        Ok(None) => return false,
+        Ok(None) => return None,
         Err(reason) => {
             tracing::warn!(?reason, from = %short_id(sender_hash), "Dropping invalid LRGP envelope");
-            return true;
+            return Some(outcome);
         }
     };
     let _game_transaction = Arc::new(state.lrgp_transaction.clone().lock_owned().await);
@@ -6987,7 +7153,7 @@ async fn try_handle_inbound_lrgp(
                 reason = "reencode_failed",
                 "Dropping LRGP envelope that cannot be encoded"
             );
-            return true;
+            return Some(outcome);
         }
     };
     let durable_nonce: [u8; lrgp::protocol::NONCE_BYTES] = envelope
@@ -7009,7 +7175,7 @@ async fn try_handle_inbound_lrgp(
     .unwrap_or(false);
     if replayed_after_restart {
         tracing::debug!(session_id, command, "Dropping durable LRGP replay");
-        return true;
+        return Some(outcome);
     }
 
     // Keep a router snapshot until durable storage commits. The LRGP app
@@ -7027,7 +7193,7 @@ async fn try_handle_inbound_lrgp(
         Ok(lrgp::app_base::IncomingDispatch::Applied(result)) => result,
         Ok(lrgp::app_base::IncomingDispatch::Replay) => {
             tracing::debug!(session_id, command, "Dropping in-process LRGP replay");
-            return true;
+            return Some(outcome);
         }
         Ok(lrgp::app_base::IncomingDispatch::RemoteError(error)) => {
             // Remote protocol errors are accepted LRGP actions even though
@@ -7084,7 +7250,7 @@ async fn try_handle_inbound_lrgp(
                     session = %short_id(&error.session_id),
                     "Remote LRGP error was not surfaced because durable replay state failed"
                 );
-                state.emit_to_all(
+                outcome.emit(
                     "game_action_received",
                     json!({
                         "session_id": error.session_id,
@@ -7095,7 +7261,7 @@ async fn try_handle_inbound_lrgp(
                         "reason": "storage_failed",
                     }),
                 );
-                return true;
+                return Some(outcome);
             } else {
                 let iid = identity_id.to_string();
                 let all = db::spawn_db_with_lease(
@@ -7105,7 +7271,7 @@ async fn try_handle_inbound_lrgp(
                 )
                 .await
                 .unwrap_or_default();
-                state.emit_to_all("all_game_sessions", all.into());
+                outcome.emit("all_game_sessions", all.into());
             }
             tracing::warn!(
                 session = %short_id(&error.session_id),
@@ -7113,7 +7279,7 @@ async fn try_handle_inbound_lrgp(
                 action_kind = %error_payload["ref"].as_str().unwrap_or("action"),
                 "Remote LRGP peer reported a protocol error"
             );
-            state.emit_to_all(
+            outcome.emit(
                 "game_protocol_error",
                 json!({
                     "session_id": error.session_id,
@@ -7124,7 +7290,7 @@ async fn try_handle_inbound_lrgp(
                     "ref": error_payload["ref"],
                 }),
             );
-            state.emit_to_all(
+            outcome.emit(
                 "game_action_received",
                 json!({
                     "session_id": session_id,
@@ -7135,7 +7301,7 @@ async fn try_handle_inbound_lrgp(
                     "remote_error": true,
                 }),
             );
-            return true;
+            return Some(outcome);
         }
         Err(error) => {
             tracing::warn!(
@@ -7173,6 +7339,7 @@ async fn try_handle_inbound_lrgp(
             send_lrgp_error_best_effort(
                 state,
                 LrgpErrorReply {
+                    receiver: &receiver.identity_id,
                     destination: sender_hash,
                     identity_id,
                     app_id: &app_id,
@@ -7184,7 +7351,7 @@ async fn try_handle_inbound_lrgp(
                 },
             );
             // Envelope parsed as LRGP; do not fall through to chat.
-            return true;
+            return Some(outcome);
         }
     };
 
@@ -7198,7 +7365,7 @@ async fn try_handle_inbound_lrgp(
             reason = "empty_session_id",
             "dropping inbound LRGP envelope with empty session_id"
         );
-        return true;
+        return Some(outcome);
     }
 
     tracing::info!(
@@ -7231,6 +7398,7 @@ async fn try_handle_inbound_lrgp(
         send_lrgp_error_best_effort(
             state,
             LrgpErrorReply {
+                receiver: &receiver.identity_id,
                 destination: sender_hash,
                 identity_id,
                 app_id: &app_id,
@@ -7241,7 +7409,7 @@ async fn try_handle_inbound_lrgp(
                 message,
             },
         );
-        state.emit_to_all(
+        outcome.emit(
             "game_action_received",
             json!({
                 "session_id": session_id,
@@ -7252,7 +7420,7 @@ async fn try_handle_inbound_lrgp(
                 "error": error,
             }),
         );
-        return true;
+        return Some(outcome);
     }
 
     let payload_json = result
@@ -7321,7 +7489,7 @@ async fn try_handle_inbound_lrgp(
             command,
             "Rejected LRGP action because durable persistence did not commit"
         );
-        state.emit_to_all(
+        outcome.emit(
             "game_action_received",
             json!({
                 "session_id": session_id,
@@ -7332,19 +7500,18 @@ async fn try_handle_inbound_lrgp(
                 "reason": "storage_failed",
             }),
         );
-        return true;
+        return Some(outcome);
     };
 
-    notify_game_if_background(
-        state,
-        sender_hash,
-        &session_id,
-        &app_id,
-        &command,
-        !had_session,
-    );
+    outcome.alert = Some(GameAlert {
+        sender_hash: sender_hash.to_string(),
+        session_id: session_id.clone(),
+        app_id: app_id.clone(),
+        command: command.clone(),
+        is_new_session: !had_session,
+    });
 
-    state.emit_to_all(
+    outcome.emit(
         "active_games",
         json!({"hash": sender_hash, "games": sessions}),
     );
@@ -7355,11 +7522,11 @@ async fn try_handle_inbound_lrgp(
         total_sessions = all.len(),
         "emitting all_game_sessions + active_games after inbound"
     );
-    state.emit_to_all("all_game_sessions", all.into());
+    outcome.emit("all_game_sessions", all.into());
 
     // Positive per-action signal so the frontend can force-redraw the active
     // board even if the bulk `all_game_sessions` payload looks identical.
-    state.emit_to_all(
+    outcome.emit(
         "game_action_received",
         json!({
             "session_id": session_id,
@@ -7370,7 +7537,7 @@ async fn try_handle_inbound_lrgp(
         }),
     );
 
-    true
+    Some(outcome)
 }
 
 #[cfg(test)]
@@ -8584,12 +8751,14 @@ mod inbound_pipeline_tests {
 
         let opp_data = packed_inbound(dest, [0xE3; 16], "via opportunistic");
         let msg = lxmf_core::message_api::LxMessage::unpack(&opp_data).unwrap();
+        let session = state.session_shutdown.read().unwrap().clone();
         process_inbound_lxmf(
             &state,
             msg,
             &opp_data,
             InboundLxmfSource::Opportunistic { raw: Bytes::new() },
             state.activity_request_fence(),
+            session,
         )
         .await;
 
@@ -9196,8 +9365,8 @@ mod notification_tests {
         );
     }
 
-    #[tokio::test]
-    async fn inbound_message_notifies_only_when_backgrounded_and_enabled() {
+    #[test]
+    fn inbound_message_notifies_only_when_backgrounded_and_enabled() {
         let notifier = Arc::new(RecordingNotifier::default());
         let state = make_state(notifier.clone());
         state
@@ -9215,11 +9384,10 @@ mod notification_tests {
         notify_inbound_message_if_background(
             &state,
             "abcd1234abcd1234",
-            "identity-a",
+            &contact_label_from_db(&state.db, "abcd1234abcd1234", "identity-a"),
             "hello from mesh",
             false,
-        )
-        .await;
+        );
 
         let seen = notifier.notifications.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
@@ -9233,11 +9401,10 @@ mod notification_tests {
         notify_inbound_message_if_background(
             &state,
             "abcd1234abcd1234",
-            "identity-a",
+            &contact_label_from_db(&state.db, "abcd1234abcd1234", "identity-a"),
             "foreground",
             false,
-        )
-        .await;
+        );
         assert_eq!(notifier.notifications.lock().unwrap().len(), 1);
 
         state
@@ -9248,11 +9415,10 @@ mod notification_tests {
         notify_inbound_message_if_background(
             &state,
             "abcd1234abcd1234",
-            "identity-a",
+            &contact_label_from_db(&state.db, "abcd1234abcd1234", "identity-a"),
             "disabled",
             false,
-        )
-        .await;
+        );
         assert_eq!(notifier.notifications.lock().unwrap().len(), 1);
     }
 
@@ -9322,22 +9488,15 @@ mod notification_tests {
             "identity-a",
         );
 
-        notify_game_if_background(
-            &state,
-            "feedfacefeedface",
-            "session-1",
-            "chess",
-            "move",
-            false,
-        );
-        notify_game_if_background(
-            &state,
-            "feedfacefeedface",
-            "session-1",
-            "chess",
-            "move",
-            false,
-        );
+        let alert = GameAlert {
+            sender_hash: "feedfacefeedface".into(),
+            session_id: "session-1".into(),
+            app_id: "chess".into(),
+            command: "move".into(),
+            is_new_session: false,
+        };
+        notify_game_if_background(&state, "identity-a", &alert);
+        notify_game_if_background(&state, "identity-a", &alert);
 
         let seen = notifier.notifications.lock().unwrap().clone();
         assert_eq!(seen.len(), 2);

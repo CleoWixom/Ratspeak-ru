@@ -1962,6 +1962,28 @@ pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Stores an attachment in an identity's `files` directory, under a fresh name.
+pub(crate) fn save_attachment_in(
+    files_dir: &Path,
+    file_name: &str,
+    data: &[u8],
+) -> std::io::Result<String> {
+    use std::io::Write;
+
+    let stored_name = attachment_storage_name(file_name);
+    let path = files_dir.join(&stored_name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    if let Err(error) = file.write_all(data).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(stored_name)
+}
+
 impl LxmfManager {
     /// Load/create a manager after [`initialize_storage_namespace`] has completed
     /// before database or configuration users are opened.
@@ -3377,20 +3399,7 @@ impl LxmfManager {
     }
 
     pub fn save_attachment(&self, file_name: &str, data: &[u8]) -> std::io::Result<String> {
-        use std::io::Write;
-
-        let stored_name = attachment_storage_name(file_name);
-        let path = self.files_dir().join(&stored_name);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        if let Err(error) = file.write_all(data).and_then(|_| file.sync_all()) {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
-        }
-        Ok(stored_name)
+        save_attachment_in(&self.files_dir(), file_name, data)
     }
 
     fn adopt_staged_attachment(
