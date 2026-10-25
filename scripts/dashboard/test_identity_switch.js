@@ -58,8 +58,11 @@ var page = {
     loadConversations: function() { calls.push('loadConversations'); },
 };
 vm.createContext(page);
-vm.runInContext(functionSource('switchToIdentity') + '\n' + listenerSource('identity_switch_failed'),
-    page, { filename: 'identity-switch.js' });
+var pendingDeclaration = identity.slice(identity.indexOf('var _switchRequestsPending'),
+    identity.indexOf(';', identity.indexOf('var _switchRequestsPending')) + 1);
+assert(pendingDeclaration, 'missing the pending-switch count');
+vm.runInContext(pendingDeclaration + '\n' + functionSource('switchToIdentity') + '\n' +
+    listenerSource('identity_switch_failed'), page, { filename: 'identity-switch.js' });
 
 (async function() {
     var target = 'bb'.repeat(16);
@@ -79,6 +82,13 @@ vm.runInContext(functionSource('switchToIdentity') + '\n' + listenerSource('iden
     fail(error);
     await settle();
     assert.deepStrictEqual(toasts, [[reason, 'toast-error']], 'the reason is swallowed');
+
+    // Started elsewhere, by a removal's re-activation or another window: the
+    // event is all this window hears, so it says why.
+    toasts = [];
+    calls = [];
+    handlers.identity_switch_failed({ hash: target, generation: '10', error: reason });
+    assert.deepStrictEqual(toasts, [[reason, 'toast-error']], 'a switch this window did not start fails silently');
 
     // Refused before it began: no event, so the reply clears the overlay.
     toasts = [];

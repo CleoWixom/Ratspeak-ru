@@ -1444,7 +1444,7 @@ fn load_hwid_identity(
     )
 }
 
-fn bounded_plain_identity_from_file(
+pub(crate) fn bounded_plain_identity_from_file(
     path: &Path,
 ) -> Result<Identity, Box<dyn std::error::Error + Send + Sync>> {
     let key = crate::vault::read_plain_identity_key(path)?;

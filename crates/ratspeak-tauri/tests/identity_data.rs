@@ -483,6 +483,7 @@ fn setup_and_factory_reset_start_a_new_identity_session() {
             json!({ "args": { "display_name": "Ann" } }),
         )
         .unwrap();
+    // A guard, which passes without B3 too.
     assert_eq!(
         generation(),
         created,

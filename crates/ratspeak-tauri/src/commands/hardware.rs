@@ -363,7 +363,15 @@ pub async fn hw_remove(state: State<'_, Arc<AppState>>, hash: String) -> AppResu
         .and_then(|lxmf| lxmf.as_ref().map(|mgr| mgr.identity_hash.clone()))
         .as_deref()
         == Some(hash.as_str());
-    let live = was_loaded || was_locked;
+    let was_active =
+        db::spawn_db_with_lease(state.db.clone(), Arc::clone(&identity_lifecycle), |p| {
+            db::get_active_identity(&p)
+        })
+        .await
+        .map_err(|_| AppError::internal("active identity db task panicked"))?
+        .map_err(AppError::database_unavailable)?
+        .is_some_and(|row| row.get("hash").and_then(|v| v.as_str()) == Some(hash.as_str()));
+    let live = was_loaded || was_locked || was_active;
     if live {
         state.bump_identity_session_generation();
         shutdown_for_hardware_change(&state, "hardware_identity_remove").await?;
@@ -530,121 +538,6 @@ fn parse_remaining(msg: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// H is a locked hardware identity and the active one; S and an older
-    /// identity remain. Reticulum runs with no interfaces and shares no instance.
-    fn removal_state(protected_s: bool) -> (tempfile::TempDir, Arc<AppState>, String, String) {
-        let root = tempfile::tempdir().unwrap();
-        let data_root = root.path().to_path_buf();
-        crate::lxmf::initialize_storage_namespace(&data_root).unwrap();
-        let rns_dir = data_root.join("rns");
-        std::fs::create_dir_all(&rns_dir).unwrap();
-        std::fs::write(
-            rns_dir.join("config"),
-            "[reticulum]\nshare_instance = No\nenable_transport = No\n\n[interfaces]\n",
-        )
-        .unwrap();
-        let config = crate::config::DashboardConfig {
-            data_root: data_root.clone(),
-            data_dir: data_root.join(".ratspeak"),
-            rns_config_dir: rns_dir,
-            rns_config_dir_overridden: true,
-            max_log_entries: 20,
-        };
-        let pool = db::init_pool(&data_root).unwrap();
-        db::init_schema(&pool).unwrap();
-        let state = Arc::new(AppState::new(
-            config,
-            pool,
-            Arc::new(ratspeak_core::NoopEmitter),
-            Arc::new(ratspeak_core::NoopNotifier),
-        ));
-        let import = |nickname: &str| {
-            let key = rns_identity::identity::Identity::new()
-                .get_private_key()
-                .unwrap()
-                .to_vec();
-            crate::lxmf::LxmfManager::import_identity_to_data_dir(
-                &state.config.data_dir,
-                &key,
-                nickname,
-                &state.db,
-            )
-            .unwrap()
-            .0
-        };
-        let older = import("Older");
-        let s = import("S");
-        if protected_s {
-            let profile = state.config.data_dir.join("identities").join(&s);
-            std::fs::rename(profile.join("identity"), profile.join("identity.enc")).unwrap();
-        }
-        let h = "cccccccccccccccccccccccccccccccc".to_string();
-        let profile = state.config.data_dir.join("identities").join(&h);
-        std::fs::create_dir_all(&profile).unwrap();
-        std::fs::write(profile.join("identity.hwid"), b"{}").unwrap();
-        db::save_identity(&state.db, &h, "dddddddddddddddddddddddddddddddd", "H", "H");
-        let conn = state.db.get().unwrap();
-        for (hash, last_used) in [(&older, 1.0), (&s, 2.0)] {
-            conn.execute(
-                "UPDATE identities SET last_used = ?1 WHERE hash = ?2",
-                rusqlite::params![last_used, hash],
-            )
-            .unwrap();
-        }
-        drop(conn);
-        db::set_active_identity(&state.db, &h).unwrap();
-        state.set_hw_locked(Some(h.clone()));
-        state.set_startup_stage("hw_locked");
-        (root, state, h, s)
-    }
-
-    // N2: after hw_remove(H), a plain S is active and running; a passcode S
-    // is active and locked.
-    #[test]
-    fn removing_the_live_hardware_identity_activates_the_most_recent_one() {
-        use tauri::Manager;
-        for protected_s in [false, true] {
-            let (_root, state, h, s) = removal_state(protected_s);
-            let app = tauri::test::mock_builder()
-                .manage(Arc::clone(&state))
-                .build(tauri::test::mock_context(tauri::test::noop_assets()))
-                .unwrap();
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async {
-                let generation = state.current_identity_session_generation();
-                let removed = hw_remove(app.state(), h.clone()).await.unwrap();
-                assert_eq!(removed["needs_setup"], false);
-                assert!(db::get_identity(&state.db, &h).is_none());
-                let active = db::get_active_identity(&state.db)
-                    .unwrap()
-                    .and_then(|row| row["hash"].as_str().map(str::to_owned));
-                assert_eq!(
-                    active.as_deref(),
-                    Some(s.as_str()),
-                    "protected: {protected_s}"
-                );
-                assert!(state.current_identity_session_generation() > generation);
-                if protected_s {
-                    assert_eq!(state.hw_locked_hash().as_deref(), Some(s.as_str()));
-                } else {
-                    let loaded = state
-                        .lxmf
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|mgr| mgr.identity_hash.clone());
-                    assert_eq!(loaded.as_deref(), Some(s.as_str()));
-                    assert!(state.rns.read().unwrap().is_some(), "S is not running");
-                    crate::shutdown_rns_lxmf(&state).await.unwrap();
-                }
-            });
-        }
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hardware_mutation_cancelled_waiter_keeps_actual_disk_worker_owned() {

@@ -836,6 +836,9 @@ function updateRemoveButtonState() {
     }
 }
 
+// Switches this window asked for; their own replies say why one failed.
+var _switchRequestsPending = 0;
+
 function switchToIdentity(hash) {
     var card = document.getElementById('identity-active-card');
     if (card) {
@@ -843,7 +846,11 @@ function switchToIdentity(hash) {
     }
     // Backend reloads LXMF manager + emits identity_switched, which drives
     // full state cleanup + re-emits initial state for the new identity.
-    RS.invoke('switch_identity', { hash: hash }).catch(function(err) {
+    _switchRequestsPending += 1;
+    RS.invoke('switch_identity', { hash: hash }).then(function() {
+        _switchRequestsPending -= 1;
+    }, function(err) {
+        _switchRequestsPending -= 1;
         showToast((err && err.message) ? err.message : 'Could not switch identity', 'toast-error', 4000);
         loadIdentities();
     });
@@ -1830,8 +1837,9 @@ RS.listen('identity_switching', function() {
 });
 
 // A switch that did not finish: the previous identity is back, or none is.
-RS.listen('identity_switch_failed', function() {
+RS.listen('identity_switch_failed', function(data) {
     window._identitySwitchInProgress = false;
+    if (!_switchRequestsPending && data && data.error) showToast(data.error, 'toast-error', 4000);
     loadIdentities();
     if (typeof loadConversations === 'function') loadConversations();
 });

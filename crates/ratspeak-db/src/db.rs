@@ -1984,16 +1984,16 @@ pub fn save_identity(
     };
     let now = now_ts();
     // ON CONFLICT closes the race between two "not exists" → INSERT callers.
+    // Only an activation marks an identity used.
     conn.execute(
         "INSERT INTO identities
              (hash, lxmf_hash, nickname, display_name, created_at, last_used,
               is_active, propagation_node, propagation_enabled)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, '', 0)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, '', 0)
          ON CONFLICT(hash) DO UPDATE SET
              lxmf_hash    = excluded.lxmf_hash,
              nickname     = excluded.nickname,
-             display_name = excluded.display_name,
-             last_used    = excluded.last_used",
+             display_name = excluded.display_name",
         params![hash_hex, lxmf_hash, nickname, display_name, now],
     )
     .ok();

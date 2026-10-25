@@ -1212,7 +1212,7 @@ fn profile_has_identity_material(dir: &std::path::Path) -> bool {
         || dir.join("identity.hwid").exists()
 }
 
-/// The most recently used identity whose key material is on disk.
+/// The most recently used identity that can open.
 pub fn most_recent_identity(
     pool: &db::DbPool,
     data_dir: &std::path::Path,
@@ -1221,9 +1221,18 @@ pub fn most_recent_identity(
     Ok(db::identity_hashes_by_last_use(pool)?
         .into_iter()
         .find(|hash| {
-            helpers::is_protocol_hash_16(hash)
-                && profile_has_identity_material(&identities.join(hash))
+            helpers::is_protocol_hash_16(hash) && profile_opens(&identities.join(hash), hash)
         }))
+}
+
+/// A protected identity opens to its lock sheet; a plain one only when its key
+/// loads as that identity.
+fn profile_opens(dir: &std::path::Path, hash: &str) -> bool {
+    if dir.join("identity.hwid").exists() || dir.join("identity.enc").exists() {
+        return true;
+    }
+    lxmf::bounded_plain_identity_from_file(&dir.join("identity"))
+        .is_ok_and(|identity| hex::encode(identity.hash) == hash)
 }
 
 /// No active row: the most recently used identity becomes active, as after a
@@ -8861,107 +8870,36 @@ mod identity_material_tests {
 mod identity_session_tests {
     use super::*;
 
-    /// Startup stops at Reticulum, which has no configuration here: these
-    /// tests need only its identity half, and start no runtime.
-    fn identity_state() -> (tempfile::TempDir, Arc<AppState>) {
+    // Locking ends the session: nothing begun under it may land behind the
+    // lock. The lock is private, so this stays in the library's tests.
+    #[tokio::test]
+    async fn auto_lock_starts_a_new_identity_session() {
         let root = tempfile::tempdir().unwrap();
         let data_root = root.path().to_path_buf();
         lxmf::initialize_storage_namespace(&data_root).unwrap();
-        let rns_dir = data_root.join("rns");
         let config = crate::config::DashboardConfig {
             data_root: data_root.clone(),
             data_dir: data_root.join(".ratspeak"),
-            rns_config_dir: rns_dir,
+            rns_config_dir: data_root.join("rns"),
             rns_config_dir_overridden: true,
             max_log_entries: 20,
         };
         let pool = db::init_pool(&data_root).unwrap();
         db::init_schema(&pool).unwrap();
-        let state = AppState::new(
+        let state = Arc::new(AppState::new(
             config,
             pool,
             Arc::new(ratspeak_core::NoopEmitter),
             Arc::new(ratspeak_core::NoopNotifier),
-        );
-        (root, Arc::new(state))
-    }
-
-    fn import(state: &AppState, nickname: &str) -> String {
-        let key = rns_identity::identity::Identity::new()
-            .get_private_key()
-            .unwrap()
-            .to_vec();
-        lxmf::LxmfManager::import_identity_to_data_dir(
-            &state.config.data_dir,
-            &key,
-            nickname,
-            &state.db,
-        )
-        .unwrap()
-        .0
-    }
-
-    fn active(state: &AppState) -> Option<String> {
-        db::get_active_identity(&state.db)
-            .unwrap()
-            .and_then(|row| row.get("hash").and_then(|v| v.as_str()).map(str::to_owned))
-    }
-
-    // Locking ends the session: nothing begun under it may land behind the lock.
-    #[tokio::test]
-    async fn auto_lock_starts_a_new_identity_session() {
-        let (_root, state) = identity_state();
+        ));
         let identity = rns_identity::identity::Identity::new();
-        let manager =
-            lxmf::LxmfManager::from_loaded_identity(&state.config.data_root, identity, true)
-                .unwrap();
+        let manager = lxmf::LxmfManager::from_loaded_identity(&data_root, identity, true).unwrap();
         let hash = manager.identity_hash.clone();
         state.set_lxmf(manager);
         let generation = state.current_identity_session_generation();
         let lock_generation = state.hw_lock_gen.load(std::sync::atomic::Ordering::SeqCst);
         lock_hardware_session(Arc::clone(&state), lock_generation).await;
         assert_eq!(state.hw_locked_hash().as_deref(), Some(hash.as_str()));
-        assert!(state.current_identity_session_generation() > generation);
-    }
-
-    #[tokio::test]
-    async fn startup_recovery_starts_a_new_identity_session() {
-        let (_root, state) = identity_state();
-        let hash = import(&state, "Found");
-        state
-            .db
-            .get()
-            .unwrap()
-            .execute("DELETE FROM identities", [])
-            .unwrap();
-        let generation = state.current_identity_session_generation();
-        init_rns_lxmf(Arc::clone(&state), state.config.data_root.clone()).await;
-        assert_eq!(active(&state).as_deref(), Some(hash.as_str()));
-        assert!(state.current_identity_session_generation() > generation);
-    }
-
-    // With no active row the most recently used identity opens, as after a
-    // removal; a protected one opens to its lock sheet.
-    #[tokio::test]
-    async fn a_cold_start_without_an_active_row_opens_the_most_recent_identity() {
-        let (_root, state) = identity_state();
-        let older = import(&state, "Older");
-        let newer = import(&state, "Newer");
-        let profile = state.config.data_dir.join("identities").join(&newer);
-        std::fs::rename(profile.join("identity"), profile.join("identity.enc")).unwrap();
-        let conn = state.db.get().unwrap();
-        for (hash, last_used) in [(&older, 1.0), (&newer, 2.0)] {
-            conn.execute(
-                "UPDATE identities SET last_used = ?1 WHERE hash = ?2",
-                rusqlite::params![last_used, hash],
-            )
-            .unwrap();
-        }
-        drop(conn);
-        let generation = state.current_identity_session_generation();
-        init_rns_lxmf(Arc::clone(&state), state.config.data_root.clone()).await;
-        assert_eq!(active(&state).as_deref(), Some(newer.as_str()));
-        assert_eq!(state.hw_locked_hash().as_deref(), Some(newer.as_str()));
         assert!(state.current_identity_session_generation() > generation);
     }
 }
@@ -9181,6 +9119,69 @@ mod notification_tests {
             !burst.activity_recorded,
             "a transition must suppress the announce"
         );
+    }
+
+    // A burst that really sends: its dispatch waits outside the lifecycle
+    // lock, so routine work goes on meanwhile, and it invalidates no request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sending_burst_waits_for_dispatch_outside_the_lock_and_invalidates_nothing() {
+        use rns_transport::messages::{OutboundDispatchResult, TransportMessage};
+        let state = announce_state();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("config"),
+            "[reticulum]\nshare_instance = No\nenable_transport = No\n[interfaces]\n",
+        )
+        .unwrap();
+        let mut network = crate::rns::RnsManager::init(
+            root.path().to_str().unwrap(),
+            Some(root.path().join("cache")),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .await
+        .unwrap();
+        let (tx, mut packets) = tokio::sync::mpsc::channel(4);
+        network.handle.transport_tx = tx;
+        let network_shutdown = network.handle.shutdown.clone();
+        *state.rns.write().unwrap() = Some(network);
+
+        let origin = state.activity_request_fence();
+        let bystander = state.activity_request_fence();
+        let burst = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                execute_announce_burst(&state, false, origin, &manual_leadership(&state)).await
+            }
+        });
+        let Some(TransportMessage::SendPacket { result_tx, .. }) = packets.recv().await else {
+            panic!("the burst sent nothing");
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                state.identity_switch_lock.lock_routine()
+            )
+            .await
+            .is_ok(),
+            "the burst held the lifecycle lock across a pending dispatch"
+        );
+        let _ = result_tx.send(OutboundDispatchResult::Sent);
+        let answer = tokio::spawn(async move {
+            while let Some(message) = packets.recv().await {
+                if let TransportMessage::SendPacket { result_tx, .. } = message {
+                    let _ = result_tx.send(OutboundDispatchResult::Sent);
+                }
+            }
+        });
+        let burst = burst.await.unwrap();
+        assert!(burst.report.lxmf_delivery_queued, "the burst did not send");
+        assert!(
+            state.is_current_activity_origin_fence(bystander),
+            "sending the announce invalidated another request"
+        );
+        network_shutdown.trigger();
+        state.rns.write().unwrap().take();
+        answer.abort();
     }
 
     #[test]
