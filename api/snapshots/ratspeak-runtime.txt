@@ -1347,7 +1347,7 @@ pub ratspeak_runtime::hardware::HwExisting::on_card_only: bool
 pub struct ratspeak_runtime::hardware::HwProvisioned
 pub ratspeak_runtime::hardware::HwProvisioned::hash: alloc::string::String
 pub ratspeak_runtime::hardware::HwProvisioned::lxmf_hash: alloc::string::String
-pub ratspeak_runtime::hardware::HwProvisioned::mnemonic: core::option::Option<alloc::string::String>
+pub ratspeak_runtime::hardware::HwProvisioned::mnemonic: core::option::Option<zeroize::Zeroizing<alloc::string::String>>
 pub struct ratspeak_runtime::hardware::PinnedProvisionRequest<'a>
 pub ratspeak_runtime::hardware::PinnedProvisionRequest::current_pin: core::option::Option<&'a str>
 pub ratspeak_runtime::hardware::PinnedProvisionRequest::expected_serial: u32
@@ -2636,9 +2636,9 @@ pub fn ratspeak_runtime::RNodeActivityRuntimeContext::handle(&self) -> &rns_runt
 pub fn ratspeak_runtime::RNodeActivityRuntimeContext::origin(&self) -> ratspeak_runtime::state::RNodeActivityOrigin
 pub fn ratspeak_runtime::any_interface_online_cached(&ratspeak_runtime::state::AppState) -> core::option::Option<bool>
 pub fn ratspeak_runtime::apply_lxmf_settings_from_state(&ratspeak_runtime::state::AppState, &mut ratspeak_runtime::lxmf::LxmfManager)
-pub fn ratspeak_runtime::derive_identity_key_from_phrase(&str) -> core::result::Result<[u8; 64], alloc::string::String>
+pub fn ratspeak_runtime::derive_identity_key_from_phrase(&str) -> core::result::Result<zeroize::Zeroizing<[u8; 64]>, alloc::string::String>
 pub async fn ratspeak_runtime::finish_shutdown(&alloc::sync::Arc<ratspeak_runtime::state::AppState>, &ratspeak_runtime::ActivityReset)
-pub fn ratspeak_runtime::generate_recoverable_key() -> core::result::Result<(alloc::string::String, [u8; 64]), alloc::string::String>
+pub fn ratspeak_runtime::generate_recoverable_key() -> core::result::Result<(zeroize::Zeroizing<alloc::string::String>, zeroize::Zeroizing<[u8; 64]>), alloc::string::String>
 pub async fn ratspeak_runtime::init_rns_lxmf(alloc::sync::Arc<ratspeak_runtime::state::AppState>, std::path::PathBuf)
 pub async fn ratspeak_runtime::maybe_opportunistic_announce_before_user_send(&alloc::sync::Arc<ratspeak_runtime::state::AppState>, &str) -> ratspeak_runtime::AnnounceSendReport
 pub async fn ratspeak_runtime::maybe_opportunistic_announce_before_user_send_from_origin(&alloc::sync::Arc<ratspeak_runtime::state::AppState>, &str, ratspeak_runtime::state::ActivityRequestFence) -> ratspeak_runtime::AnnounceSendReport

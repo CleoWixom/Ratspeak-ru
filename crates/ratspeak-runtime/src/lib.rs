@@ -1245,13 +1245,13 @@ async fn lock_protected_session(state: Arc<AppState>, lock: state::AutoLock) {
 /// as recoverable hardware provisioning, so the restored identity matches the
 /// YubiKey-backed one. Hardware-independent — works on every platform.
 #[cfg(feature = "seed")]
-pub fn derive_identity_key_from_phrase(phrase: &str) -> Result<[u8; 64], String> {
+pub fn derive_identity_key_from_phrase(phrase: &str) -> Result<Zeroizing<[u8; 64]>, String> {
     if !rns_ratkey::seed::validate_mnemonic(phrase) {
         return Err("Invalid recovery phrase — expected 12 valid BIP-39 words".into());
     }
     let derived = rns_ratkey::seed::derive_identity(phrase)
         .map_err(|e| format!("Could not derive identity: {e}"))?;
-    let mut key = [0u8; 64];
+    let mut key = Zeroizing::new([0u8; 64]);
     key[..32].copy_from_slice(&derived.x25519_secret);
     key[32..].copy_from_slice(&derived.ed25519_seed);
     Ok(key)
@@ -1262,9 +1262,11 @@ pub fn derive_identity_key_from_phrase(phrase: &str) -> Result<[u8; 64], String>
 /// software identity and stores the mnemonic with the same at-rest protection as
 /// the identity key so it can be re-displayed after re-authentication.
 #[cfg(feature = "seed")]
-pub fn generate_recoverable_key() -> Result<(String, [u8; 64]), String> {
-    let mnemonic = rns_ratkey::seed::generate_mnemonic()
-        .map_err(|e| format!("Could not generate recovery phrase: {e}"))?;
+pub fn generate_recoverable_key() -> Result<(Zeroizing<String>, Zeroizing<[u8; 64]>), String> {
+    let mnemonic = Zeroizing::new(
+        rns_ratkey::seed::generate_mnemonic()
+            .map_err(|e| format!("Could not generate recovery phrase: {e}"))?,
+    );
     let key = derive_identity_key_from_phrase(&mnemonic)?;
     Ok((mnemonic, key))
 }

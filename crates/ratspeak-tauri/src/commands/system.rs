@@ -151,7 +151,7 @@ pub async fn api_setup_complete(
         let write = tokio::task::spawn_blocking(move || {
             crate::lxmf::LxmfManager::import_identity_to_data_dir(
                 &write_dir,
-                &key,
+                &key[..],
                 &write_nick,
                 &write_db,
             )
@@ -211,7 +211,7 @@ pub async fn api_setup_complete(
         "identity_hash": identity_hash,
         "lxmf_hash": lxmf_hash,
         "display_name": display_name,
-        "mnemonic": mnemonic,
+        "mnemonic": mnemonic.as_deref().map(String::as_str),
     }))
 }
 
@@ -869,6 +869,67 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_returns_the_recoverable_phrase_once_with_the_same_json_shape() {
+        use tauri::Manager;
+
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+        let pool = db::init_pool(root.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        let state = Arc::new(AppState::new(
+            config,
+            pool,
+            Arc::new(ratspeak_core::NoopEmitter),
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        let app = tauri::test::mock_builder()
+            .manage(Arc::clone(&state))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let first = api_setup_complete(app.state(), SetupCompleteArgs { display_name: None })
+            .await
+            .unwrap();
+        let phrase = first["mnemonic"].as_str().unwrap();
+        let key = ratspeak_runtime::derive_identity_key_from_phrase(phrase).unwrap();
+        let identity = rns_identity::identity::Identity::from_private_key(&key[..]).unwrap();
+        let hash = hex::encode(identity.hash);
+        let directory = state.config.data_dir.join("identities").join(&hash);
+        let stored =
+            ratspeak_runtime::vault::read_plain_identity_key(&directory.join("identity")).unwrap();
+        assert_eq!(&key[..], &stored[..]);
+        let lxmf_hash = first["lxmf_hash"].as_str().unwrap();
+        assert_eq!(
+            first,
+            json!({
+                "ok": true,
+                "identity_hash": hash,
+                "lxmf_hash": lxmf_hash,
+                "display_name": format!("!Ratspeak.org-{}", &lxmf_hash[..6]),
+                "mnemonic": phrase,
+            })
+        );
+        let second = api_setup_complete(
+            app.state(),
+            SetupCompleteArgs {
+                display_name: Some("Ann".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second,
+            json!({
+                "ok": true,
+                "identity_hash": hash,
+                "lxmf_hash": lxmf_hash,
+                "display_name": "Ann",
+                "mnemonic": null,
+            })
+        );
+    }
 
     #[derive(Default)]
     struct Recorder(std::sync::Mutex<Vec<String>>);

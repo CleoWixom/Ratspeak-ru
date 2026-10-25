@@ -119,7 +119,11 @@ struct EncryptedIdentityBackupV2 {
 struct LegacyIdentityBackupV1 {
     format: String,
     kind: String,
-    private_key: String,
+    #[serde(
+        serialize_with = "serialize_private_key",
+        deserialize_with = "deserialize_private_key"
+    )]
+    private_key: Zeroizing<String>,
     identity_hash: String,
     lxmf_hash: String,
     #[serde(default)]
@@ -135,6 +139,20 @@ struct ParsedIdentityImport {
     key_bytes: Zeroizing<Vec<u8>>,
     format: &'static str,
     mnemonic: Option<Zeroizing<String>>,
+}
+
+fn serialize_private_key<S>(key: &Zeroizing<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(key.as_str())
+}
+
+fn deserialize_private_key<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Zeroizing::new)
 }
 
 fn now_ts() -> f64 {
@@ -522,7 +540,6 @@ pub async fn api_create_identity(
     // duplicate-check, on-disk write, and activation.
     let (mnemonic, key) =
         ratspeak_runtime::generate_recoverable_key().map_err(AppError::internal)?;
-    let (mnemonic, key) = (Zeroizing::new(mnemonic), Zeroizing::new(key));
     let mut resp = import_identity_request(
         Arc::clone(&state),
         Zeroizing::new(key.to_vec()),
@@ -596,10 +613,8 @@ pub async fn restore_seed_identity(
     let request_fence = state.activity_request_fence();
     let phrase = Zeroizing::new(args.phrase);
     let phrase = Zeroizing::new(phrase.trim().to_owned());
-    let key = Zeroizing::new(
-        ratspeak_runtime::derive_identity_key_from_phrase(&phrase)
-            .map_err(AppError::bad_request)?,
-    );
+    let key = ratspeak_runtime::derive_identity_key_from_phrase(&phrase)
+        .map_err(AppError::bad_request)?;
     import_identity_request(
         Arc::clone(&state),
         Zeroizing::new(key.to_vec()),
@@ -2189,11 +2204,11 @@ mod tests {
         }
     }
 
-    fn parsed_key(key_bytes: Vec<u8>, mnemonic: Option<String>) -> ParsedIdentityImport {
+    fn parsed_key(key_bytes: Vec<u8>, mnemonic: Option<Zeroizing<String>>) -> ParsedIdentityImport {
         ParsedIdentityImport {
             key_bytes: Zeroizing::new(key_bytes),
             format: "test-private-key",
-            mnemonic: mnemonic.map(Zeroizing::new),
+            mnemonic,
         }
     }
 
@@ -2202,7 +2217,7 @@ mod tests {
     async fn identity_mutation_cancelled_import_keeps_reset_blocked_until_seed_worker_finishes() {
         let (_root, state) = mutation_state();
         let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
-        let identity = Identity::from_private_key(&key).unwrap();
+        let identity = Identity::from_private_key(&key[..]).unwrap();
         let hash = hex::encode(identity.hash);
         let request_fence = state.activity_request_fence();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -2212,7 +2227,7 @@ mod tests {
             import_identity_after_parse(
                 worker_state,
                 None,
-                Some(Zeroizing::new(phrase)),
+                Some(phrase),
                 request_fence,
                 std::future::ready(Ok(parsed_key(key.to_vec(), None))),
                 move |state, parsed, nickname, mnemonic| {
@@ -2339,7 +2354,7 @@ mod tests {
         for explicit in [true, false] {
             let (_root, state) = mutation_state();
             let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
-            let identity = Identity::from_private_key(&key).unwrap();
+            let identity = Identity::from_private_key(&key[..]).unwrap();
             let hash = hex::encode(identity.hash);
             let parsed = parsed_key(key.to_vec(), (!explicit).then_some(phrase.clone()));
             let value = tokio::time::timeout(
@@ -2347,7 +2362,7 @@ mod tests {
                 import_identity_after_parse(
                     Arc::clone(&state),
                     None,
-                    explicit.then(|| Zeroizing::new(phrase)),
+                    explicit.then_some(phrase),
                     state.activity_request_fence(),
                     std::future::ready(Ok(parsed)),
                     |state, parsed, nickname, mnemonic| {
@@ -2480,6 +2495,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_backup_private_key_keeps_its_json_string_shape() {
+        let value = json!({
+            "format": LEGACY_IDENTITY_BACKUP_FORMAT,
+            "kind": "private",
+            "private_key": "cHJpdmF0ZSBrZXk=",
+            "identity_hash": "identity",
+            "lxmf_hash": "destination",
+            "display_name": "Name",
+            "status": "Away",
+            "nickname": "Alias",
+            "exported_at": 1.0,
+        });
+        let backup: LegacyIdentityBackupV1 = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(backup.private_key.as_str(), "cHJpdmF0ZSBrZXk=");
+        assert_eq!(serde_json::to_value(&backup).unwrap(), value);
+
+        let mut invalid = value;
+        invalid["private_key"] = json!([1, 2, 3]);
+        assert!(serde_json::from_value::<LegacyIdentityBackupV1>(invalid).is_err());
+    }
+
+    #[test]
     fn parse_private_identity_accepts_legacy_backup_envelope() {
         let _serial = VAULT_TEST_SERIAL.lock().unwrap();
         let key = private_key_bytes();
@@ -2487,7 +2524,7 @@ mod tests {
         let backup = LegacyIdentityBackupV1 {
             format: LEGACY_IDENTITY_BACKUP_FORMAT.to_string(),
             kind: "private".to_string(),
-            private_key: B64.encode(&key),
+            private_key: Zeroizing::new(B64.encode(&key)),
             identity_hash: preview
                 .get("identity_hash")
                 .and_then(|v| v.as_str())
@@ -2545,7 +2582,7 @@ mod tests {
         let backup = LegacyIdentityBackupV1 {
             format: LEGACY_IDENTITY_BACKUP_FORMAT.to_string(),
             kind: "public".to_string(),
-            private_key: B64.encode(&key),
+            private_key: Zeroizing::new(B64.encode(&key)),
             identity_hash: String::new(),
             lxmf_hash: String::new(),
             display_name: String::new(),
@@ -2568,7 +2605,7 @@ mod tests {
         let backup = LegacyIdentityBackupV1 {
             format: LEGACY_IDENTITY_BACKUP_FORMAT.to_string(),
             kind: "private".to_string(),
-            private_key: B64.encode(&key),
+            private_key: Zeroizing::new(B64.encode(&key)),
             identity_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             lxmf_hash: String::new(),
             display_name: String::new(),

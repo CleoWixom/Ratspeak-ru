@@ -43,7 +43,7 @@
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/ratspeak-runtime.txt",
       "itemCount": 2657,
-      "sha256": "708e63c9827190bac39039d112f0b132085618cb25fa063581a6fb3ceea14251"
+      "sha256": "b4f050449fbeca4533e9ce361753f3441daedb3f382987f8eacc878cc1bc677e"
     },
     {
       "name": "ratspeak-tauri",

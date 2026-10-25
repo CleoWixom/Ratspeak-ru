@@ -14,6 +14,7 @@ use rns_ratkey::mock::TouchPolicy;
 use rns_ratkey::provision::{self, ProvisionConfig};
 use rns_ratkey::{PcscPivSession, RatkeyError};
 
+use crate::Zeroizing;
 use crate::state::DbPool;
 use ratspeak_core::LXMF_DELIVERY_APP_NAME as LXMF_APP_NAME;
 
@@ -53,8 +54,21 @@ pub struct HwProvisioned {
     pub hash: String,
     pub lxmf_hash: String,
     /// Present only for recoverable provisioning — shown to the user once.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mnemonic: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_mnemonic"
+    )]
+    pub mnemonic: Option<Zeroizing<String>>,
+}
+
+fn serialize_mnemonic<S>(
+    mnemonic: &Option<Zeroizing<String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serde::Serialize::serialize(&mnemonic.as_deref().map(String::as_str), serializer)
 }
 
 /// PIV native Ed25519/X25519 needs YubiKey firmware >= 5.7.0.
@@ -199,6 +213,7 @@ pub fn provision_recoverable(
     let (result, mnemonic) =
         provision::provision_recoverable(&mut session, &DEFAULT_MGMT_KEY, &cfg)
             .map_err(|e| e.to_string())?;
+    let mnemonic = Zeroizing::new(mnemonic);
     let lxmf_hash = register(
         data_dir,
         db,
@@ -531,6 +546,26 @@ fn register(
 #[cfg(test)]
 mod tests {
     use super::verify_expected_serial;
+
+    #[test]
+    fn provisioned_mnemonic_keeps_its_optional_json_shape() {
+        let mut provisioned = super::HwProvisioned {
+            hash: "identity".to_owned(),
+            lxmf_hash: "destination".to_owned(),
+            mnemonic: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&provisioned).unwrap(),
+            serde_json::json!({"hash": "identity", "lxmf_hash": "destination"})
+        );
+        provisioned.mnemonic = Some(super::Zeroizing::new("recovery phrase".to_owned()));
+        assert_eq!(
+            serde_json::to_value(&provisioned).unwrap(),
+            serde_json::json!({
+                "hash": "identity", "lxmf_hash": "destination", "mnemonic": "recovery phrase"
+            })
+        );
+    }
 
     #[test]
     fn destructive_operations_require_the_pinned_device_serial() {

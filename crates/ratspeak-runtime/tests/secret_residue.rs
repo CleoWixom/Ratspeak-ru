@@ -1,5 +1,5 @@
-//! Plain identity keys and recovery phrases read from disk leave no copy in
-//! freed heap memory, also when a file is refused. A recording allocator
+//! Owned identity keys and recovery phrases leave no copy in freed heap memory
+//! when dropped or read from disk, also when a file is refused. A recording allocator
 //! copies every block the checking thread frees, and each check searches
 //! those copies for its secret.
 
@@ -196,5 +196,65 @@ fn a_plain_identitys_phrase_and_key_are_read_without_residue() {
         ));
         found.extend(residue(&freed, &format!("{name}: key"), &key));
     }
+    assert!(found.is_empty(), "{found:?}");
+}
+
+// Record only the returned owner's destruction: derivation's internal
+// allocations belong to the seed implementation's own tests. Boxing the key
+// lets the allocator observe its storage immediately after Drop.
+#[cfg(feature = "seed")]
+#[test]
+fn derived_identity_key_owner_wipes_on_drop() {
+    let _serial = serial();
+    let key = ratspeak_runtime::derive_identity_key_from_phrase(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    )
+    .unwrap();
+    let expected = key.to_vec();
+    let key = std::hint::black_box(Box::new(key));
+
+    let ((), freed) = freed_by(|| drop(key));
+
+    assert!(!freed.is_empty(), "key storage was not recorded");
+    let found = residue(&freed, "derived key", &expected);
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[cfg(feature = "seed")]
+#[test]
+fn recoverable_key_owners_wipe_on_drop() {
+    let _serial = serial();
+    let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
+    let expected_phrase = phrase.as_bytes().to_vec();
+    let expected_key = key.to_vec();
+    let key = std::hint::black_box(Box::new(key));
+
+    let ((), freed) = freed_by(|| drop((phrase, key)));
+
+    assert!(freed.len() >= 2, "phrase and key storage were not recorded");
+    let mut found = residue(&freed, "generated phrase", &expected_phrase);
+    found.extend(residue(&freed, "generated key", &expected_key));
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[cfg(all(
+    feature = "hardware",
+    not(any(target_os = "android", target_os = "ios"))
+))]
+#[test]
+fn provisioned_phrase_owner_wipes_on_drop() {
+    let _serial = serial();
+    let phrase =
+        "orbit velvet lantern mosaic ember quarry tundra violet walnut zephyr bramble cinder";
+    let provisioned = ratspeak_runtime::hardware::HwProvisioned {
+        hash: "identity".to_owned(),
+        lxmf_hash: "destination".to_owned(),
+        mnemonic: Some(phrase.to_owned().into()),
+    };
+
+    let ((), freed) = freed_by(|| drop(provisioned));
+
+    assert!(freed.iter().any(|block| block.len() >= phrase.len()));
+    let found = residue(&freed, "provisioned phrase", phrase.as_bytes());
     assert!(found.is_empty(), "{found:?}");
 }
