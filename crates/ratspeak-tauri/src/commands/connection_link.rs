@@ -165,7 +165,9 @@ fn parse_uint(value: &str, field: &str) -> Result<u64, String> {
         && value.bytes().all(|b| b.is_ascii_digit())
         && (value == "0" || !value.starts_with('0'));
     if !valid {
-        return Err(format!("Connection link field `{field}` is not a valid number"));
+        return Err(format!(
+            "Connection link field `{field}` is not a valid number"
+        ));
     }
     value
         .parse::<u64>()
@@ -190,7 +192,9 @@ fn parse_percent(value: &str, field: &str) -> Result<f64, String> {
     let number = well_formed.then(|| value.parse::<f64>().ok()).flatten();
     match number {
         Some(number) if number > 0.0 && number <= 100.0 => Ok(number),
-        _ => Err(format!("Connection link field `{field}` must be a percentage above 0 and up to 100")),
+        _ => Err(format!(
+            "Connection link field `{field}` must be a percentage above 0 and up to 100"
+        )),
     }
 }
 
@@ -281,8 +285,18 @@ fn parse_radio(payload: &str, url: &Url) -> Result<RadioLinkTarget, String> {
     let mut fields = collect_fields(
         url,
         &[
-            "v", "name", "mode", "region", "preset", "freq", "bw", "sf", "cr", "tx",
-            "airtime_short", "airtime_long",
+            "v",
+            "name",
+            "mode",
+            "region",
+            "preset",
+            "freq",
+            "bw",
+            "sf",
+            "cr",
+            "tx",
+            "airtime_short",
+            "airtime_long",
         ],
     )?;
     require_version(&mut fields)?;
@@ -314,9 +328,7 @@ fn parse_radio(payload: &str, url: &Url) -> Result<RadioLinkTarget, String> {
     let named = region.is_some() || preset.is_some();
     let custom = freq.is_some() || bw.is_some() || sf.is_some() || cr.is_some() || tx.is_some();
     if named == custom {
-        return Err(
-            "Radio link needs either region and preset, or freq, bw, sf, cr and tx".into(),
-        );
+        return Err("Radio link needs either region and preset, or freq, bw, sf, cr and tx".into());
     }
 
     let (region_key, preset_key, frequency, bandwidth, spreading_factor, coding_rate, tx_power) =
@@ -410,7 +422,8 @@ pub fn build_tcp_link(
     ifac_network_name: Option<&str>,
     ifac_passphrase: Option<&str>,
 ) -> Result<TcpLinkTarget, String> {
-    let mut url = Url::parse("ratspeak://tcp").map_err(|_| "Could not create a link".to_string())?;
+    let mut url =
+        Url::parse("ratspeak://tcp").map_err(|_| "Could not create a link".to_string())?;
     {
         let mut query = url.query_pairs_mut();
         query
@@ -451,7 +464,9 @@ pub fn build_radio_preset_link(
         if let Some(mode) = mode {
             query.append_pair("mode", mode);
         }
-        query.append_pair("region", region).append_pair("preset", preset);
+        query
+            .append_pair("region", region)
+            .append_pair("preset", preset);
     }
     match parse_connection_link(url.as_str())? {
         ConnectionLinkTarget::Radio(target) => Ok(target),
@@ -511,8 +526,14 @@ mod tests {
     fn tcp_accepts_ipv6_literal_and_non_ascii_values_round_trip() {
         let target = tcp("ratspeak://tcp?v=1&host=2001%3Adb8%3A%3A1&port=4242");
         assert_eq!(target.host, "2001:db8::1");
-        let built = build_tcp_link("node.example", 4242, Some("Узел"), Some("сеть"), Some("пароль"))
-            .expect("builds");
+        let built = build_tcp_link(
+            "node.example",
+            4242,
+            Some("Узел"),
+            Some("сеть"),
+            Some("пароль"),
+        )
+        .expect("builds");
         assert_eq!(tcp(&built.payload), built);
     }
 
@@ -578,7 +599,9 @@ mod tests {
 
     #[test]
     fn radio_named_region_and_preset_resolve_parameters() {
-        let target = radio("ratspeak://radio?v=1&name=Local%20mesh&region=europe&preset=medium_fast&mode=gateway");
+        let target = radio(
+            "ratspeak://radio?v=1&name=Local%20mesh&region=europe&preset=medium_fast&mode=gateway",
+        );
         let expected = radio::resolve_rnode_params("europe", "medium_fast").unwrap();
         assert!(!target.custom_params);
         assert_eq!(target.region_key.as_deref(), Some("europe"));
@@ -598,7 +621,13 @@ mod tests {
         assert!(target.custom_params);
         assert_eq!(target.region_key, None);
         assert_eq!(
-            (target.frequency, target.bandwidth, target.spreading_factor, target.coding_rate, target.tx_power),
+            (
+                target.frequency,
+                target.bandwidth,
+                target.spreading_factor,
+                target.coding_rate,
+                target.tx_power
+            ),
             (868_000_000, 250_000, 9, 5, 14)
         );
         assert_eq!(target.airtime_limit_short, Some(1.5));
@@ -634,8 +663,9 @@ mod tests {
 
     #[test]
     fn radio_builder_round_trips() {
-        let built = build_radio_preset_link("europe", "medium_fast", Some("Local mesh"), Some("full"))
-            .expect("builds");
+        let built =
+            build_radio_preset_link("europe", "medium_fast", Some("Local mesh"), Some("full"))
+                .expect("builds");
         assert_eq!(radio(&built.payload), built);
     }
 }

@@ -9556,9 +9556,8 @@ fn native_connection_links_prefill_forms_and_never_connect_on_their_own() {
     let parser = read_source(root.join("crates/ratspeak-tauri/src/commands/connection_link.rs"))
         .expect("connection-link parser");
     let lib = read_source(root.join("src-tauri/src/lib.rs")).expect("Tauri entry point");
-    let manifest =
-        read_source(root.join("src-tauri/gen/android/app/src/main/AndroidManifest.xml"))
-            .expect("Android manifest");
+    let manifest = read_source(root.join("src-tauri/gen/android/app/src/main/AndroidManifest.xml"))
+        .expect("Android manifest");
 
     // Rust is the only parser; the frontend never sees the raw platform URL.
     assert!(native.contains("parse_connection_link(payload)"));
@@ -9580,7 +9579,12 @@ fn native_connection_links_prefill_forms_and_never_connect_on_their_own() {
         .nth(1)
         .and_then(|rest| rest.split("window.openNativeConnectionLink").next())
         .expect("connection-link presenters");
-    for forbidden in ["add_tcp_connection", "add_lora_interface", "submitConnection(", "rnodeSubmit"] {
+    for forbidden in [
+        "add_tcp_connection",
+        "add_lora_interface",
+        "submitConnection(",
+        "rnodeSubmit",
+    ] {
         assert!(
             !presenter.contains(forbidden),
             "connection links must not call {forbidden}"

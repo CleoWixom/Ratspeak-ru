@@ -8,7 +8,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use ratspeak_tauri::commands::connection_link::{parse_connection_link, ConnectionLinkTarget};
+use ratspeak_tauri::commands::connection_link::{ConnectionLinkTarget, parse_connection_link};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -254,7 +254,11 @@ mod tests {
         let mobile = config.plugins.0["deep-link"]["mobile"].as_array().unwrap();
         let hosts: Vec<_> = mobile.iter().map(|e| e["host"].as_str().unwrap()).collect();
         assert_eq!(hosts, ["channel", "tcp", "radio"]);
-        assert!(mobile.iter().all(|e| e["scheme"] == serde_json::json!(["ratspeak"])));
+        assert!(
+            mobile
+                .iter()
+                .all(|e| e["scheme"] == serde_json::json!(["ratspeak"]))
+        );
     }
 
     #[test]
@@ -277,7 +281,9 @@ mod tests {
             "https://tcp.invalid/",
         ]));
         let delivery = inbox.peek().expect("original link");
-        assert!(matches!(delivery.target, ConnectionLinkTarget::Tcp(ref t) if t.host == "a.example"));
+        assert!(
+            matches!(delivery.target, ConnectionLinkTarget::Tcp(ref t) if t.host == "a.example")
+        );
     }
 
     #[test]
