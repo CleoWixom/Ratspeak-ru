@@ -341,10 +341,18 @@ pub extern "system" fn Java_org_ratspeak_android_RatspeakTextShares_accept(
             .get_string(subject)
             .map_err(|_| "Invalid shared title.")?
             .into();
+        // A shared connection link opens the add-connection form instead of
+        // becoming a message draft.
+        if APP
+            .get()
+            .is_some_and(|app| crate::connection_deep_link::accept_shared_text(app, &text))
+        {
+            return Ok::<_, String>(false);
+        }
         transaction(|inbox| inbox.accept(&id, &text, &subject))?;
-        Ok::<_, String>(())
+        Ok::<_, String>(true)
     })();
-    if result.is_ok() {
+    if matches!(result, Ok(true)) {
         notify();
     }
     env.new_string(result.err().unwrap_or_default())

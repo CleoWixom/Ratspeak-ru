@@ -9572,6 +9572,9 @@ fn native_connection_links_prefill_forms_and_never_connect_on_their_own() {
     assert!(lib.contains("connection_deep_link::install(app)"));
     assert!(lib.contains("connection_deep_link::extend_android_runtime(context.config_mut())"));
     assert!(index.contains("/static/js/native_connection_link.js"));
+    let text_share = read_source(root.join("src-tauri/src/text_share/android.rs"))
+        .expect("Android text share intake");
+    assert!(text_share.contains("connection_deep_link::accept_shared_text"));
 
     // A link pre-fills the normal forms. It must not call an add command.
     let presenter = modals

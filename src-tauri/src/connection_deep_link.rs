@@ -8,7 +8,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use ratspeak_tauri::commands::connection_link::{ConnectionLinkTarget, parse_connection_link};
+use ratspeak_tauri::commands::connection_link::{parse_connection_link, ConnectionLinkTarget};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -179,6 +179,32 @@ pub(crate) fn notify_pending(app: &AppHandle) {
     }
 }
 
+/// Android's system "Share" delivers a link as plain text, not as a VIEW
+/// intent. Return the payload when the whole shared text is exactly one valid
+/// connection link; anything else stays an ordinary shared draft.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn shared_text_link(text: &str) -> Option<&str> {
+    let payload = text.trim();
+    parse_connection_link(payload).ok().map(|_| payload)
+}
+
+/// Route a shared connection link into the same inbox as a native deep link.
+/// Returns `true` when the text was consumed and must not become a draft.
+#[cfg(target_os = "android")]
+pub(crate) fn accept_shared_text(app: &AppHandle, text: &str) -> bool {
+    let Some(payload) = shared_text_link(text) else {
+        return false;
+    };
+    let inbox = app.state::<NativeConnectionLinkInbox>();
+    if inbox.accept_payloads([payload]) && app.emit(NATIVE_CONNECTION_LINK_AVAILABLE, ()).is_err() {
+        tracing::debug!(
+            reason = "native_connection_link_event_unavailable",
+            "could not notify the WebView about a shared connection link"
+        );
+    }
+    true
+}
+
 /// Register the running-app listener before sampling the cold-start value.
 pub(crate) fn install(app: &mut tauri::App) {
     let listener_app = app.handle().clone();
@@ -254,11 +280,9 @@ mod tests {
         let mobile = config.plugins.0["deep-link"]["mobile"].as_array().unwrap();
         let hosts: Vec<_> = mobile.iter().map(|e| e["host"].as_str().unwrap()).collect();
         assert_eq!(hosts, ["channel", "tcp", "radio"]);
-        assert!(
-            mobile
-                .iter()
-                .all(|e| e["scheme"] == serde_json::json!(["ratspeak"]))
-        );
+        assert!(mobile
+            .iter()
+            .all(|e| e["scheme"] == serde_json::json!(["ratspeak"])));
     }
 
     #[test]
@@ -323,5 +347,21 @@ mod tests {
         assert_eq!(last.revision, u64::MAX.to_string());
         assert!(!inbox.accept_payloads([RADIO]));
         assert_eq!(inbox.peek(), Some(last));
+    }
+
+    #[test]
+    fn shared_text_is_routed_only_when_it_is_exactly_one_valid_link() {
+        assert_eq!(shared_text_link(TCP_A), Some(TCP_A));
+        assert_eq!(shared_text_link(&format!("  {RADIO}\n")), Some(RADIO));
+        for text in [
+            "",
+            "hello",
+            "see ratspeak://tcp?v=1&host=a.example",
+            &format!("{TCP_A} {TCP_B}"),
+            "ratspeak://tcp?v=1",
+            "ratspeak://channel?v=1&hub=00112233445566778899aabbccddeeff",
+        ] {
+            assert_eq!(shared_text_link(text), None, "routed {text:?}");
+        }
     }
 }
