@@ -19,9 +19,10 @@ changes that materially affect how an artifact is reproduced.
 - Ratspeak warns at startup when its data is on a network drive or in temporary memory, where messages and keys may not survive a crash or restart.
 - Deleting all messages or contacts now clears them from every screen at once, and blocked users stay blocked.
 - Creating, importing or restoring an identity no longer fails at random while the app is busy, and reading a channel or bringing the app forward no longer drops an announce.
-- A failed identity switch brings the previous identity back online and shows why, instead of leaving the app offline mid-switch.
+- A failed identity switch or security key activation brings the previous identity back online and shows why, instead of leaving the app offline mid-switch.
 - Removing the active hardware identity, or starting with no identity selected, opens the most recently used one that still opens; a protected one asks for its PIN.
 - Messages and game moves received during an identity switch stay with the identity they were sent to and never show under the next one.
+- After an identity switch the new identity's contacts show at once, instead of an empty contact list until the view is reopened.
 - Renames, status changes and blocks made during an identity switch are refused instead of landing on the next identity, and a rename never announces the old name afterwards.
 - Ratspeak won't open data that another Ratspeak app is using or that a newer version saved, and says what to do instead. Drives that can't lock get a warning.
 

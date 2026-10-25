@@ -462,25 +462,39 @@ pub async fn hw_activate_and_unlock(
         ));
     }
 
+    // Without the previous identity a failed activation could not restore it.
+    let previous_active =
+        db::spawn_db_with_lease(state.db.clone(), Arc::clone(&identity_lifecycle), |p| {
+            db::get_active_identity(&p)
+        })
+        .await
+        .map_err(|_| AppError::internal("active identity db task panicked"))?
+        .map_err(AppError::database_unavailable)?
+        .and_then(|row| row.get("hash").and_then(|v| v.as_str()).map(str::to_owned));
     let reset = reset_for_hardware_change(&state, "hardware_identity_activate").await?;
     state.bump_identity_session_generation();
     crate::finish_shutdown(&state, &reset).await;
 
     let hash_for_active = hash.clone();
-    db::spawn_db_with_lease(
+    let activation = db::spawn_db_with_lease(
         state.db.clone(),
         Arc::clone(&identity_lifecycle),
         move |p| db::set_active_identity(&p, &hash_for_active),
     )
-    .await
-    .map_err(|_| AppError::internal("activate identity db task panicked"))?
-    .map_err(|_| {
+    .await;
+    if !matches!(activation, Ok(Ok(()))) {
         tracing::error!(
             reason = "activate_failed",
             "hardware identity activation failed"
         );
-        AppError::internal("Could not activate hardware identity.")
-    })?;
+        let error = AppError::internal("Could not activate hardware identity.");
+        // The runtime is down: bring the previous identity back, in a session
+        // of its own, and end the switch as a failed one does.
+        state.bump_identity_session_generation();
+        super::identity::resume_previous(&state, previous_active).await;
+        super::identity::emit_switch_failed(&state, &hash, &error.message);
+        return Err(error);
+    }
 
     state.clear_identity_scoped_runtime_state();
     state.set_hw_last_error(None);

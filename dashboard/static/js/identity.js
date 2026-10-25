@@ -1898,8 +1898,8 @@ RS.listen('identity_switched', function(data) {
 
     // Clear identity-scoped frontend state so the old identity's data
     // doesn't leak. PeersCache rehydrates from the new snapshot on activation.
-    if (typeof lxmfContacts !== 'undefined') lxmfContacts = [];
-
+    // Contacts left when the switch began, and the new identity's start has
+    // already sent its own.
     resetConversationCaches();
 
     if (typeof _resetConversationSession === 'function') _resetConversationSession('identity_replaced');

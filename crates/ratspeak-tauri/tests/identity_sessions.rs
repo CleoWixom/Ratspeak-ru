@@ -297,6 +297,60 @@ fn a_switch_that_began_completes_when_activity_goes_away() {
     assert!(f.recorder.last("identity_switch_failed").is_none());
 }
 
+// A hardware activation that fails after the previous runtime stopped brings
+// the previous identity back, in a session of its own, and ends with the
+// switch's closing event, as a failed switch does.
+#[cfg(feature = "hardware")]
+#[test]
+fn a_failed_hardware_activation_resumes_the_previous_identity() {
+    let f = Fixture::new();
+    let a = f.import("A");
+    f.start(&a);
+    let h = "cccccccccccccccccccccccccccccccc".to_string();
+    std::fs::create_dir_all(f.profile(&h)).unwrap();
+    std::fs::write(f.profile(&h).join("identity.hwid"), b"{}").unwrap();
+    db::save_identity(
+        &f.state.db,
+        &h,
+        "dddddddddddddddddddddddddddddddd",
+        "H",
+        "H",
+    );
+    f.state
+        .db
+        .get()
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER refuse_h BEFORE UPDATE OF is_active ON identities \
+             WHEN NEW.hash = '{h}' AND NEW.is_active = 1 \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;"
+        ))
+        .unwrap();
+    let generation = f.state.current_identity_session_generation();
+    let result = f
+        .runtime
+        .block_on(ratspeak_tauri::commands::hardware::hw_activate_and_unlock(
+            f.app.state(),
+            h.clone(),
+            "123456".into(),
+        ));
+    assert!(result.is_err());
+    let closing = f
+        .recorder
+        .last("identity_switch_failed")
+        .expect("the failed activation never ended");
+    assert_eq!(closing["hash"], h.as_str());
+    assert_eq!(f.active().as_deref(), Some(a.as_str()));
+    assert_eq!(f.loaded().as_deref(), Some(a.as_str()));
+    assert!(f.running(), "the previous identity stayed down");
+    let resumed = f.state.current_identity_session_generation();
+    assert!(
+        resumed > generation + 1,
+        "the restored session reuses the failed activation's generation"
+    );
+    assert_eq!(closing["generation"], resumed.to_string());
+}
+
 /// What `hw_remove` finds: H, a hardware identity, is the active one.
 #[cfg(feature = "hardware")]
 #[derive(Clone, Copy, Debug, PartialEq)]

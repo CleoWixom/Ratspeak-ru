@@ -415,6 +415,9 @@ function completeSetupAfterHardwareIdentity(result, pin) {
         window.RS.diag('error', '[setup] Hardware identity unlock failed:', detail);
     }
 
+    // This screen says why an activation failed; the switch's closing event
+    // must not say it again.
+    if (typeof _switchRequestsPending !== 'undefined') _switchRequestsPending += 1;
     RS.invoke('hw_activate_and_unlock', { hash: hash, pin: pin }).then(function(res) {
         if (res && res.ok) {
             requestSetupNotificationPermissionIfEnabled();
@@ -426,6 +429,8 @@ function completeSetupAfterHardwareIdentity(result, pin) {
     }).catch(function(err) {
         var detail = (err && err.message) ? err.message : 'Could not unlock the hardware identity.';
         failHardwareUnlock(detail, false);
+    }).finally(function() {
+        if (typeof _switchRequestsPending !== 'undefined') _switchRequestsPending -= 1;
     });
 }
 

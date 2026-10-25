@@ -1446,22 +1446,28 @@ impl Drop for SwitchUnderWay {
         if self.finished {
             return;
         }
-        self.state.emit_to_all(
-            "identity_switch_failed",
-            json!({
-                "hash": std::mem::take(&mut self.target),
-                "generation": self.state.current_identity_session_generation().to_string(),
-                "error": self
-                    .error
-                    .take()
-                    .unwrap_or_else(|| "The identity switch was interrupted.".to_string()),
-            }),
-        );
+        let error = self
+            .error
+            .take()
+            .unwrap_or_else(|| "The identity switch was interrupted.".to_string());
+        emit_switch_failed(&self.state, &self.target, &error);
     }
 }
 
+/// A switch to `target` that did not finish, in the session that followed it.
+pub(super) fn emit_switch_failed(state: &AppState, target: &str, error: &str) {
+    state.emit_to_all(
+        "identity_switch_failed",
+        json!({
+            "hash": target,
+            "generation": state.current_identity_session_generation().to_string(),
+            "error": error,
+        }),
+    );
+}
+
 /// Bring the previous identity back up after a failed switch.
-async fn resume_previous(state: &Arc<AppState>, previous: Option<String>) {
+pub(super) async fn resume_previous(state: &Arc<AppState>, previous: Option<String>) {
     let Some(old_hash) = previous else {
         state.set_startup_stage("ready");
         return;

@@ -11,6 +11,8 @@ var vm = require('vm');
 
 var root = path.join(__dirname, '..', '..');
 var identity = fs.readFileSync(path.join(root, 'dashboard/static/js/identity.js'), 'utf8');
+var lxmf = fs.readFileSync(path.join(root, 'dashboard/static/js/lxmf.js'), 'utf8');
+var setup = fs.readFileSync(path.join(root, 'dashboard/static/js/setup.js'), 'utf8');
 
 function block(source, start, what) {
     assert(start !== -1, 'missing ' + what);
@@ -22,14 +24,16 @@ function block(source, start, what) {
     throw new Error('unterminated ' + what);
 }
 
-function functionSource(name) {
-    return block(identity, identity.indexOf('function ' + name + '('), name);
+function functionSource(name, source) {
+    source = source || identity;
+    return block(source, source.indexOf('function ' + name + '('), name);
 }
 
-function listenerSource(event) {
-    var start = identity.indexOf("RS.listen('" + event + "', function(");
-    var body = block(identity, start, 'listener ' + event);
-    return body + identity.slice(start + body.length, identity.indexOf(';', start + body.length) + 1);
+function listenerSource(event, source) {
+    source = source || identity;
+    var start = source.indexOf("RS.listen('" + event + "', function(");
+    var body = block(source, start, 'listener ' + event);
+    return body + source.slice(start + body.length, source.indexOf(';', start + body.length) + 1);
 }
 
 function settle() {
@@ -56,14 +60,28 @@ var page = {
     showToast: function(message, kind) { toasts.push([message, kind]); },
     loadIdentities: function() { calls.push('loadIdentities'); },
     loadConversations: function() { calls.push('loadConversations'); },
+    setTimeout: function() {},
+    showSetupConnectingStep: function() {},
+    resetSetupToStart: function() { calls.push('resetSetupToStart'); },
+    requestSetupNotificationPermissionIfEnabled: function() {},
+    runConnectingProgress: function() {},
+    normalizeContactList: function(data) { return data.slice(); },
+    _refreshRenderedConversationNames: function() {},
+    renderVoiceUi: function() {},
 };
 vm.createContext(page);
 var pendingDeclaration = identity.slice(identity.indexOf('var _switchRequestsPending'),
     identity.indexOf(';', identity.indexOf('var _switchRequestsPending')) + 1);
 assert(pendingDeclaration, 'missing the pending-switch count');
 vm.runInContext(pendingDeclaration + '\n' + functionSource('switchToIdentity') + '\n' +
+    functionSource('resetConversationCaches') + '\n' +
     listenerSource('identity_switching') + '\n' +
-    listenerSource('identity_switch_failed'), page, { filename: 'identity-switch.js' });
+    listenerSource('identity_switched') + '\n' +
+    listenerSource('identity_switch_failed') + '\n' +
+    listenerSource('contacts_update', lxmf) + '\n' +
+    functionSource('completeSetupAfterHardwareIdentity', setup), page, { filename: 'identity-switch.js' });
+page.window.RS = page.RS;
+page.RS.diag = function() {};
 
 (async function() {
     var target = 'bb'.repeat(16);
@@ -77,7 +95,16 @@ vm.runInContext(pendingDeclaration + '\n' + functionSource('switchToIdentity') +
     handlers.identity_switching({ hash: target, generation: '8' });
     assert.strictEqual(page.lxmfContacts.length, 0, 'the previous contacts stay while switching');
     assert.strictEqual(rendered, 1, 'the contact list is not redrawn');
+    // The next identity's start sends its contacts before identity_switched,
+    // which must keep them.
+    var next = 'dd'.repeat(16);
+    handlers.contacts_update([{ hash: next, display_name: 'Next' }]);
+    handlers.identity_switched({ hash: target, lxmf_hash: '', display_name: 'B' });
+    assert.strictEqual(page.lxmfContacts.length, 1, 'identity_switched dropped the new contacts');
+    assert.strictEqual(page.lxmfContacts[0].hash, next);
     page.window._identitySwitchInProgress = false;
+    toasts = [];
+    calls = [];
 
     // The switch began and failed: its closing event ends it.
     page.switchToIdentity(target);
@@ -111,6 +138,21 @@ vm.runInContext(pendingDeclaration + '\n' + functionSource('switchToIdentity') +
     await settle();
     assert.deepStrictEqual(toasts, [['Identity not found', 'toast-error']]);
     assert(calls.indexOf('loadIdentities') !== -1, 'a refused switch leaves its overlay');
+
+    // Setup's hardware activation fails after the previous runtime stopped:
+    // setup says why, once, and the closing event does not say it again.
+    toasts = [];
+    calls = [];
+    var hardware = 'cc'.repeat(16);
+    var activation = 'Could not activate hardware identity.';
+    page.completeSetupAfterHardwareIdentity({ hash: hardware }, '123456');
+    handlers.identity_switch_failed({ hash: hardware, generation: '11', error: activation });
+    var refusedActivation = new Error(activation);
+    refusedActivation.code = 'internal_error';
+    fail(refusedActivation);
+    await settle();
+    assert.deepStrictEqual(toasts, [[activation, 'toast-error']], 'the failure is said twice');
+    assert.strictEqual(page._switchRequestsPending, 0, 'the activation stays pending');
     console.log('Identity switch tests passed');
 })().catch(function(error) {
     console.error(error);
