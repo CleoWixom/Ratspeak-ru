@@ -2559,7 +2559,9 @@ fn android_service_is_not_sticky_without_runtime_ownership() {
         .next()
         .unwrap();
     let admission = create
-        .find("if (!RatspeakNativeBridge.hasActivitySession())")
+        .find(
+            "if (!RatspeakNativeBridge.hasActivitySession() || RatspeakNativeBridge.coreStartupFailed)",
+        )
         .unwrap();
     let rejected = create[admission..]
         .split("sessionAdmitted = true")
@@ -3801,10 +3803,10 @@ fn a_failed_start_shows_its_screen_without_command_state() {
     assert!(!shell.contains("Failed to start Ratspeak core"));
     let setup = shell.split(".setup(|app| {").nth(1).expect("setup closure");
     let failure = setup
-        .find("Err(error) => {")
+        .find("Err(failure) => {")
         .expect("startup failure branch");
     let managed = setup
-        .find("app.manage(error);")
+        .find("app.manage(failure.error);")
         .expect("startup failure is managed for the window");
     let window = setup
         .find("let window = main_window_builder(&handle);")
@@ -3829,6 +3831,93 @@ fn a_failed_start_shows_its_screen_without_command_state() {
         .expect("desktop close handler");
     assert!(close.contains("try_state::<ratspeak_tauri::StartupError>()"));
     assert!(close.contains(".is_none()"));
+}
+
+/// Tauri runs `setup` inside `run`, so diagnostics start before the profile
+/// opens. A failed start is logged where setup handles it, under fields the
+/// diagnostics filter keeps, and nothing before `run` looks for one.
+#[test]
+fn a_failed_start_is_logged_with_its_step_and_io_kind() {
+    let root = repo_root();
+    let shell = read_source(root.join("src-tauri/src/lib.rs")).expect("app shell");
+
+    let setup = shell.split(".setup(|app| {").nth(1).expect("setup closure");
+    assert!(setup.contains("ratspeak_tauri::init_core("));
+    assert_eq!(shell.matches("ratspeak_tauri::init_core(").count(), 1);
+    let failure = setup
+        .split("Err(failure) => {")
+        .nth(1)
+        .and_then(|tail| tail.split("None").next())
+        .expect("startup failure branch");
+    let logged = failure.find("tracing::error!(").expect("failure is logged");
+    assert!(failure.contains("reason = failure.step"));
+    assert!(failure.contains("kind = ?failure.kind"));
+    assert!(logged < failure.find("app.manage(failure.error);").unwrap());
+
+    let build = shell.find(".build(context)").unwrap();
+    let tracing = shell
+        .find("let mut tracing_guard = init_tracing();")
+        .unwrap();
+    let run = shell.find("app.run(|app_handle, event| {").unwrap();
+    assert!(build < tracing && tracing < run);
+    assert!(!shell[tracing..run].contains("StartupError"));
+}
+
+/// A core that failed to start keeps nothing running on Android: the session
+/// is not retained when its task closes, and the foreground service stops and
+/// stays stopped, so closing the app ends the process.
+#[test]
+fn a_failed_start_leaves_no_android_session_or_service() {
+    let root = repo_root();
+    let read = |path: &str| read_source(root.join(path)).expect(path);
+    let kotlin = "src-tauri/gen/android/app/src/main/java/org/ratspeak/android/";
+    let lifecycle = read("src-tauri/src/android_lifecycle.rs");
+    let shell = read("src-tauri/src/lib.rs");
+    let native = read("src-tauri/src/mobile_native.rs");
+    let bridge = read(&format!("{kotlin}RatspeakNativeBridge.kt"));
+    let service = read(&format!("{kotlin}RatspeakService.kt"));
+    let activity = read(&format!("{kotlin}MainActivity.kt"));
+    let boundaries = read("scripts/release/android-jni-boundaries.json");
+
+    let ready = lifecycle
+        .split("tauri::RunEvent::Ready => {")
+        .nth(1)
+        .and_then(|tail| tail.split("tauri::RunEvent::ExitRequested").next())
+        .expect("Ready handling");
+    let guard = ready
+        .find("try_state::<ratspeak_tauri::StartupError>()")
+        .expect("a failed start is not retained");
+    assert!(guard < ready.find("NativeLifecycleEvent::Ready").unwrap());
+
+    let failure = shell
+        .split("Err(failure) => {")
+        .nth(1)
+        .and_then(|tail| tail.split("None").next())
+        .expect("startup failure branch");
+    assert!(failure.contains("mobile_native::report_startup_failure();"));
+    assert!(native.contains("\"reportStartupFailure\""));
+    assert!(boundaries.contains("[\"reportStartupFailure\", \"()V\"]"));
+    assert!(bridge.contains("fun reportStartupFailure()"));
+    assert!(service.contains("fun stopForStartupFailure()"));
+
+    let create = service
+        .split("override fun onCreate()")
+        .nth(1)
+        .and_then(|tail| tail.split("sessionAdmitted = true").next())
+        .expect("service admission");
+    assert!(create.contains(
+        "if (!RatspeakNativeBridge.hasActivitySession() || RatspeakNativeBridge.coreStartupFailed)"
+    ));
+    let start = activity
+        .find("ContextCompat.startForegroundService(this, serviceIntent)")
+        .unwrap();
+    assert!(activity[..start].contains("if (!RatspeakNativeBridge.coreStartupFailed)"));
+    let refresh = activity
+        .split("private fun refreshServicePoll()")
+        .nth(1)
+        .and_then(|tail| tail.split("startService(intent)").next())
+        .expect("service refresh");
+    assert!(refresh.contains("if (RatspeakNativeBridge.coreStartupFailed) return"));
 }
 
 /// A profile on a filesystem that cannot lock opens with a warning beside the

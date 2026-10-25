@@ -85,16 +85,20 @@ pub(crate) const IDENTITY_FREE: &[&str] = &[
     "hw_activate_and_unlock",
 ];
 
-/// Wraps the generated command handler in the admission check.
+/// Wraps the generated command handler in the admission check. A core that
+/// failed to start answers no command at all; its window is static.
 pub fn gated<R: tauri::Runtime>(
     commands: impl Fn(Invoke<R>) -> bool + Send + Sync + 'static,
 ) -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'static {
     move |invoke| {
-        let refused = invoke
-            .message
-            .webview_ref()
-            .try_state::<Arc<AppState>>()
-            .and_then(|state| refusal(&state, invoke.message.command()));
+        let webview = invoke.message.webview_ref();
+        let refused = if webview.try_state::<crate::StartupError>().is_some() {
+            Some(AppError::new("startup_error", "Ratspeak could not start"))
+        } else {
+            webview
+                .try_state::<Arc<AppState>>()
+                .and_then(|state| refusal(&state, invoke.message.command()))
+        };
         match refused {
             Some(error) => {
                 invoke.resolver.reject(error);
@@ -111,4 +115,63 @@ fn refusal(state: &AppState, command: &str) -> Option<AppError> {
         return Some(AppError::conflict("no active identity"));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use tauri::test::{
+        INVOKE_KEY, MockRuntime, get_ipc_response, mock_builder, mock_context, noop_assets,
+    };
+
+    fn invoke(window: &tauri::WebviewWindow<MockRuntime>, command: &str) -> Result<Value, Value> {
+        get_ipc_response(
+            window,
+            tauri::webview::InvokeRequest {
+                cmd: command.into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: if cfg!(any(windows, target_os = "android")) {
+                    "http://tauri.localhost"
+                } else {
+                    "tauri://localhost"
+                }
+                .parse()
+                .unwrap(),
+                body: tauri::ipc::InvokeBody::Json(json!({})),
+                headers: Default::default(),
+                invoke_key: INVOKE_KEY.into(),
+            },
+        )
+        .map(|response| response.deserialize().unwrap())
+    }
+
+    fn window(failed: bool) -> (tauri::App<MockRuntime>, tauri::WebviewWindow<MockRuntime>) {
+        let builder = mock_builder();
+        let builder = if failed {
+            builder.manage(crate::StartupError::Storage)
+        } else {
+            builder
+        };
+        let app = builder
+            .invoke_handler(super::gated(tauri::generate_handler![
+                crate::commands::system::api_version
+            ]))
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        (app, window)
+    }
+
+    #[test]
+    fn a_failed_start_refuses_even_commands_that_need_no_state() {
+        let (_app, started) = window(false);
+        assert_eq!(invoke(&started, "api_version").unwrap()["name"], "Ratspeak");
+
+        let (_app, failed) = window(true);
+        let refused = invoke(&failed, "api_version").unwrap_err();
+        assert_eq!(refused["code"], "startup_error");
+    }
 }

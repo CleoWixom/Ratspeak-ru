@@ -1871,7 +1871,8 @@ fn prepare_identity_namespace(
 /// Establish/reconcile the app's private directory tree before configuration,
 /// database pools, identity files or network workers are opened. Call once at
 /// process startup; live identity rebuilds only validate its committed marker.
-/// Takes the profile owner lock before reconciling anything.
+/// Takes the profile owner lock, and refuses a newer build's database, before
+/// reconciling anything.
 pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
     // Platform-provided roots already exist. A fresh explicit/test root may
     // need multiple ancestors, all established from an existing outside anchor.
@@ -1897,8 +1898,10 @@ pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
         durable_create_dir_all(data_root, &witness).map_err(std::io::Error::other)?;
     }
     require_real_directory(data_root)?;
-    // Reconciliation may retire identities; never run it beside another owner.
+    // Reconciliation may retire identities; never run it beside another owner,
+    // or on a newer build's profile, whose recorded intents may differ.
     crate::owner_lock::acquire_owner_lock(data_root)?;
+    db::refuse_newer_database(data_root).map_err(std::io::Error::other)?;
     if data_root.join(STORAGE_NAMESPACE_READY).try_exists()? {
         // Completed roots cannot become fresh merely because directories have
         // disappeared. Only an explicit recorded deletion may retire identity
@@ -8638,6 +8641,51 @@ mod tests {
         );
         assert!(second.status.success(), "{output}");
         assert!(output.contains("test result: ok. 1 passed"), "{output}");
+    }
+
+    #[test]
+    fn storage_namespace_refuses_a_newer_database_before_reconciling() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let manager = LxmfManager::load_or_create(temp.path(), None, None).unwrap();
+        let hash = manager.identity_hash.clone();
+        let identities = manager.data_dir.join("identities");
+        drop(manager);
+        let pool = crate::db::init_pool(temp.path()).unwrap();
+        crate::db::init_schema(&pool).unwrap();
+        let current: i64 = pool
+            .get()
+            .unwrap()
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute("UPDATE schema_version SET version = ?1", [current + 1])
+            .unwrap();
+        drop(pool);
+        // A newer build recorded a deletion and a reset in a format this
+        // build may read differently; neither may be replayed here.
+        let intent = identities.join(format!("{hash}.namespace-delete"));
+        durable_write(&intent, DELETE_IDENTITY_ALL).unwrap();
+        let ready = temp.path().join(STORAGE_NAMESPACE_READY);
+        durable_write(&ready, STORAGE_NAMESPACE_RESET_BYTES).unwrap();
+
+        let result = initialize_storage_namespace(temp.path());
+
+        assert!(
+            std::fs::read(&ready).unwrap() == STORAGE_NAMESPACE_RESET_BYTES,
+            "the pending reset was finished"
+        );
+        assert!(
+            intent.is_file() && identities.join(&hash).join("identity").is_file(),
+            "the recorded deletion was replayed"
+        );
+        let error = result.unwrap_err();
+        let newer = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<crate::db::NewerSchema>())
+            .expect("a newer database is reported as such");
+        assert_eq!((newer.found, newer.supported), (current + 1, current));
     }
 
     #[test]

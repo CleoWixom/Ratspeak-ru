@@ -38,7 +38,7 @@ class FakeElement {
     text() { return [this.textContent].concat(this.children.map(child => child.text())).join(' '); }
 }
 
-function page(failure) {
+function page(failure, mobile) {
     const classes = new Set(['checking-setup']);
     const body = new FakeElement('body');
     body.classList = {
@@ -61,6 +61,7 @@ function page(failure) {
     };
     context.window = context;
     if (failure !== undefined) context.__RATSPEAK_STARTUP_ERROR__ = failure;
+    if (mobile) context.__RATSPEAK_MOBILE__ = true;
     context.__TAURI_INTERNALS__ = {
         invoke: (name) => {
             context.invoked.push(name);
@@ -87,17 +88,22 @@ async function check(name, run) {
     }
 }
 
+// Desktop can be quit and restarted; on a phone, closing the app ends the
+// failed process, so the next launch starts afresh.
 const screens = [
-    [{ code: 'profile_in_use' }, ['Ratspeak is already open', 'Quit it, then open Ratspeak again']],
-    [{ code: 'schema_newer', found: 46, supported: 45 }, ['Update Ratspeak', 'newer version of Ratspeak', '46', '45']],
-    [{ code: 'storage' }, ["Ratspeak can't open its data", 'Restart Ratspeak']],
-    [{ code: 'from_a_later_build' }, ["Ratspeak can't open its data"]]
+    [{ code: 'profile_in_use' }, false, ['Ratspeak is already open', 'Quit it, then open Ratspeak again']],
+    [{ code: 'profile_in_use' }, true, ['Ratspeak is already open', 'Close Ratspeak and open it again']],
+    [{ code: 'schema_newer', found: 46, supported: 45 }, false, ['Update Ratspeak', 'newer version of Ratspeak', '46', '45']],
+    [{ code: 'storage' }, false, ["Ratspeak can't open its data", 'is connected', 'free space', 'write to it', 'restart Ratspeak']],
+    [{ code: 'storage' }, true, ["Ratspeak can't open its data", 'Close Ratspeak and open it again', 'free space']],
+    [{ code: 'from_a_later_build' }, false, ["Ratspeak can't open its data", 'is connected']]
 ];
 
 (async () => {
-    for (const [failure, copy] of screens) {
-        await check('a ' + failure.code + ' start shows its static screen before any invoke', async () => {
-            const { context, body } = page(failure);
+    for (const [failure, mobile, copy] of screens) {
+        const where = mobile ? ' on a phone' : '';
+        await check('a ' + failure.code + ' start shows its static screen' + where + ' before any invoke', async () => {
+            const { context, body } = page(failure, mobile);
             context._rsBootstrapOnLoad();
             await flush();
             assert.deepEqual(context.invoked, [], 'a failed start must not invoke');

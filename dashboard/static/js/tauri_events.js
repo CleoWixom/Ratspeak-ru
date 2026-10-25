@@ -10,11 +10,13 @@ function showConnectionSummary() {
 }
 
 // Shown in place of the app when the core could not start. It is static: no
-// command state exists, so nothing here may invoke.
+// command state exists, so nothing here may invoke. On a phone, closing the
+// app ends the failed process, so opening it again starts afresh.
 var _RS_STARTUP_ERROR_COPY = {
     profile_in_use: {
         title: 'Ratspeak is already open',
-        message: 'Another Ratspeak app is using this data. Quit it, then open Ratspeak again.'
+        message: 'Another Ratspeak app is using this data. Quit it, then open Ratspeak again.',
+        mobile: 'Another Ratspeak app is using this data. Close Ratspeak and open it again.'
     },
     schema_newer: {
         title: 'Update Ratspeak',
@@ -22,12 +24,14 @@ var _RS_STARTUP_ERROR_COPY = {
     },
     storage: {
         title: "Ratspeak can't open its data",
-        message: 'Restart Ratspeak. If this keeps happening, make sure this device has free space.'
+        message: "Make sure the drive with Ratspeak's data is connected, has free space and lets Ratspeak write to it. Then restart Ratspeak.",
+        mobile: 'Close Ratspeak and open it again. If this keeps happening, make sure this device has free space.'
     }
 };
 
 function _rsShowStartupError(failure) {
     var copy = _RS_STARTUP_ERROR_COPY[failure.code] || _RS_STARTUP_ERROR_COPY.storage;
+    var mobile = window.__RATSPEAK_MOBILE__ === true;
     var overlay = document.createElement('div');
     overlay.id = 'startup-error-overlay';
     overlay.className = 'hw-unlock-overlay';
@@ -44,7 +48,7 @@ function _rsShowStartupError(failure) {
     title.textContent = copy.title;
     var message = document.createElement('div');
     message.className = 'hw-unlock-sub';
-    message.textContent = copy.message;
+    message.textContent = (mobile && copy.mobile) || copy.message;
     card.appendChild(icon);
     card.appendChild(title);
     card.appendChild(message);

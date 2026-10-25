@@ -836,4 +836,8 @@ pub ratspeak_tauri::StartupError::SchemaNewer
 pub ratspeak_tauri::StartupError::SchemaNewer::found: i64
 pub ratspeak_tauri::StartupError::SchemaNewer::supported: i64
 pub ratspeak_tauri::StartupError::Storage
-pub async fn ratspeak_tauri::init_core(std::path::PathBuf, tauri::app::AppHandle) -> core::result::Result<alloc::sync::Arc<ratspeak_runtime::state::AppState>, ratspeak_tauri::StartupError>
+pub struct ratspeak_tauri::StartupFailure
+pub ratspeak_tauri::StartupFailure::error: ratspeak_tauri::StartupError
+pub ratspeak_tauri::StartupFailure::kind: core::option::Option<core::io::error::ErrorKind>
+pub ratspeak_tauri::StartupFailure::step: &'static str
+pub async fn ratspeak_tauri::init_core(std::path::PathBuf, tauri::app::AppHandle) -> core::result::Result<alloc::sync::Arc<ratspeak_runtime::state::AppState>, ratspeak_tauri::StartupFailure>

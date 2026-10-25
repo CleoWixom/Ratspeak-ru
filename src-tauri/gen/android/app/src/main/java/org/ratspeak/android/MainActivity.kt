@@ -315,9 +315,11 @@ class MainActivity : TauriActivity() {
             insets
         }
 
-        // Start foreground service
-        val serviceIntent = Intent(this, RatspeakService::class.java)
-        ContextCompat.startForegroundService(this, serviceIntent)
+        // Start foreground service, unless the core already failed to start.
+        if (!RatspeakNativeBridge.coreStartupFailed) {
+            val serviceIntent = Intent(this, RatspeakService::class.java)
+            ContextCompat.startForegroundService(this, serviceIntent)
+        }
         // Wry/Tao registration and this Activity's native UI hooks are ready.
         // If a previous task was removed, reconnect its retained Rust session
         // to this new view without opening another identity or network stack.
@@ -366,6 +368,7 @@ class MainActivity : TauriActivity() {
     }
 
     private fun refreshServicePoll() {
+        if (RatspeakNativeBridge.coreStartupFailed) return
         try {
             val intent = Intent(this, RatspeakService::class.java).apply {
                 action = RatspeakService.ACTION_REFRESH

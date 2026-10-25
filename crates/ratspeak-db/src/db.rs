@@ -107,8 +107,8 @@ pub fn init_pool(data_dir: &Path) -> Result<DbPool, Box<dyn std::error::Error + 
     Ok(pool)
 }
 
-/// A database written by a newer Ratspeak. [`init_schema`] refuses it before
-/// writing anything.
+/// A database written by a newer Ratspeak. [`refuse_newer_database`] and
+/// [`init_schema`] refuse it before writing anything.
 #[derive(Debug, thiserror::Error)]
 #[error("database schema {found} is newer than this build ({supported})")]
 pub struct NewerSchema {
@@ -116,33 +116,58 @@ pub struct NewerSchema {
     pub supported: i64,
 }
 
-pub fn init_schema(pool: &DbPool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let conn = pool.get()?;
-
+/// The recorded schema version, `None` before the schema exists. A version
+/// that cannot be read is an error, never a fresh database. Older code must
+/// never run against a schema it does not understand.
+fn understood_schema_version(
+    conn: &Connection,
+) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
     let has_schema: bool = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
         [],
         |row| row.get::<_, i64>(0),
     )? > 0;
-
-    if has_schema {
-        let version: i64 = conn
-            .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
-
-        // Older code must never run against a schema it does not understand.
-        if version > SCHEMA_VERSION {
-            return Err(NewerSchema {
-                found: version,
-                supported: SCHEMA_VERSION,
-            }
-            .into());
+    if !has_schema {
+        return Ok(None);
+    }
+    let version = conn
+        .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .unwrap_or(0);
+    if version > SCHEMA_VERSION {
+        return Err(NewerSchema {
+            found: version,
+            supported: SCHEMA_VERSION,
         }
-        if version < SCHEMA_VERSION {
-            run_migrations(&conn, version)?;
-        }
+        .into());
+    }
+    Ok(Some(version))
+}
+
+/// Refuse a database written by a newer Ratspeak, or one whose version cannot
+/// be read, before anything opens it for writing. The read-only connection is
+/// closed on return; nothing in the file changes.
+pub fn refuse_newer_database(
+    data_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let db_path = data_dir.join(".ratspeak").join("ratspeak.db");
+    if !db_path.try_exists()? {
+        return Ok(());
+    }
+    let conn = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    understood_schema_version(&conn)?;
+    Ok(())
+}
+
+pub fn init_schema(pool: &DbPool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = pool.get()?;
+
+    if let Some(version) = understood_schema_version(&conn)?
+        && version < SCHEMA_VERSION
+    {
+        run_migrations(&conn, version)?;
     }
 
     conn.execute_batch(SCHEMA_SQL)?;
@@ -11114,6 +11139,93 @@ mod migration_tests {
         );
         drop(pool);
         drop(observer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_schema_version_is_refused_before_anything_is_written() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratspeak-unreadable-schema-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        {
+            let pool = init_pool(&dir).unwrap();
+            init_schema(&pool).unwrap();
+            pool.get()
+                .unwrap()
+                .execute_batch("UPDATE schema_version SET version = 'unreadable';")
+                .unwrap();
+        }
+        let observer = Connection::open(dir.join(".ratspeak/ratspeak.db")).unwrap();
+        let data_version = || -> i64 {
+            observer
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = data_version();
+
+        let pool = init_pool(&dir).unwrap();
+        let result = init_schema(&pool);
+
+        assert_eq!(data_version(), before, "a write was committed");
+        assert!(result.is_err(), "an unreadable version was read as fresh");
+        drop(pool);
+        drop(observer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_newer_database_is_refused_without_opening_it_for_writing() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratspeak-newer-database-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        assert!(refuse_newer_database(&dir).is_ok(), "no database yet");
+        {
+            let pool = init_pool(&dir).unwrap();
+            init_schema(&pool).unwrap();
+        }
+        assert!(refuse_newer_database(&dir).is_ok(), "this build's database");
+        let path = dir.join(".ratspeak/ratspeak.db");
+        {
+            // A newer build that left WAL mode: opening it for writing would
+            // convert the header back before any version check.
+            let conn = Connection::open(&path).unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete");
+            conn.execute(
+                "UPDATE schema_version SET version = ?1",
+                params![SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+
+        let error = refuse_newer_database(&dir).unwrap_err();
+
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(!dir.join(".ratspeak/ratspeak.db-wal").exists());
+        let newer = error.downcast_ref::<NewerSchema>().expect("typed refusal");
+        assert_eq!(
+            (newer.found, newer.supported),
+            (SCHEMA_VERSION + 1, SCHEMA_VERSION)
+        );
+
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE schema_version SET version = 'unreadable'", [])
+            .unwrap();
+        assert!(
+            refuse_newer_database(&dir)
+                .unwrap_err()
+                .downcast_ref::<NewerSchema>()
+                .is_none(),
+            "an unreadable version is refused, not reported as newer"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

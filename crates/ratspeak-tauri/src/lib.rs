@@ -61,13 +61,56 @@ pub enum StartupError {
     Storage,
 }
 
+/// A failed start: the screen to show, and the failing step and I/O error kind
+/// for the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupFailure {
+    pub error: StartupError,
+    pub step: &'static str,
+    pub kind: Option<std::io::ErrorKind>,
+}
+
+impl StartupFailure {
+    fn at(step: &'static str, error: &(dyn std::error::Error + 'static)) -> Self {
+        let io = error.downcast_ref::<std::io::Error>();
+        let cause: &(dyn std::error::Error + 'static) = match io.and_then(std::io::Error::get_ref) {
+            Some(inner) => inner,
+            None => error,
+        };
+        let error = if cause.is::<ratspeak_runtime::owner_lock::ProfileInUse>() {
+            StartupError::ProfileInUse
+        } else if let Some(newer) = cause.downcast_ref::<db::NewerSchema>() {
+            StartupError::SchemaNewer {
+                found: newer.found,
+                supported: newer.supported,
+            }
+        } else {
+            StartupError::Storage
+        };
+        Self {
+            error,
+            step,
+            kind: io.map(std::io::Error::kind),
+        }
+    }
+
+    /// A step whose blocking task did not finish.
+    fn task(step: &'static str) -> Self {
+        Self {
+            error: StartupError::Storage,
+            step,
+            kind: None,
+        }
+    }
+}
+
 /// Open the profile (storage, DB pool + schema), AppState, BLE diag relay, then
 /// spawn `init_rns_lxmf`. AppHandle is wrapped in a `TauriEmitter` and stashed
 /// in AppState before any background task can `emit_to_all`.
 pub async fn init_core(
     data_dir: std::path::PathBuf,
     app_handle: tauri::AppHandle,
-) -> Result<Arc<AppState>, StartupError> {
+) -> Result<Arc<AppState>, StartupFailure> {
     let (config, db_pool) = open_profile(data_dir.clone()).await?;
 
     let emitter: Arc<dyn ratspeak_core::Emitter> =
@@ -101,39 +144,24 @@ pub async fn init_core(
 /// another process owns, and nothing is written to a newer Ratspeak's database.
 async fn open_profile(
     data_dir: std::path::PathBuf,
-) -> Result<(config::DashboardConfig, db::DbPool), StartupError> {
+) -> Result<(config::DashboardConfig, db::DbPool), StartupFailure> {
     // Windows may need to publish a fresh sibling during crash reconciliation.
     // Establish roots before configuration or SQLite can hold live handles.
     let storage_root = data_dir.clone();
     tokio::task::spawn_blocking(move || lxmf::initialize_storage_namespace(&storage_root))
         .await
-        .map_err(|_| StartupError::Storage)?
-        .map_err(|error| {
-            let in_use = error
-                .get_ref()
-                .is_some_and(|inner| inner.is::<ratspeak_runtime::owner_lock::ProfileInUse>());
-            if in_use {
-                StartupError::ProfileInUse
-            } else {
-                StartupError::Storage
-            }
-        })?;
+        .map_err(|_| StartupFailure::task("storage"))?
+        .map_err(|error| StartupFailure::at("storage", &error))?;
     let config = config::DashboardConfig::from_env_and_defaults(data_dir.clone());
 
     let db_pool = tokio::task::spawn_blocking(move || db::init_pool(&data_dir))
         .await
-        .map_err(|_| StartupError::Storage)?
-        .map_err(|_| StartupError::Storage)?;
+        .map_err(|_| StartupFailure::task("database_pool"))?
+        .map_err(|error| StartupFailure::at("database_pool", &*error))?;
     db::spawn_db(db_pool.clone(), |p| db::init_schema(&p))
         .await
-        .map_err(|_| StartupError::Storage)?
-        .map_err(|error| match error.downcast_ref::<db::NewerSchema>() {
-            Some(newer) => StartupError::SchemaNewer {
-                found: newer.found,
-                supported: newer.supported,
-            },
-            None => StartupError::Storage,
-        })?;
+        .map_err(|_| StartupFailure::task("database_schema"))?
+        .map_err(|error| StartupFailure::at("database_schema", &*error))?;
     Ok((config, db_pool))
 }
 
@@ -147,8 +175,12 @@ mod tests {
         let other = std::fs::File::create(root.path().join(".ratspeak-host.lock")).unwrap();
         rns_identity::persistence::try_lock_exclusive(&other).unwrap();
 
-        let error = open_profile(root.path().to_path_buf()).await.unwrap_err();
-        assert_eq!(error, StartupError::ProfileInUse);
+        let failure = open_profile(root.path().to_path_buf()).await.unwrap_err();
+        assert_eq!(failure.error, StartupError::ProfileInUse);
+        assert_eq!(
+            (failure.step, failure.kind),
+            ("storage", Some(std::io::ErrorKind::ResourceBusy))
+        );
         assert!(!root.path().join(".ratspeak").exists());
     }
 
@@ -169,9 +201,47 @@ mod tests {
             .unwrap();
         drop(pool);
 
-        let error = open_profile(root.path().to_path_buf()).await.unwrap_err();
+        let failure = open_profile(root.path().to_path_buf()).await.unwrap_err();
         assert_eq!(
-            error,
+            failure.error,
+            StartupError::SchemaNewer {
+                found: supported + 1,
+                supported
+            }
+        );
+        assert_eq!(failure.step, "storage");
+    }
+
+    #[tokio::test]
+    async fn a_newer_database_is_refused_before_the_pool_opens_it() {
+        let root = tempfile::tempdir().unwrap();
+        lxmf::initialize_storage_namespace(root.path()).unwrap();
+        db::init_schema(&db::init_pool(root.path()).unwrap()).unwrap();
+        let path = root.path().join(".ratspeak/ratspeak.db");
+        let supported: i64 = {
+            // A newer build that left WAL mode: the pool would convert it back.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete");
+            let supported = conn
+                .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+                .unwrap();
+            conn.execute("UPDATE schema_version SET version = ?1", [supported + 1])
+                .unwrap();
+            supported
+        };
+        let bytes = std::fs::read(&path).unwrap();
+
+        let failure = open_profile(root.path().to_path_buf()).await.unwrap_err();
+
+        assert!(
+            std::fs::read(&path).unwrap() == bytes,
+            "the newer database was written"
+        );
+        assert_eq!(
+            failure.error,
             StartupError::SchemaNewer {
                 found: supported + 1,
                 supported
@@ -185,7 +255,11 @@ mod tests {
         let file = root.path().join("profile");
         std::fs::write(&file, b"not a directory").unwrap();
 
-        let error = open_profile(file).await.unwrap_err();
-        assert_eq!(error, StartupError::Storage);
+        let failure = open_profile(file).await.unwrap_err();
+        assert_eq!(failure.error, StartupError::Storage);
+        assert_eq!(
+            (failure.step, failure.kind),
+            ("storage", Some(std::io::ErrorKind::InvalidInput))
+        );
     }
 }

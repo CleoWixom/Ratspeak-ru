@@ -55,6 +55,18 @@ object RatspeakNativeBridge {
 
     internal fun hasActivitySession(): Boolean = activitySessionStarted
 
+    // Set when the Rust core reports that it could not start. Nothing may then
+    // keep this process running; a new process always starts false.
+    @Volatile
+    internal var coreStartupFailed = false
+        private set
+
+    @JvmStatic
+    fun reportStartupFailure() {
+        coreStartupFailed = true
+        mainHandler.post { RatspeakService.stopForStartupFailure() }
+    }
+
     internal fun attachActivity(activity: MainActivity, webviewReady: Boolean): Long {
         check(Looper.myLooper() == Looper.getMainLooper())
         val generation = activitySequence.incrementAndGet()

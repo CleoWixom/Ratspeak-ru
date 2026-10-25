@@ -1325,8 +1325,16 @@ pub fn run() {
             // Without AppState no command runs; the window shows the failure.
             let state = match rt.block_on(ratspeak_tauri::init_core(data_dir, tauri_handle)) {
                 Ok(state) => Some(state),
-                Err(error) => {
-                    app.manage(error);
+                Err(failure) => {
+                    tracing::error!(
+                        reason = failure.step,
+                        kind = ?failure.kind,
+                        screen = ?failure.error,
+                        "Ratspeak could not start"
+                    );
+                    #[cfg(target_os = "android")]
+                    mobile_native::report_startup_failure();
+                    app.manage(failure.error);
                     None
                 }
             };
@@ -1498,6 +1506,7 @@ pub fn run() {
     // Initialize file diagnostics only after Builder::build has completed.
     // The desktop single-instance plugin may exit a secondary process during
     // build; that process must never touch or rotate the primary's logs.
+    // Tauri runs `setup`, which opens the profile, inside `run` below.
     let mut tracing_guard = init_tracing();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if let Some(dropped) = tracing_guard.dropped_counter() {
@@ -1505,9 +1514,6 @@ pub fn run() {
     }
     if linux_webkit_dmabuf_workaround {
         tracing::info!("WebKitGTK < 2.46: disabled DMA-BUF renderer for Wayland startup");
-    }
-    if let Some(error) = app.try_state::<ratspeak_tauri::StartupError>() {
-        tracing::error!(reason = ?*error, "Ratspeak could not start");
     }
 
     app.run(|app_handle, event| {

@@ -49,6 +49,7 @@
         ["nativeBleRnodeState", "(Ljava/lang/String;JIILjava/lang/String;)V"],
         ["nativeMemoryPressure", "(Z)V"],
         ["showActivityRestoreFailure", "(J)V"],
+        ["reportStartupFailure", "()V"],
         ["nativeActivityAttached", "(JIZ)V"],
         ["nativeActivityDetached", "(J)V"],
         ["nativeActivityResumed", "(JZ)V"],

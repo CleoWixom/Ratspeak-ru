@@ -52,6 +52,13 @@ class RatspeakService : Service() {
 
         internal fun lastMicrophoneFailureCode(): String = lastMicrophoneFailure
 
+        /** A core that failed to start leaves no session for this service to keep alive. */
+        internal fun stopForStartupFailure() {
+            val service = activeService ?: return
+            service.stopForeground(Service.STOP_FOREGROUND_REMOVE)
+            service.stopSelf()
+        }
+
         private fun publishReady(service: RatspeakService) {
             synchronized(serviceReadyLock) {
                 activeService = service
@@ -149,7 +156,8 @@ class RatspeakService : Service() {
         // Never leave a misleading foreground notification or observers alive
         // after process death. An explicit Activity launch authorizes only this
         // process lifetime; removing its task does not revoke the live session.
-        if (!RatspeakNativeBridge.hasActivitySession()) {
+        // A core that failed to start has no session at all.
+        if (!RatspeakNativeBridge.hasActivitySession() || RatspeakNativeBridge.coreStartupFailed) {
             running = false
             // A pending foreground start still requires promotion, even when
             // immediately rejected. stopSelf() alone makes Android crash this

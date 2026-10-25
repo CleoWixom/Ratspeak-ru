@@ -23,9 +23,15 @@ initial startup, before those file users exist.
 The same call takes the profile's owner lock, `.ratspeak-host.lock` in the data
 root, and the process keeps it until exit. While another process holds it, the
 call fails with `ResourceBusy` carrying `owner_lock::ProfileInUse` before
-reconciling anything. `ratspeak_db::init_schema` refuses a database written by a
-newer build with `NewerSchema`, before writing to it. `init_core` reports both
-as a `StartupError`.
+reconciling anything. On a filesystem that cannot lock, such as some network and
+FUSE mounts, the call succeeds without that exclusion, and
+`owner_lock::unenforced(data_root)` reports it. Next, before reconciling, it
+reads the database's schema version over a short-lived read-only connection
+(`ratspeak_db::refuse_newer_database`). A database written by a newer build
+fails with `NewerSchema`, and one whose version cannot be read fails too;
+neither is written to. `ratspeak_db::init_schema` applies the same check.
+`init_core` reports any failure as a `StartupFailure`: the `StartupError` the
+window shows, plus the failing step and I/O error kind.
 
 Identity and factory reset stop their identity/storage workers before calling
 `clear_identity_storage_namespace`. Reset preserves the established database

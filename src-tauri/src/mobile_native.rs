@@ -351,6 +351,16 @@ pub(crate) fn save_stored_file(
     .unwrap_or(false)
 }
 
+/// No session will run in this process: stop the foreground service and keep
+/// it from starting again.
+#[cfg(target_os = "android")]
+pub(crate) fn report_startup_failure() {
+    let _ = with_android_bridge(|env, class| {
+        env.call_static_method(class, "reportStartupFailure", "()V", &[])?;
+        Ok(())
+    });
+}
+
 #[cfg(target_os = "android")]
 fn android_request_usb_permission(
     vendor_id: u16,
