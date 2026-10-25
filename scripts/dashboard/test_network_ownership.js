@@ -35,7 +35,7 @@ let applyReply = null;
 let refreshReply = null;
 let confirmationReply = true;
 let authorization = { passcode: 'synthetic pin' };
-const authorizations = [], exportArgs = [], copied = [];
+const authorizations = [], authorizationMessages = [], exportArgs = [], copied = [];
 const appliedRequests = [];
 const toasts = [];
 let developer = false;
@@ -54,6 +54,7 @@ const context = {
     activeIdentity: () => ({ hash: 'synthetic identity', passcode_protected: true }),
     async authorizeIdentityKey(target, opts, send) {
         authorizations.push(target.hash);
+        authorizationMessages.push(opts.message);
         return authorization ? send(authorization) : null;
     },
     RS: { listen(name, fn) { events[name] = fn; },
@@ -159,6 +160,7 @@ function access(port, key) {
     await field('export').events.click(); await settle();
     assert.deepEqual(authorizations, ['synthetic identity'], "the active identity's PIN, or a confirmation without one");
     assert.deepEqual(exportArgs, [{ passcode: 'synthetic pin' }]);
+    assert.match(authorizationMessages[0], /admin credential/, 'the control key is named for what it is');
     assert.deepEqual(copied, ['synthetic access']);
     authorization = null;
     await field('export').events.click(); await settle();

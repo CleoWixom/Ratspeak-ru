@@ -199,7 +199,7 @@
             // The active identity's PIN, or a confirmation when it has none.
             content = await authorizeIdentityKey(activeIdentity(), {
                 title: 'Copy Access Configuration',
-                message: 'This configuration includes a secret granting access to your local Reticulum control service. Copy it only to apps you trust. Clipboard history may retain it.',
+                message: 'This configuration includes the control key of your local Reticulum service. It is an admin credential: an app that has it can read this device\'s network state, drop its paths and block identities. Copy it only to apps you trust. Clipboard history may retain it.',
                 confirmText: 'Copy secret'
             }, function(auth) {
                 if (requestEpoch !== epoch || !developer()) return Promise.resolve(null);
