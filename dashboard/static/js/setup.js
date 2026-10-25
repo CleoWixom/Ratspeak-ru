@@ -500,10 +500,10 @@ document.addEventListener('DOMContentLoaded', function() {
     if (setupMnemonicCopy) {
         setupMnemonicCopy.addEventListener('click', function() {
             if (!setupRecoveryMnemonic) return;
-            RS.copyText(setupRecoveryMnemonic).then(function(ok) {
+            RS.copySecret(setupRecoveryMnemonic).then(function(ok) {
                 if (ok) {
-                    if (typeof showCopyConfirmationToast === 'function') {
-                        showCopyConfirmationToast('Recovery phrase');
+                    if (typeof showSecretCopiedToast === 'function') {
+                        showSecretCopiedToast('Recovery phrase');
                     }
                 } else if (typeof showToast === 'function') {
                     showToast('Could not copy the recovery phrase', 'toast-error', 2000);

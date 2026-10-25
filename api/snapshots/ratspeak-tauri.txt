@@ -323,6 +323,7 @@ pub struct ratspeak_tauri::commands::identity::RestoreSeedArgs
 pub ratspeak_tauri::commands::identity::RestoreSeedArgs::nickname: core::option::Option<alloc::string::String>
 pub ratspeak_tauri::commands::identity::RestoreSeedArgs::phrase: alloc::string::String
 pub struct ratspeak_tauri::commands::identity::RevealMnemonicArgs
+pub ratspeak_tauri::commands::identity::RevealMnemonicArgs::confirmed: core::option::Option<bool>
 pub ratspeak_tauri::commands::identity::RevealMnemonicArgs::hash: alloc::string::String
 pub ratspeak_tauri::commands::identity::RevealMnemonicArgs::passcode: core::option::Option<alloc::string::String>
 pub struct ratspeak_tauri::commands::identity::SetPasscodeArgs
@@ -335,11 +336,9 @@ pub ratspeak_tauri::commands::identity::UpdateIdentityArgs::nickname: core::opti
 pub async fn ratspeak_tauri::commands::identity::api_activate_identity(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::identity::api_create_identity(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::identity::CreateIdentityArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::identity::api_delete_identity(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String, core::option::Option<bool>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
-pub async fn ratspeak_tauri::commands::identity::api_export_identity(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
-pub async fn ratspeak_tauri::commands::identity::api_export_identity_backup_base64(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
-pub async fn ratspeak_tauri::commands::identity::api_export_identity_base64(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
-pub async fn ratspeak_tauri::commands::identity::api_export_identity_reticulum_base32(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
-pub async fn ratspeak_tauri::commands::identity::api_export_identity_reticulum_base64(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
+pub async fn ratspeak_tauri::commands::identity::api_export_identity_backup_base64(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String, alloc::string::String, core::option::Option<alloc::string::String>, core::option::Option<bool>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
+pub async fn ratspeak_tauri::commands::identity::api_export_identity_reticulum_base32(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String, core::option::Option<alloc::string::String>, core::option::Option<bool>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
+pub async fn ratspeak_tauri::commands::identity::api_export_identity_reticulum_base64(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String, core::option::Option<alloc::string::String>, core::option::Option<bool>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::identity::api_identity(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::identity::api_import_identity(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::identity::ImportIdentityArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::identity::api_import_identity_base64(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::identity::ImportIdentityArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
@@ -817,6 +816,8 @@ pub fn ratspeak_tauri::notifier::TauriNotifier::new(tauri::app::AppHandle) -> Se
 impl ratspeak_core::notification::NativeNotifier for ratspeak_tauri::notifier::TauriNotifier
 pub fn ratspeak_tauri::notifier::TauriNotifier::notify(&self, ratspeak_core::notification::NativeNotification)
 pub fn ratspeak_tauri::notifier::TauriNotifier::withdraw_all(&self)
+pub mod ratspeak_tauri::process
+pub fn ratspeak_tauri::process::harden()
 pub mod ratspeak_tauri::window_prefs
 pub enum ratspeak_tauri::window_prefs::DecorationsPref
 pub ratspeak_tauri::window_prefs::DecorationsPref::Auto

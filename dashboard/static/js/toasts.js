@@ -181,6 +181,11 @@ function showCopyConfirmationToast(noun) {
     showToast(noun + ' copied', 'toast-success', 1500);
 }
 
+// Matches RS.copySecret: a copied key or phrase leaves the clipboard after a minute.
+function showSecretCopiedToast(noun) {
+    showToast(noun + ' copied. It clears from the clipboard in a minute.', 'toast-success', 3000);
+}
+
 function showRateLimitedToast() {
     showToast('Wait a moment before announcing again', 'toast-warning', 3000);
 }

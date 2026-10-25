@@ -2495,22 +2495,6 @@ impl LxmfManager {
         Ok(())
     }
 
-    pub fn export_identity(&self, hash_hex: &str) -> Option<Vec<u8>> {
-        if self.identity_hash == hash_hex
-            && !self.is_hardware
-            && let Some(private_key) = self.identity.get_private_key()
-        {
-            return Some(private_key.to_vec());
-        }
-
-        let id_file = self
-            .data_dir
-            .join("identities")
-            .join(hash_hex)
-            .join("identity");
-        std::fs::read(&id_file).ok()
-    }
-
     pub fn contact_card_public_key(&self, hash_hex: &str) -> Option<[u8; 64]> {
         if self.identity_hash == hash_hex {
             return Some(self.identity.get_public_key());
@@ -8869,7 +8853,7 @@ mod tests {
     }
 
     #[test]
-    fn export_identity_uses_unlocked_active_identity_without_plaintext_file() {
+    fn contact_card_public_key_uses_the_loaded_identity_without_its_key_file() {
         let unique = TEMP_LXMF_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!(
             "ratspeak-lxmf-export-active-test-{}-{}-{unique}",
@@ -8882,7 +8866,6 @@ mod tests {
         initialize_storage_namespace(&tmp).unwrap();
         let mgr = LxmfManager::load_or_create(&tmp, None, None).unwrap();
         let hash = mgr.identity_hash.clone();
-        let private_key = mgr.identity.get_private_key().unwrap().to_vec();
         let public_key = mgr.identity.get_public_key();
         let id_file = tmp
             .join(".ratspeak")
@@ -8891,7 +8874,6 @@ mod tests {
             .join("identity");
         std::fs::remove_file(id_file).unwrap();
 
-        assert_eq!(mgr.export_identity(&hash).unwrap(), private_key);
         assert_eq!(mgr.contact_card_public_key(&hash).unwrap(), public_key);
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -8970,7 +8952,6 @@ mod tests {
         )
         .unwrap();
 
-        assert!(mgr.export_identity(&hash).is_none());
         assert_eq!(mgr.contact_card_public_key(&hash).unwrap(), public_key);
         assert_eq!(
             contact_card_public_key_from_profile(&tmp.join(".ratspeak"), &hash),

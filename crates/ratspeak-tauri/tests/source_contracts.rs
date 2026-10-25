@@ -8057,7 +8057,8 @@ fn identity_management_is_first_class_tab() {
     assert!(identity_js.contains("function openRatspeakBackupImportPinModal"));
     assert!(identity_js.contains("function openEncryptedIdentityExportModal"));
     assert!(identity_js.contains("passcode: importPasscode"));
-    assert!(identity_js.contains("passcode: passcode || ''"));
+    // The backup PIN goes as the backup's `passcode`, beside the identity's own.
+    assert!(identity_js.contains("auth.passcode = pin;"));
     assert!(identity_js.contains("protectIdentityWithPasscode(data.hash, importPasscode)"));
     assert!(!identity_js.contains(r#"<path d="M7 16l5 5 5-5"/>"#));
     assert!(identity_js.contains("function identityImportFormatChoices()"));
@@ -10057,8 +10058,6 @@ fn a_locked_identity_keeps_only_settings_and_identity_management() {
         "api_set_display_name",
         "set_identity_status",
         "api_update_identity",
-        "api_export_identity",
-        "api_export_identity_base64",
     ] {
         assert!(
             !lock_free.contains(&scoped),
@@ -10316,4 +10315,112 @@ fn the_call_alert_never_holds_up_the_voice_loop() {
     let alert = rust_function_block(&voice, "raise_incoming_call_alert");
     assert!(alert.contains("tokio::spawn("));
     assert!(alert.contains("lock_routine()"));
+}
+
+/// Copied keys and phrases leave the clipboard after a minute of clock time:
+/// the deadline runs on the clock that counts suspend and its wait re-checks
+/// it at least every 5 s, never one awake-time sleep. Desktop keeps them out
+/// of clipboard history and clears them on quit; Android marks them
+/// sensitive; iOS keeps them on the device with a native expiry. Checking
+/// that needs a live clipboard, so the platform half is pinned here.
+#[test]
+fn copied_secrets_leave_the_clipboard() {
+    let root = repo_root();
+    let read = |path: &str| read_source(root.join(path)).expect(path);
+    let shell = read("src-tauri/src/lib.rs");
+    assert!(shell.contains("secret_clipboard::copy_secret,"));
+    assert!(shell.contains("tauri::RunEvent::Exit => secret_clipboard::forget_now(),"));
+    let clipboard = read("src-tauri/src/secret_clipboard.rs");
+    assert!(
+        clipboard.contains(
+            "const CLEAR_AFTER: std::time::Duration = std::time::Duration::from_secs(60);"
+        )
+    );
+    assert!(clipboard.contains("const RECHECK: Duration = Duration::from_secs(5);"));
+    assert!(clipboard.contains("ContinuousInstant::now()"));
+    assert!(clipboard.contains(".min(RECHECK)"));
+    assert!(!clipboard.contains("thread::sleep"));
+    assert!(!clipboard.contains("sleep(CLEAR_AFTER)"));
+    for exclusion in [
+        "SetExtApple::exclude_from_history",
+        "SetExtWindows::exclude_from_monitoring",
+        "SetExtLinux::exclude_from_history",
+        "UIPasteboardOptionLocalOnly",
+        "UIPasteboardOptionExpirationDate",
+    ] {
+        assert!(clipboard.contains(exclusion), "{exclusion}");
+    }
+    let android =
+        read("src-tauri/gen/android/app/src/main/java/org/ratspeak/android/RatspeakClipboard.kt");
+    assert!(android.contains("ClipDescription.EXTRA_IS_SENSITIVE"));
+    // Made on the main thread: before Android 9 it needs a looper, and Rust
+    // calls in on threads without one.
+    let bridge = read(
+        "src-tauri/gen/android/app/src/main/java/org/ratspeak/android/RatspeakNativeBridge.kt",
+    );
+    assert!(bridge.contains("RatspeakClipboard.initialize(context.applicationContext)"));
+    let gate = read("crates/ratspeak-tauri/src/invoke_gate.rs");
+    for list in ["IDENTITY_FREE", "LOCK_FREE"] {
+        assert!(gate_list(&gate, list).contains(&"copy_secret"), "{list}");
+    }
+    // Every recovery phrase and access file goes through it.
+    for path in [
+        "dashboard/static/js/identity.js",
+        "dashboard/static/js/setup.js",
+        "dashboard/static/js/network_ownership.js",
+    ] {
+        let source = read(path);
+        assert!(source.contains("RS.copySecret("), "{path}");
+        for secret in [
+            "RS.copyText(mnemonic",
+            "RS.copyText(phrase",
+            "RS.copyText(setupRecoveryMnemonic",
+            "RS.copyText(content",
+        ] {
+            assert!(!source.contains(secret), "{path}: {secret}");
+        }
+    }
+}
+
+/// The app hardens its process before anything else runs or any secret is
+/// in memory; the hardening itself is tested in a process of its own.
+#[test]
+fn the_app_hardens_its_process_first() {
+    let shell = read_source(repo_root().join("src-tauri/src/lib.rs")).expect("Tauri shell");
+    let run = rust_function_block(&shell, "run");
+    let body = run[run.find('{').unwrap() + 1..].trim_start();
+    assert!(
+        body.starts_with("ratspeak_tauri::process::harden();"),
+        "{body}"
+    );
+}
+
+/// Keys leave only through the exports that ask for the identity's PIN or a
+/// confirmation; the raw-key commands that asked for neither are gone.
+#[test]
+fn identity_keys_leave_only_through_authorized_exports() {
+    let root = repo_root();
+    let identity = read_source(root.join("crates/ratspeak-tauri/src/commands/identity.rs"))
+        .expect("identity commands");
+    let shell = read_source(root.join("src-tauri/src/lib.rs")).expect("Tauri shell");
+    for removed in ["fn api_export_identity(", "fn api_export_identity_base64("] {
+        assert!(!identity.contains(removed), "{removed}");
+    }
+    assert!(!shell.contains("identity::api_export_identity,"));
+    assert!(!shell.contains("identity::api_export_identity_base64,"));
+    for export in [
+        "api_export_identity_reticulum_base64",
+        "api_export_identity_reticulum_base32",
+        "api_export_identity_backup_base64",
+    ] {
+        assert!(
+            rust_function_block(&identity, export).contains("export_identity("),
+            "{export}"
+        );
+    }
+    let reveal = rust_function_block(&identity, "reveal_identity_mnemonic");
+    assert!(reveal.contains("active_identity_id(&state)"));
+    assert!(reveal.contains("release_passcode("));
+    let runtime = read_source(root.join("crates/ratspeak-runtime/src/lxmf.rs")).expect("lxmf");
+    assert!(!runtime.contains("pub fn export_identity("));
 }

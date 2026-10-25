@@ -710,14 +710,18 @@ pub async fn remove_identity_passcode(
 #[derive(Deserialize)]
 pub struct RevealMnemonicArgs {
     pub hash: String,
-    /// Required only when the identity is passcode-protected (phrase in the vault).
+    /// Required when the identity is passcode-protected (phrase in the vault).
     #[serde(default)]
     pub passcode: Option<String>,
+    /// Required when it is not.
+    #[serde(default)]
+    pub confirmed: Option<bool>,
 }
 
-/// Re-display a software identity's 12-word recovery phrase. Reads the plaintext
-/// sidecar, or decrypts it from the vault (Argon2 → spawn_blocking) when the
-/// identity is passcode-protected. Hardware identities have no stored phrase.
+/// Re-display the active software identity's 12-word recovery phrase: from
+/// its vault with its passcode (Argon2 → spawn_blocking), or from the
+/// plaintext sidecar after a confirmation. Hardware identities have no stored
+/// phrase.
 #[tauri::command]
 pub async fn reveal_identity_mnemonic(
     state: State<'_, Arc<AppState>>,
@@ -726,16 +730,20 @@ pub async fn reveal_identity_mnemonic(
     if !validate_hex(&args.hash, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
+    if args.hash != active_identity_id(&state) {
+        return Err(AppError::forbidden(
+            "Only the active identity's recovery phrase can be shown",
+        ));
+    }
+    let passcode = release_passcode(&state, &args.hash, args.passcode, args.confirmed)?;
     let id_dir = state.config.data_dir.join("identities").join(&args.hash);
-    let passcode = args.passcode.map(Zeroizing::new);
     let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     let phrase = tokio::task::spawn_blocking(move || {
         job.reveal_mnemonic(&id_dir, passcode.as_deref().map(String::as_str))
-            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|_| AppError::internal("reveal_mnemonic task panicked"))?
-    .map_err(AppError::bad_request)?;
+    .map_err(key_release_error)?;
     Ok(json!({ "mnemonic": phrase.as_str() }))
 }
 
@@ -1130,53 +1138,6 @@ pub async fn api_activate_identity(
     switch_identity_session(Arc::clone(&state), hash_hex).await
 }
 
-/// Existence check; the actual bytes ship via `api_export_identity_base64`.
-#[tauri::command]
-pub async fn api_export_identity(
-    state: State<'_, Arc<AppState>>,
-    hash_hex: String,
-) -> AppResult<Value> {
-    if !validate_hex(&hash_hex, 16, 128) {
-        return Err(AppError::bad_request("Invalid hash"));
-    }
-    let exists = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|l| l.as_ref().and_then(|mgr| mgr.export_identity(&hash_hex)))
-        .is_some();
-    if exists {
-        Ok(json!({ "message": "Use export-base64 endpoint for key data" }))
-    } else {
-        Err(AppError::not_found("Identity file not found"))
-    }
-}
-
-#[tauri::command]
-pub async fn api_export_identity_base64(
-    state: State<'_, Arc<AppState>>,
-    hash_hex: String,
-) -> AppResult<Value> {
-    if !validate_hex(&hash_hex, 16, 128) {
-        return Err(AppError::bad_request("Invalid hash"));
-    }
-    if is_hardware_identity(&state, &hash_hex) {
-        return Err(AppError::bad_request(
-            "Hardware-backed identity: the private key lives on the token and cannot be exported",
-        ));
-    }
-    let key_bytes = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|l| l.as_ref().and_then(|mgr| mgr.export_identity(&hash_hex)))
-        .map(Zeroizing::new);
-    match key_bytes {
-        Some(bytes) => Ok(json!({ "key": B64.encode(&*bytes) })),
-        None => Err(AppError::not_found("Identity file not found")),
-    }
-}
-
 /// Pull the PIV `serial` out of a `.hwid` (TOML) without a ratkey dependency,
 /// so the always-compiled list path works in non-`hardware` builds too.
 fn read_hwid_serial(path: &std::path::Path) -> Option<u64> {
@@ -1192,44 +1153,44 @@ fn read_hwid_serial(path: &std::path::Path) -> Option<u64> {
     None
 }
 
-/// A hardware-backed identity stores a `.hwid` instead of a private-key file.
-fn is_hardware_identity(state: &AppState, hash_hex: &str) -> bool {
-    state
-        .config
-        .data_dir
-        .join("identities")
-        .join(hash_hex)
-        .join("identity.hwid")
-        .exists()
-}
-
-pub(crate) fn export_identity_key_bytes(
+/// Runs `export` on `hash`'s private key and stored recovery phrase, under the
+/// one vault job, opened as an unlock opens them: a passcode identity's from
+/// its vault with its passcode, so a locked one exports too; any other's from
+/// its files once confirmed. A hardware key never leaves its token.
+async fn export_identity<T: Send + 'static>(
     state: &AppState,
-    hash_hex: &str,
-) -> AppResult<Zeroizing<Vec<u8>>> {
-    if !validate_hex(hash_hex, 16, 128) {
+    hash: &str,
+    passcode: Option<String>,
+    confirmed: Option<bool>,
+    export: impl FnOnce(&VaultJob, &vault::UnlockedVault) -> AppResult<T> + Send + 'static,
+) -> AppResult<T> {
+    if !validate_hex(hash, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
-    if is_hardware_identity(state, hash_hex) {
+    let id_dir = state.config.data_dir.join("identities").join(hash);
+    if id_dir.join("identity.hwid").exists() {
         return Err(AppError::bad_request(
             "Hardware-backed identity: the private key lives on the token and cannot be exported",
         ));
     }
-    let key_bytes = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|l| l.as_ref().and_then(|mgr| mgr.export_identity(hash_hex)))
-        .map(Zeroizing::new)
-        .ok_or_else(|| AppError::not_found("Identity file not found"))?;
-
-    let identity =
-        Identity::from_private_key(&key_bytes).map_err(|_| AppError::bad_request("Invalid key"))?;
-    let identity_hash = hex::encode(identity.hash);
-    if identity_hash != hash_hex {
-        return Err(AppError::conflict("Identity file hash mismatch"));
+    if !identity_material_exists(&id_dir) {
+        return Err(AppError::not_found("Identity file not found"));
     }
-    Ok(key_bytes)
+    let passcode = release_passcode(state, hash, passcode, confirmed)?;
+    let hash = hash.to_owned();
+    let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let (unlocked, _) = open_identity_files(
+            &job,
+            &id_dir,
+            &hash,
+            passcode.as_deref().map(String::as_str),
+        )
+        .map_err(key_release_error)?;
+        export(&job, &unlocked)
+    })
+    .await
+    .map_err(|_| AppError::internal("identity export task panicked"))?
 }
 
 fn identity_export_hashes(key_bytes: &[u8]) -> AppResult<(String, String)> {
@@ -1240,45 +1201,62 @@ fn identity_export_hashes(key_bytes: &[u8]) -> AppResult<(String, String)> {
     Ok((identity_hash, hex::encode(lxmf_dest)))
 }
 
+/// The raw private key. Takes the identity's passcode when it has one,
+/// otherwise `confirmed`.
 #[tauri::command]
 pub async fn api_export_identity_reticulum_base64(
     state: State<'_, Arc<AppState>>,
     hash_hex: String,
+    passcode: Option<String>,
+    confirmed: Option<bool>,
 ) -> AppResult<Value> {
-    let key_bytes = export_identity_key_bytes(&state, &hash_hex)?;
-    let (identity_hash, lxmf_hash) = identity_export_hashes(&key_bytes)?;
-    Ok(json!({
-        "data_base64": B64.encode(&*key_bytes),
-        "file_name": format!("{}-reticulum-identity.identity", &identity_hash[..16]),
-        "identity_hash": identity_hash,
-        "lxmf_hash": lxmf_hash,
-        "format": "reticulum.raw-private-key",
-    }))
+    export_identity(&state, &hash_hex, passcode, confirmed, |_, identity| {
+        let (identity_hash, lxmf_hash) = identity_export_hashes(identity.key())?;
+        Ok(json!({
+            "data_base64": B64.encode(identity.key()),
+            "file_name": format!("{}-reticulum-identity.identity", &identity_hash[..16]),
+            "identity_hash": identity_hash,
+            "lxmf_hash": lxmf_hash,
+            "format": "reticulum.raw-private-key",
+        }))
+    })
+    .await
 }
 
+/// The private key as base32 text. Takes the identity's passcode when it has
+/// one, otherwise `confirmed`.
 #[tauri::command]
 pub async fn api_export_identity_reticulum_base32(
     state: State<'_, Arc<AppState>>,
     hash_hex: String,
+    passcode: Option<String>,
+    confirmed: Option<bool>,
 ) -> AppResult<Value> {
-    let key_bytes = export_identity_key_bytes(&state, &hash_hex)?;
-    let (identity_hash, lxmf_hash) = identity_export_hashes(&key_bytes)?;
-    let text = Zeroizing::new(base32_encode_padded(&key_bytes));
-    Ok(json!({
-        "data_base64": B64.encode(text.as_bytes()),
-        "text": text.as_str(),
-        "file_name": format!("{}-reticulum-identity-key-base32.txt", &identity_hash[..16]),
-        "identity_hash": identity_hash,
-        "lxmf_hash": lxmf_hash,
-        "format": "reticulum.base32-private-key",
-    }))
+    export_identity(&state, &hash_hex, passcode, confirmed, |_, identity| {
+        let (identity_hash, lxmf_hash) = identity_export_hashes(identity.key())?;
+        let text = Zeroizing::new(base32_encode_padded(identity.key()));
+        Ok(json!({
+            "data_base64": B64.encode(text.as_bytes()),
+            "text": text.as_str(),
+            "file_name": format!("{}-reticulum-identity-key-base32.txt", &identity_hash[..16]),
+            "identity_hash": identity_hash,
+            "lxmf_hash": lxmf_hash,
+            "format": "reticulum.base32-private-key",
+        }))
+    })
+    .await
 }
 
+/// A backup sealed with `passcode`, the backup PIN. Like the raw exports it
+/// takes the identity's own passcode (`identity_passcode`) when it has one,
+/// otherwise `confirmed`.
 #[tauri::command]
 pub async fn api_export_identity_backup_base64(
     state: State<'_, Arc<AppState>>,
     hash_hex: String,
     passcode: String,
+    identity_passcode: Option<String>,
+    confirmed: Option<bool>,
 ) -> AppResult<Value> {
     let passcode = Zeroizing::new(passcode);
     let passcode = Zeroizing::new(passcode.trim().to_owned());
@@ -1287,14 +1265,9 @@ pub async fn api_export_identity_backup_base64(
             "Backup PIN must be at least 6 characters",
         ));
     }
-    let key_bytes = export_identity_key_bytes(&state, &hash_hex)?;
-    let (identity_hash, lxmf_hash) = identity_export_hashes(&key_bytes)?;
-    let key_array: Zeroizing<[u8; 64]> = Zeroizing::new(
-        key_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| AppError::internal("identity key length mismatch"))?,
-    );
+    if !validate_hex(&hash_hex, 16, 128) {
+        return Err(AppError::bad_request("Invalid hash"));
+    }
 
     let row_hash = hash_hex.clone();
     let identity_row = db::spawn_db(state.db.clone(), move |p| db::get_identity(&p, &row_hash))
@@ -1318,19 +1291,22 @@ pub async fn api_export_identity_backup_base64(
         .to_string();
 
     // Argon2id KDF — off the async worker like the other vault paths.
-    let identity_dir = state.config.data_dir.join("identities").join(&hash_hex);
-    let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
-    let vault = tokio::task::spawn_blocking(move || {
-        let mnemonic = job.reveal_mnemonic(&identity_dir, None).ok();
-        job.encrypt_identity(
-            &passcode,
-            &key_array,
-            mnemonic.as_deref().map(String::as_str),
-        )
-    })
-    .await
-    .map_err(|_| AppError::internal("identity backup task panicked"))?
-    .map_err(|e| AppError::internal(format!("failed to encrypt identity backup: {e}")))?;
+    let (vault, identity_hash, lxmf_hash) = export_identity(
+        &state,
+        &hash_hex,
+        identity_passcode,
+        confirmed,
+        move |job, identity| {
+            let (identity_hash, lxmf_hash) = identity_export_hashes(identity.key())?;
+            let vault = job
+                .encrypt_identity(&passcode, identity.key(), identity.mnemonic())
+                .map_err(|e| {
+                    AppError::internal(format!("failed to encrypt identity backup: {e}"))
+                })?;
+            Ok((vault, identity_hash, lxmf_hash))
+        },
+    )
+    .await?;
 
     let backup = EncryptedIdentityBackupV2 {
         format: IDENTITY_BACKUP_FORMAT.to_string(),

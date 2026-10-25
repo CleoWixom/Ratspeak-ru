@@ -8,6 +8,7 @@ mod channel_deep_link;
 )]
 mod mobile_native;
 mod paths;
+mod secret_clipboard;
 mod text_share;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -984,6 +985,7 @@ fn init_tracing() -> TracingGuard {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    ratspeak_tauri::process::harden();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if std::env::args().any(|arg| arg == "--webview-diag") {
         print_webview_diagnostics();
@@ -1032,6 +1034,7 @@ pub fn run() {
                 save_image_to_photos,
                 save_stored_attachment_native,
                 request_microphone_permission,
+                secret_clipboard::copy_secret,
                 channel_deep_link::peek_native_channel_share,
                 channel_deep_link::ack_native_channel_share,
                 text_share::list_text_shares,
@@ -1206,8 +1209,6 @@ pub fn run() {
                 ratspeak_tauri::commands::identity::unlock_identity,
                 ratspeak_tauri::commands::identity::api_preview_identity_import_base64,
                 ratspeak_tauri::commands::identity::api_activate_identity,
-                ratspeak_tauri::commands::identity::api_export_identity,
-                ratspeak_tauri::commands::identity::api_export_identity_base64,
                 ratspeak_tauri::commands::identity::api_export_identity_backup_base64,
                 ratspeak_tauri::commands::identity::api_export_identity_reticulum_base64,
                 ratspeak_tauri::commands::identity::api_export_identity_reticulum_base32,
@@ -1563,6 +1564,7 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { .. } => {
                 shutdown_desktop_core_for_exit(app_handle);
             }
+            tauri::RunEvent::Exit => secret_clipboard::forget_now(),
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen {
                 has_visible_windows,

@@ -1594,7 +1594,6 @@ pub fn ratspeak_runtime::lxmf::LxmfManager::download_state_revision(&self) -> u6
 pub fn ratspeak_runtime::lxmf::LxmfManager::download_suppression_snapshot(&mut self) -> core::option::Option<ratspeak_runtime::lxmf::DownloadSuppressionSnapshot>
 pub fn ratspeak_runtime::lxmf::LxmfManager::enable_propagation(&mut self, bool, &ratspeak_db::db::DbPool, &str)
 pub fn ratspeak_runtime::lxmf::LxmfManager::encrypt_for_destination(&self, &str, &[u8]) -> core::option::Option<alloc::vec::Vec<u8>>
-pub fn ratspeak_runtime::lxmf::LxmfManager::export_identity(&self, &str) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn ratspeak_runtime::lxmf::LxmfManager::files_dir(&self) -> std::path::PathBuf
 pub fn ratspeak_runtime::lxmf::LxmfManager::get_contacts_list(&self, &ratspeak_db::db::DbPool, &str) -> alloc::vec::Vec<serde_json::value::Value>
 pub fn ratspeak_runtime::lxmf::LxmfManager::get_conversation(&self, &str, &ratspeak_db::db::DbPool, &str) -> alloc::vec::Vec<serde_json::value::Value>

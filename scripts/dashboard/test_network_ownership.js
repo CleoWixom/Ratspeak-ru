@@ -57,8 +57,8 @@ const context = {
         authorizationMessages.push(opts.message);
         return authorization ? send(authorization) : null;
     },
-    RS: { listen(name, fn) { events[name] = fn; },
-        async copyText(text) { copied.push(text); return true; },
+    RS: { listen(name, fn) { events[name] = fn; }, copyText: async () => true,
+        async copySecret(text) { copied.push(text); return true; },
         async invoke(name, args) {
             calls.push(name);
             if (name === 'export_shared_access') { exportArgs.push(JSON.parse(JSON.stringify(args))); return 'synthetic access'; }
@@ -161,7 +161,8 @@ function access(port, key) {
     assert.deepEqual(authorizations, ['synthetic identity'], "the active identity's PIN, or a confirmation without one");
     assert.deepEqual(exportArgs, [{ passcode: 'synthetic pin' }]);
     assert.match(authorizationMessages[0], /admin credential/, 'the control key is named for what it is');
-    assert.deepEqual(copied, ['synthetic access']);
+    assert.deepEqual(copied, ['synthetic access'], 'copied as a secret, cleared later');
+    assert.match(field('status').textContent, /clears from the clipboard in a minute/);
     authorization = null;
     await field('export').events.click(); await settle();
     assert.equal(exportArgs.length, 1, 'declining fetches nothing');

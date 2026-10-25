@@ -168,6 +168,17 @@ window.RS.copyText = function(value) {
     return Promise.resolve(false);
 };
 
+// Keys and phrases. The native side keeps them out of clipboard history where
+// the platform allows and clears them after a minute unless something else
+// was copied since. A failed copy never falls back to one that stays.
+window.RS.copySecret = function(value) {
+    var text = String(value == null ? '' : value);
+    return RS.invoke('copy_secret', { text: text }).then(
+        function() { return true; },
+        function() { return false; }
+    );
+};
+
 var _rsAndroidMediaPermissionSeq = 0;
 var _rsAndroidMediaPermissionWaiters = {};
 

@@ -16,6 +16,7 @@ pub mod emitter;
 pub mod error;
 pub mod invoke_gate;
 pub mod notifier;
+pub mod process;
 pub mod window_prefs;
 
 // Re-export runtime modules so internal `crate::*` paths in commands keep

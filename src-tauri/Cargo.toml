@@ -33,8 +33,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 base64 = "0.22"
+zeroize = "1"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 ratspeak-tauri = { path = "../crates/ratspeak-tauri", version = "1.0.34", features = ["ble", "hardware"] }
+arboard = { version = "3.7", default-features = false }
 rfd = "0.15"
 dirs = "6"
 tauri = { version = "2", features = ["tray-icon", "devtools"] }

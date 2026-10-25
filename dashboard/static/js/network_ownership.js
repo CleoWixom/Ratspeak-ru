@@ -199,15 +199,15 @@
             // The active identity's PIN, or a confirmation when it has none.
             content = await authorizeIdentityKey(activeIdentity(), {
                 title: 'Copy Access Configuration',
-                message: 'This configuration includes the control key of your local Reticulum service. It is an admin credential: an app that has it can read this device\'s network state, drop its paths and block identities. Copy it only to apps you trust. Clipboard history may retain it.',
+                message: 'This configuration includes the control key of your local Reticulum service. It is an admin credential: an app that has it can read this device\'s network state, drop its paths and block identities. Copy it only to apps you trust.',
                 confirmText: 'Copy secret'
             }, function(auth) {
                 if (requestEpoch !== epoch || !developer()) return Promise.resolve(null);
                 return RS.invoke('export_shared_access', auth);
             });
             if (!content || requestEpoch !== epoch || !developer()) return;
-            var copied = await RS.copyText(content);
-            status(copied ? 'Access configuration copied. Clear your clipboard after use.' : 'Copy failed. The secret was not displayed.');
+            var copied = await RS.copySecret(content);
+            status(copied ? 'Access configuration copied. It clears from the clipboard in a minute.' : 'Copy failed. The secret was not displayed.');
         } catch (error) { status(error.message || String(error)); }
         finally { content = ''; }
     }

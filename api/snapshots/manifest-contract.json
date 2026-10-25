@@ -149,6 +149,17 @@
           "sourceKind": "registry"
         },
         {
+          "name": "zeroize",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
           "name": "ratspeak-tauri",
           "rename": null,
           "kind": null,
@@ -172,6 +183,17 @@
           "requirement": "^2",
           "optional": false,
           "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "arboard",
+          "rename": null,
+          "kind": null,
+          "target": "cfg(not(any(target_os = \"android\", target_os = \"ios\")))",
+          "requirement": "^3.7",
+          "optional": false,
+          "defaultFeatures": false,
           "features": [],
           "sourceKind": "registry"
         },

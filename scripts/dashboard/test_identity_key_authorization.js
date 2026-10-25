@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // A key, phrase or access file is released with its identity's PIN, or after
-// a confirmation when it has none. A wrong PIN stays in the PIN sheet.
+// a confirmation when it has none. A wrong PIN stays in the PIN sheet; a
+// backup takes the identity's PIN beside its own.
 'use strict';
 
 const assert = require('node:assert/strict');
@@ -25,14 +26,18 @@ function functionSource(source, name) {
 
 const HASH = 'ab'.repeat(16);
 
-function load({ confirm = true } = {}) {
-    const seen = { confirms: [], modals: [], closed: 0 };
+function load({ confirm = true, protectedIdentity = false, format = 'reticulum', replies = {} } = {}) {
+    const seen = { confirms: [], modals: [], closed: 0, invoked: [], shown: [], saved: [], toasts: [] };
     const fields = new Map();
     const field = id => {
         if (!fields.has(id)) fields.set(id, { value: '', textContent: '', style: {}, dataset: {} });
         return fields.get(id);
     };
+    const target = { hash: HASH, nickname: 'Fir', passcode_protected: protectedIdentity };
     const context = {
+        console,
+        atob,
+        RECOVERY_PHRASE_WORDS: 12,
         document: { getElementById: field },
         rsConfirm(opts) {
             seen.confirms.push(opts);
@@ -42,14 +47,41 @@ function load({ confirm = true } = {}) {
             seen.modals.push({ title, body, onConfirm, confirmClass });
         },
         closeIdentityModal() { seen.closed++; },
-        window: {}
+        showRecoveryPhraseBackup(mnemonic) { seen.shown.push(mnemonic); },
+        saveIdentityExportPayload(payload) {
+            seen.saved.push(payload.label);
+            return Promise.resolve();
+        },
+        handleIdentityExportError(error) { throw error; },
+        showToast(...args) { seen.toasts.push(args); },
+        showPreConditionToast(message) { seen.toasts.push([message]); },
+        chooseIdentityExportFormat: () => Promise.resolve(format),
+        identityByHash: hash => (hash === HASH ? target : null),
+        identityDisplayName: ident => ident.nickname,
+        window: {},
+        RS: {
+            invoke(name, args) {
+                seen.invoked.push([name, JSON.parse(JSON.stringify(args))]);
+                const reply = (replies[name] || []).shift();
+                if (reply instanceof Error) return Promise.reject(reply);
+                return Promise.resolve(reply || { mnemonic: 'words', data_base64: 'AA==', backup_base64: 'AA==' });
+            }
+        }
     };
     vm.runInNewContext([
         functionSource(stateSource, 'escapeHtml'),
         functionSource(identitySource, 'identityPinError'),
-        functionSource(identitySource, 'authorizeIdentityKey')
+        functionSource(identitySource, 'base64ToBytes'),
+        functionSource(identitySource, 'backupPinFieldsHtml'),
+        functionSource(identitySource, 'readBackupPin'),
+        functionSource(identitySource, 'authorizeIdentityKey'),
+        functionSource(identitySource, 'viewRecoveryPhrase'),
+        functionSource(identitySource, 'exportIdentityPayload'),
+        functionSource(identitySource, 'exportWarningForFormat'),
+        functionSource(identitySource, 'openEncryptedIdentityExportModal'),
+        functionSource(identitySource, 'exportIdentityBackup')
     ].join('\n'), context, { filename: 'identity.js' });
-    return { context, seen, field };
+    return { context, seen, field, target };
 }
 
 function unauthorized(message) {
@@ -104,6 +136,103 @@ const opts = { title: 'Copy Secret', message: 'A <secret>.', confirmText: 'Copy'
     assert.deepEqual(pins, ['wrong pin', 'right pin']);
     assert.equal(h.seen.closed, 1);
     assert.equal(await pending, 'released');
+
+    // A recovery phrase: a confirmation without a PIN, the PIN sheet with one.
+    h = load();
+    h.context.viewRecoveryPhrase(h.target);
+    await settle();
+    assert.equal(h.seen.confirms.length, 1, 'an open phrase asks first');
+    assert.deepEqual(h.seen.invoked, [['reveal_identity_mnemonic', { args: { hash: HASH, confirmed: true } }]]);
+    assert.deepEqual(h.seen.shown, ['words']);
+
+    h = load({ confirm: false });
+    h.context.viewRecoveryPhrase(h.target);
+    await settle();
+    assert.deepEqual(h.seen.invoked, [], 'declining sends nothing');
+
+    h = load({ protectedIdentity: true, replies: { reveal_identity_mnemonic: [unauthorized('Incorrect PIN')] } });
+    h.context.viewRecoveryPhrase(h.target);
+    await settle();
+    let sheet2 = h.seen.modals[0];
+    assert.equal(sheet2.title, 'View Recovery Phrase');
+    h.field('identity-key-pin').value = 'wrong pin';
+    await sheet2.onConfirm();
+    assert.equal(h.field('identity-key-error').textContent, 'Incorrect PIN');
+    h.field('identity-key-pin').value = 'right pin';
+    await sheet2.onConfirm();
+    await settle();
+    assert.deepEqual(h.seen.invoked.map(([, args]) => args), [
+        { args: { hash: HASH, passcode: 'wrong pin' } },
+        { args: { hash: HASH, passcode: 'right pin' } }
+    ]);
+    assert.deepEqual(h.seen.shown, ['words']);
+
+    // The private key, each way.
+    h = load({ format: 'reticulum-base32' });
+    h.context.exportIdentityBackup(HASH);
+    await settle();
+    assert.equal(h.seen.confirms[0].danger, true);
+    assert.deepEqual(h.seen.invoked, [
+        ['api_export_identity_reticulum_base32', { hashHex: HASH, confirmed: true }]
+    ]);
+    assert.deepEqual(h.seen.saved, ['Reticulum base32 key']);
+
+    h = load({ protectedIdentity: true, format: 'reticulum' });
+    h.context.exportIdentityBackup(HASH);
+    await settle();
+    assert.match(h.seen.modals[0].body, /unencrypted private Reticulum identity key for Fir/);
+    assert.equal(h.seen.modals[0].confirmClass, 'danger');
+    h.field('identity-key-pin').value = 'right pin';
+    await h.seen.modals[0].onConfirm();
+    await settle();
+    assert.deepEqual(h.seen.invoked, [
+        ['api_export_identity_reticulum_base64', { hashHex: HASH, passcode: 'right pin' }]
+    ]);
+    assert.deepEqual(h.seen.saved, ['Reticulum identity file']);
+
+    // A backup: its own PIN, plus the identity's or the sheet as confirmation.
+    h = load({ format: 'ratspeak' });
+    h.context.exportIdentityBackup(HASH);
+    await settle();
+    let backup = h.seen.modals[0];
+    assert.doesNotMatch(backup.body, /Identity PIN/);
+    assert.match(backup.body, /<label>Backup PIN<\/label>/);
+    assert.match(backup.body, /<label>Confirm backup PIN<\/label>/);
+    h.field('identity-export-backup-pin').value = 'backup pin';
+    h.field('identity-export-backup-pin-confirm').value = 'backup pin';
+    await backup.onConfirm();
+    await settle();
+    assert.deepEqual(h.seen.invoked, [
+        ['api_export_identity_backup_base64', { hashHex: HASH, confirmed: true, passcode: 'backup pin' }]
+    ]);
+    assert.deepEqual(h.seen.saved, ['Ratspeak identity backup']);
+
+    h = load({
+        protectedIdentity: true,
+        format: 'ratspeak',
+        replies: { api_export_identity_backup_base64: [unauthorized('Incorrect PIN')] }
+    });
+    h.context.exportIdentityBackup(HASH);
+    await settle();
+    backup = h.seen.modals[0];
+    assert.match(backup.body, /<label>Identity PIN<\/label>/);
+    h.field('identity-export-backup-pin').value = 'backup pin';
+    h.field('identity-export-backup-pin-confirm').value = 'backup pin';
+    assert.equal(backup.onConfirm(), undefined, 'no identity PIN, no request');
+    assert.equal(h.field('identity-export-backup-pin-error').textContent, "Enter this identity's PIN.");
+    h.field('identity-export-identity-pin').value = 'wrong pin';
+    await backup.onConfirm();
+    assert.equal(h.field('identity-export-backup-pin-error').textContent, 'Incorrect PIN');
+    assert.equal(h.seen.closed, 0);
+    h.field('identity-export-identity-pin').value = 'right pin';
+    await backup.onConfirm();
+    await settle();
+    assert.deepEqual(h.seen.invoked.map(([, args]) => args), [
+        { hashHex: HASH, identityPasscode: 'wrong pin', passcode: 'backup pin' },
+        { hashHex: HASH, identityPasscode: 'right pin', passcode: 'backup pin' }
+    ]);
+    assert.equal(h.seen.closed, 1);
+    assert.deepEqual(h.seen.saved, ['Ratspeak identity backup']);
 
     console.log('Identity key authorization tests passed');
 })().catch(error => {

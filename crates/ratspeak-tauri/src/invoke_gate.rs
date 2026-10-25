@@ -21,6 +21,7 @@ pub(crate) const IDENTITY_FREE: &[&str] = &[
     "save_image_to_photos",
     "request_microphone_permission",
     "open_mobile_app_settings",
+    "copy_secret",
     // Platform and runtime probes, read once at page load.
     "api_ble_available",
     "api_ble_peer_available",
@@ -68,8 +69,6 @@ pub(crate) const IDENTITY_FREE: &[&str] = &[
     "set_identity_passcode",
     "remove_identity_passcode",
     "reveal_identity_mnemonic",
-    "api_export_identity",
-    "api_export_identity_base64",
     "api_export_identity_backup_base64",
     "api_export_identity_reticulum_base64",
     "api_export_identity_reticulum_base32",
@@ -96,6 +95,7 @@ pub(crate) const LOCK_FREE: &[&str] = &[
     "save_image_to_photos",
     "request_microphone_permission",
     "open_mobile_app_settings",
+    "copy_secret",
     // Platform probes.
     "api_ble_available",
     "api_ble_peer_available",

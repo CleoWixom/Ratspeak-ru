@@ -45,6 +45,8 @@
         ["startOrReplaceBleRnode", "(Ljava/lang/String;ILjava/lang/String;J)Z"],
         ["disconnectBleRnode", "(Ljava/lang/String;J)Z"],
         ["saveStoredFile", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZLjava/lang/String;)Z"],
+        ["copySecret", "(Ljava/lang/String;)Z"],
+        ["clearSecret", "()V"],
         ["nativeSetNetworkType", "(Ljava/lang/String;J)V"],
         ["nativeUsbDeviceEvent", "(ILjava/lang/String;IILjava/lang/String;ZJ)V"],
         ["nativeBleRnodeState", "(Ljava/lang/String;JIILjava/lang/String;)V"],

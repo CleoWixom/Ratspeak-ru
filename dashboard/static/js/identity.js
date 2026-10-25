@@ -314,14 +314,16 @@ function chooseIdentityExportFormat() {
     });
 }
 
-function backupPinFieldsHtml(prefix, confirm) {
+// `noun` names the PIN in its labels: 'PIN' (default) or 'backup PIN'.
+function backupPinFieldsHtml(prefix, confirm, noun) {
+    noun = noun || 'PIN';
     return '' +
         '<div class="modal-field">' +
-            '<label>PIN</label>' +
+            '<label>' + noun.charAt(0).toUpperCase() + noun.slice(1) + '</label>' +
             '<input type="password" id="' + prefix + '-pin" class="modal-input" maxlength="128" autocomplete="off" placeholder="At least 6 characters">' +
         '</div>' +
         (confirm ? '<div class="modal-field">' +
-            '<label>Confirm PIN</label>' +
+            '<label>Confirm ' + noun + '</label>' +
             '<input type="password" id="' + prefix + '-pin-confirm" class="modal-input" maxlength="128" autocomplete="off">' +
         '</div>' : '') +
         '<div class="modal-error" id="' + prefix + '-pin-error" style="display:none;"></div>';
@@ -1041,8 +1043,8 @@ function showRecoveryPhraseBackup(mnemonic, onDone, opts) {
         var copyBtn = document.getElementById('recovery-backup-copy');
         if (copyBtn) {
             copyBtn.addEventListener('click', function() {
-                RS.copyText(mnemonic).then(function(ok) {
-                    if (ok) showCopyConfirmationToast('Recovery phrase');
+                RS.copySecret(mnemonic).then(function(ok) {
+                    if (ok) showSecretCopiedToast('Recovery phrase');
                     else showToast('Could not copy the recovery phrase', 'toast-error', 2000);
                 });
             });
@@ -1065,9 +1067,8 @@ function showRecoveryPhraseBackup(mnemonic, onDone, opts) {
 }
 window.showRecoveryPhraseBackup = showRecoveryPhraseBackup;
 
-// Re-display a software identity's recovery phrase. Passcode-protected identities
-// prompt for the passcode (decrypts from the vault); otherwise the plaintext
-// sidecar is read directly. Hardware identities never reach here (no stored phrase).
+// Re-display the active software identity's recovery phrase, with its PIN or
+// after a confirmation. Hardware identities never reach here (no stored phrase).
 function viewRecoveryPhrase(target) {
     if (!target || target.is_hardware) return;
     var viewOpts = {
@@ -1077,33 +1078,18 @@ function viewRecoveryPhrase(target) {
         button: 'Done',
         requireConfirm: false
     };
-    if (target.passcode_protected) {
-        showIdentityModal('View Recovery Phrase',
-            '<div class="modal-field"><label>PIN</label>' +
-                '<input type="password" id="reveal-passcode-input" class="modal-input" maxlength="128" autocomplete="off"></div>' +
-            '<p class="recovery-warn">Enter your PIN to reveal the ' + RECOVERY_PHRASE_WORDS + '-word recovery phrase for this identity.</p>' +
-            '<div class="modal-error" id="reveal-error" style="display:none"></div>',
-            function() {
-                var pw = document.getElementById('reveal-passcode-input').value;
-                var errEl = document.getElementById('reveal-error');
-                if (!pw) { if (errEl) { errEl.textContent = 'Enter your PIN.'; errEl.style.display = ''; } return; }
-                return RS.invoke('reveal_identity_mnemonic', { args: { hash: target.hash, passcode: pw } }).then(function(data) {
-                    closeIdentityModal();
-                    showRecoveryPhraseBackup(data && data.mnemonic, null, viewOpts);
-                }).catch(function(err) {
-                    if (errEl) { errEl.textContent = identityPinError(err, 'Could not reveal phrase'); errEl.style.display = ''; }
-                });
-            }
-        );
-        var btn = document.getElementById('identity-modal-confirm');
-        if (btn) { btn.textContent = 'Reveal'; btn.dataset.baseLabel = 'Reveal'; }
-    } else {
-        RS.invoke('reveal_identity_mnemonic', { args: { hash: target.hash } }).then(function(data) {
-            showRecoveryPhraseBackup(data && data.mnemonic, null, viewOpts);
-        }).catch(function(err) {
-            showToast((err && err.message) || 'Could not reveal phrase', 'toast-error', 3000);
-        });
-    }
+    authorizeIdentityKey(target, {
+        title: 'View Recovery Phrase',
+        message: 'Anyone who sees these ' + RECOVERY_PHRASE_WORDS + ' words controls this identity. ' +
+            'Make sure no one can see your screen.',
+        confirmText: 'Reveal'
+    }, function(auth) {
+        return RS.invoke('reveal_identity_mnemonic', { args: Object.assign({ hash: target.hash }, auth) });
+    }).then(function(data) {
+        if (data) showRecoveryPhraseBackup(data.mnemonic, null, viewOpts);
+    }).catch(function(err) {
+        showToast((err && err.message) || 'Could not reveal phrase', 'toast-error', 3000);
+    });
 }
 window.viewRecoveryPhrase = viewRecoveryPhrase;
 
@@ -1370,9 +1356,12 @@ function exportActiveIdentity() {
     exportIdentityBackup((active && active.hash) || activeIdentityHash);
 }
 
-function exportIdentityPayload(hash, format, passcode) {
+// `auth` carries the identity's own authorization, and for a backup also the
+// backup's `passcode`.
+function exportIdentityPayload(hash, format, auth) {
+    var args = Object.assign({ hashHex: hash }, auth);
     if (format === 'reticulum') {
-        return RS.invoke('api_export_identity_reticulum_base64', { hashHex: hash }).then(function(data) {
+        return RS.invoke('api_export_identity_reticulum_base64', args).then(function(data) {
             return {
                 bytes: base64ToBytes(data.data_base64),
                 base64: data.data_base64,
@@ -1383,7 +1372,7 @@ function exportIdentityPayload(hash, format, passcode) {
         });
     }
     if (format === 'reticulum-base32') {
-        return RS.invoke('api_export_identity_reticulum_base32', { hashHex: hash }).then(function(data) {
+        return RS.invoke('api_export_identity_reticulum_base32', args).then(function(data) {
             return {
                 bytes: base64ToBytes(data.data_base64),
                 base64: data.data_base64,
@@ -1393,7 +1382,7 @@ function exportIdentityPayload(hash, format, passcode) {
             };
         });
     }
-    return RS.invoke('api_export_identity_backup_base64', { hashHex: hash, passcode: passcode || '' }).then(function(data) {
+    return RS.invoke('api_export_identity_backup_base64', args).then(function(data) {
         return {
             bytes: base64ToBytes(data.backup_base64),
             base64: data.backup_base64,
@@ -1435,16 +1424,33 @@ function handleIdentityExportError(err) {
     }
 }
 
-function openEncryptedIdentityExportModal(hash, targetName) {
-    var body = backupPinFieldsHtml('identity-export-backup', true) +
-        '<p class="recovery-warn">This PIN encrypts the .rsi backup file. You will need it to import this identity on another device.</p>';
+function openEncryptedIdentityExportModal(hash, target) {
+    var protectedIdentity = !!(target && target.passcode_protected);
+    var body = (protectedIdentity
+            ? '<div class="modal-field"><label>Identity PIN</label>' +
+                  '<input type="password" id="identity-export-identity-pin" class="modal-input" maxlength="128" autocomplete="off"></div>'
+            : '') +
+        backupPinFieldsHtml('identity-export-backup', true, 'backup PIN') +
+        '<p class="recovery-warn">The backup PIN encrypts the .rsi file. You will need it to import this identity on another device.</p>';
     showIdentityModal('Export Identity Backup', body, function() {
+        var errEl = document.getElementById('identity-export-backup-pin-error');
+        function fail(text) { if (errEl) { errEl.textContent = text; errEl.style.display = ''; } }
+        // Opening this sheet and choosing Export is the confirmation.
+        var auth = { confirmed: true };
+        if (protectedIdentity) {
+            var identityPin = document.getElementById('identity-export-identity-pin').value;
+            if (!identityPin) { fail("Enter this identity's PIN."); return; }
+            auth = { identityPasscode: identityPin };
+        }
         var pin = readBackupPin('identity-export-backup', true);
         if (!pin) return;
-        closeIdentityModal();
-        return exportIdentityPayload(hash, 'ratspeak', pin)
-            .then(saveIdentityExportPayload)
-            .catch(handleIdentityExportError);
+        auth.passcode = pin;
+        return exportIdentityPayload(hash, 'ratspeak', auth).then(function(payload) {
+            closeIdentityModal();
+            return saveIdentityExportPayload(payload).catch(handleIdentityExportError);
+        }, function(err) {
+            fail(identityPinError(err, 'Could not export the identity'));
+        });
     });
 }
 
@@ -1459,23 +1465,18 @@ function exportIdentityBackup(hash) {
         return;
     }
     var targetName = target ? identityDisplayName(target) : 'Identity';
-    var chosenFormat = null;
     chooseIdentityExportFormat().then(function(format) {
         if (!format) return null;
         if (format === 'ratspeak') {
-            openEncryptedIdentityExportModal(hash, targetName);
+            openEncryptedIdentityExportModal(hash, target);
             return null;
         }
-        chosenFormat = format;
-        return rsConfirm({
+        return authorizeIdentityKey(target, {
             title: 'Export Private Identity',
             message: exportWarningForFormat(format, targetName),
             confirmText: 'Export',
             danger: true
-        });
-    }).then(function(ok) {
-        if (!ok) return;
-        return exportIdentityPayload(hash, chosenFormat || 'ratspeak');
+        }, function(auth) { return exportIdentityPayload(hash, format, auth); });
     }).then(function(payload) {
         if (!payload) return;
         return saveIdentityExportPayload(payload);
@@ -2554,8 +2555,9 @@ function _hwFinish(result) {
 function _hwCopyMnemonic() {
     var phrase = _hwCtx && _hwCtx.mnemonic;
     if (!phrase) return;
-    RS.copyText(phrase).then(function(ok) {
-        if (ok) showCopyConfirmationToast('Recovery phrase');
+    RS.copySecret(phrase).then(function(ok) {
+        if (ok) showSecretCopiedToast('Recovery phrase');
+        else showToast('Could not copy the recovery phrase', 'toast-error', 2000);
     });
 }
 
