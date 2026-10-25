@@ -1187,48 +1187,41 @@ async fn teardown_rns_runtime_interfaces(handle: &rns_runtime::reticulum::Reticu
     }
 }
 
-/// Initialize RNS runtime and LXMF manager.
-/// Arm the hardware auto-lock timer (no-op unless `hardware_session_timeout` > 0).
-/// The timer fires once; it locks the session only if its generation still matches
-/// (i.e. the session wasn't switched/unlocked/quit in the meantime).
-fn arm_hw_lock_timer(state: &Arc<AppState>) {
-    let secs = db::get_setting(&state.db, "hardware_session_timeout")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    if secs == 0 {
-        return;
-    }
-    let generation = state.hw_lock_gen.load(std::sync::atomic::Ordering::SeqCst);
-    let st = Arc::clone(state);
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(secs)).await;
-        lock_hardware_session(st, generation).await;
-    });
+/// The auto-lock setting, `hardware_session_timeout` in seconds; zero is off.
+fn auto_lock_timeout(state: &AppState) -> Duration {
+    Duration::from_secs(
+        db::get_setting(&state.db, "hardware_session_timeout")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0),
+    )
 }
 
-/// Auto-lock fired: tear down the session (which re-locks the token) and enter the
-/// locked state so the UI prompts for the PIN again.
-async fn lock_hardware_session(state: Arc<AppState>, generation: u64) {
+/// Auto-lock fell due: tear down the session (which re-locks a token), drop
+/// the unlock, and wait for the identity's PIN or passcode again.
+async fn lock_protected_session(state: Arc<AppState>, lock: state::AutoLock) {
     // Serialize with switch/unlock so two teardowns can't race on rns/lxmf.
     let _guard = state.identity_switch_lock.lock().await;
     // Superseded while we waited on the lock (switch / unlock / quit)?
-    if state.hw_lock_gen.load(std::sync::atomic::Ordering::SeqCst) != generation {
+    if state.hw_lock_gen.load(std::sync::atomic::Ordering::SeqCst) != lock.generation {
         return;
     }
-    let hash = state.lxmf.lock().ok().and_then(|l| {
-        l.as_ref()
-            .filter(|m| m.is_hardware)
-            .map(|m| m.identity_hash.clone())
-    });
-    let Some(hash) = hash else { return };
-    tracing::info!(identity = %short_id(&hash), "hardware session auto-lock timeout — locking");
+    let loaded = state
+        .lxmf
+        .lock()
+        .ok()
+        .and_then(|l| l.as_ref().map(|m| m.identity_hash.clone()));
+    if loaded.as_deref() != Some(lock.hash.as_str()) {
+        return;
+    }
+    let hash = lock.hash;
+    tracing::info!(identity = %short_id(&hash), kind = lock.kind, "auto-lock timeout — locking");
     let reset = match reset_activity_for_shutdown(&state).await {
         Ok(reset) => reset,
         Err(error) => {
             tracing::error!(
                 %error,
                 identity = %short_id(&hash),
-                "hardware session auto-lock aborted because Activity reset failed"
+                "auto-lock aborted because Activity reset failed"
             );
             return;
         }
@@ -1242,7 +1235,7 @@ async fn lock_hardware_session(state: Arc<AppState>, generation: u64) {
     state.set_startup_stage("hw_locked");
     state.emit_to_all(
         "hardware_locked",
-        serde_json::json!({ "hash": hash, "reason": "timeout" }),
+        serde_json::json!({ "hash": hash, "kind": lock.kind, "reason": "timeout" }),
     );
 }
 
@@ -1604,6 +1597,7 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
     } else {
         None
     };
+    let from_retained_unlock = retained_identity.is_some();
     let load_dir = data_dir.clone();
     let load_hash = preferred_identity_hash.clone();
     let loaded = tokio::task::spawn_blocking(move || match retained_identity {
@@ -1760,10 +1754,13 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 tracing::warn!("conversations pre-warm failed; tab will fetch on demand");
             }
             tracing::info!("LXMF manager initialized");
-            // Protected identities (hardware PIN or software passcode) can auto-lock
-            // after an idle timeout (off by default).
-            if active_is_protected {
-                arm_hw_lock_timer(&state);
+            // Protected identities (hardware PIN or software passcode) lock once
+            // the auto-lock timeout has passed since their unlock (off by default).
+            match lock_kind.zip(preferred_identity_hash.as_deref()) {
+                Some((kind, hash)) => {
+                    state.arm_auto_lock(hash, kind, auto_lock_timeout(&state), from_retained_unlock)
+                }
+                None => state.disarm_auto_lock(),
             }
             state.request_poll_now();
         }
@@ -2601,6 +2598,13 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                     let tick_activity_origin = tick_state.activity_request_fence();
                     if tick_shutdown.is_triggered() {
                         break;
+                    }
+                    // A deadline that passed while the system slept fires on
+                    // the first tick after it wakes.
+                    if let Some(lock) =
+                        tick_state.take_due_auto_lock(rns_link::clock::ContinuousInstant::now())
+                    {
+                        tokio::spawn(lock_protected_session(Arc::clone(&tick_state), lock));
                     }
                     // Mobile: drop to 2s while backgrounded.
                     #[cfg(feature = "mobile-throttle")]
@@ -9112,38 +9116,114 @@ mod identity_material_tests {
 #[cfg(test)]
 mod identity_session_tests {
     use super::*;
+    use rns_link::clock::ContinuousInstant;
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<(String, Value)>>);
+
+    impl ratspeak_core::Emitter for Recorder {
+        fn try_emit(&self, event: &str, payload: Value) -> Result<(), ratspeak_core::EmitError> {
+            self.0.lock().unwrap().push((event.to_owned(), payload));
+            Ok(())
+        }
+    }
 
     // Locking ends the session: nothing begun under it may land behind the
-    // lock. The lock is private, so this stays in the library's tests.
+    // lock. A passcode identity locks as a hardware one does, and its unlock
+    // goes with the session. The lock is private, so this stays in the
+    // library's tests.
     #[tokio::test]
-    async fn auto_lock_starts_a_new_identity_session() {
-        let root = tempfile::tempdir().unwrap();
-        let data_root = root.path().to_path_buf();
-        lxmf::initialize_storage_namespace(&data_root).unwrap();
-        let config = crate::config::DashboardConfig {
-            data_root: data_root.clone(),
-            data_dir: data_root.join(".ratspeak"),
-            rns_config_dir: data_root.join("rns"),
-            rns_config_dir_overridden: true,
-            max_log_entries: 20,
+    async fn auto_lock_locks_either_kind_and_starts_a_new_identity_session() {
+        for kind in ["hardware", "passcode"] {
+            let root = tempfile::tempdir().unwrap();
+            let data_root = root.path().to_path_buf();
+            lxmf::initialize_storage_namespace(&data_root).unwrap();
+            let config = crate::config::DashboardConfig {
+                data_root: data_root.clone(),
+                data_dir: data_root.join(".ratspeak"),
+                rns_config_dir: data_root.join("rns"),
+                rns_config_dir_overridden: true,
+                max_log_entries: 20,
+            };
+            let pool = db::init_pool(&data_root).unwrap();
+            db::init_schema(&pool).unwrap();
+            let recorder = Arc::new(Recorder::default());
+            let state = Arc::new(AppState::new(
+                config,
+                pool,
+                Arc::clone(&recorder) as Arc<dyn ratspeak_core::Emitter>,
+                Arc::new(ratspeak_core::NoopNotifier),
+            ));
+            let identity = rns_identity::identity::Identity::new();
+            let hash = hex::encode(identity.hash);
+            if kind == "passcode" {
+                let generation = state.current_identity_session_generation();
+                assert!(state.retain_unlocked_identity(identity.clone(), &hash, generation));
+            }
+            let manager =
+                lxmf::LxmfManager::from_loaded_identity(&data_root, identity, kind == "hardware")
+                    .unwrap();
+            state.set_lxmf(manager);
+            let generation = state.current_identity_session_generation();
+            let lock = state::AutoLock {
+                hash: hash.clone(),
+                kind,
+                unlocked_at: ContinuousInstant::now(),
+                timeout: Duration::from_secs(60),
+                generation: state.hw_lock_gen.load(std::sync::atomic::Ordering::SeqCst),
+            };
+
+            lock_protected_session(Arc::clone(&state), lock).await;
+
+            assert_eq!(
+                state.hw_locked_hash().as_deref(),
+                Some(hash.as_str()),
+                "{kind}"
+            );
+            assert!(
+                state.current_identity_session_generation() > generation,
+                "{kind}"
+            );
+            assert!(
+                state
+                    .network_session
+                    .read()
+                    .unwrap()
+                    .retained_identity
+                    .is_none(),
+                "{kind}: the unlock outlived the lock"
+            );
+            let events = recorder.0.lock().unwrap();
+            let (_, locked) = events
+                .iter()
+                .rev()
+                .find(|(event, _)| event == "hardware_locked")
+                .expect("no lock event");
+            assert_eq!(locked["kind"], kind);
+            assert_eq!(locked["reason"], "timeout");
+        }
+    }
+
+    // The deadline runs from the unlock on the suspend-counting clock, so time
+    // the system slept counts toward it.
+    #[test]
+    fn an_auto_lock_falls_due_once_its_timeout_has_passed_since_the_unlock() {
+        let unlocked_at = ContinuousInstant::now();
+        let lock = |timeout: u64| state::AutoLock {
+            hash: "ab".repeat(16),
+            kind: "passcode",
+            unlocked_at,
+            timeout: Duration::from_secs(timeout),
+            generation: 0,
         };
-        let pool = db::init_pool(&data_root).unwrap();
-        db::init_schema(&pool).unwrap();
-        let state = Arc::new(AppState::new(
-            config,
-            pool,
-            Arc::new(ratspeak_core::NoopEmitter),
-            Arc::new(ratspeak_core::NoopNotifier),
-        ));
-        let identity = rns_identity::identity::Identity::new();
-        let manager = lxmf::LxmfManager::from_loaded_identity(&data_root, identity, true).unwrap();
-        let hash = manager.identity_hash.clone();
-        state.set_lxmf(manager);
-        let generation = state.current_identity_session_generation();
-        let lock_generation = state.hw_lock_gen.load(std::sync::atomic::Ordering::SeqCst);
-        lock_hardware_session(Arc::clone(&state), lock_generation).await;
-        assert_eq!(state.hw_locked_hash().as_deref(), Some(hash.as_str()));
-        assert!(state.current_identity_session_generation() > generation);
+        let quarter_hour = lock(15 * 60);
+        assert!(!quarter_hour.due_at(unlocked_at + Duration::from_secs(15 * 60 - 1)));
+        assert!(quarter_hour.due_at(unlocked_at + Duration::from_secs(15 * 60)));
+        // A lid closed for eight hours.
+        assert!(quarter_hour.due_at(unlocked_at + Duration::from_secs(8 * 3600)));
+        assert!(!quarter_hour.due_at(unlocked_at.checked_sub(Duration::from_secs(1)).unwrap()));
+        // Off.
+        assert!(!lock(0).due_at(unlocked_at + Duration::from_secs(8 * 3600)));
     }
 }
 

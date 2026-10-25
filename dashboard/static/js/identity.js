@@ -2887,5 +2887,13 @@ function _hwForgetLockedIdentity() {
 }
 
 if (typeof RS !== 'undefined' && RS.listen) {
-    RS.listen('hardware_locked', function(data) { showHwUnlock(data && data.hash, data && data.kind); });
+    RS.listen('hardware_locked', function(data) {
+        // An auto-lock starts the page over, so none of the identity's data
+        // stays behind the PIN sheet.
+        if (data && data.reason === 'timeout') {
+            window.location.reload();
+            return;
+        }
+        showHwUnlock(data && data.hash, data && data.kind);
+    });
 }

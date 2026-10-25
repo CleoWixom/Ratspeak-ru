@@ -1512,8 +1512,8 @@ pub async fn set_developer_mode(
     Ok(json!({ "developer_mode": enabled }))
 }
 
-/// Auto-lock timeout for hardware identities (seconds; 0 = off). Applies on the
-/// next unlock/boot — the running session keeps its current timer.
+/// Auto-lock timeout for identities with a PIN, hardware or passcode (seconds;
+/// 0 = off), counted from the unlock. Applies on the next unlock.
 #[tauri::command]
 pub async fn set_hardware_lock_timeout(
     state: State<'_, Arc<AppState>>,
@@ -1535,7 +1535,7 @@ pub async fn set_hardware_lock_timeout(
         "app_settings_updated",
         json!({ "hardware_session_timeout": seconds }),
     );
-    tracing::info!("Hardware auto-lock timeout set to {seconds}s");
+    tracing::info!("Auto-lock timeout set to {seconds}s");
     Ok(json!({ "hardware_session_timeout": seconds }))
 }
 

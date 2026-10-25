@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 use ratspeak_core::{Emitter, NativeNotification, NativeNotifier};
+/// The suspend-counting clock an [`AutoLock`] deadline runs on.
+pub use rns_link::clock::ContinuousInstant;
 use rns_runtime::lifecycle::ShutdownSignal;
 use tokio::sync::watch;
 use zeroize::Zeroizing;
@@ -797,9 +799,11 @@ pub struct AppState {
     pub hw_locked: RwLock<Option<String>>,
     /// Last protected-identity unlock failure message.
     pub hw_last_error: Mutex<Option<String>>,
-    /// Bumped on every session teardown; an auto-lock timer no-ops if its captured
+    /// Bumped on every session teardown; an auto-lock no-ops if its captured
     /// generation no longer matches (i.e. the session was switched/unlocked/quit).
     pub hw_lock_gen: AtomicU64,
+    /// The loaded protected identity's auto-lock, which the LXMF tick checks.
+    pub auto_lock: Mutex<Option<AutoLock>>,
     /// Read-through cache for the active identity's (hash, lxmf_hash),
     /// stamped with `db::identity_generation()` so identity-table writes
     /// invalidate it. Keeps hot async paths off sync DB reads.
@@ -809,6 +813,28 @@ pub struct AppState {
 /// (identity-table generation, active identity (hash, lxmf_hash) at that
 /// generation — `None` when no identity is active).
 pub type CachedActiveIdentity = (u64, Option<(String, String)>);
+
+/// A protected identity's auto-lock. Its deadline runs from the unlock on the
+/// suspend-counting clock, so time the system slept counts; it is checked on
+/// a tick, never armed as a timer, which would count awake time only.
+#[derive(Clone, Debug)]
+pub struct AutoLock {
+    pub hash: String,
+    /// `hardware` or `passcode`.
+    pub kind: &'static str,
+    pub unlocked_at: ContinuousInstant,
+    /// Zero when auto-lock is off. Read at the unlock.
+    pub timeout: Duration,
+    /// The `hw_lock_gen` of the session it belongs to.
+    pub generation: u64,
+}
+
+impl AutoLock {
+    /// Whether the identity is due to lock at `now`.
+    pub fn due_at(&self, now: ContinuousInstant) -> bool {
+        !self.timeout.is_zero() && now.saturating_duration_since(self.unlocked_at) >= self.timeout
+    }
+}
 
 impl AppState {
     pub fn new(
@@ -1002,7 +1028,48 @@ impl AppState {
             hw_locked: RwLock::new(None),
             hw_last_error: Mutex::new(None),
             hw_lock_gen: AtomicU64::new(0),
+            auto_lock: Mutex::new(None),
             active_identity_cache: Mutex::new(None),
+        }
+    }
+
+    /// Arm the auto-lock of protected identity `hash` as it loads. A reload
+    /// from its retained unlock is no new unlock: the deadline runs on.
+    pub fn arm_auto_lock(
+        &self,
+        hash: &str,
+        kind: &'static str,
+        timeout: Duration,
+        from_retained_unlock: bool,
+    ) {
+        let generation = self.hw_lock_gen.load(Ordering::SeqCst);
+        let mut slot = self.auto_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let running = slot
+            .take()
+            .filter(|lock| from_retained_unlock && lock.hash == hash);
+        *slot = Some(match running {
+            Some(lock) => AutoLock { generation, ..lock },
+            None => AutoLock {
+                hash: hash.to_owned(),
+                kind,
+                unlocked_at: ContinuousInstant::now(),
+                timeout,
+                generation,
+            },
+        });
+    }
+
+    pub fn disarm_auto_lock(&self) {
+        *self.auto_lock.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The armed auto-lock if it is due at `now`, taken so that it fires once.
+    pub fn take_due_auto_lock(&self, now: ContinuousInstant) -> Option<AutoLock> {
+        let mut slot = self.auto_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|lock| lock.due_at(now)) {
+            slot.take()
+        } else {
+            None
         }
     }
 
@@ -3437,6 +3504,38 @@ mod tests {
         // Switching to another identity drops it.
         state.release_retained_identity_except(&"ab".repeat(16));
         assert!(!retained(&state));
+    }
+
+    #[test]
+    fn a_reload_from_the_retained_unlock_keeps_the_auto_lock_deadline() {
+        let state = make_state();
+        let hash = "ab".repeat(16);
+        let armed = |state: &AppState| state.auto_lock.lock().unwrap().clone().unwrap();
+        state.arm_auto_lock(&hash, "passcode", Duration::from_secs(60), false);
+        let unlocked = armed(&state);
+
+        // A restart of the same identity from its retained unlock.
+        state.hw_lock_gen.fetch_add(1, Ordering::SeqCst);
+        state.arm_auto_lock(&hash, "passcode", Duration::from_secs(900), true);
+        let restarted = armed(&state);
+        assert_eq!(restarted.unlocked_at, unlocked.unlocked_at);
+        assert_eq!(restarted.timeout, Duration::from_secs(60));
+        assert_eq!(restarted.generation, unlocked.generation + 1);
+
+        // An unlock with the secret starts it over.
+        state.arm_auto_lock(&hash, "passcode", Duration::from_secs(900), false);
+        let fresh = armed(&state);
+        assert_eq!(fresh.timeout, Duration::from_secs(900));
+
+        // It fires once.
+        let due = fresh.unlocked_at + fresh.timeout;
+        assert!(
+            state
+                .take_due_auto_lock(due - Duration::from_secs(1))
+                .is_none()
+        );
+        assert!(state.take_due_auto_lock(due).is_some());
+        assert!(state.take_due_auto_lock(due).is_none());
     }
 
     #[test]

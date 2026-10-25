@@ -84,6 +84,75 @@ pub(crate) const IDENTITY_FREE: &[&str] = &[
     "hw_activate_and_unlock",
 ];
 
+/// Commands that still answer while the active identity is locked: the shell,
+/// platform probes, startup, setup and reset, app settings and identity
+/// management. The rest is the locked identity's and waits for its unlock.
+pub(crate) const LOCK_FREE: &[&str] = &[
+    // Shell.
+    "open_external_url",
+    "open_support_email",
+    "set_window_decorations",
+    "save_image_to_photos",
+    "request_microphone_permission",
+    "open_mobile_app_settings",
+    // Platform probes.
+    "api_ble_available",
+    "api_ble_peer_available",
+    // Startup, setup and reset.
+    "api_version",
+    "api_startup_progress",
+    "api_setup_status",
+    "api_setup_complete",
+    "api_setup_restart",
+    "api_set_foreground",
+    "api_factory_reset",
+    // App settings.
+    "api_app_settings",
+    "api_notification_settings",
+    "set_appearance",
+    "set_native_theme",
+    "set_text_scale",
+    "set_desktop_notifications",
+    "set_hide_known_spam_peers",
+    "set_lxmf_limit_1mb",
+    "set_peers_sort",
+    "accept_public_channel_consent",
+    "set_auto_announce",
+    "set_hardware_lock_timeout",
+    "set_developer_mode",
+    "set_announce_ratspeak_usage",
+    "set_android_ble_rnode_auto_resume",
+    "set_activity_identity_protection",
+    // Identities: unlock, switch, add and remove.
+    "api_identity",
+    "api_list_identities",
+    "api_create_identity",
+    "api_import_identity",
+    "api_import_identity_base64",
+    "api_preview_identity_import_base64",
+    "restore_seed_identity",
+    "switch_identity",
+    "api_activate_identity",
+    "api_delete_identity",
+    "unlock_identity",
+    "set_identity_passcode",
+    "remove_identity_passcode",
+    "reveal_identity_mnemonic",
+    "api_export_identity_backup_base64",
+    "api_export_identity_reticulum_base64",
+    "api_export_identity_reticulum_base32",
+    "hw_detect",
+    "hw_provision_recoverable",
+    "hw_provision_hardware_only",
+    "hw_import_existing",
+    "hw_restore",
+    "hw_reset_piv",
+    "hw_change_pin",
+    "hw_remove",
+    "hw_unlock",
+    "hw_activate_and_unlock",
+];
+
 /// Wraps the generated command handler in the admission check. A core that
 /// failed to start answers no command at all; its window is static.
 pub fn gated<R: tauri::Runtime>(
@@ -112,6 +181,9 @@ pub fn gated<R: tauri::Runtime>(
 fn refusal(state: &AppState, command: &str) -> Option<AppError> {
     if !IDENTITY_FREE.contains(&command) && helpers::active_identity_known_absent(state) {
         return Some(AppError::conflict("no active identity"));
+    }
+    if !LOCK_FREE.contains(&command) && state.hw_locked_hash().is_some() {
+        return Some(AppError::new("locked", "Unlock this identity first."));
     }
     None
 }

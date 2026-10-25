@@ -4139,7 +4139,7 @@ fn only_real_transitions_take_the_lifecycle_lock_as_a_transition() {
     assert_eq!(
         transitions,
         [
-            "crates/ratspeak-runtime/src/lib.rs lock_hardware_session",
+            "crates/ratspeak-runtime/src/lib.rs lock_protected_session",
             "crates/ratspeak-runtime/src/lib.rs restart_rns_lxmf",
             "crates/ratspeak-runtime/src/network_ownership.rs apply",
             "crates/ratspeak-runtime/src/propagation_recovery.rs recover_host",
@@ -4255,7 +4255,7 @@ fn every_activation_starts_a_new_identity_session() {
         ),
         (
             &runtime,
-            "fn lock_hardware_session(",
+            "fn lock_protected_session(",
             "reset_activity_for_shutdown(",
         ),
     ] {
@@ -6830,10 +6830,7 @@ fn settings_information_architecture_groups_one_off_settings() {
     assert!(identity_panel.contains(
         r#"class="selector-badge selector-badge-no-caret" id="settings-view-recovery-phrase-btn">View</button>"#
     ));
-    assert!(
-        identity_panel
-            .contains(r#"<span class="settings-row-label">Hardware Key Auto-Lock</span>"#)
-    );
+    assert!(identity_panel.contains(r#"<span class="settings-row-label">Auto-Lock</span>"#));
     assert!(identity_panel.contains(r#"id="hw-lock-row""#));
 
     let network_panel = index
@@ -6843,7 +6840,7 @@ fn settings_information_architecture_groups_one_off_settings() {
         .expect("network settings panel");
     assert!(network_panel.contains(r#"<span class="settings-row-label">Transport Mode</span>"#));
     assert!(network_panel.contains(r#"<span class="settings-row-label">Auto-Announce</span>"#));
-    assert!(!network_panel.contains("Hardware Key Auto-Lock"));
+    assert!(!network_panel.contains("Auto-Lock"));
 
     assert!(
         settings_js
@@ -10014,19 +10011,73 @@ fn every_ipc_command_passes_the_invoke_gate() {
     assert!(registered.len() > 200, "command registry not found");
     let gate = read_source(repo_root().join("crates/ratspeak-tauri/src/invoke_gate.rs"))
         .expect("invoke gate");
-    let free = gate
-        .split("const IDENTITY_FREE: &[&str] = &[")
+    for list in ["IDENTITY_FREE", "LOCK_FREE"] {
+        let free = gate_list(&gate, list);
+        assert!(free.len() > 40, "{list} not parsed");
+        for command in free {
+            assert!(
+                registered.contains(&command),
+                "{list}: {command} is not registered"
+            );
+        }
+    }
+}
+
+/// The command names of one of the invoke gate's lists.
+fn gate_list<'a>(gate: &'a str, list: &str) -> Vec<&'a str> {
+    gate.split(&format!("const {list}: &[&str] = &["))
         .nth(1)
         .and_then(|tail| tail.split("];").next())
-        .expect("IDENTITY_FREE list");
-    let free: Vec<&str> = free
+        .unwrap_or_else(|| panic!("{list} list"))
         .lines()
         .map(str::trim)
         .filter_map(|line| line.strip_prefix('"')?.strip_suffix("\","))
-        .collect();
-    assert!(free.len() > 40, "IDENTITY_FREE not parsed");
-    for command in free {
-        assert!(registered.contains(&command), "{command} is not registered");
+        .collect()
+}
+
+/// A locked identity's data waits for its unlock; the gate still answers
+/// app settings and identity management.
+#[test]
+fn a_locked_identity_keeps_only_settings_and_identity_management() {
+    let gate = read_source(repo_root().join("crates/ratspeak-tauri/src/invoke_gate.rs"))
+        .expect("invoke gate");
+    let lock_free = gate_list(&gate, "LOCK_FREE");
+    for scoped in [
+        "api_lxmf_conversations",
+        "get_conversation",
+        "api_contacts",
+        "api_contact_card",
+        "api_blocked_contacts",
+        "api_channels",
+        "api_announces",
+        "api_get_peers_snapshot",
+        "api_list_network_interfaces",
+        "activity_status",
+        "get_all_game_sessions",
+        "voice_status",
+        "api_lxmf_limits",
+        "send_lxmf_message",
+        "api_set_display_name",
+        "set_identity_status",
+        "api_update_identity",
+        "api_export_identity",
+        "api_export_identity_base64",
+    ] {
+        assert!(
+            !lock_free.contains(&scoped),
+            "{scoped} answers while locked"
+        );
+    }
+    for unlock in [
+        "unlock_identity",
+        "hw_unlock",
+        "switch_identity",
+        "api_list_identities",
+    ] {
+        assert!(
+            lock_free.contains(&unlock),
+            "{unlock} is refused while locked"
+        );
     }
 }
 
@@ -10110,4 +10161,23 @@ fn auto_lock_copy_counts_from_the_unlock() {
             "{copy}"
         );
     }
+}
+
+/// Auto-lock runs on the suspend-counting clock and is checked on the LXMF
+/// tick, every 0.5 s or 2 s in the mobile background: no timer counts down
+/// the unlock in awake time.
+#[test]
+fn auto_lock_is_checked_on_the_lxmf_tick() {
+    let runtime =
+        read_source(repo_root().join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime lib");
+    assert!(!runtime.contains("fn arm_hw_lock_timer"));
+    let tick = runtime
+        .split("let mut interval = tokio::time::interval(Duration::from_millis(500));")
+        .nth(1)
+        .and_then(|tail| tail.split("download_coordinator.synchronize(").next())
+        .expect("LXMF tick loop");
+    assert!(tick.contains("take_due_auto_lock(rns_link::clock::ContinuousInstant::now())"));
+    assert!(tick.contains("Duration::from_secs(2)"));
+    let lock = rust_function_block(&runtime, "lock_protected_session");
+    assert!(!lock.contains("sleep("));
 }

@@ -1630,13 +1630,16 @@ function _hwLockLabel(secs) {
     return secs + 's';
 }
 
-// Reveal the Hardware Key Auto-Lock row only when a hardware identity exists.
+// Reveal the Auto-Lock row when an identity has a PIN: a hardware key or a
+// passcode.
 function _maybeRevealHwLockRow() {
     var row = document.getElementById('hw-lock-row');
     if (!row) return;
     RS.invoke('api_list_identities').then(function(list) {
-        var hasHw = Array.isArray(list) && list.some(function(i) { return i && i.is_hardware; });
-        row.style.display = hasHw ? '' : 'none';
+        var protectedIdentity = Array.isArray(list) && list.some(function(i) {
+            return i && (i.is_hardware || i.passcode_protected);
+        });
+        row.style.display = protectedIdentity ? '' : 'none';
     }).catch(function() {});
 }
 
@@ -1645,8 +1648,8 @@ function _initHwLockSetting() {
     if (!badge) return;
     function open() {
         rsChoice({
-            title: 'Hardware Key Auto-Lock',
-            message: 'Lock your hardware identity once this long has passed since you unlocked it. You’ll re-enter the PIN to resume.',
+            title: 'Auto-Lock',
+            message: 'Lock an identity with a PIN once this long has passed since you unlocked it. You’ll re-enter its PIN to resume.',
             choices: [
                 { label: 'OFF', value: '0', hint: 'Only locks when you quit Ratspeak.' },
                 { label: '5 minutes', value: '300', hint: 'Tightest; frequent PIN prompts.' },

@@ -68,10 +68,16 @@ function _rsBootstrapOnLoad() {
         _rsShowStartupError(window.__RATSPEAK_STARTUP_ERROR__);
         return;
     }
+    if (window.RS && RS.audioPlayback && typeof RS.audioPlayback.installUnlock === 'function') {
+        RS.audioPlayback.installUnlock();
+    }
+    if (typeof loadIdentities === 'function') loadIdentities();
     // Race-free check for a locked protected identity at boot (the
-    // hardware_locked event can fire before this listener attaches).
+    // hardware_locked event can fire before this listener attaches). A
+    // locked identity's data waits for the unlock, which reloads the page.
     RS.invoke('api_startup_progress').then(function(data) {
-        if (data && data.stage === 'hw_locked' && typeof showHwUnlock === 'function') {
+        var locked = !!(data && data.stage === 'hw_locked');
+        if (locked && typeof showHwUnlock === 'function') {
             showHwUnlock(data.hw_locked, data.hw_locked_kind);
         }
         if (data && data.storage_warning && typeof showToast === 'function') {
@@ -80,17 +86,18 @@ function _rsBootstrapOnLoad() {
         if (data && data.profile_lock_warning && typeof showToast === 'function') {
             showToast(data.profile_lock_warning, 'toast-warning', 5000);
         }
-    }).catch(function() {});
-    if (window.RS && RS.audioPlayback && typeof RS.audioPlayback.installUnlock === 'function') {
-        RS.audioPlayback.installUnlock();
-    }
+        if (!locked) _rsLoadIdentityViews();
+    }).catch(function() { _rsLoadIdentityViews(); });
+}
+
+// The active identity's announces, conversations, blocks and peers.
+function _rsLoadIdentityViews() {
     RS.invoke('api_announces').then(function(data) {
         if (Array.isArray(data)) {
             announceCache = data;
             if (typeof renderAnnounceList === 'function') renderAnnounceList();
         }
     }).catch(function() {});
-    if (typeof loadIdentities === 'function') loadIdentities();
     if (typeof loadConversations === 'function') loadConversations();
     if (typeof updateBlockedCount === 'function') updateBlockedCount();
 

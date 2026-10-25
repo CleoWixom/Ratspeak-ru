@@ -119,6 +119,8 @@ RS.sheetShell = {
 // (callers are fire-and-forget; chained .then handlers see undefined).
 RS.invokeOrToast = function(command, args, failMessage) {
     return RS.invoke(command, args).catch(function(err) {
+        // A locked identity answers with its PIN sheet, not a toast.
+        if (err && err.code === 'locked') return undefined;
         var message = failMessage || 'Action failed';
         if (typeof showToast === 'function') {
             var copy = typeof toastErrorCopy === 'function'

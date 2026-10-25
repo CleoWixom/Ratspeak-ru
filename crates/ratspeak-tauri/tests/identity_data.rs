@@ -312,6 +312,34 @@ fn the_invoke_gate_refuses_identity_scoped_commands_without_an_active_identity()
     }
 }
 
+// While the active identity is locked, its data waits for the unlock; the
+// gate still answers what the lock screen needs.
+#[test]
+fn the_invoke_gate_holds_a_locked_identitys_data() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::new(Some(A), true);
+    fixture.state.set_hw_locked(Some(A.into()));
+
+    for (command, body) in [
+        ("api_contacts", json!({})),
+        (
+            "add_contact",
+            json!({ "args": { "hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" } }),
+        ),
+    ] {
+        let refused = fixture.invoke(command, body).unwrap_err();
+        assert_eq!(refused["code"], "locked", "{command}");
+    }
+    assert_eq!(db::get_all_contacts(&fixture.state.db, A).len(), 1);
+    assert!(fixture.invoke("api_version", json!({})).is_ok());
+
+    fixture.state.set_hw_locked(None);
+    let contacts = fixture.invoke("api_contacts", json!({})).unwrap();
+    assert_eq!(contacts.as_array().map(Vec::len), Some(1));
+}
+
 #[test]
 fn clearing_contacts_or_all_data_keeps_blocks() {
     let _serial = SERIAL
