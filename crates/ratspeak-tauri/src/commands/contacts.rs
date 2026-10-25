@@ -500,14 +500,31 @@ pub async fn unblock_contact(
     }
     let peer = read_peer_delta(&state, &identity_id, &dest_hash).await;
 
-    let _identity = state.identity_switch_lock.lock_routine().await;
     if let Some(input_bytes) = lift_input.filter(|_| lift.is_none()) {
         // Its runtime stopped first. While the identity is still the active
-        // one, lift through its live runtime; otherwise once one is up.
-        let live = (active_identity_id(&state) == identity_id)
-            .then(|| transport_sender(&state))
-            .flatten();
-        if let Some(live) = live {
+        // one, lift through its live runtime, read with it under the lock;
+        // otherwise once one is up. The lift itself runs off the lock.
+        let live = {
+            let _identity = state.identity_switch_lock.lock_routine().await;
+            (active_identity_id(&state) == identity_id)
+                .then(|| transport_sender(&state))
+                .flatten()
+        };
+        // Pending until it lands: a block made from now on cancels it like any
+        // pending lift, and one made since keeps its network block.
+        let dest_c = dest_hash.clone();
+        let id_c = identity_id.clone();
+        let wanted = db::spawn_db(state.db.clone(), move |p| {
+            db::queue_pending_network_lift(&p, &id_c, &dest_c);
+            let blocked = db::is_blocked(&p, &dest_c, &id_c);
+            if blocked {
+                db::clear_pending_network_lift(&p, &id_c, &dest_c);
+            }
+            !blocked
+        })
+        .await
+        .unwrap_or(false);
+        if let Some(live) = live.filter(|_| wanted) {
             lift = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 ratspeak_runtime::blackhole::lift_network_block(
@@ -520,19 +537,20 @@ pub async fn unblock_contact(
             .await
             .ok()
             .flatten();
-        }
-        if lift.is_none() {
-            let dest_c = dest_hash.clone();
-            let id_c = identity_id.clone();
-            db::spawn_db(state.db.clone(), move |p| {
-                db::queue_pending_network_lift(&p, &id_c, &dest_c)
-            })
-            .await
-            .ok();
+            if lift.is_some() {
+                let dest_c = dest_hash.clone();
+                let id_c = identity_id.clone();
+                db::spawn_db(state.db.clone(), move |p| {
+                    db::clear_pending_network_lift(&p, &id_c, &dest_c)
+                })
+                .await
+                .ok();
+            }
         }
     }
     let unblackholed = lift == Some(true);
     // As a block: nothing reaches the next session's window.
+    let _identity = state.identity_switch_lock.lock_routine().await;
     if state.current_identity_session_generation() == generation {
         if let Some(entries) = blackhole_entries {
             state.emit_to_all("blackhole_update", json!({ "entries": entries }));

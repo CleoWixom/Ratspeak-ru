@@ -1165,6 +1165,142 @@ fn an_unblock_overtaken_by_a_switch_lifts_its_network_block_later() {
     );
 }
 
+// An unblock that retries its network lift through the identity's restarted
+// runtime holds the lifecycle lock only to read that runtime: a switch never
+// waits on the retry, whose lift then waits for the identity it was asked
+// for and whose events reach no window.
+#[test]
+fn an_unblock_retrying_its_network_lift_holds_no_lifecycle_lock() {
+    use ratspeak_tauri::commands::contacts::{UnblockContactArgs, unblock_contact};
+    use rns_transport::messages::{TransportQuery, TransportQueryResponse};
+    use tauri::Manager;
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::new(Some(A), false);
+    let (first_root, second_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let reply = runtime().block_on(async {
+        let (first, mut first_queries) = network_runtime(&fixture.state, first_root.path()).await;
+        let unblock = unblock_contact(
+            fixture.app.state::<Arc<AppState>>(),
+            UnblockContactArgs {
+                hash: SPAM.into(),
+                also_remove_blackhole: true,
+            },
+        );
+        let switch = async {
+            let (query, answer) = next_query(&mut first_queries).await;
+            assert!(matches!(query, TransportQuery::ResolveIdentityHash { .. }));
+            let _ = answer.send(TransportQueryResponse::HashResult(Some([0x42; 16])));
+            let (query, unanswered) = next_query(&mut first_queries).await;
+            assert!(matches!(query, TransportQuery::UnblackholeIdentity { .. }));
+            // The runtime restarts under the same identity before the retry.
+            let held = fixture.state.identity_switch_lock.lock_routine().await;
+            first.shutdown.trigger();
+            drop(unanswered);
+            drop(first_queries);
+            let (second, mut second_queries) =
+                network_runtime(&fixture.state, second_root.path()).await;
+            drop(held);
+            let (_retry, pending) = next_query(&mut second_queries).await;
+            let transition = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                fixture.state.identity_switch_lock.lock(),
+            )
+            .await
+            .expect("the unblock held the lifecycle lock across its retried network query");
+            db::set_active_identity(&fixture.state.db, B).unwrap();
+            fixture.state.bump_identity_session_generation();
+            second.shutdown.trigger();
+            drop(pending);
+            drop(second_queries);
+            *fixture.state.rns.write().unwrap() = None;
+            drop(transition);
+        };
+        let (reply, ()) = tokio::join!(unblock, switch);
+        reply
+    });
+    assert_eq!(reply.unwrap()["unblackholed"], false);
+    assert!(!db::is_blocked(&fixture.state.db, SPAM, A));
+    assert!(db::is_blocked(&fixture.state.db, SPAM, B));
+    assert_eq!(db::pending_network_lifts(&fixture.state.db, A), [SPAM]);
+    assert!(db::pending_network_lifts(&fixture.state.db, B).is_empty());
+    assert!(
+        fixture.last_event("contact_unblocked").is_none(),
+        "contact_unblocked reached the next session"
+    );
+}
+
+// A block made while an unblock's network lift waits on a stopped runtime
+// keeps the network block: the unblock's retry neither lifts it nor leaves
+// it pending.
+#[test]
+fn a_block_made_before_an_unblock_retries_its_lift_is_not_undone() {
+    use ratspeak_tauri::commands::contacts::{UnblockContactArgs, unblock_contact};
+    use rns_transport::messages::{TransportMessage, TransportQuery, TransportQueryResponse};
+    use tauri::Manager;
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::new(Some(A), false);
+    let (first_root, second_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (reply, lifted) = runtime().block_on(async {
+        let (first, mut first_queries) = network_runtime(&fixture.state, first_root.path()).await;
+        let unblock = unblock_contact(
+            fixture.app.state::<Arc<AppState>>(),
+            UnblockContactArgs {
+                hash: SPAM.into(),
+                also_remove_blackhole: true,
+            },
+        );
+        let block_and_restart = async {
+            let (query, answer) = next_query(&mut first_queries).await;
+            assert!(matches!(query, TransportQuery::ResolveIdentityHash { .. }));
+            let _ = answer.send(TransportQueryResponse::HashResult(Some([0x42; 16])));
+            let (query, unanswered) = next_query(&mut first_queries).await;
+            assert!(matches!(query, TransportQuery::UnblackholeIdentity { .. }));
+            // The user blocks the contact again while the lift waits.
+            fixture
+                .invoke(
+                    "block_contact",
+                    json!({ "args": { "hash": SPAM, "escalate_to_blackhole": false } }),
+                )
+                .unwrap();
+            let held = fixture.state.identity_switch_lock.lock_routine().await;
+            first.shutdown.trigger();
+            drop(unanswered);
+            drop(first_queries);
+            let (second, mut second_queries) =
+                network_runtime(&fixture.state, second_root.path()).await;
+            drop(held);
+            let mut lifted = Vec::new();
+            while let Ok(Some(TransportMessage::Rpc { query, response_tx })) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), second_queries.recv())
+                    .await
+            {
+                let response = match query {
+                    TransportQuery::ResolveIdentityHash { .. } => {
+                        TransportQueryResponse::HashResult(Some([0x42; 16]))
+                    }
+                    TransportQuery::UnblackholeIdentity { hash } => {
+                        lifted.push(hash);
+                        TransportQueryResponse::BoolResult(true)
+                    }
+                    _ => TransportQueryResponse::BlackholeList(Vec::new()),
+                };
+                let _ = response_tx.send(response);
+            }
+            second.shutdown.trigger();
+            lifted
+        };
+        tokio::join!(unblock, block_and_restart)
+    });
+    assert!(lifted.is_empty(), "the unblock undid a block made since");
+    assert_eq!(reply.unwrap()["unblackholed"], false);
+    assert!(db::is_blocked(&fixture.state.db, SPAM, A));
+    assert!(db::pending_network_lifts(&fixture.state.db, A).is_empty());
+}
+
 // A block made after an unblock whose network lift is still pending keeps
 // that lift from undoing it later.
 #[test]
