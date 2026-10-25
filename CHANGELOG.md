@@ -31,6 +31,7 @@ changes that materially affect how an artifact is reproduced.
 - Auto-Lock now locks passcode identities too, and counts time the device slept, so a lock that fell due during sleep happens within seconds of waking. If you turned on the hardware auto-lock, passcode identities now lock after the same time.
 - While an identity is locked, its messages, contacts and other data stay out of the app until you unlock it.
 - Ratspeak keeps its data folder and desktop diagnostic logs private to your user account, and copying the shared-instance access configuration asks for your identity's PIN, or a confirmation when it has none.
+- The Linux packages' USB radio rule gives access to the user signed in at the computer, and applies to radios that are already plugged in.
 
 ### Build and compatibility
 

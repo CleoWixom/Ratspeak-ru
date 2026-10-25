@@ -10181,3 +10181,68 @@ fn auto_lock_is_checked_on_the_lxmf_tick() {
     let lock = rust_function_block(&runtime, "lock_protected_session");
     assert!(!lock.contains("sleep("));
 }
+
+/// The radio rule gives ports to the user at the seat through uaccess, which
+/// systemd applies in 73-seat-late.rules: it sorts before that and opens no
+/// port to every local account. Packages run udevadm so plugged-in radios
+/// follow it, and the copy tells the AppImage path and to drop the old file.
+#[test]
+fn linux_radio_rule_reaches_only_the_seat_user() {
+    let root = repo_root();
+    let linux = root.join("src-tauri/resources/linux");
+    let mut rules: Vec<String> = std::fs::read_dir(&linux)
+        .expect("Linux resources")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rules"))
+        .collect();
+    rules.sort();
+    assert_eq!(rules, ["70-ratspeak.rules"]);
+    assert!(rules[0].as_str() < "73-seat-late.rules");
+    let rule = read_source(linux.join("70-ratspeak.rules")).expect("udev rule");
+    let matches: Vec<&str> = rule
+        .lines()
+        .filter(|line| line.starts_with("SUBSYSTEM=="))
+        .collect();
+    assert_eq!(matches.len(), 8);
+    for line in matches {
+        assert!(line.ends_with(r#", TAG+="uaccess""#), "{line}");
+        assert!(
+            !line.contains("MODE=") && !line.contains("GROUP="),
+            "{line}"
+        );
+    }
+    assert!(!rule.contains("0666"));
+    assert!(rule.contains("/etc/udev/rules.d/99-ratspeak.rules"));
+
+    let config: serde_json::Value = serde_json::from_str(
+        &read_source(root.join("src-tauri/tauri.conf.json")).expect("Tauri config"),
+    )
+    .expect("valid Tauri config");
+    for package in ["deb", "rpm"] {
+        let bundle = &config["bundle"]["linux"][package];
+        assert_eq!(
+            bundle["files"]["/usr/lib/udev/rules.d/70-ratspeak.rules"],
+            "resources/linux/70-ratspeak.rules",
+            "{package}"
+        );
+        let script = bundle["postInstallScript"].as_str().expect(package);
+        let script = read_source(root.join("src-tauri").join(script)).expect(package);
+        assert!(script.contains("udevadm trigger --subsystem-match=tty --action=change"));
+        assert!(
+            script.contains("|| true"),
+            "{package}: a failed trigger fails no install"
+        );
+    }
+    assert!(
+        !read_source(root.join("src-tauri/tauri.conf.json"))
+            .unwrap()
+            .contains("99-ratspeak")
+    );
+
+    let health = read_source(root.join("dashboard/static/js/health.js")).expect("health");
+    assert!(health.contains("dialout") && health.contains("uucp"));
+    let modals = read_source(root.join("dashboard/static/js/modals.js")).expect("modals");
+    assert!(modals.contains("/etc/udev/rules.d/70-ratspeak.rules"));
+    assert!(modals.contains("99-ratspeak.rules"));
+}

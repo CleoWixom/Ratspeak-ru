@@ -53,15 +53,17 @@
         "desktopTemplate": "resources/linux/Ratspeak.desktop",
         "files": {
           "/usr/share/metainfo/org.ratspeak.desktop.metainfo.xml": "resources/linux/org.ratspeak.desktop.metainfo.xml",
-          "/usr/lib/udev/rules.d/99-ratspeak.rules": "resources/linux/99-ratspeak.rules"
-        }
+          "/usr/lib/udev/rules.d/70-ratspeak.rules": "resources/linux/70-ratspeak.rules"
+        },
+        "postInstallScript": "resources/linux/udev-postinst.sh"
       },
       "rpm": {
         "desktopTemplate": "resources/linux/Ratspeak.desktop",
         "files": {
           "/usr/share/metainfo/org.ratspeak.desktop.metainfo.xml": "resources/linux/org.ratspeak.desktop.metainfo.xml",
-          "/usr/lib/udev/rules.d/99-ratspeak.rules": "resources/linux/99-ratspeak.rules"
-        }
+          "/usr/lib/udev/rules.d/70-ratspeak.rules": "resources/linux/70-ratspeak.rules"
+        },
+        "postInstallScript": "resources/linux/udev-postinst.sh"
       }
     },
     "macOS": {
