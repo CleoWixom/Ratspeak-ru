@@ -1901,6 +1901,13 @@ pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
     // Reconciliation may retire identities; never run it beside another owner,
     // or on a newer build's profile, whose recorded intents may differ.
     crate::owner_lock::acquire_owner_lock(data_root)?;
+    let ratspeak_dir = data_root.join(".ratspeak");
+    // The version check must not follow a linked `.ratspeak` either.
+    match std::fs::symlink_metadata(&ratspeak_dir) {
+        Ok(_) => require_real_directory(&ratspeak_dir)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     db::refuse_newer_database(data_root).map_err(std::io::Error::other)?;
     if data_root.join(STORAGE_NAMESPACE_READY).try_exists()? {
         // Completed roots cannot become fresh merely because directories have
@@ -1911,7 +1918,7 @@ pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
             let witness = storage_namespace_witness(data_root)?;
             let reset = durable_reconcile(&ready, STORAGE_NAMESPACE_RESET_BYTES)
                 .map_err(std::io::Error::other)?;
-            finish_identity_storage_reset(&data_root.join(".ratspeak"), &witness, &reset)?;
+            finish_identity_storage_reset(&ratspeak_dir, &witness, &reset)?;
             durable_write(&ready, STORAGE_NAMESPACE_BYTES).map_err(std::io::Error::other)?;
         } else {
             established_storage_namespace(data_root)?;
@@ -1922,7 +1929,6 @@ pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
         STORAGE_NAMESPACE_BYTES,
     )
     .map_err(std::io::Error::other)?;
-    let ratspeak_dir = data_root.join(".ratspeak");
     let identities = ratspeak_dir.join("identities");
     durable_create_dir_all(&ratspeak_dir, &witness).map_err(std::io::Error::other)?;
     durable_create_dir_all(&identities, &witness).map_err(std::io::Error::other)?;
@@ -8641,6 +8647,45 @@ mod tests {
         );
         assert!(second.status.success(), "{output}");
         assert!(output.contains("test result: ok. 1 passed"), "{output}");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn storage_namespace_refuses_a_linked_profile_before_reading_its_database() {
+        let temp = tempfile::tempdir().unwrap();
+        // A newer database somewhere else, and a profile whose `.ratspeak`
+        // only links to it.
+        let elsewhere = temp.path().join("elsewhere");
+        let pool = crate::db::init_pool(&elsewhere).unwrap();
+        crate::db::init_schema(&pool).unwrap();
+        let current: i64 = pool
+            .get()
+            .unwrap()
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute("UPDATE schema_version SET version = ?1", [current + 1])
+            .unwrap();
+        drop(pool);
+        let root = temp.path().join("profile");
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere.join(".ratspeak"), root.join(".ratspeak")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(elsewhere.join(".ratspeak"), root.join(".ratspeak"))
+            .unwrap();
+
+        let error = initialize_storage_namespace(&root).unwrap_err();
+
+        assert!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<crate::db::NewerSchema>())
+                .is_none(),
+            "the linked database was read"
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

@@ -217,6 +217,12 @@ class MainActivity : TauriActivity() {
         if (appBackCallback != null) return
         val callback = object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                // Android 12+ only backgrounds a task on Back; a failed start
+                // closes, so opening Ratspeak again starts a fresh process.
+                if (RatspeakNativeBridge.coreStartupFailed) {
+                    finishAndRemoveTask()
+                    return
+                }
                 dispatchBackToWebView()
             }
         }
@@ -365,6 +371,14 @@ class MainActivity : TauriActivity() {
         RatspeakNativeBridge.activityResumed(activityGeneration, false)
         super.onPause()
         refreshServicePoll()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // Home or another app only backgrounds a task; a failed start closes.
+        if (RatspeakNativeBridge.coreStartupFailed && !isChangingConfigurations) {
+            finishAndRemoveTask()
+        }
     }
 
     private fun refreshServicePoll() {

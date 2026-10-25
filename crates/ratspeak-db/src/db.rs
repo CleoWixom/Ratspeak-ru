@@ -147,22 +147,61 @@ fn understood_schema_version(
 }
 
 /// Refuse a database written by a newer Ratspeak, or one whose version cannot
-/// be read, before anything opens it for writing. The read-only connection is
-/// closed on return; nothing in the file changes.
+/// be read, before anything opens it for writing. Nothing is written to the
+/// database. With no WAL or journal beside it, every committed page is in the
+/// file, which is opened as immutable and so gains no side files; otherwise
+/// the read goes through the side files already there.
 pub fn refuse_newer_database(
     data_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let db_path = data_dir.join(".ratspeak").join("ratspeak.db");
+    let ratspeak_dir = data_dir.join(".ratspeak");
+    let db_path = ratspeak_dir.join("ratspeak.db");
     if !db_path.try_exists()? {
         return Ok(());
     }
-    let conn = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut journaled = false;
+    for side_file in ["ratspeak.db-wal", "ratspeak.db-journal"] {
+        journaled |= ratspeak_dir.join(side_file).try_exists()?;
+    }
+    let read_only = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    let uri = if journaled {
+        None
+    } else {
+        immutable_uri(&db_path)
+    };
+    let immutable = uri.and_then(|uri| {
+        Connection::open_with_flags(uri, read_only | rusqlite::OpenFlags::SQLITE_OPEN_URI).ok()
+    });
+    let conn = match immutable {
+        Some(conn) => conn,
+        // A path this platform's URIs cannot express is read the plain way.
+        None => Connection::open_with_flags(&db_path, read_only)?,
+    };
     understood_schema_version(&conn)?;
     Ok(())
 }
 
+/// `path` as an SQLite URI that opens it immutable: read-only, with no locks
+/// and no side files.
+fn immutable_uri(path: &Path) -> Option<String> {
+    let path = std::path::absolute(path).ok()?;
+    let path = path.to_str()?;
+    let mut uri = String::from(if cfg!(windows) { "file:///" } else { "file:" });
+    for byte in path.bytes() {
+        match byte {
+            b'\\' if cfg!(windows) => uri.push('/'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                uri.push(char::from(byte))
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Some(uri)
+}
+
 pub fn init_schema(pool: &DbPool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let conn = pool.get()?;
+    let mut conn = pool.get()?;
 
     if let Some(version) = understood_schema_version(&conn)?
         && version < SCHEMA_VERSION
@@ -170,21 +209,25 @@ pub fn init_schema(pool: &DbPool) -> Result<(), Box<dyn std::error::Error + Send
         run_migrations(&conn, version)?;
     }
 
-    conn.execute_batch(SCHEMA_SQL)?;
-    conn.execute_batch(crate::admission::SCHEMA_SQL)?;
-    conn.execute_batch(VOICE_FORMAT_SCHEMA_SQL)?;
-    conn.execute_batch(CHANNEL_HISTORY_SCHEMA_SQL)?;
-    conn.execute_batch(CHANNEL_ROOM_STATE_SCHEMA_SQL)?;
-    conn.execute_batch(CHANNEL_PARTICIPANT_OBSERVATION_SCHEMA_SQL)?;
-    reconcile_channel_history_usage(&conn)?;
+    // The schema and its version row commit together: a database never holds
+    // a schema without its version.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(SCHEMA_SQL)?;
+    tx.execute_batch(crate::admission::SCHEMA_SQL)?;
+    tx.execute_batch(VOICE_FORMAT_SCHEMA_SQL)?;
+    tx.execute_batch(CHANNEL_HISTORY_SCHEMA_SQL)?;
+    tx.execute_batch(CHANNEL_ROOM_STATE_SCHEMA_SQL)?;
+    tx.execute_batch(CHANNEL_PARTICIPANT_OBSERVATION_SCHEMA_SQL)?;
+    reconcile_channel_history_usage(&tx)?;
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?;
+    let count: i64 = tx.query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?;
     if count == 0 {
-        conn.execute(
+        tx.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             params![SCHEMA_VERSION],
         )?;
     }
+    tx.commit()?;
 
     tracing::info!("Database schema initialized (version {SCHEMA_VERSION})");
     Ok(())
@@ -11294,6 +11337,89 @@ mod migration_tests {
                 .is_none(),
             "an unreadable version is refused, not reported as newer"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_version_check_leaves_no_side_files_beside_a_wal_database() {
+        // Characters a URI must escape, in a path the check opens as one.
+        let name = if cfg!(windows) {
+            "ratspeak side #files% 1"
+        } else {
+            "ratspeak side #files% ?1"
+        };
+        let dir =
+            std::env::temp_dir().join(format!("{name}-{}-{}", std::process::id(), now_unix_ms()));
+        init_schema(&init_pool(&dir).unwrap()).unwrap();
+        let ratspeak = dir.join(".ratspeak");
+        let path = ratspeak.join("ratspeak.db");
+        let side_files = || {
+            ["ratspeak.db-wal", "ratspeak.db-shm", "ratspeak.db-journal"]
+                .into_iter()
+                .filter(|name| ratspeak.join(name).exists())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(side_files(), Vec::<&str>::new(), "a closed database");
+        let bytes = std::fs::read(&path).unwrap();
+
+        refuse_newer_database(&dir).unwrap();
+
+        assert_eq!(side_files(), Vec::<&str>::new());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        // While a newer writer still holds its change in the WAL, the check
+        // reads through it rather than the file alone.
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(&format!(
+                "PRAGMA wal_autocheckpoint=0;
+                 UPDATE schema_version SET version = {};",
+                SCHEMA_VERSION + 1
+            ))
+            .unwrap();
+        assert!(ratspeak.join("ratspeak.db-wal").exists());
+        let error = refuse_newer_database(&dir).unwrap_err();
+        assert!(error.downcast_ref::<NewerSchema>().is_some(), "{error}");
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interrupted_schema_creation_leaves_no_versionless_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratspeak-interrupted-schema-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let pool = init_pool(&dir).unwrap();
+        // Something the creation cannot get past, after the version table.
+        pool.get()
+            .unwrap()
+            .execute_batch("CREATE VIEW channel_history AS SELECT 1 AS sequence;")
+            .unwrap();
+
+        assert!(init_schema(&pool).is_err());
+
+        let conn = pool.get().unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let versioned: i64 = if tables > 0 {
+            conn.query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+                .unwrap()
+        } else {
+            1
+        };
+        assert!(
+            tables == 0 || versioned > 0,
+            "a schema without its version was left behind"
+        );
+        drop(conn);
+        drop(pool);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

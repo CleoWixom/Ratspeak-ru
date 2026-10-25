@@ -3920,6 +3920,36 @@ fn a_failed_start_leaves_no_android_session_or_service() {
     assert!(refresh.contains("if (RatspeakNativeBridge.coreStartupFailed) return"));
 }
 
+/// On Android 12+ Back and Home only move a task to the background. A failed
+/// start closes instead whenever it is left, so opening Ratspeak again starts
+/// a fresh process.
+#[test]
+fn a_failed_start_closes_when_left_on_android() {
+    let activity = read_source(
+        repo_root()
+            .join("src-tauri/gen/android/app/src/main/java/org/ratspeak/android/MainActivity.kt"),
+    )
+    .expect("Android MainActivity");
+
+    let back = activity
+        .split("override fun handleOnBackPressed()")
+        .nth(1)
+        .and_then(|tail| tail.split("dispatchBackToWebView()").next())
+        .expect("app back handling");
+    assert!(back.contains("if (RatspeakNativeBridge.coreStartupFailed)"));
+    assert!(back.contains("finishAndRemoveTask()"));
+
+    let stop = activity
+        .split("override fun onStop()")
+        .nth(1)
+        .and_then(|tail| tail.split("\n    }\n").next())
+        .expect("Activity stop handling");
+    assert!(
+        stop.contains("if (RatspeakNativeBridge.coreStartupFailed && !isChangingConfigurations)")
+    );
+    assert!(stop.contains("finishAndRemoveTask()"));
+}
+
 /// A profile on a filesystem that cannot lock opens with a warning beside the
 /// storage warning; the lock itself is covered by the runtime's tests.
 #[test]

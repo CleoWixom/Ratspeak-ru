@@ -25,11 +25,16 @@ root, and the process keeps it until exit. While another process holds it, the
 call fails with `ResourceBusy` carrying `owner_lock::ProfileInUse` before
 reconciling anything. On a filesystem that cannot lock, such as some network and
 FUSE mounts, the call succeeds without that exclusion, and
-`owner_lock::unenforced(data_root)` reports it. Next, before reconciling, it
-reads the database's schema version over a short-lived read-only connection
-(`ratspeak_db::refuse_newer_database`). A database written by a newer build
-fails with `NewerSchema`, and one whose version cannot be read fails too;
-neither is written to. `ratspeak_db::init_schema` applies the same check.
+`owner_lock::unenforced(data_root)` reports it. Next, before reconciling, and
+after refusing a linked `.ratspeak`, it reads the database's schema version
+over a short-lived read-only connection (`ratspeak_db::refuse_newer_database`).
+A database written by a newer build fails with `NewerSchema`, and one whose
+version cannot be read fails too. The check never writes to the database. With
+no WAL or journal file beside it, it opens the file as immutable wherever an
+SQLite URI can name the path, which leaves no side files; otherwise it reads
+through the side files already there.
+`ratspeak_db::init_schema` applies the same check, and creates a schema and
+its version row in one transaction.
 `init_core` reports any failure as a `StartupFailure`: the `StartupError` the
 window shows, plus the failing step and I/O error kind.
 
