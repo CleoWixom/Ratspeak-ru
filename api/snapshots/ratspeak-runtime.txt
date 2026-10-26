@@ -2258,7 +2258,8 @@ pub fn ratspeak_runtime::state::AppState::android_ble_rnode_auto_resume_enabled(
 pub fn ratspeak_runtime::state::AppState::announce_ratspeak_usage_enabled(&self) -> bool
 pub fn ratspeak_runtime::state::AppState::announce_semantic_revision(&self) -> ratspeak_runtime::announce::AnnounceSemanticRevision
 pub fn ratspeak_runtime::state::AppState::append_attachment_staging(&self, &str, usize, &[u8]) -> core::io::error::Result<usize>
-pub fn ratspeak_runtime::state::AppState::arm_auto_lock(&self, &str, &'static str, core::time::Duration, bool)
+pub fn ratspeak_runtime::state::AppState::arm_auto_lock(&self, &str, &'static str, core::time::Duration, bool) -> u64
+pub fn ratspeak_runtime::state::AppState::armed_auto_lock(&self, u64) -> core::option::Option<ratspeak_runtime::state::AutoLock>
 pub fn ratspeak_runtime::state::AppState::attachment_staging_is_current(&self, &ratspeak_runtime::state::StagedAttachment) -> bool
 pub fn ratspeak_runtime::state::AppState::begin_attachment_staging(&alloc::sync::Arc<Self>, alloc::string::String, alloc::string::String, usize, bool) -> core::result::Result<alloc::string::String, ratspeak_runtime::state::AttachmentTransferAdmissionError>
 pub fn ratspeak_runtime::state::AppState::begin_ble_rnode_activity_cancellation(&self) -> core::option::Option<BleRnodeActivityCancellation>
@@ -2365,7 +2366,6 @@ pub fn ratspeak_runtime::state::AppState::take_channels(&self) -> core::option::
 pub fn ratspeak_runtime::state::AppState::take_completed_attachment_staging(&self, &str) -> core::option::Option<ratspeak_runtime::state::StagedAttachment>
 pub fn ratspeak_runtime::state::AppState::take_completing_ble_rnode_activity_cancellation(&self, &str) -> core::option::Option<ratspeak_runtime::state::ActivityRequestFence>
 pub fn ratspeak_runtime::state::AppState::take_completing_ble_rnode_activity_operation(&self, &str) -> core::option::Option<BleRnodeActivityTake>
-pub fn ratspeak_runtime::state::AppState::take_due_auto_lock(&self, rns_link::clock::ContinuousInstant) -> core::option::Option<ratspeak_runtime::state::AutoLock>
 pub fn ratspeak_runtime::state::AppState::take_hw_last_error(&self) -> core::option::Option<alloc::string::String>
 pub fn ratspeak_runtime::state::AppState::take_initializing_ble_rnode_activity_operation(&self, &str) -> core::option::Option<BleRnodeActivityTake>
 pub fn ratspeak_runtime::state::AppState::take_interface_reannounce_suppression(&self, &str) -> bool
@@ -2386,6 +2386,7 @@ pub ratspeak_runtime::state::AutoLock::timeout: core::time::Duration
 pub ratspeak_runtime::state::AutoLock::unlocked_at: rns_link::clock::ContinuousInstant
 impl ratspeak_runtime::state::AutoLock
 pub fn ratspeak_runtime::state::AutoLock::due_at(&self, rns_link::clock::ContinuousInstant) -> bool
+pub fn ratspeak_runtime::state::AutoLock::remaining_at(&self, rns_link::clock::ContinuousInstant) -> core::time::Duration
 pub struct ratspeak_runtime::state::IdentitySwitchGuard<'a>
 impl core::ops::drop::Drop for ratspeak_runtime::state::IdentitySwitchGuard<'_>
 pub fn ratspeak_runtime::state::IdentitySwitchGuard<'_>::drop(&mut self)
@@ -2645,6 +2646,7 @@ pub fn ratspeak_runtime::RNodeActivityRuntimeContext::handle(&self) -> &rns_runt
 pub fn ratspeak_runtime::RNodeActivityRuntimeContext::origin(&self) -> ratspeak_runtime::state::RNodeActivityOrigin
 pub fn ratspeak_runtime::any_interface_online_cached(&ratspeak_runtime::state::AppState) -> core::option::Option<bool>
 pub fn ratspeak_runtime::apply_lxmf_settings_from_state(&ratspeak_runtime::state::AppState, &mut ratspeak_runtime::lxmf::LxmfManager)
+pub fn ratspeak_runtime::arm_auto_lock(&alloc::sync::Arc<ratspeak_runtime::state::AppState>, &str, &'static str, bool)
 pub fn ratspeak_runtime::derive_identity_key_from_phrase(&str) -> core::result::Result<zeroize::Zeroizing<[u8; 64]>, alloc::string::String>
 pub async fn ratspeak_runtime::finish_shutdown(&alloc::sync::Arc<ratspeak_runtime::state::AppState>, &ratspeak_runtime::ActivityReset)
 pub fn ratspeak_runtime::generate_recoverable_key() -> core::result::Result<(zeroize::Zeroizing<alloc::string::String>, zeroize::Zeroizing<[u8; 64]>), alloc::string::String>

@@ -669,13 +669,20 @@ pub async fn set_identity_passcode(
             "Identity changed while preparing protection; retry",
         ));
     }
+    let worker_state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         let _identity_lifecycle = identity_lifecycle;
-        job.commit_protection(prepared)
+        job.commit_protection(prepared)?;
+        // The open active identity locks once the set time has passed from now.
+        if args.hash == active_identity_id(&worker_state) && worker_state.hw_locked_hash().is_none()
+        {
+            ratspeak_runtime::arm_auto_lock(&worker_state, &args.hash, "passcode", false);
+        }
+        Ok(())
     })
     .await
     .map_err(|_| AppError::internal("vault commit task panicked"))?
-    .map_err(|e| AppError::bad_request(e.to_string()))?;
+    .map_err(|e: vault::VaultError| AppError::bad_request(e.to_string()))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -712,13 +719,19 @@ pub async fn remove_identity_passcode(
             "Identity changed while preparing unprotection; retry",
         ));
     }
+    let worker_state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         let _identity_lifecycle = identity_lifecycle;
-        job.commit_unprotection(prepared)
+        job.commit_unprotection(prepared)?;
+        // Without a passcode the active identity no longer locks.
+        if args.hash == active_identity_id(&worker_state) {
+            worker_state.disarm_auto_lock();
+        }
+        Ok(())
     })
     .await
     .map_err(|_| AppError::internal("vault commit task panicked"))?
-    .map_err(|e| AppError::bad_request(e.to_string()))?;
+    .map_err(|e: vault::VaultError| AppError::bad_request(e.to_string()))?;
     Ok(json!({ "ok": true }))
 }
 

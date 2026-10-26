@@ -738,8 +738,9 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
     state.bump_identity_session_generation();
     state.withdraw_native_notifications();
     crate::finish_shutdown(state.inner(), &reset).await;
-    // Every identity goes, and every unlock with it.
+    // Every identity goes, and every unlock and auto-lock with it.
     state.release_retained_identity_except("");
+    state.disarm_auto_lock();
     state.clear_pending_hw_pin();
     state.set_hw_locked(None);
     state.set_hw_last_error(None);

@@ -10172,11 +10172,11 @@ fn auto_lock_copy_counts_from_the_unlock() {
     }
 }
 
-/// Auto-lock runs on the suspend-counting clock and is checked on the LXMF
-/// tick, every 0.5 s or 2 s in the mobile background: no timer counts down
-/// the unlock in awake time.
+/// Auto-lock runs on the suspend-counting clock and has a watcher of its own,
+/// which reads that clock again at least every 5 s: no timer counts down the
+/// unlock in awake time, and the lock waits for no network or LXMF tick.
 #[test]
-fn auto_lock_is_checked_on_the_lxmf_tick() {
+fn auto_lock_has_a_watcher_of_its_own() {
     let runtime =
         read_source(repo_root().join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime lib");
     assert!(!runtime.contains("fn arm_hw_lock_timer"));
@@ -10185,10 +10185,24 @@ fn auto_lock_is_checked_on_the_lxmf_tick() {
         .nth(1)
         .and_then(|tail| tail.split("download_coordinator.synchronize(").next())
         .expect("LXMF tick loop");
-    assert!(tick.contains("take_due_auto_lock(rns_link::clock::ContinuousInstant::now())"));
-    assert!(tick.contains("Duration::from_secs(2)"));
+    assert!(!tick.contains("auto_lock"), "the lock waits for the tick");
+    assert!(runtime.contains("const AUTO_LOCK_RECHECK: Duration = Duration::from_secs(5);"));
+    let arm = rust_function_block(&runtime, "arm_auto_lock");
+    assert!(arm.contains("tokio::spawn(watch_auto_lock("));
+    let watcher = rust_function_block(&runtime, "watch_auto_lock");
+    assert!(watcher.contains("ContinuousInstant::now()"));
+    assert!(watcher.contains(".min(AUTO_LOCK_RECHECK)"));
+    assert!(watcher.contains("armed_auto_lock(generation)"));
     let lock = rust_function_block(&runtime, "lock_protected_session");
     assert!(!lock.contains("sleep("));
+    let refused = lock
+        .find("set_hw_locked(Some(")
+        .expect("the lock refuses the identity");
+    let teardown = lock.find("finish_shutdown(").expect("teardown");
+    assert!(
+        refused < teardown,
+        "the identity stays open through its teardown"
+    );
 }
 
 /// The radio rule gives ports to the user at the seat through uaccess, which
