@@ -1,6 +1,9 @@
 //! RNS config file (INI-flavoured) read/write.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use crate::Zeroizing;
 
 use ratspeak_core::config::{
     LEGACY_RNS_INSTANCE_CONTROL_PORT, LEGACY_RNS_SHARED_INSTANCE_PORT,
@@ -15,21 +18,65 @@ pub const RETICULUM_DEFAULT_INTERFACE_MODE: &str = "full";
 pub const RNODE_INTERFACE_MODES: &[&str] =
     &["full", "gateway", "access_point", "boundary", "roaming"];
 
-pub fn read_config(config_dir: &Path) -> Option<String> {
+pub fn read_config(config_dir: &Path) -> Option<Zeroizing<String>> {
     let path = config_dir.join("config");
-    std::fs::read_to_string(&path).ok()
+    read_config_text(&path).ok()
+}
+
+fn read_config_bytes(path: impl AsRef<Path>) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    let mut chunk = Zeroizing::new([0u8; 8192]);
+    loop {
+        let count = match file.read(chunk.as_mut()) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            break;
+        }
+        let required = bytes.len() + count;
+        if required > bytes.capacity() {
+            let mut grown = Zeroizing::new(Vec::with_capacity(
+                required.max(bytes.capacity().saturating_mul(2)),
+            ));
+            grown.extend_from_slice(&bytes);
+            bytes = grown;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    Ok(bytes)
+}
+
+fn read_config_text(path: impl AsRef<Path>) -> std::io::Result<Zeroizing<String>> {
+    let bytes = read_config_bytes(path)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(Zeroizing::new(text.to_owned()))
+}
+
+// String growth otherwise releases the old allocation without wiping it.
+fn reserve_config_space(content: &mut Zeroizing<String>, additional: usize) {
+    let required = content.len() + additional;
+    if required > content.capacity() {
+        let mut grown = Zeroizing::new(String::with_capacity(
+            required.max(content.capacity().saturating_mul(2)),
+        ));
+        grown.push_str(content);
+        *content = grown;
+    }
 }
 
 /// Validate before publication; preserve the prior file in a private, unique backup.
 /// The shared OS lock also serializes app writes with the offline CLI migrator.
 pub fn write_config_result(config_dir: &Path, content: &str) -> std::io::Result<()> {
     let path = config_dir.join("config");
-    let previous = match std::fs::read_to_string(&path) {
+    let previous = match read_config_text(&path) {
         Ok(value) => Some(value),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    write_config_if_unchanged(config_dir, previous.as_deref(), content)
+    write_config_if_unchanged(config_dir, previous.as_deref().map(String::as_str), content)
 }
 
 fn write_config_if_unchanged(
@@ -40,17 +87,17 @@ fn write_config_if_unchanged(
     std::fs::create_dir_all(config_dir)?;
     let path = config_dir.join("config");
     let _lock = rns_runtime::config::ifac_lock::ConfigWriteLock::acquire(&path)?;
-    let previous = match std::fs::read_to_string(&path) {
+    let previous = match read_config_text(&path) {
         Ok(value) => Some(value),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    if previous.as_deref() != expected {
+    if previous.as_deref().map(String::as_str) != expected {
         return Err(std::io::Error::other(
             "Settings changed; reload before saving.",
         ));
     }
-    publish_config_locked(config_dir, previous.as_deref(), content)
+    publish_config_locked(config_dir, previous.as_deref().map(String::as_str), content)
 }
 
 fn publish_config_locked(
@@ -86,7 +133,7 @@ pub fn migrate_ifac_units(
 ) -> std::io::Result<bool> {
     let path = config_dir.join("config");
     let _lock = rns_runtime::config::ifac_lock::ConfigWriteLock::acquire(&path)?;
-    let source = std::fs::read_to_string(&path)?;
+    let source = read_config_text(&path)?;
     if rns_crypto::sha::sha256(source.as_bytes()) != *expected_source_hash {
         return Err(std::io::Error::other(
             "Settings changed. Reload the interface and choose again.",
@@ -99,7 +146,7 @@ pub fn migrate_ifac_units(
         return Ok(false);
     }
     // Detect an editor that does not participate in our OS lock before replacing.
-    if std::fs::read(&path)? != source.as_bytes() {
+    if read_config_bytes(&path)?.as_slice() != source.as_bytes() {
         return Err(std::io::Error::other(
             "Settings changed. Reload the interface and choose again.",
         ));
@@ -128,7 +175,7 @@ pub fn ensure_app_private_shared_instance_ports(
         return Ok(RatspeakRnsPortConfigChange::Created);
     }
 
-    let content = std::fs::read_to_string(&path)?;
+    let content = read_config_text(&path)?;
     if has_operator_shared_selector(&content) {
         return Ok(RatspeakRnsPortConfigChange::Unchanged);
     }
@@ -157,7 +204,7 @@ pub(crate) fn ensure_app_private_shared_instance(
         return Ok(RatspeakRnsPortConfigChange::Created);
     }
 
-    let content = std::fs::read_to_string(&path)?;
+    let content = read_config_text(&path)?;
     if has_operator_shared_selector(&content) {
         return Ok(RatspeakRnsPortConfigChange::Unchanged);
     }
@@ -175,11 +222,11 @@ pub(crate) fn ensure_app_private_shared_instance(
     Ok(RatspeakRnsPortConfigChange::Updated)
 }
 
-fn ratspeak_default_config(config_dir: &Path) -> String {
+fn ratspeak_default_config(config_dir: &Path) -> Zeroizing<String> {
     let instance_name = ratspeak_private_instance_name(config_dir);
-    format!(
+    Zeroizing::new(format!(
         "# This is the default Ratspeak Reticulum config file.\n\n[reticulum]\nenable_transport = False\nshare_instance = No\ninstance_name = {instance_name}\nshared_instance_port = {RATSPEAK_RNS_SHARED_INSTANCE_PORT}\ninstance_control_port = {RATSPEAK_RNS_INSTANCE_CONTROL_PORT}\n\n[logging]\nloglevel = 4\n\n[interfaces]\n"
-    )
+    ))
 }
 
 fn ratspeak_private_instance_name(config_dir: &Path) -> String {
@@ -195,7 +242,10 @@ pub(crate) fn has_operator_shared_selector(content: &str) -> bool {
     if rns_runtime::config::Config::parse(content).is_err() {
         return true;
     }
-    let lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let lines = content
+        .lines()
+        .map(|line| Zeroizing::new(line.to_string()))
+        .collect::<Vec<_>>();
     let Some((start, end)) = reticulum_section_bounds(&lines) else {
         return false;
     };
@@ -206,7 +256,7 @@ pub(crate) fn has_operator_shared_selector(content: &str) -> bool {
         match key.as_str() {
             "rpc_key" | "shared_instance_type" => return true,
             "instance_name"
-                if value != "default"
+                if value.as_str() != "default"
                     && !value.strip_prefix("ratspeak-").is_some_and(|s| {
                         s.len() == 16 && s.bytes().all(|c| c.is_ascii_hexdigit())
                     }) =>
@@ -235,9 +285,9 @@ pub(crate) fn has_operator_shared_selector(content: &str) -> bool {
     false
 }
 
-pub fn strip_legacy_default_auto_interface(content: &str) -> String {
+pub fn strip_legacy_default_auto_interface(content: &str) -> Zeroizing<String> {
     if !content.contains("[[Default Interface]]") {
-        return content.to_string();
+        return Zeroizing::new(content.to_string());
     }
 
     let lines: Vec<&str> = content.lines().collect();
@@ -258,8 +308,9 @@ pub fn strip_legacy_default_auto_interface(content: &str) -> String {
         i += 1;
     }
 
-    let mut result = out.join("\n");
+    let mut result = join_config_text(out, false);
     if had_trailing_newline && !result.ends_with('\n') {
+        reserve_config_space(&mut result, 1);
         result.push('\n');
     }
     result
@@ -341,8 +392,14 @@ impl PortSetting {
     }
 }
 
-fn ratspeak_private_instance_name_update(content: &str, config_dir: &Path) -> Option<String> {
-    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+fn ratspeak_private_instance_name_update(
+    content: &str,
+    config_dir: &Path,
+) -> Option<Zeroizing<String>> {
+    let mut lines = content
+        .lines()
+        .map(|line| Zeroizing::new(line.to_string()))
+        .collect::<Vec<_>>();
     let (section_start, section_end) = reticulum_section_bounds(&lines)?;
 
     let mut instance_name_line = None;
@@ -438,10 +495,10 @@ fn ratspeak_private_instance_name_update(content: &str, config_dir: &Path) -> Op
         None => {
             lines.splice(
                 section_end..section_end,
-                [format!(
+                [Zeroizing::new(format!(
                     "instance_name = {}",
                     ratspeak_private_instance_name(config_dir)
-                )],
+                ))],
             );
         }
     }
@@ -449,15 +506,21 @@ fn ratspeak_private_instance_name_update(content: &str, config_dir: &Path) -> Op
     Some(join_config_lines(lines))
 }
 
-fn ratspeak_shared_instance_port_update(content: &str) -> Option<String> {
-    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+fn ratspeak_shared_instance_port_update(content: &str) -> Option<Zeroizing<String>> {
+    let mut lines = content
+        .lines()
+        .map(|line| Zeroizing::new(line.to_string()))
+        .collect::<Vec<_>>();
     let Some((section_start, section_end)) = reticulum_section_bounds(&lines) else {
         let mut new_lines = vec![
             "[reticulum]".to_string(),
             format!("shared_instance_port = {RATSPEAK_RNS_SHARED_INSTANCE_PORT}"),
             format!("instance_control_port = {RATSPEAK_RNS_INSTANCE_CONTROL_PORT}"),
             String::new(),
-        ];
+        ]
+        .into_iter()
+        .map(Zeroizing::new)
+        .collect::<Vec<_>>();
         new_lines.extend(lines);
         return Some(join_config_lines(new_lines));
     };
@@ -542,13 +605,16 @@ fn ratspeak_shared_instance_port_update(content: &str) -> Option<String> {
     }
 
     if !inserted.is_empty() {
-        lines.splice(section_end..section_end, inserted);
+        lines.splice(
+            section_end..section_end,
+            inserted.into_iter().map(Zeroizing::new),
+        );
     }
 
     Some(join_config_lines(lines))
 }
 
-fn reticulum_section_bounds(lines: &[String]) -> Option<(usize, usize)> {
+fn reticulum_section_bounds(lines: &[Zeroizing<String>]) -> Option<(usize, usize)> {
     let start = lines
         .iter()
         .position(|line| named_top_level_section(line, "reticulum"))?;
@@ -579,7 +645,7 @@ fn is_top_level_section(line: &str) -> bool {
         && trimmed.len() >= 3
 }
 
-fn parse_ini_key_value(line: &str) -> Option<(String, String)> {
+fn parse_ini_key_value(line: &str) -> Option<(String, Zeroizing<String>)> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
@@ -591,7 +657,7 @@ fn parse_ini_key_value(line: &str) -> Option<(String, String)> {
     }
     Some((
         unquote_ini_scalar(key).to_ascii_lowercase(),
-        unquote_ini_scalar(strip_inline_comment(value).trim()).to_string(),
+        Zeroizing::new(unquote_ini_scalar(strip_inline_comment(value).trim()).to_string()),
     ))
 }
 
@@ -623,18 +689,37 @@ fn unquote_ini_scalar(value: &str) -> &str {
     value
 }
 
-fn replace_key_line(line: &str, key: &str, value: impl std::fmt::Display) -> String {
+fn replace_key_line(line: &str, key: &str, value: impl std::fmt::Display) -> Zeroizing<String> {
     let indent = line
         .chars()
         .take_while(|ch| ch.is_whitespace())
         .collect::<String>();
-    format!("{indent}{key} = {value}")
+    Zeroizing::new(format!("{indent}{key} = {value}"))
 }
 
-fn join_config_lines(lines: Vec<String>) -> String {
-    let mut content = lines.join("\n");
-    content.push('\n');
+fn join_config_text<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    trailing_newline: bool,
+) -> Zeroizing<String> {
+    let lines = lines.into_iter().collect::<Vec<_>>();
+    let capacity = lines.iter().map(|line| line.len()).sum::<usize>()
+        + lines.len().saturating_sub(1)
+        + usize::from(trailing_newline);
+    let mut content = Zeroizing::new(String::with_capacity(capacity));
+    for (index, line) in lines.into_iter().enumerate() {
+        if index > 0 {
+            content.push('\n');
+        }
+        content.push_str(line);
+    }
+    if trailing_newline {
+        content.push('\n');
+    }
     content
+}
+
+fn join_config_lines(lines: Vec<Zeroizing<String>>) -> Zeroizing<String> {
+    join_config_text(lines.iter().map(|line| line.as_str()), true)
 }
 
 /// Used by the BLE↔USB priority handoff.
@@ -720,8 +805,8 @@ pub fn get_all_interfaces(config_dir: &Path) -> Value {
                 (
                     key.clone(),
                     match value {
-                        ConfigValue::Scalar(value) => value.clone(),
-                        ConfigValue::List(values) => values.join(","),
+                        ConfigValue::Scalar(value) => Zeroizing::new(value.clone()),
+                        ConfigValue::List(values) => Zeroizing::new(values.join(",")),
                     },
                 )
             })
@@ -856,11 +941,11 @@ pub fn apply_android_usb_selector_migration(
     )
 }
 
-fn parse_key_value(line: &str) -> Option<(String, String)> {
+fn parse_key_value(line: &str) -> Option<(String, Zeroizing<String>)> {
     let parts: Vec<&str> = line.splitn(2, '=').collect();
     if parts.len() == 2 {
         let key = parts[0].trim().to_lowercase();
-        let value = parts[1].trim().to_string();
+        let value = Zeroizing::new(parts[1].trim().to_string());
         Some((key, value))
     } else {
         None
@@ -870,7 +955,7 @@ fn parse_key_value(line: &str) -> Option<(String, String)> {
 fn build_interface_entry(
     name: &str,
     itype: &str,
-    props: &std::collections::HashMap<String, String>,
+    props: &std::collections::HashMap<String, Zeroizing<String>>,
 ) -> Value {
     let mut entry = json!({
         "name": name,
@@ -878,7 +963,7 @@ fn build_interface_entry(
     });
     if let Some(obj) = entry.as_object_mut() {
         for (k, v) in props {
-            obj.insert(k.clone(), json!(v));
+            obj.insert(k.clone(), json!(v.as_str()));
         }
     }
     entry
@@ -969,11 +1054,21 @@ fn safe_backbone_client_args(args: BackboneClientArgs<'_>) -> bool {
     safe_interface_name(args.name) && safe_config_scalar(args.host) && safe_ifac_args(args.ifac)
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct InterfaceIfacArgs<'a> {
     pub network_name: Option<&'a str>,
     pub passphrase: Option<&'a str>,
     pub ifac_size: Option<usize>,
+}
+
+impl std::fmt::Debug for InterfaceIfacArgs<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterfaceIfacArgs")
+            .field("network_name", &self.network_name)
+            .field("passphrase", &self.passphrase.map(|_| "[REDACTED]"))
+            .field("ifac_size", &self.ifac_size)
+            .finish()
+    }
 }
 
 fn safe_ifac_args(args: InterfaceIfacArgs<'_>) -> bool {
@@ -1096,7 +1191,7 @@ pub fn remove_interface_checked(config_dir: &Path, name: &str) -> RemoveInterfac
         return RemoveInterfaceOutcome::WriteFailed;
     }
 
-    let content = match std::fs::read_to_string(config_dir.join("config")) {
+    let content = match read_config_text(config_dir.join("config")) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return match std::fs::metadata(config_dir) {
@@ -1145,7 +1240,7 @@ pub fn remove_interfaces(config_dir: &Path, names: &[String]) -> bool {
 pub struct InterfaceBlockRevision {
     config_path: PathBuf,
     name: String,
-    block: String,
+    block: Zeroizing<String>,
 }
 
 impl std::fmt::Debug for InterfaceBlockRevision {
@@ -1187,7 +1282,7 @@ pub fn snapshot_interface_block(
     }
 
     let config_path = config_dir.join("config");
-    let content = match std::fs::read_to_string(&config_path) {
+    let content = match read_config_text(&config_path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(InterfaceBlockSnapshotError::NotFound);
@@ -1203,7 +1298,7 @@ pub fn snapshot_interface_block(
     Ok(InterfaceBlockRevision {
         config_path,
         name: name.to_string(),
-        block: content[range.start..range.end].to_string(),
+        block: Zeroizing::new(content[range.start..range.end].to_string()),
     })
 }
 
@@ -1223,7 +1318,7 @@ pub fn restore_interface_block_if_revision(
         return InterfaceBlockCasOutcome::Stale;
     }
 
-    let content = match std::fs::read_to_string(&config_path) {
+    let content = match read_config_text(&config_path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return InterfaceBlockCasOutcome::NotFound;
@@ -1235,7 +1330,7 @@ pub fn restore_interface_block_if_revision(
         Ok(None) => return InterfaceBlockCasOutcome::NotFound,
         Err(()) => return InterfaceBlockCasOutcome::Stale,
     };
-    if content[current.start..current.end] != expected_current.block {
+    if &content[current.start..current.end] != expected_current.block.as_str() {
         return InterfaceBlockCasOutcome::Stale;
     }
 
@@ -1267,7 +1362,7 @@ pub fn remove_interface_block_if_revision(
         return InterfaceBlockCasOutcome::Stale;
     }
 
-    let content = match std::fs::read_to_string(&config_path) {
+    let content = match read_config_text(&config_path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return InterfaceBlockCasOutcome::NotFound;
@@ -1279,7 +1374,7 @@ pub fn remove_interface_block_if_revision(
         Ok(None) => return InterfaceBlockCasOutcome::NotFound,
         Err(()) => return InterfaceBlockCasOutcome::Stale,
     };
-    if content[current.start..current.end] != expected_current.block {
+    if &content[current.start..current.end] != expected_current.block.as_str() {
         return InterfaceBlockCasOutcome::Stale;
     }
 
@@ -1302,7 +1397,7 @@ pub fn set_interface_enabled_if_revision(
         return InterfaceBlockCasOutcome::Stale;
     }
 
-    let content = match std::fs::read_to_string(&config_path) {
+    let content = match read_config_text(&config_path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return InterfaceBlockCasOutcome::NotFound;
@@ -1314,7 +1409,7 @@ pub fn set_interface_enabled_if_revision(
         Ok(None) => return InterfaceBlockCasOutcome::NotFound,
         Err(()) => return InterfaceBlockCasOutcome::Stale,
     };
-    if content[current.start..current.end] != expected_current.block {
+    if &content[current.start..current.end] != expected_current.block.as_str() {
         return InterfaceBlockCasOutcome::Stale;
     }
 
@@ -1346,7 +1441,7 @@ pub fn set_rnode_usb_selector_if_revision(
     if expected_current.config_path != config_path {
         return InterfaceBlockCasOutcome::Stale;
     }
-    let content = match std::fs::read_to_string(&config_path) {
+    let content = match read_config_text(&config_path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return InterfaceBlockCasOutcome::NotFound;
@@ -1358,7 +1453,7 @@ pub fn set_rnode_usb_selector_if_revision(
         Ok(None) => return InterfaceBlockCasOutcome::NotFound,
         Err(()) => return InterfaceBlockCasOutcome::Stale,
     };
-    if content[current.start..current.end] != expected_current.block {
+    if &content[current.start..current.end] != expected_current.block.as_str() {
         return InterfaceBlockCasOutcome::Stale;
     }
     let updated_block = interface_block_with_usb_selector(
@@ -1418,19 +1513,23 @@ fn replace_interface_block_range(
     content: &str,
     current: &InterfaceBlockRange,
     replacement: &str,
-) -> String {
-    let mut updated =
-        String::with_capacity(content.len() - (current.end - current.start) + replacement.len());
+) -> Zeroizing<String> {
+    let mut updated = Zeroizing::new(String::with_capacity(
+        content.len() - (current.end - current.start) + replacement.len(),
+    ));
     updated.push_str(&content[..current.start]);
     updated.push_str(replacement);
     updated.push_str(&content[current.end..]);
     updated
 }
 
-fn interface_block_with_enabled(block: &str, enabled: bool) -> String {
+fn interface_block_with_enabled(block: &str, enabled: bool) -> Zeroizing<String> {
     let enabled_value = if enabled { "true" } else { "false" };
     let had_trailing_newline = block.ends_with('\n');
-    let mut lines = block.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut lines = block
+        .lines()
+        .map(|line| Zeroizing::new(line.to_string()))
+        .collect::<Vec<_>>();
     let mut saw_enabled_key = false;
     let mut insert_idx = 1usize.min(lines.len());
     let mut insert_indent = "    ".to_string();
@@ -1452,15 +1551,11 @@ fn interface_block_with_enabled(block: &str, enabled: bool) -> String {
     if !saw_enabled_key {
         lines.insert(
             insert_idx,
-            format!("{insert_indent}enabled = {enabled_value}"),
+            Zeroizing::new(format!("{insert_indent}enabled = {enabled_value}")),
         );
     }
 
-    let mut updated = lines.join("\n");
-    if had_trailing_newline {
-        updated.push('\n');
-    }
-    updated
+    join_config_text(lines.iter().map(|line| line.as_str()), had_trailing_newline)
 }
 
 fn interface_block_with_usb_selector(
@@ -1468,7 +1563,7 @@ fn interface_block_with_usb_selector(
     vendor_id: u16,
     product_id: u16,
     serial_number: Option<&str>,
-) -> String {
+) -> Zeroizing<String> {
     let had_trailing_newline = block.ends_with('\n');
     let mut lines = block
         .lines()
@@ -1480,7 +1575,7 @@ fn interface_block_with_usb_selector(
                 )
             })
         })
-        .map(str::to_string)
+        .map(|line| Zeroizing::new(line.to_string()))
         .collect::<Vec<_>>();
     let insert_idx = lines
         .iter()
@@ -1497,17 +1592,16 @@ fn interface_block_with_usb_selector(
     if let Some(serial_number) = serial_number {
         selector.push(format!("{indent}usb_serial_number = {serial_number}"));
     }
-    lines.splice(insert_idx..insert_idx, selector);
-    let mut updated = lines.join("\n");
-    if had_trailing_newline {
-        updated.push('\n');
-    }
-    updated
+    lines.splice(
+        insert_idx..insert_idx,
+        selector.into_iter().map(Zeroizing::new),
+    );
+    join_config_text(lines.iter().map(|line| line.as_str()), had_trailing_newline)
 }
 
-fn replace_ini_value_preserving_comment(line: &str, replacement: &str) -> String {
+fn replace_ini_value_preserving_comment(line: &str, replacement: &str) -> Zeroizing<String> {
     let Some(equals) = line.find('=') else {
-        return line.to_string();
+        return Zeroizing::new(line.to_string());
     };
     let value = &line[equals + 1..];
     let comment_start = inline_comment_start(value).unwrap_or(value.len());
@@ -1517,7 +1611,7 @@ fn replace_ini_value_preserving_comment(line: &str, replacement: &str) -> String
     let scalar_len = remaining.trim_end().len();
     let trailing_start = leading_len + scalar_len;
 
-    let mut updated = String::with_capacity(line.len() + replacement.len());
+    let mut updated = Zeroizing::new(String::with_capacity(line.len() + replacement.len()));
     updated.push_str(&line[..equals + 1]);
     updated.push_str(&value_area[..leading_len]);
     updated.push_str(replacement);
@@ -1583,6 +1677,7 @@ pub fn set_interface_enabled(config_dir: &Path, name: &str, enabled: bool) -> bo
     }
     let mut updated = content.clone();
     for (range, replacement) in edits.into_iter().rev() {
+        reserve_config_space(&mut updated, replacement.len());
         updated.replace_range(range, &replacement);
     }
     write_config_if_unchanged(config_dir, Some(&content), &updated).is_ok()
@@ -1637,14 +1732,19 @@ pub fn enable_unflagged_interfaces(config_dir: &Path) -> Result<usize, String> {
     insertions.sort_unstable();
     let mut updated = content.clone();
     for at in insertions.iter().rev() {
-        updated.insert_str(*at, &enabled_line(&content, *at, true));
+        let line = enabled_line(&content, *at, true);
+        reserve_config_space(&mut updated, line.len());
+        updated.insert_str(*at, &line);
     }
     write_config_if_unchanged(config_dir, Some(&content), &updated)
         .map_err(|_| "interface configuration changed while it was being prepared".to_string())?;
     Ok(insertions.len())
 }
 
-fn remove_interface_blocks_from_content(content: &str, names: &[&str]) -> (String, bool) {
+fn remove_interface_blocks_from_content(
+    content: &str,
+    names: &[&str],
+) -> (Zeroizing<String>, bool) {
     let mut ranges = interface_block_ranges(content)
         .into_iter()
         .filter(|(name, _)| names.contains(&name.as_str()))
@@ -1652,7 +1752,7 @@ fn remove_interface_blocks_from_content(content: &str, names: &[&str]) -> (Strin
         .collect::<Vec<_>>();
     ranges.sort_by_key(|range| range.start);
     let removed = !ranges.is_empty();
-    let mut result = content.to_owned();
+    let mut result = Zeroizing::new(content.to_owned());
     for range in ranges.into_iter().rev() {
         result.replace_range(range.start..range.end, "");
     }
@@ -1660,17 +1760,19 @@ fn remove_interface_blocks_from_content(content: &str, names: &[&str]) -> (Strin
 }
 
 /// Insert under the authoritative interfaces section, never under a quoted fake header.
-fn insert_interface_block(content: &str, block: &str) -> String {
+fn insert_interface_block(content: &str, block: &str) -> Zeroizing<String> {
     let Ok(spans) = rns_runtime::config::ifac::section_spans(content) else {
-        return content.to_owned();
+        return Zeroizing::new(content.to_owned());
     };
-    let mut result = content.to_owned();
+    let mut result = Zeroizing::new(content.to_owned());
     if let Some(section) = spans
         .iter()
         .find(|span| span.section == "interfaces" && span.path.is_empty())
     {
+        reserve_config_space(&mut result, block.len());
         result.insert_str(section.range.end, block);
     } else {
+        reserve_config_space(&mut result, "\n[interfaces]\n".len() + block.len());
         result.push_str("\n[interfaces]\n");
         result.push_str(block);
     }
@@ -1749,7 +1851,11 @@ const BACKBONE_SERVER_OWNED_KEYS: &[&str] = &[
 ];
 
 /// Key lines in `name`'s block that no generator owns, in original order.
-fn unowned_block_lines(content: &str, name: &str, owned_keys: &[&[&str]]) -> Vec<String> {
+fn unowned_block_lines(
+    content: &str,
+    name: &str,
+    owned_keys: &[&[&str]],
+) -> Vec<Zeroizing<String>> {
     rns_runtime::config::ifac::property_spans(content)
         .unwrap_or_default()
         .into_iter()
@@ -1761,9 +1867,11 @@ fn unowned_block_lines(content: &str, name: &str, owned_keys: &[&[&str]]) -> Vec
                     .any(|keys| keys.contains(&span.key.as_str()))
         })
         .map(|span| {
-            content[span.range]
-                .trim_end_matches(['\r', '\n'])
-                .to_owned()
+            Zeroizing::new(
+                content[span.range]
+                    .trim_end_matches(['\r', '\n'])
+                    .to_owned(),
+            )
         })
         .collect()
 }
@@ -1789,8 +1897,9 @@ fn replace_interface_block(
     {
         return false;
     }
-    let mut block = block.to_string();
+    let mut block = Zeroizing::new(block.to_string());
     for line in unowned_block_lines(&content, old_name, owned_keys) {
+        reserve_config_space(&mut block, line.len() + 1);
         block.push_str(&line);
         block.push('\n');
     }
@@ -1807,7 +1916,7 @@ fn replace_interface_block(
     write_config_if_unchanged(config_dir, Some(&content), &new_content).is_ok()
 }
 
-fn rnode_interface_block(args: RnodeInterfaceArgs<'_>) -> String {
+fn rnode_interface_block(args: RnodeInterfaceArgs<'_>) -> Zeroizing<String> {
     let RnodeInterfaceArgs {
         name,
         port,
@@ -1825,9 +1934,9 @@ fn rnode_interface_block(args: RnodeInterfaceArgs<'_>) -> String {
     } = args;
     let mode = rnode_interface_mode_passthrough(mode);
 
-    let mut block = format!(
+    let mut block = Zeroizing::new(format!(
         "\n  [[{name}]]\n    type = RNodeInterface\n    port = {port}\n    mode = {mode}\n    frequency = {frequency}\n    bandwidth = {bandwidth}\n    spreadingfactor = {spreading_factor}\n    codingrate = {coding_rate}\n    txpower = {tx_power}\n    enabled = true\n"
-    );
+    ));
     if let Some(v) = airtime_limit_short {
         block.push_str(&format!("    airtime_limit_short = {v}\n"));
     }
@@ -1862,25 +1971,40 @@ fn append_public_map_fields(block: &mut String, public_map: RnodePublicMapArgs<'
     }
 }
 
-fn append_ifac_fields(block: &mut String, ifac: InterfaceIfacArgs<'_>) {
-    if let Some(network_name) = ifac.network_name.filter(|s| !s.is_empty()) {
-        block.push_str(&format!("    network_name = {network_name}\n"));
+fn append_ifac_fields(block: &mut Zeroizing<String>, ifac: InterfaceIfacArgs<'_>) {
+    let network_name = ifac.network_name.filter(|s| !s.is_empty());
+    let passphrase = ifac.passphrase.filter(|s| !s.is_empty());
+    let size_fields = ifac
+        .ifac_size
+        .map(|size| format!("    ifac_size = {}\n    ifac_size_unit = bits\n", size * 8));
+    let additional = network_name.map_or(0, |name| "    network_name = \n".len() + name.len())
+        + passphrase.map_or(0, |phrase| "    passphrase = \n".len() + phrase.len())
+        + size_fields.as_ref().map_or(0, String::len);
+    reserve_config_space(block, additional);
+    if let Some(network_name) = network_name {
+        block.push_str("    network_name = ");
+        block.push_str(network_name);
+        block.push('\n');
     }
-    if let Some(passphrase) = ifac.passphrase.filter(|s| !s.is_empty()) {
-        block.push_str(&format!("    passphrase = {passphrase}\n"));
+    if let Some(passphrase) = passphrase {
+        block.push_str("    passphrase = ");
+        block.push_str(passphrase);
+        block.push('\n');
     }
-    if let Some(ifac_size) = ifac.ifac_size {
-        block.push_str(&format!(
-            "    ifac_size = {}\n    ifac_size_unit = bits\n",
-            ifac_size * 8
-        ));
+    if let Some(size_fields) = size_fields {
+        block.push_str(&size_fields);
     }
 }
 
-fn tcp_client_block(name: &str, host: &str, port: u16, ifac: InterfaceIfacArgs<'_>) -> String {
-    let mut block = format!(
+fn tcp_client_block(
+    name: &str,
+    host: &str,
+    port: u16,
+    ifac: InterfaceIfacArgs<'_>,
+) -> Zeroizing<String> {
+    let mut block = Zeroizing::new(format!(
         "\n  [[{name}]]\n    type = TCPClientInterface\n    target_host = {host}\n    target_port = {port}\n    enabled = true\n"
-    );
+    ));
     append_ifac_fields(&mut block, ifac);
     block
 }
@@ -1890,10 +2014,10 @@ fn tcp_server_block(
     listen_port: u16,
     listen_ip: &str,
     ifac: InterfaceIfacArgs<'_>,
-) -> String {
-    let mut block = format!(
+) -> Zeroizing<String> {
+    let mut block = Zeroizing::new(format!(
         "\n  [[{name}]]\n    type = TCPServerInterface\n    listen_ip = {listen_ip}\n    listen_port = {listen_port}\n    enabled = true\n"
-    );
+    ));
     append_ifac_fields(&mut block, ifac);
     block
 }
@@ -1911,7 +2035,7 @@ pub struct BackboneClientArgs<'a> {
     pub ifac: InterfaceIfacArgs<'a>,
 }
 
-fn backbone_client_block(args: BackboneClientArgs<'_>) -> String {
+fn backbone_client_block(args: BackboneClientArgs<'_>) -> Zeroizing<String> {
     let BackboneClientArgs {
         name,
         host,
@@ -1923,9 +2047,9 @@ fn backbone_client_block(args: BackboneClientArgs<'_>) -> String {
         ifac,
     } = args;
 
-    let mut block = format!(
+    let mut block = Zeroizing::new(format!(
         "\n  [[{name}]]\n    type = BackboneInterface\n    target_host = {host}\n    target_port = {port}\n    enabled = true\n"
-    );
+    ));
     if prefer_ipv6 {
         block.push_str("    prefer_ipv6 = true\n");
     }
@@ -1949,10 +2073,10 @@ fn backbone_server_block(
     prefer_ipv6: bool,
     device: Option<&str>,
     ifac: InterfaceIfacArgs<'_>,
-) -> String {
-    let mut block = format!(
+) -> Zeroizing<String> {
+    let mut block = Zeroizing::new(format!(
         "\n  [[{name}]]\n    type = BackboneInterface\n    listen_on = {listen_ip}\n    listen_port = {listen_port}\n    enabled = true\n"
-    );
+    ));
     if prefer_ipv6 {
         block.push_str("    prefer_ipv6 = true\n");
     }
@@ -2318,21 +2442,27 @@ pub fn set_transport_mode(config_dir: &Path, enable: bool) -> bool {
         .unwrap_or_else(|| ratspeak_default_config(config_dir));
     write_config_if_unchanged(
         config_dir,
-        previous.as_deref(),
+        previous.as_deref().map(String::as_str),
         &transport_mode_update(&content, enable),
     )
     .is_ok()
 }
 
-fn transport_mode_update(content: &str, enable: bool) -> String {
+fn transport_mode_update(content: &str, enable: bool) -> Zeroizing<String> {
     let val = if enable { "True" } else { "False" };
-    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut lines = content
+        .lines()
+        .map(|line| Zeroizing::new(line.to_string()))
+        .collect::<Vec<_>>();
     let Some((section_start, section_end)) = reticulum_section_bounds(&lines) else {
         let mut new_lines = vec![
             "[reticulum]".to_string(),
             format!("enable_transport = {val}"),
             String::new(),
-        ];
+        ]
+        .into_iter()
+        .map(Zeroizing::new)
+        .collect::<Vec<_>>();
         new_lines.extend(lines);
         return join_config_lines(new_lines);
     };
@@ -2346,7 +2476,7 @@ fn transport_mode_update(content: &str, enable: bool) -> String {
 
     lines.splice(
         section_end..section_end,
-        [format!("enable_transport = {val}")],
+        [Zeroizing::new(format!("enable_transport = {val}"))],
     );
     join_config_lines(lines)
 }
@@ -2358,7 +2488,10 @@ pub fn transport_mode_enabled(config_dir: &Path) -> bool {
 }
 
 fn transport_enabled_from_config(content: &str) -> Option<bool> {
-    let lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let lines = content
+        .lines()
+        .map(|line| Zeroizing::new(line.to_string()))
+        .collect::<Vec<_>>();
     let (section_start, section_end) = reticulum_section_bounds(&lines)?;
     lines
         .iter()
@@ -2439,7 +2572,7 @@ mod tests {
 
         write_config_result(&dir, "[interfaces]\n").unwrap();
 
-        assert_eq!(read_config(&dir).unwrap(), "[interfaces]\n");
+        assert_eq!(read_config(&dir).unwrap().as_str(), "[interfaces]\n");
         assert!(dir.join("config").exists());
     }
 
@@ -2547,7 +2680,7 @@ mod tests {
                 ensure_app_private_shared_instance(&dir).unwrap(),
                 RatspeakRnsPortConfigChange::Unchanged
             );
-            assert_eq!(read_config(&dir).unwrap(), original);
+            assert_eq!(read_config(&dir).unwrap().as_str(), original);
         }
     }
 
@@ -2572,17 +2705,17 @@ mod tests {
         assert!(!content.contains("instance_name = default"));
         assert_eq!(
             std::fs::read_to_string(dir.join("config.backup")).unwrap(),
-            before
+            before.as_str()
         );
 
         assert_eq!(
             ensure_app_private_shared_instance(&dir).unwrap(),
             RatspeakRnsPortConfigChange::Unchanged
         );
-        assert_eq!(read_config(&dir).unwrap(), content);
+        assert_eq!(read_config(&dir).unwrap().as_str(), content.as_str());
         assert_eq!(
             std::fs::read_to_string(dir.join("config.backup")).unwrap(),
-            before
+            before.as_str()
         );
     }
 
@@ -2616,7 +2749,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(dir.join("config.backup")).unwrap(),
-            before
+            before.as_str()
         );
     }
 
@@ -2660,7 +2793,10 @@ mod tests {
     fn strip_legacy_default_auto_interface_preserves_custom_auto_config() {
         let content = "[interfaces]\n  [[Default Interface]]\n    type = AutoInterface\n    enabled = True\n    group_id = private\n";
 
-        assert_eq!(strip_legacy_default_auto_interface(content), content);
+        assert_eq!(
+            strip_legacy_default_auto_interface(content).as_str(),
+            content
+        );
     }
 
     #[test]
@@ -2682,7 +2818,7 @@ mod tests {
         assert!(!content.contains("instance_control_port = 37429"));
         assert_eq!(
             std::fs::read_to_string(dir.join("config.backup")).unwrap(),
-            before
+            before.as_str()
         );
     }
 
@@ -3909,7 +4045,7 @@ mod tests {
         assert_eq!(enable_unflagged_interfaces(&dir), Ok(2));
         let written = read_config(&dir).unwrap();
         assert_eq!(
-            written,
+            written.as_str(),
             original
                 .replace(
                     "    type = TCPClientInterface\n    target_host = h",
@@ -3946,7 +4082,7 @@ mod tests {
         assert!(rows[0].get("ifac_size").is_none());
         assert_eq!(rows[0]["ifac_migration"]["bytes"], 16);
         assert_eq!(rows[0]["ifac_migration"]["python_bytes"], 2);
-        assert_eq!(read_config(&dir).unwrap(), original);
+        assert_eq!(read_config(&dir).unwrap().as_str(), original);
     }
 
     #[test]
@@ -4088,7 +4224,7 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(read_config(&dir).unwrap(), source);
+        assert_eq!(read_config(&dir).unwrap().as_str(), source);
         drop(lock);
         std::fs::write(dir.join("config"), format!("{source}# changed\n")).unwrap();
         assert!(write_config_if_unchanged(&dir, Some(source), "[interfaces]\n").is_err());
@@ -4103,6 +4239,6 @@ mod tests {
         assert!(listing.get("config_error").is_some());
         assert_eq!(listing["tcp_client"].as_array().unwrap().len(), 0);
         assert!(!set_interface_enabled(&dir, "Peer", true));
-        assert_eq!(read_config(&dir).unwrap(), content);
+        assert_eq!(read_config(&dir).unwrap().as_str(), content);
     }
 }

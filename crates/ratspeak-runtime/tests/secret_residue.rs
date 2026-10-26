@@ -120,6 +120,115 @@ fn pseudo_random<const N: usize>(seed: u64) -> [u8; N] {
     out
 }
 
+#[test]
+fn config_text_owner_wipes_ifac_passphrase_on_drop() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let phrase = hex::encode(pseudo_random::<48>(0x89ab_cdef_1020_3040));
+    let source = format!("[interfaces]\n[[relay]]\npassphrase = {phrase}\n");
+    std::fs::write(dir.path().join("config"), &source).unwrap();
+    let config = ratspeak_runtime::rns_config::read_config(dir.path()).unwrap();
+    assert_eq!(config.as_str(), source);
+
+    let ((), freed) = freed_by(|| drop(config));
+
+    assert!(freed.iter().any(|block| block.len() >= source.len()));
+    let found = residue(&freed, "config passphrase", phrase.as_bytes());
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn invalid_config_text_frees_no_ifac_passphrase() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let phrase = hex::encode(pseudo_random::<48>(0x1122_3344_5566_7788));
+    let mut source = format!("[interfaces]\n[[relay]]\npassphrase = {phrase}\n").into_bytes();
+    source.push(0xff);
+    std::fs::write(dir.path().join("config"), &source).unwrap();
+
+    let (result, freed) = freed_by(|| ratspeak_runtime::rns_config::read_config(dir.path()));
+
+    assert!(result.is_none());
+    assert!(freed.iter().any(|block| block.len() >= source.len()));
+    let found = residue(&freed, "invalid config passphrase", phrase.as_bytes());
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn config_reads_leave_no_temporary_passphrase_copies() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let phrase = hex::encode(pseudo_random::<48>(0x5abc_6743_0921_fed8));
+    for padding in [0, 20_000] {
+        let source = format!(
+            "[interfaces]\n[[relay]]\npassphrase = {phrase}\n# {}é\n",
+            "a".repeat(padding)
+        );
+        std::fs::write(dir.path().join("config"), &source).unwrap();
+        let ((), freed) = freed_by(|| {
+            let config = ratspeak_runtime::rns_config::read_config(dir.path()).unwrap();
+            assert_eq!(config.as_str(), source);
+            drop(config);
+        });
+        assert!(freed.iter().any(|block| block.len() >= source.len()));
+        let found = residue(&freed, "temporary config passphrase", phrase.as_bytes());
+        assert!(found.is_empty(), "{found:?}");
+    }
+}
+
+#[test]
+fn config_revision_owners_wipe_ifac_passphrase_on_drop() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let phrase = hex::encode(pseudo_random::<48>(0x1020_3040_89ab_cdef));
+    let source = format!("[interfaces]\n[[relay]]\npassphrase = {phrase}\n");
+    std::fs::write(dir.path().join("config"), &source).unwrap();
+    let revision =
+        ratspeak_runtime::rns_config::snapshot_interface_block(dir.path(), "relay").unwrap();
+    let copied_revision = revision.clone();
+    assert!(!format!("{revision:?}").contains(&phrase));
+
+    let ((), freed) = freed_by(|| drop((revision, copied_revision)));
+
+    assert!(
+        freed
+            .iter()
+            .filter(|block| block.len() >= phrase.len())
+            .count()
+            >= 2
+    );
+    let found = residue(&freed, "revision passphrase", phrase.as_bytes());
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn stripped_config_owner_wipes_ifac_passphrase_on_drop() {
+    let _serial = serial();
+    let phrase = hex::encode(pseudo_random::<48>(0xfedc_ba98_7654_3210));
+    let source = format!("[interfaces]\n[[relay]]\npassphrase = {phrase}\n");
+    let config = ratspeak_runtime::rns_config::strip_legacy_default_auto_interface(&source);
+    assert_eq!(config.as_str(), source);
+
+    let ((), freed) = freed_by(|| drop(config));
+
+    assert!(freed.iter().any(|block| block.len() >= source.len()));
+    let found = residue(&freed, "rewritten config passphrase", phrase.as_bytes());
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn ifac_arguments_debug_redacts_passphrase() {
+    let phrase = "a private overlay passphrase that must never appear in debug output";
+    let args = ratspeak_runtime::rns_config::InterfaceIfacArgs {
+        network_name: Some("overlay"),
+        passphrase: Some(phrase),
+        ifac_size: Some(16),
+    };
+    let debug = format!("{args:?}");
+    assert!(debug.contains("overlay"));
+    assert!(!debug.contains(phrase));
+}
+
 // A key file with bytes after the key is refused, and the key it starts with
 // is not left behind, whatever the file's size.
 #[test]

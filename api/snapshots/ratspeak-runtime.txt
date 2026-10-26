@@ -1943,6 +1943,8 @@ pub struct ratspeak_runtime::rns_config::InterfaceIfacArgs<'a>
 pub ratspeak_runtime::rns_config::InterfaceIfacArgs::ifac_size: core::option::Option<usize>
 pub ratspeak_runtime::rns_config::InterfaceIfacArgs::network_name: core::option::Option<&'a str>
 pub ratspeak_runtime::rns_config::InterfaceIfacArgs::passphrase: core::option::Option<&'a str>
+impl core::fmt::Debug for ratspeak_runtime::rns_config::InterfaceIfacArgs<'_>
+pub fn ratspeak_runtime::rns_config::InterfaceIfacArgs<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct ratspeak_runtime::rns_config::RnodeInterfaceArgs<'a>
 pub ratspeak_runtime::rns_config::RnodeInterfaceArgs::airtime_limit_long: core::option::Option<f64>
 pub ratspeak_runtime::rns_config::RnodeInterfaceArgs::airtime_limit_short: core::option::Option<f64>
@@ -1989,7 +1991,7 @@ pub fn ratspeak_runtime::rns_config::get_all_interfaces(&std::path::Path) -> ser
 pub fn ratspeak_runtime::rns_config::interface_entry_enabled(&serde_json::value::Value) -> bool
 pub fn ratspeak_runtime::rns_config::migrate_ifac_units(&std::path::Path, &str, rns_runtime::config::ifac::IfacSourceUnits, &[u8; 32]) -> core::io::error::Result<bool>
 pub fn ratspeak_runtime::rns_config::normalize_rnode_interface_mode(core::option::Option<&str>) -> core::option::Option<&'static str>
-pub fn ratspeak_runtime::rns_config::read_config(&std::path::Path) -> core::option::Option<alloc::string::String>
+pub fn ratspeak_runtime::rns_config::read_config(&std::path::Path) -> core::option::Option<zeroize::Zeroizing<alloc::string::String>>
 pub fn ratspeak_runtime::rns_config::remove_interface(&std::path::Path, &str) -> bool
 pub fn ratspeak_runtime::rns_config::remove_interface_block_if_revision(&std::path::Path, &ratspeak_runtime::rns_config::InterfaceBlockRevision) -> ratspeak_runtime::rns_config::InterfaceBlockCasOutcome
 pub fn ratspeak_runtime::rns_config::remove_interface_checked(&std::path::Path, &str) -> ratspeak_runtime::rns_config::RemoveInterfaceOutcome
@@ -2003,7 +2005,7 @@ pub fn ratspeak_runtime::rns_config::set_interface_enabled_if_revision(&std::pat
 pub fn ratspeak_runtime::rns_config::set_rnode_usb_selector_if_revision(&std::path::Path, &ratspeak_runtime::rns_config::InterfaceBlockRevision, u16, u16, core::option::Option<&str>) -> ratspeak_runtime::rns_config::InterfaceBlockCasOutcome
 pub fn ratspeak_runtime::rns_config::set_transport_mode(&std::path::Path, bool) -> bool
 pub fn ratspeak_runtime::rns_config::snapshot_interface_block(&std::path::Path, &str) -> core::result::Result<ratspeak_runtime::rns_config::InterfaceBlockRevision, ratspeak_runtime::rns_config::InterfaceBlockSnapshotError>
-pub fn ratspeak_runtime::rns_config::strip_legacy_default_auto_interface(&str) -> alloc::string::String
+pub fn ratspeak_runtime::rns_config::strip_legacy_default_auto_interface(&str) -> zeroize::Zeroizing<alloc::string::String>
 pub fn ratspeak_runtime::rns_config::transport_mode_enabled(&std::path::Path) -> bool
 pub fn ratspeak_runtime::rns_config::update_backbone_client(&std::path::Path, &str, ratspeak_runtime::rns_config::BackboneClientArgs<'_>) -> bool
 pub fn ratspeak_runtime::rns_config::update_backbone_server(&std::path::Path, &str, &str, u16, &str, bool, core::option::Option<&str>) -> bool

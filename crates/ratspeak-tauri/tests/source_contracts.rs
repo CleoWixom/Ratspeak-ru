@@ -4899,10 +4899,23 @@ fn ifac_is_available_ungated_on_client_and_server_sheets() {
     let rns_config =
         read_source(root.join("crates/ratspeak-runtime/src/rns_config.rs")).expect("rns config");
     assert!(rns_config.contains("pub struct InterfaceIfacArgs"));
-    assert!(rns_config.contains("network_name = {network_name}"));
-    assert!(rns_config.contains("passphrase = {passphrase}"));
-    assert!(rns_config.contains("ifac_size = {}\\n    ifac_size_unit = bits\\n"));
-    assert!(rns_config.contains("ifac_size * 8"));
+    let config_dir = tempfile::tempdir().expect("config directory");
+    fs::write(config_dir.path().join("config"), "[interfaces]\n").expect("base config");
+    assert!(ratspeak_runtime::rns_config::add_tcp_client_with_ifac(
+        config_dir.path(),
+        "Private TCP",
+        "private.example",
+        4242,
+        ratspeak_runtime::rns_config::InterfaceIfacArgs {
+            network_name: Some("private network"),
+            passphrase: Some("test passphrase"),
+            ifac_size: Some(8),
+        },
+    ));
+    let config = ratspeak_runtime::rns_config::read_config(config_dir.path()).expect("IFAC config");
+    assert!(config.contains("    network_name = private network\n"));
+    assert!(config.contains("    passphrase = test passphrase\n"));
+    assert!(config.contains("    ifac_size = 64\n    ifac_size_unit = bits\n"));
     assert!(rns_config.contains("add_tcp_client_with_ifac"));
     assert!(rns_config.contains("update_tcp_client_with_ifac"));
     assert!(rns_config.contains("add_tcp_server_with_ifac"));

@@ -4,7 +4,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ratspeak_runtime::PendingRNodeActivityMonitor;
 #[cfg(any(
     feature = "ble",
     feature = "serial",
@@ -22,6 +21,7 @@ use ratspeak_runtime::mobile_platform::NativeBleRnodeDisconnect;
 use ratspeak_runtime::mobile_platform::NativeBleRnodeRequest;
 #[cfg(all(feature = "ble", not(target_os = "android")))]
 use ratspeak_runtime::rns::ble_rnode_startup_options;
+use ratspeak_runtime::{PendingRNodeActivityMonitor, Zeroizing};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tauri::State;
@@ -2228,12 +2228,71 @@ fn cfg_bool(entry: &Value, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct InterfaceIfacSettings {
     network_name: Option<String>,
-    passphrase: Option<String>,
+    passphrase: Option<Zeroizing<String>>,
     ifac_size: Option<usize>,
     unresolved: bool,
+}
+
+impl std::fmt::Debug for InterfaceIfacSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterfaceIfacSettings")
+            .field("network_name", &self.network_name)
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("ifac_size", &self.ifac_size)
+            .field("unresolved", &self.unresolved)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod ifac_secret_tests {
+    use super::*;
+
+    #[test]
+    fn ifac_settings_debug_redacts_passphrase() {
+        let phrase = "a private overlay passphrase that must never appear in debug output";
+        let settings = ifac_settings_from_entry(&json!({
+            "network_name": "overlay",
+            "passphrase": phrase,
+            "ifac_size": "16",
+        }));
+        assert_eq!(settings.config_args().passphrase, Some(phrase));
+        let debug = format!("{settings:?}");
+        assert!(debug.contains("overlay"));
+        assert!(!debug.contains(phrase));
+    }
+
+    #[test]
+    fn ifac_passphrase_keeps_its_optional_json_string_shape() {
+        for value in [json!({}), json!({ "ifac_passphrase": null })] {
+            let fields: InterfaceIfacCommandFields = serde_json::from_value(value).unwrap();
+            assert!(fields.ifac_passphrase.is_none());
+        }
+        let phrase = "a private overlay passphrase";
+        let fields: InterfaceIfacCommandFields = serde_json::from_value(json!({
+            "ifac_enabled": true,
+            "ifac_passphrase": phrase,
+        }))
+        .unwrap();
+        let settings = ifac_settings_from_args(&fields, None).unwrap();
+        assert_eq!(settings.config_args().passphrase, Some(phrase));
+        assert_eq!(
+            settings.runtime_config().unwrap().passphrase.as_deref(),
+            Some(phrase)
+        );
+        assert!(
+            serde_json::from_value::<InterfaceIfacCommandFields>(json!({
+                "ifac_passphrase": 123,
+            }))
+            .is_err()
+        );
+    }
 }
 
 impl InterfaceIfacSettings {
@@ -2245,7 +2304,7 @@ impl InterfaceIfacSettings {
     fn config_args(&self) -> crate::rns_config::InterfaceIfacArgs<'_> {
         crate::rns_config::InterfaceIfacArgs {
             network_name: self.network_name.as_deref(),
-            passphrase: self.passphrase.as_deref(),
+            passphrase: self.passphrase.as_deref().map(String::as_str),
             ifac_size: self.ifac_size,
         }
     }
@@ -2254,7 +2313,7 @@ impl InterfaceIfacSettings {
         self.is_enabled()
             .then(|| rns_runtime::reticulum::RuntimeInterfaceIfacConfig {
                 network_name: self.network_name.clone(),
-                passphrase: self.passphrase.clone(),
+                passphrase: self.passphrase.as_deref().cloned(),
                 ifac_size: self.ifac_size,
             })
     }
@@ -2266,10 +2325,16 @@ struct InterfaceIfacCommandFields {
     ifac_enabled: Option<bool>,
     #[serde(default)]
     ifac_network_name: Option<String>,
-    #[serde(default)]
-    ifac_passphrase: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_ifac_passphrase")]
+    ifac_passphrase: Option<Zeroizing<String>>,
     #[serde(default)]
     ifac_size: Option<usize>,
+}
+
+fn deserialize_ifac_passphrase<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Zeroizing<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(|value| value.map(Zeroizing::new))
 }
 
 fn ifac_settings_from_entry(entry: &Value) -> InterfaceIfacSettings {
@@ -2277,7 +2342,8 @@ fn ifac_settings_from_entry(entry: &Value) -> InterfaceIfacSettings {
         network_name: cfg_non_empty_str(entry, "network_name")
             .or_else(|| cfg_non_empty_str(entry, "networkname")),
         passphrase: cfg_non_empty_str(entry, "passphrase")
-            .or_else(|| cfg_non_empty_str(entry, "pass_phrase")),
+            .or_else(|| cfg_non_empty_str(entry, "pass_phrase"))
+            .map(Zeroizing::new),
         ifac_size: cfg_usize(entry, "ifac_size"),
         unresolved: entry.get("ifac_error").is_some(),
     }
@@ -2310,7 +2376,7 @@ fn ifac_settings_from_args(
             passphrase: fields
                 .ifac_passphrase
                 .as_deref()
-                .map(|s| sanitize_text(s, 256))
+                .map(|s| Zeroizing::new(sanitize_text(s, 256)))
                 .filter(|s| !s.is_empty()),
             ifac_size: fields
                 .ifac_size
@@ -3619,7 +3685,9 @@ mod android_ble_owner_policy_tests {
             .expect_err("ambiguous name must fail closed");
         assert!(error.to_string().contains("More than one interface"));
         assert_eq!(
-            crate::rns_config::read_config(temp.path()).as_deref(),
+            crate::rns_config::read_config(temp.path())
+                .as_deref()
+                .map(String::as_str),
             Some(config)
         );
     }
@@ -4060,7 +4128,7 @@ async fn finish_interface_replace(
     activity_fence: ActivityRequestFence,
     config_dir: PathBuf,
     operation: &'static str,
-    old_config_content: String,
+    old_config_content: Zeroizing<String>,
     old_runtime: EditableInterfaceConfig,
     new_runtime: EditableInterfaceConfig,
 ) {
