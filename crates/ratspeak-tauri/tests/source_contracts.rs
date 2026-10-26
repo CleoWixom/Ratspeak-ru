@@ -10205,6 +10205,47 @@ fn auto_lock_has_a_watcher_of_its_own() {
     );
 }
 
+/// A hardware change that shuts down the identity its token backs keeps that
+/// identity locked, whether the change succeeds or not: lifting the lock
+/// would open its data, and setup, with no PIN. An activation keeps its
+/// identity locked until the load has checked the PIN. These paths need a
+/// card to run, so this pins them.
+#[test]
+fn a_hardware_change_keeps_the_identity_it_shut_down_locked() {
+    let hardware = read_source(repo_root().join("crates/ratspeak-tauri/src/commands/hardware.rs"))
+        .expect("hardware commands");
+    assert!(!hardware.contains("fn clear_hardware_lock_state"));
+    for function in [
+        "hw_provision_recoverable",
+        "hw_provision_hardware_only",
+        "hw_restore",
+        "hw_reset_piv",
+    ] {
+        let block = rust_function_block(&hardware, function);
+        let operation = block
+            .find("run_identity_mutation(")
+            .unwrap_or_else(|| panic!("{function} changes no token"));
+        let kept = block
+            .find("keep_hardware_identity_locked(")
+            .unwrap_or_else(|| panic!("{function} lifts the lock"));
+        let answered = block[operation..]
+            .find(".map_err(")
+            .map(|at| operation + at)
+            .unwrap_or_else(|| panic!("{function} has no result"));
+        assert!(kept < answered, "{function} keeps the lock only on success");
+        assert!(!block.contains("set_hw_locked(None)"), "{function}");
+    }
+    let activation = rust_function_block(&hardware, "hw_activate_and_unlock");
+    let activated = activation.find("set_active_identity(").expect("activation");
+    let loaded = activation[activated..]
+        .find("crate::init_rns_lxmf(")
+        .map(|at| activated + at)
+        .expect("load");
+    let before_load = &activation[activated..loaded];
+    assert!(before_load.contains("set_hw_locked(Some(hash.clone()))"));
+    assert!(!before_load.contains("set_hw_locked(None)"));
+}
+
 /// The radio rule gives ports to the user at the seat through uaccess, which
 /// systemd applies in 73-seat-late.rules: it sorts before that and opens no
 /// port to every local account. Packages run udevadm so plugged-in radios

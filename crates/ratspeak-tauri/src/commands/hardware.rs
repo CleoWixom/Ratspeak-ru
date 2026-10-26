@@ -57,37 +57,39 @@ async fn reset_for_hardware_change(
         .map_err(|error| activity_reset_failed(operation, error))
 }
 
-fn inserted_token_backs_live_or_locked_hardware(state: &AppState, inserted_serial: u32) -> bool {
+/// The live or locked hardware identity the inserted token backs, if any.
+fn identity_backed_by_inserted_token(state: &AppState, inserted_serial: u32) -> Option<String> {
     let data_dir = &state.config.data_dir;
+    let backed = |hash: &String| {
+        ratspeak_runtime::hardware::registered_device_serial(data_dir, hash)
+            .is_none_or(|serial| serial == inserted_serial)
+    };
     let loaded_hardware = state.lxmf.lock().ok().and_then(|lxmf| {
         lxmf.as_ref()
             .filter(|manager| manager.is_hardware)
             .map(|manager| manager.identity_hash.clone())
     });
-    let loaded_requires_shutdown = loaded_hardware.as_deref().is_some_and(|hash| {
-        ratspeak_runtime::hardware::registered_device_serial(data_dir, hash)
-            .is_none_or(|serial| serial == inserted_serial)
-    });
-
-    let locked_requires_shutdown = state.hw_locked_hash().as_deref().is_some_and(|hash| {
-        let hwid_path = data_dir.join("identities").join(hash).join("identity.hwid");
-        hwid_path.exists()
-            && ratspeak_runtime::hardware::registered_device_serial(data_dir, hash)
-                .is_none_or(|serial| serial == inserted_serial)
-    });
-
-    loaded_requires_shutdown || locked_requires_shutdown
+    loaded_hardware.filter(backed).or_else(|| {
+        state.hw_locked_hash().filter(|hash| {
+            data_dir
+                .join("identities")
+                .join(hash)
+                .join("identity.hwid")
+                .exists()
+                && backed(hash)
+        })
+    })
 }
 
 /// Resolve and pin the inserted token while the caller holds
 /// `identity_switch_lock`. A matching live/locked hardware identity is fully
-/// reset and shut down before this returns.
+/// reset and shut down before this returns, and its hash comes back.
 async fn prepare_destructive_hardware_operation(
     state: &Arc<AppState>,
     operation: &'static str,
     overwrite_authorized: bool,
     identity_lifecycle: &Arc<OwnedIdentitySwitchGuard>,
-) -> AppResult<(u32, bool)> {
+) -> AppResult<(u32, Option<String>)> {
     let data_dir = state.config.data_dir.clone();
     let detected = run_identity_mutation(Arc::clone(identity_lifecycle), move || {
         ratspeak_runtime::hardware::detect(&data_dir)
@@ -104,8 +106,8 @@ async fn prepare_destructive_hardware_operation(
             "Could not verify the inserted security key; hardware operation was cancelled.",
         )
     })?;
-    let shutdown_required = inserted_token_backs_live_or_locked_hardware(state, expected_serial);
-    if shutdown_required {
+    let shut_down = identity_backed_by_inserted_token(state, expected_serial);
+    if shut_down.is_some() {
         if !overwrite_authorized {
             return Err(AppError::conflict(
                 "This security key backs the active hardware identity. Confirm overwrite before replacing its keys.",
@@ -114,14 +116,19 @@ async fn prepare_destructive_hardware_operation(
         let reset = reset_for_hardware_change(state, operation).await?;
         crate::finish_shutdown(state, &reset).await;
     }
-    Ok((expected_serial, shutdown_required))
+    Ok((expected_serial, shut_down))
 }
 
-fn clear_hardware_lock_state(state: &AppState) {
-    state.set_hw_locked(None);
-    state.set_hw_last_error(None);
-    state.clear_pending_hw_pin();
+/// The identity a hardware change shut down stays locked, whatever the
+/// change did to its token: its data and setup open again only through an
+/// unlock, or once another identity is chosen.
+fn keep_hardware_identity_locked(state: &AppState, hash: &str) {
     state.release_retained_identity_except("");
+    state.clear_pending_hw_pin();
+    state.disarm_auto_lock();
+    state.set_hw_last_error(None);
+    state.set_hw_locked(Some(hash.to_owned()));
+    state.set_startup_stage("hw_locked");
 }
 
 #[tauri::command]
@@ -150,7 +157,7 @@ pub async fn hw_provision_recoverable(
     let state = Arc::clone(&state);
     let request_fence = state.activity_request_fence();
     let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
-    let (expected_serial, shutdown_required) = prepare_destructive_hardware_operation(
+    let (expected_serial, shut_down) = prepare_destructive_hardware_operation(
         &state,
         "hardware_provision_recoverable",
         force,
@@ -172,12 +179,13 @@ pub async fn hw_provision_recoverable(
             },
         )
     })
-    .await
-    .map_err(|_| AppError::internal("provision task panicked"))?
-    .map_err(AppError::bad_request)?;
-    if shutdown_required {
-        clear_hardware_lock_state(&state);
+    .await;
+    if let Some(hash) = shut_down.as_deref() {
+        keep_hardware_identity_locked(&state, hash);
     }
+    let res = res
+        .map_err(|_| AppError::internal("provision task panicked"))?
+        .map_err(AppError::bad_request)?;
     to_value(res)
 }
 
@@ -198,7 +206,7 @@ pub async fn hw_provision_hardware_only(
     let state = Arc::clone(&state);
     let request_fence = state.activity_request_fence();
     let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
-    let (expected_serial, shutdown_required) = prepare_destructive_hardware_operation(
+    let (expected_serial, shut_down) = prepare_destructive_hardware_operation(
         &state,
         "hardware_provision_hardware_only",
         force,
@@ -220,12 +228,13 @@ pub async fn hw_provision_hardware_only(
             },
         )
     })
-    .await
-    .map_err(|_| AppError::internal("provision task panicked"))?
-    .map_err(AppError::bad_request)?;
-    if shutdown_required {
-        clear_hardware_lock_state(&state);
+    .await;
+    if let Some(hash) = shut_down.as_deref() {
+        keep_hardware_identity_locked(&state, hash);
     }
+    let res = res
+        .map_err(|_| AppError::internal("provision task panicked"))?
+        .map_err(AppError::bad_request)?;
     to_value(res)
 }
 
@@ -266,7 +275,7 @@ pub async fn hw_restore(
     let state = Arc::clone(&state);
     let request_fence = state.activity_request_fence();
     let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
-    let (expected_serial, shutdown_required) = prepare_destructive_hardware_operation(
+    let (expected_serial, shut_down) = prepare_destructive_hardware_operation(
         &state,
         "hardware_restore",
         force,
@@ -290,12 +299,13 @@ pub async fn hw_restore(
             },
         )
     })
-    .await
-    .map_err(|_| AppError::internal("restore task panicked"))?
-    .map_err(AppError::bad_request)?;
-    if shutdown_required {
-        clear_hardware_lock_state(&state);
+    .await;
+    if let Some(hash) = shut_down.as_deref() {
+        keep_hardware_identity_locked(&state, hash);
     }
+    let res = res
+        .map_err(|_| AppError::internal("restore task panicked"))?
+        .map_err(AppError::bad_request)?;
     to_value(res)
 }
 
@@ -304,19 +314,20 @@ pub async fn hw_reset_piv(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
     let state = Arc::clone(&state);
     let request_fence = state.activity_request_fence();
     let identity_lifecycle = acquire_identity_mutation(&state, request_fence).await?;
-    let (expected_serial, shutdown_required) =
+    let (expected_serial, shut_down) =
         prepare_destructive_hardware_operation(&state, "piv_reset", true, &identity_lifecycle)
             .await?;
 
-    run_identity_mutation(Arc::clone(&identity_lifecycle), move || {
+    let reset = run_identity_mutation(Arc::clone(&identity_lifecycle), move || {
         ratspeak_runtime::hardware::reset_piv_application(expected_serial)
     })
-    .await
-    .map_err(|_| AppError::internal("reset PIV task panicked"))?
-    .map_err(AppError::bad_request)?;
-    if shutdown_required {
-        clear_hardware_lock_state(&state);
+    .await;
+    if let Some(hash) = shut_down.as_deref() {
+        keep_hardware_identity_locked(&state, hash);
     }
+    reset
+        .map_err(|_| AppError::internal("reset PIV task panicked"))?
+        .map_err(AppError::bad_request)?;
     to_value(serde_json::json!({ "ok": true }))
 }
 
@@ -503,7 +514,8 @@ pub async fn hw_activate_and_unlock(
     // No way back to the previous identity from here: its unlock goes.
     state.release_retained_identity_except(&hash);
     state.set_hw_last_error(None);
-    state.set_hw_locked(None);
+    // Locked until the load has checked the PIN.
+    state.set_hw_locked(Some(hash.clone()));
     state.stage_pending_hw_pin(&hash, pin);
     if let Ok(mut sig) = state.session_shutdown.write() {
         *sig = rns_runtime::lifecycle::ShutdownSignal::new();
@@ -562,6 +574,36 @@ fn parse_remaining(msg: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A hardware change that shut down the identity its token backs keeps
+    // that identity locked: its data opens again only through an unlock.
+    #[test]
+    fn a_hardware_change_keeps_the_identity_it_shut_down_locked() {
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+        let pool = db::init_pool(root.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        let state = AppState::new(
+            config,
+            pool,
+            Arc::new(ratspeak_core::NoopEmitter),
+            Arc::new(ratspeak_core::NoopNotifier),
+        );
+        let hash = "cc".repeat(16);
+        state.stage_pending_hw_pin(&hash, Zeroizing::new("123456".to_owned()));
+        state.arm_auto_lock(&hash, "hardware", std::time::Duration::from_secs(60), false);
+
+        keep_hardware_identity_locked(&state, &hash);
+
+        assert_eq!(state.hw_locked_hash().as_deref(), Some(hash.as_str()));
+        assert_eq!(state.get_startup_stage(), "hw_locked");
+        assert!(
+            state.take_pending_hw_pin().is_none(),
+            "its PIN outlived the change"
+        );
+        assert!(state.auto_lock.lock().unwrap().is_none());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hardware_mutation_cancelled_waiter_keeps_actual_disk_worker_owned() {
