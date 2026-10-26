@@ -1851,6 +1851,10 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 );
                 return;
             }
+            // Without its identity the network would run as a ready app
+            // that can't message.
+            state.set_startup_stage("error");
+            return;
         }
     }
 

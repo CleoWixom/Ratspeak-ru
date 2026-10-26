@@ -2108,18 +2108,44 @@ pub fn set_identity_propagation_node(
 }
 
 pub fn set_active_identity(pool: &DbPool, hash_hex: &str) -> Result<(), String> {
+    activate(pool, hash_hex, true)
+}
+
+/// As `set_active_identity`, without counting it as a use: a switch counts
+/// it once the identity has opened.
+pub fn activate_identity(pool: &DbPool, hash_hex: &str) -> Result<(), String> {
+    activate(pool, hash_hex, false)
+}
+
+pub fn mark_identity_used(pool: &DbPool, hash_hex: &str) -> Result<(), String> {
+    let _write = IdentityTablesWrite;
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    conn.execute(
+        "UPDATE identities SET last_used = ?1 WHERE hash = ?2",
+        params![now_ts(), hash_hex],
+    )
+    .map_err(|e| format!("use: {e}"))?;
+    Ok(())
+}
+
+fn activate(pool: &DbPool, hash_hex: &str, used: bool) -> Result<(), String> {
     let _write = IdentityTablesWrite;
     let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
-    let now = now_ts();
     let tx = conn.transaction().map_err(|e| format!("begin: {e}"))?;
     tx.execute("UPDATE identities SET is_active = 0", [])
         .map_err(|e| format!("deactivate: {e}"))?;
-    let updated = tx
-        .execute(
+    let updated = if used {
+        tx.execute(
             "UPDATE identities SET is_active = 1, last_used = ?1 WHERE hash = ?2",
-            params![now, hash_hex],
+            params![now_ts(), hash_hex],
         )
-        .map_err(|e| format!("activate: {e}"))?;
+    } else {
+        tx.execute(
+            "UPDATE identities SET is_active = 1 WHERE hash = ?1",
+            params![hash_hex],
+        )
+    }
+    .map_err(|e| format!("activate: {e}"))?;
     if updated != 1 {
         return Err("identity not found".into());
     }

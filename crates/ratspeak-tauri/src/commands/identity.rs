@@ -1548,23 +1548,52 @@ pub(super) fn emit_switch_failed(state: &AppState, target: &str, error: &str) {
 pub(super) async fn resume_previous(state: &Arc<AppState>, previous: Option<String>, target: &str) {
     let Some(old_hash) = previous else {
         let target = target.to_owned();
-        let _ = db::spawn_db(state.db.clone(), move |p| {
+        let deactivated = db::spawn_db(state.db.clone(), move |p| {
             db::deactivate_identity(&p, &target)
         })
         .await;
+        // Still active, it would come back at the next start without a runtime.
+        if !matches!(deactivated, Ok(Ok(()))) {
+            tracing::error!(
+                reason = "deactivate_failed",
+                "could not leave the failed identity inactive"
+            );
+            state.set_startup_stage("error");
+            return;
+        }
         state.set_startup_stage("ready");
         return;
     };
-    let _ = db::spawn_db(state.db.clone(), move |p| {
+    let reactivated = db::spawn_db(state.db.clone(), move |p| {
         db::set_active_identity(&p, &old_hash)
     })
     .await;
+    // With the failed identity still active, a start would only open it again.
+    if !matches!(reactivated, Ok(Ok(()))) {
+        tracing::error!(
+            reason = "reactivate_failed",
+            "could not bring the previous identity back"
+        );
+        state.set_startup_stage("error");
+        return;
+    }
     if let Ok(mut sig) = state.session_shutdown.write() {
         *sig = rns_runtime::lifecycle::ShutdownSignal::new();
     }
     state.set_startup_stage("checking");
     crate::init_rns_lxmf(Arc::clone(state), state.config.data_root.clone()).await;
     crate::commands::ble::restore_ble_peer_if_requested(Arc::clone(state)).await;
+}
+
+async fn mark_identity_used(state: &AppState, hash: &str) {
+    let hash = hash.to_owned();
+    let marked = db::spawn_db(state.db.clone(), move |p| db::mark_identity_used(&p, &hash)).await;
+    if !matches!(marked, Ok(Ok(()))) {
+        tracing::warn!(
+            reason = "mark_used_failed",
+            "could not count the identity's use"
+        );
+    }
 }
 
 async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppResult<Value> {
@@ -1640,9 +1669,10 @@ async fn switch_identity_session_held(
     crate::finish_shutdown(&state, &reset).await;
     state.clear_identity_scoped_runtime_state();
 
+    // Counted as its use only once the identity opens.
     let hash_for_db = hash_hex.clone();
     let activation = match db::spawn_db(state.db.clone(), move |p| {
-        db::set_active_identity(&p, &hash_for_db)
+        db::activate_identity(&p, &hash_for_db)
     })
     .await
     {
@@ -1672,6 +1702,7 @@ async fn switch_identity_session_held(
     // intermediate state, not a failed switch. Keep it active and let the unlock
     // prompt (driven by the hardware_locked event) take over; do not roll back.
     if state.hw_locked_hash().as_deref() == Some(hash_hex.as_str()) {
+        mark_identity_used(&state, &hash_hex).await;
         state.release_retained_identity_except(&hash_hex);
         let payload = json!({
             "hash": hash_hex,
@@ -1721,6 +1752,7 @@ async fn switch_identity_session_held(
         )));
     }
 
+    mark_identity_used(&state, &hash_hex).await;
     // Switched away for good: the previous identity's unlock goes. A failed
     // switch kept it to bring that identity back as it was.
     state.release_retained_identity_except(&hash_hex);

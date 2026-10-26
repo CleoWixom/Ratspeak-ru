@@ -286,6 +286,7 @@ pub const ratspeak_db::db::PUBLIC_CHANNEL_CONSENT_SETTING: &str
 pub const ratspeak_db::db::PUBLIC_CHANNEL_CONSENT_VERSION: u16
 pub const ratspeak_db::db::RESET_TABLES: &[&str]
 pub const ratspeak_db::db::SOFT_CAP_IDENTITIES: usize
+pub fn ratspeak_db::db::activate_identity(&ratspeak_db::DbPool, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::db::append_channel_history_events(&ratspeak_db::DbPool, &str, &[ratspeak_db::NewChannelHistoryEvent]) -> core::result::Result<ratspeak_db::ChannelHistoryAppendOutcome, alloc::string::String>
 pub fn ratspeak_db::db::append_game_action(&ratspeak_db::DbPool, &str, &str, &str, &str, &str, f64, core::option::Option<&[u8]>) -> core::option::Option<i64>
 pub fn ratspeak_db::db::apply_hub_ops(&ratspeak_db::DbPool, &str, &[ratspeak_db::HubRoomOp]) -> core::result::Result<(), alloc::string::String>
@@ -370,6 +371,7 @@ pub fn ratspeak_db::db::load_game_sessions(&ratspeak_db::DbPool) -> alloc::vec::
 pub fn ratspeak_db::db::mark_channel_room_key_required(&ratspeak_db::DbPool, &str, &str, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::db::mark_channel_room_read(&ratspeak_db::DbPool, &str, &str, &str, &str) -> core::result::Result<ratspeak_db::ChannelRoomReadState, alloc::string::String>
 pub fn ratspeak_db::db::mark_game_read(&ratspeak_db::DbPool, &str, &str)
+pub fn ratspeak_db::db::mark_identity_used(&ratspeak_db::DbPool, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::db::mark_message_resent(&ratspeak_db::DbPool, &str, &str)
 pub fn ratspeak_db::db::mark_read(&ratspeak_db::DbPool, &str, &str)
 pub fn ratspeak_db::db::message_exists(&ratspeak_db::DbPool, &str) -> bool
@@ -646,6 +648,7 @@ pub const ratspeak_db::PUBLIC_CHANNEL_CONSENT_SETTING: &str
 pub const ratspeak_db::PUBLIC_CHANNEL_CONSENT_VERSION: u16
 pub const ratspeak_db::RESET_TABLES: &[&str]
 pub const ratspeak_db::SOFT_CAP_IDENTITIES: usize
+pub fn ratspeak_db::activate_identity(&ratspeak_db::DbPool, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::append_channel_history_events(&ratspeak_db::DbPool, &str, &[ratspeak_db::NewChannelHistoryEvent]) -> core::result::Result<ratspeak_db::ChannelHistoryAppendOutcome, alloc::string::String>
 pub fn ratspeak_db::append_game_action(&ratspeak_db::DbPool, &str, &str, &str, &str, &str, f64, core::option::Option<&[u8]>) -> core::option::Option<i64>
 pub fn ratspeak_db::apply_hub_ops(&ratspeak_db::DbPool, &str, &[ratspeak_db::HubRoomOp]) -> core::result::Result<(), alloc::string::String>
@@ -730,6 +733,7 @@ pub fn ratspeak_db::load_game_sessions(&ratspeak_db::DbPool) -> alloc::vec::Vec<
 pub fn ratspeak_db::mark_channel_room_key_required(&ratspeak_db::DbPool, &str, &str, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::mark_channel_room_read(&ratspeak_db::DbPool, &str, &str, &str, &str) -> core::result::Result<ratspeak_db::ChannelRoomReadState, alloc::string::String>
 pub fn ratspeak_db::mark_game_read(&ratspeak_db::DbPool, &str, &str)
+pub fn ratspeak_db::mark_identity_used(&ratspeak_db::DbPool, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::mark_message_resent(&ratspeak_db::DbPool, &str, &str)
 pub fn ratspeak_db::mark_read(&ratspeak_db::DbPool, &str, &str)
 pub fn ratspeak_db::message_exists(&ratspeak_db::DbPool, &str) -> bool

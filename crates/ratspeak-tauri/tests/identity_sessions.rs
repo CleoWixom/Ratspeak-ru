@@ -636,3 +636,98 @@ fn a_takeover_that_cannot_load_leaves_no_identity_active() {
     assert!(!f.running());
     assert_eq!(f.state.get_startup_stage(), "ready");
 }
+
+/// `identity`'s key loads, but its ratchet store cannot open.
+fn break_ratchets(f: &Fixture, identity: &str) {
+    let ratchets = f.profile(identity).join("ratchets");
+    std::fs::remove_dir_all(&ratchets).unwrap();
+    std::fs::write(&ratchets, b"not a directory").unwrap();
+}
+
+// A plain identity that cannot load ends its start in an error: the network
+// never runs without it, as if the app were ready.
+#[test]
+fn a_plain_identity_that_cannot_load_ends_its_start_in_an_error() {
+    let f = Fixture::new();
+    let s = f.import("S");
+    break_ratchets(&f, &s);
+    db::set_active_identity(&f.state.db, &s).unwrap();
+
+    f.launch();
+
+    assert!(f.loaded().is_none());
+    assert_eq!(f.state.get_startup_stage(), "error");
+    assert!(!f.running(), "the network ran without its identity");
+}
+
+// A switch to an identity that cannot load does not count as its use, so it
+// never becomes the one a later start without an active identity opens.
+#[test]
+fn a_switch_to_an_identity_that_cannot_load_is_not_counted_as_its_use() {
+    let f = Fixture::new();
+    let a = f.import("A");
+    let s = f.import("S");
+    f.start(&a);
+    break_ratchets(&f, &s);
+    let unused = db::get_identity(&f.state.db, &s).unwrap()["last_used"].clone();
+
+    let result = f
+        .runtime
+        .block_on(ratspeak_tauri::commands::identity::switch_identity(
+            f.app.state(),
+            s.clone(),
+        ));
+
+    assert!(result.is_err());
+    assert_eq!(f.active().as_deref(), Some(a.as_str()));
+    assert_eq!(f.loaded().as_deref(), Some(a.as_str()));
+    assert_eq!(
+        db::get_identity(&f.state.db, &s).unwrap()["last_used"],
+        unused
+    );
+}
+
+// A takeover that cannot load and cannot be made inactive again ends in an
+// error, not ready with an active identity and no runtime.
+#[cfg(feature = "hardware")]
+#[test]
+fn a_takeover_that_cannot_be_made_inactive_ends_in_an_error() {
+    let f = Fixture::new();
+    let s = f.import("S");
+    break_ratchets(&f, &s);
+    f.state
+        .db
+        .get()
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER keep_s BEFORE UPDATE OF is_active ON identities \
+             WHEN OLD.hash = '{s}' AND OLD.is_active = 1 AND NEW.is_active = 0 \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;"
+        ))
+        .unwrap();
+    let h = "cccccccccccccccccccccccccccccccc".to_string();
+    std::fs::create_dir_all(f.profile(&h)).unwrap();
+    std::fs::write(f.profile(&h).join("identity.hwid"), b"{}").unwrap();
+    db::save_identity(
+        &f.state.db,
+        &h,
+        "dddddddddddddddddddddddddddddddd",
+        "H",
+        "H",
+    );
+    db::set_active_identity(&f.state.db, &h).unwrap();
+    f.state.set_hw_locked(Some(h.clone()));
+    f.state.set_startup_stage("hw_locked");
+
+    f.runtime
+        .block_on(ratspeak_tauri::commands::hardware::hw_remove(
+            f.app.state(),
+            h.clone(),
+        ))
+        .unwrap();
+
+    assert!(f.recorder.last("identity_switch_failed").is_some());
+    assert!(f.loaded().is_none());
+    assert!(!f.running());
+    assert_eq!(f.state.get_startup_stage(), "error");
+}
