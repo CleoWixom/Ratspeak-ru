@@ -350,6 +350,80 @@ mod mailto_tests {
     }
 }
 
+// The WebView's suggested destination keeps a link's `download` name, which a
+// `blob:` URL cannot carry. Stored files drop their "1693824532000_" prefix.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn download_dialog_name(url: &tauri::Url, destination: &std::path::Path) -> String {
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download");
+    name.split_once('_')
+        .filter(|(stamp, rest)| {
+            !stamp.is_empty() && !rest.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit())
+        })
+        .map_or(name, |(_, rest)| rest)
+        .to_string()
+}
+
+#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+mod download_dialog_name_tests {
+    use super::download_dialog_name;
+
+    fn name(url: &str, destination: &str) -> String {
+        download_dialog_name(
+            &tauri::Url::parse(url).unwrap(),
+            std::path::Path::new(destination),
+        )
+    }
+
+    #[test]
+    fn blob_downloads_keep_the_links_file_name() {
+        assert_eq!(
+            name(
+                "blob:tauri://localhost/5f0c2a",
+                "/Users/me/Downloads/0123456789abcdef-reticulum-identity.identity"
+            ),
+            "0123456789abcdef-reticulum-identity.identity"
+        );
+        assert_eq!(
+            name(
+                "blob:http://tauri.localhost/5f0c2a",
+                "/home/me/Downloads/0123456789abcdef-ratspeak-identity.rsi"
+            ),
+            "0123456789abcdef-ratspeak-identity.rsi"
+        );
+    }
+
+    #[test]
+    fn only_a_numeric_stored_file_prefix_is_dropped() {
+        assert_eq!(
+            name(
+                "asset://localhost/files/1693824532000_doc.pdf",
+                "/d/1693824532000_doc.pdf"
+            ),
+            "doc.pdf"
+        );
+        assert_eq!(
+            name("blob:tauri://localhost/1", "/d/my_notes.txt"),
+            "my_notes.txt"
+        );
+        assert_eq!(name("blob:tauri://localhost/1", "/d/2026_"), "2026_");
+    }
+
+    #[test]
+    fn without_a_suggestion_the_url_then_download_names_the_file() {
+        assert_eq!(name("asset://localhost/files/report.pdf", ""), "report.pdf");
+        assert_eq!(name("blob:tauri://localhost/1", ""), "download");
+    }
+}
+
 #[tauri::command]
 async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     let clean = validate_http_url(&url)?;
@@ -1408,21 +1482,8 @@ pub fn run() {
                 };
                 match event {
                     DownloadEvent::Requested { url, destination } => {
-                        let filename = url
-                            .path_segments()
-                            .and_then(|mut s| s.next_back())
-                            .unwrap_or("download")
-                            .to_string();
-
-                        // Strip "1693824532000_doc.pdf" → "doc.pdf".
-                        let clean_name = filename
-                            .find('_')
-                            .map(|pos| &filename[pos + 1..])
-                            .unwrap_or(&filename);
-
-                        if let Some(path) =
-                            rfd::FileDialog::new().set_file_name(clean_name).save_file()
-                        {
+                        let name = download_dialog_name(&url, destination);
+                        if let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() {
                             *destination = path;
                             true
                         } else {
