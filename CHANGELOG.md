@@ -22,6 +22,7 @@ changes that materially affect how an artifact is reproduced.
 - Fixed recovery phrases not being saved in rare cases.
 - Improved compatibility with the latest Python Reticulum and LXMF.
 - Fixed downloading messages from propagation nodes that hold many messages.
+- Fixed game boards being cut off on phones; games now open full screen.
 
 ### Build and compatibility
 
