@@ -439,6 +439,34 @@ function saveIdentityBackupWithAndroid(fileName, backupBase64) {
     });
 }
 
+// How the desktop download of `url` that `start` begins ended, as the save
+// dialog and the WebView report it: `saved`, `cancelled` or `failed`. Null
+// elsewhere, or when no report comes within the dialog's ten minutes.
+function desktopDownloadResult(url, start) {
+    if (typeof isTauriDesktop !== 'function' || !isTauriDesktop() ||
+            !window.RS || typeof RS.listen !== 'function') {
+        start();
+        return Promise.resolve(null);
+    }
+    var report = null;
+    var ended = new Promise(function(resolve) { report = resolve; });
+    return Promise.resolve(RS.listen('download_result', function(data) {
+        if (data && data.url === url) report(data.status || null);
+    })).catch(function() { return null; }).then(function(unlisten) {
+        if (typeof unlisten !== 'function') {
+            start();
+            return null;
+        }
+        var timer = setTimeout(function() { report(null); }, 600000);
+        start();
+        return ended.then(function(status) {
+            clearTimeout(timer);
+            unlisten();
+            return status;
+        });
+    });
+}
+
 function saveBytesToUserFile(bytes, fileName, mimeType, backupBase64) {
     if (hasAndroidIdentityDocumentBridge()) {
         return saveIdentityDocumentWithAndroid(fileName, backupBase64 || bytesToBase64(bytes), mimeType);
@@ -449,15 +477,19 @@ function saveBytesToUserFile(bytes, fileName, mimeType, backupBase64) {
 
     var blob = new Blob([bytes], { type: mimeType || 'application/octet-stream' });
     var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(function() { try { URL.revokeObjectURL(url); } catch (_) {} }, 60000);
-    return Promise.resolve({ method: 'download', fileName: fileName });
+    return desktopDownloadResult(url, function() {
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    }).then(function(status) {
+        var revoke = function() { try { URL.revokeObjectURL(url); } catch (_) {} };
+        if (status) revoke(); else setTimeout(revoke, 60000);
+        return { method: 'download', fileName: fileName, status: status };
+    });
 }
 
 function renderNetworkIdentityCard() {
@@ -1410,9 +1442,11 @@ function saveIdentityExportPayload(payload) {
             return result;
         }).then(function(result) {
             if (!result) return;
-            if (result.method === 'android-document') {
+            if (result.method === 'android-document' || result.status === 'saved') {
                 showToast((result.label || 'Identity export') + ' saved', 'toast-success', 3000);
-            } else {
+            } else if (result.status === 'failed') {
+                showToast('Could not save ' + result.fileName, 'toast-error', 5000);
+            } else if (result.status !== 'cancelled') {
                 showToast('Save prompt opened for ' + result.fileName, 'toast-info', 4000);
             }
         });

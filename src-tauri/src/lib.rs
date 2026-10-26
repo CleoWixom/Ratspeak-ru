@@ -1397,7 +1397,15 @@ pub fn run() {
             };
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            let window = window.on_download(|_webview, event| {
+            let window = window.on_download(|webview, event| {
+                // The page learns how its download ended, not that it began.
+                let report = |url: &tauri::Url, status: &str| {
+                    let _ = tauri::Emitter::emit(
+                        &webview,
+                        "download_result",
+                        serde_json::json!({ "url": url.as_str(), "status": status }),
+                    );
+                };
                 match event {
                     DownloadEvent::Requested { url, destination } => {
                         let filename = url
@@ -1418,13 +1426,15 @@ pub fn run() {
                             *destination = path;
                             true
                         } else {
+                            report(&url, "cancelled");
                             false
                         }
                     }
-                    DownloadEvent::Finished { success, .. } => {
+                    DownloadEvent::Finished { url, success, .. } => {
                         if !success {
                             tracing::debug!(reason = "download_failed", "download failed");
                         }
+                        report(&url, if success { "saved" } else { "failed" });
                         true
                     }
                     _ => true,

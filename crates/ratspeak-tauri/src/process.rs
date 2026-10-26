@@ -1,6 +1,6 @@
-//! What the app holds stays in it: no core dumps, no panic report that
-//! quotes its message, and on Linux no other process of the same user reading
-//! its memory.
+//! What the app holds stays in it: no core dumps, and no panic report that
+//! quotes its message. The process stays dumpable on Linux: the desktop
+//! portals, which every file dialog goes through, read `/proc/<pid>/root`.
 
 /// Call first in `run()`, before any thread, secret or WebView exists: the
 /// WebView's processes inherit the core-dump limit.
@@ -11,11 +11,9 @@ pub fn harden() {
             rlim_cur: 0,
             rlim_max: 0,
         };
-        // SAFETY: plain syscalls on this process; a failure leaves the defaults.
+        // SAFETY: a plain syscall on this process; a failure leaves the default.
         unsafe {
             libc::setrlimit(libc::RLIMIT_CORE, &none);
-            #[cfg(target_os = "linux")]
-            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
         }
     }
     std::panic::set_hook(Box::new(|info| {

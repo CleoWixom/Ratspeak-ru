@@ -10246,6 +10246,19 @@ fn a_hardware_change_keeps_the_identity_it_shut_down_locked() {
     assert!(!before_load.contains("set_hw_locked(None)"));
 }
 
+/// The process stays dumpable on Linux. xdg-desktop-portal opens
+/// `/proc/<pid>/root` to tell who calls it and refuses a caller it can't
+/// read, and every file dialog, identity exports and backups included, goes
+/// through a portal there.
+#[test]
+fn the_process_stays_dumpable_for_the_desktop_portals() {
+    let process = read_source(repo_root().join("crates/ratspeak-tauri/src/process.rs"))
+        .expect("process hardening");
+    assert!(!process.contains("PR_SET_DUMPABLE"));
+    assert!(process.contains("libc::RLIMIT_CORE"));
+    assert!(process.contains("std::panic::set_hook"));
+}
+
 /// The radio rule gives ports to the user at the seat through uaccess, which
 /// systemd applies in 73-seat-late.rules: it sorts before that and opens no
 /// port to every local account. Packages run udevadm so plugged-in radios
