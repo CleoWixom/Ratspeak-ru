@@ -1161,6 +1161,7 @@ RS.listen('ble_rnode_pairing_finished', function(data) {
 // Android BLE connect phases for the add/edit dialog. Retry phases are left
 // out so they never overwrite the explained waiting reason.
 var _BLE_RNODE_PHASES = {
+    finding: 'Looking for the RNode nearby...',
     bonding: 'Pairing... Enter the PIN shown on the RNode when Android asks.',
     pairing_settle: 'Paired. Reconnecting securely...',
     mtu: 'Negotiating link...',

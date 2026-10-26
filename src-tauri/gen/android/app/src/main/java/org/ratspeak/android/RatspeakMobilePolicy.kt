@@ -656,6 +656,13 @@ object RatspeakMobilePolicy {
         failedAttempts >= BLE_DIRECT_ATTEMPTS_BEFORE_BACKGROUND
 
     /**
+     * Android bonds a device it holds no type for over classic Bluetooth, which
+     * a BLE-only RNode never answers. Such a radio is found by a scan first.
+     */
+    fun bleBondNeedsScan(bonded: Boolean, deviceTypeKnown: Boolean): Boolean =
+        !bonded && !deviceTypeKnown
+
+    /**
      * Fast retries handle Android's transient GATT failures; later retries
      * become low duty but never give up on an explicitly configured radio.
      * A stable token-derived jitter prevents several radios reconnecting in

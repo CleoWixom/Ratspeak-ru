@@ -12,6 +12,9 @@ import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -27,13 +30,15 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Native BLE GATT client + local TCP bridge for RNode communication.
  *
  * RNode requires MITM-encrypted BLE connections (NUS over bonded link).
  * Connection sequence:
- *   1. createBond() first when Android reports the device is unpaired
+ *   1. createBond() first when Android reports the device is unpaired, after a
+ *      scan if Android no longer knows it
  *   2. Wait for bonding — Android shows pairing dialog, user confirms
  *   3. After BOND_BONDED, let the RNode finish its intentional post-pair disconnect
  *   4. connectGatt() over the bonded link, where encryption is automatic
@@ -55,6 +60,8 @@ class RatspeakBleGatt(
         // Cardputer RNode keeps first-pair/manual pairing windows open longer
         // than this; time out first so the app can cleanly roll back.
         private const val BOND_TIMEOUT_SEC = 60L
+        // Many advertising intervals even at nRF52 RNode's slowest (1 s).
+        private const val RADIO_SCAN_TIMEOUT_SEC = 10L
         private const val NONE_DEBOUNCE_SEC = 3L
         private const val BOND_POLL_INTERVAL_MS = 250L
         private const val POST_BOND_RECONNECT_DELAY_MS = 2600L
@@ -217,13 +224,32 @@ class RatspeakBleGatt(
             if (!adapter.isEnabled)
                 return err("Bluetooth is turned off")
 
-            val device: BluetoothDevice = try {
+            var device: BluetoothDevice = try {
                 adapter.getRemoteDevice(address)
             } catch (e: Exception) {
                 return err("Invalid BLE address: $address")
             }
 
-            Log.i(TAG, "Device: name=${device.name} bondState=${bondStr(device.bondState)}")
+            Log.i(TAG, "Device: name=${device.name} bondState=${bondStr(device.bondState)} type=${device.type}")
+
+            // A forgotten pairing leaves Android no type for the radio; bond the
+            // device a fresh scan reports, which carries its LE address type.
+            if (RatspeakMobilePolicy.bleBondNeedsScan(
+                    bonded = device.bondState == BluetoothDevice.BOND_BONDED,
+                    deviceTypeKnown = device.type != BluetoothDevice.DEVICE_TYPE_UNKNOWN,
+                )
+            ) {
+                emitProgress("finding")
+                val seen = try {
+                    findAdvertisingRadio(adapter, address)
+                } catch (_: SecurityException) {
+                    return err("Bluetooth scan permission unavailable")
+                }
+                if (adapterUnavailable.get()) return err("Bluetooth is turned off")
+                device = seen ?: return err(
+                    "$ERR_PAIRING_MODE Radio not seen nearby; it must be on and in pairing mode"
+                )
+            }
 
             // ── Phase 0: Bond first (if needed) ──
             // RNode requires MITM-encrypted BLE (ESP_LE_AUTH_REQ_SC_MITM_BOND), so
@@ -870,6 +896,40 @@ class RatspeakBleGatt(
         if (gatt === callbackGatt) return true
         Log.i(TAG, "Ignoring stale GATT callback: $callback")
         return false
+    }
+
+    /**
+     * The radio as one short scan reports it, or null if it did not advertise in
+     * time. Unfiltered like the add flow's scan: the radio's address type is
+     * unknown here, and an address filter must name one.
+     */
+    @SuppressLint("MissingPermission")
+    private fun findAdvertisingRadio(adapter: BluetoothAdapter, address: String): BluetoothDevice? {
+        val scanner = adapter.bluetoothLeScanner ?: return null
+        val found = AtomicReference<BluetoothDevice?>(null)
+        val seen = CountDownLatch(1)
+        val callback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                if (result.device.address.equals(address, ignoreCase = true) &&
+                    found.compareAndSet(null, result.device)
+                ) {
+                    seen.countDown()
+                }
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                Log.w(TAG, "Radio scan failed: $errorCode")
+                seen.countDown()
+            }
+        }
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        scanner.startScan(null, settings, callback)
+        try {
+            seen.await(RADIO_SCAN_TIMEOUT_SEC, TimeUnit.SECONDS)
+        } finally {
+            try { scanner.stopScan(callback) } catch (e: Exception) { logEx("stopScan", e) }
+        }
+        return found.get()
     }
 
     @SuppressLint("MissingPermission")
