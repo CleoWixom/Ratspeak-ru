@@ -26,7 +26,7 @@ changes that materially affect how an artifact is reproduced.
 - Renames, status changes and blocks made during an identity switch are refused instead of landing on the next identity, and a rename never announces the old name afterwards. A network block or unblock that a switch interrupts completes once its identity runs again.
 - Ratspeak won't open data that another Ratspeak app is using or that a newer version saved, and says what to do instead. Drives that can't lock get a warning.
 - Opportunistic messages use the whole encrypted packet, as in Python LXMF, and leave room for a stamp only when one is attached; larger messages are sent and shown as Direct.
-- A PIN-protected identity asks for its PIN again after you switch to another identity and back, and a PIN entered for one identity is never used for another.
+- A PIN-protected identity asks for its PIN again after you switch to another identity and back.
 - If the identity that takes over after removing a hardware identity can't load, Ratspeak leaves no identity active instead of one without a network.
 - Auto-Lock now locks passcode identities too, and counts time the device slept, so a lock that fell due during sleep happens within seconds of waking. If you turned on the hardware auto-lock, passcode identities now lock after the same time.
 - While an identity is locked, its messages, contacts and other data stay out of the app until you unlock it.

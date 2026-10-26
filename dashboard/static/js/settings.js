@@ -1651,7 +1651,7 @@ function _initHwLockSetting() {
             title: 'Auto-Lock',
             message: 'Lock an identity with a PIN once this long has passed since you unlocked it. You’ll re-enter its PIN to resume.',
             choices: [
-                { label: 'OFF', value: '0', hint: 'Only locks when you quit Ratspeak.' },
+                { label: 'OFF', value: '0', hint: 'Locks when you switch identities or restart Ratspeak.' },
                 { label: '5 minutes', value: '300', hint: 'Tightest; frequent PIN prompts.' },
                 { label: '15 minutes', value: '900' },
                 { label: '30 minutes', value: '1800' },
