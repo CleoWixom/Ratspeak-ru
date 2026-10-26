@@ -913,65 +913,86 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn setup_returns_the_recoverable_phrase_once_with_the_same_json_shape() {
-        use tauri::Manager;
+    #[test]
+    fn setup_returns_the_recoverable_phrase_once_with_the_same_json_shape() {
+        // Vault admission is process-wide, including calls made by import tests.
+        let _serial = super::super::identity::tests::VAULT_TEST_SERIAL
+            .lock()
+            .unwrap();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use tauri::Manager;
 
-        let root = tempfile::tempdir().unwrap();
-        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
-        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
-        let pool = db::init_pool(root.path()).unwrap();
-        db::init_schema(&pool).unwrap();
-        let state = Arc::new(AppState::new(
-            config,
-            pool,
-            Arc::new(ratspeak_core::NoopEmitter),
-            Arc::new(ratspeak_core::NoopNotifier),
-        ));
-        let app = tauri::test::mock_builder()
-            .manage(Arc::clone(&state))
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .unwrap();
-        let first = api_setup_complete(app.state(), SetupCompleteArgs { display_name: None })
-            .await
-            .unwrap();
-        let phrase = first["mnemonic"].as_str().unwrap();
-        let key = ratspeak_runtime::derive_identity_key_from_phrase(phrase).unwrap();
-        let identity = rns_identity::identity::Identity::from_private_key(&key[..]).unwrap();
-        let hash = hex::encode(identity.hash);
-        let directory = state.config.data_dir.join("identities").join(&hash);
-        let stored =
-            ratspeak_runtime::vault::read_plain_identity_key(&directory.join("identity")).unwrap();
-        assert_eq!(&key[..], &stored[..]);
-        let lxmf_hash = first["lxmf_hash"].as_str().unwrap();
-        assert_eq!(
-            first,
-            json!({
-                "ok": true,
-                "identity_hash": hash,
-                "lxmf_hash": lxmf_hash,
-                "display_name": format!("!Ratspeak.org-{}", &lxmf_hash[..6]),
-                "mnemonic": phrase,
-            })
-        );
-        let second = api_setup_complete(
-            app.state(),
-            SetupCompleteArgs {
-                display_name: Some("Ann".into()),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            second,
-            json!({
-                "ok": true,
-                "identity_hash": hash,
-                "lxmf_hash": lxmf_hash,
-                "display_name": "Ann",
-                "mnemonic": null,
-            })
-        );
+                let root = tempfile::tempdir().unwrap();
+                crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+                let config =
+                    crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+                let pool = db::init_pool(root.path()).unwrap();
+                db::init_schema(&pool).unwrap();
+                let state = Arc::new(AppState::new(
+                    config,
+                    pool,
+                    Arc::new(ratspeak_core::NoopEmitter),
+                    Arc::new(ratspeak_core::NoopNotifier),
+                ));
+                let app = tauri::test::mock_builder()
+                    .manage(Arc::clone(&state))
+                    .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                    .unwrap();
+                let first =
+                    api_setup_complete(app.state(), SetupCompleteArgs { display_name: None })
+                        .await
+                        .unwrap();
+                let phrase = first["mnemonic"].as_str().unwrap();
+                let key = ratspeak_runtime::derive_identity_key_from_phrase(phrase).unwrap();
+                let identity =
+                    rns_identity::identity::Identity::from_private_key(&key[..]).unwrap();
+                let hash = hex::encode(identity.hash);
+                let directory = state.config.data_dir.join("identities").join(&hash);
+                let stored =
+                    ratspeak_runtime::vault::read_plain_identity_key(&directory.join("identity"))
+                        .unwrap();
+                assert_eq!(&key[..], &stored[..]);
+                assert_eq!(
+                    ratspeak_runtime::vault::reveal_mnemonic(&directory, None)
+                        .unwrap()
+                        .as_str(),
+                    phrase
+                );
+                let lxmf_hash = first["lxmf_hash"].as_str().unwrap();
+                assert_eq!(
+                    first,
+                    json!({
+                        "ok": true,
+                        "identity_hash": hash,
+                        "lxmf_hash": lxmf_hash,
+                        "display_name": format!("!Ratspeak.org-{}", &lxmf_hash[..6]),
+                        "mnemonic": phrase,
+                    })
+                );
+                let second = api_setup_complete(
+                    app.state(),
+                    SetupCompleteArgs {
+                        display_name: Some("Ann".into()),
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    second,
+                    json!({
+                        "ok": true,
+                        "identity_hash": hash,
+                        "lxmf_hash": lxmf_hash,
+                        "display_name": "Ann",
+                        "mnemonic": null,
+                    })
+                );
+            });
     }
 
     #[derive(Default)]

@@ -1901,11 +1901,12 @@ pub async fn set_identity_status(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static VAULT_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(in crate::commands) static VAULT_TEST_SERIAL: std::sync::Mutex<()> =
+        std::sync::Mutex::new(());
 
     static TEMP_IDENTITY_COMMAND_COUNTER: AtomicU64 = AtomicU64::new(0);
 
