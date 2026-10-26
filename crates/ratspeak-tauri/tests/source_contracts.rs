@@ -6381,7 +6381,7 @@ fn release_workflows_build_once_and_publish_only_after_complete_aggregation() {
         "messages and contacts always stay with the right identity",
         "exporting a key now asks for your PIN",
         "copied phrases clear after a minute",
-        "Fixed exported files on desktop being named `download`",
+        "Fixed a file name bug when exporting on desktop",
         "Fixed recovery phrases not being saved in rare cases",
         "latest Python Reticulum and LXMF",
         "propagation nodes that hold many messages",
