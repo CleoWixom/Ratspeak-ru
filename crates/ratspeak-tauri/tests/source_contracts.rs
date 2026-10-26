@@ -6385,6 +6385,7 @@ fn release_workflows_build_once_and_publish_only_after_complete_aggregation() {
         "latest Python Reticulum and LXMF",
         "propagation nodes that hold many messages",
         "Fixed game boards being cut off on phones",
+        "captured chess pieces and game results easier to see",
         "USB radios are now available only to the signed-in user",
         "delete any old `99-ratspeak.rules` you copied by hand",
     ];
