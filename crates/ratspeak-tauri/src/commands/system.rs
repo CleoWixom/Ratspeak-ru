@@ -114,6 +114,9 @@ pub async fn api_setup_complete(
     args: SetupCompleteArgs,
 ) -> AppResult<Value> {
     let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    if state.hw_locked_hash().is_some() {
+        return Err(AppError::new("locked", "Unlock this identity first."));
+    }
     let display_name = sanitize_announced_display_name(args.display_name.as_deref().unwrap_or(""))
         .map_err(AppError::bad_request)?;
 
@@ -869,6 +872,46 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_refuses_a_locked_identity_without_renaming_it() {
+        use tauri::Manager;
+
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+        let pool = db::init_pool(root.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        db::save_identity(
+            &pool,
+            hash,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "Personal",
+            "Alice",
+        );
+        db::set_active_identity(&pool, hash).unwrap();
+        let state = Arc::new(AppState::new(
+            config,
+            pool,
+            Arc::new(ratspeak_core::NoopEmitter),
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        state.set_hw_locked(Some(hash.to_owned()));
+        let before = db::get_active_identity(&state.db).unwrap().unwrap();
+        let generation = state.current_identity_session_generation();
+        let app = tauri::test::mock_builder()
+            .manage(Arc::clone(&state))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        for display_name in [Some("Changed".to_owned()), None, Some("\0".to_owned())] {
+            let result = api_setup_complete(app.state(), SetupCompleteArgs { display_name }).await;
+            assert_eq!(db::get_active_identity(&state.db).unwrap().unwrap(), before);
+            assert_eq!(result.unwrap_err().code, "locked");
+            assert_eq!(state.hw_locked_hash().as_deref(), Some(hash));
+            assert_eq!(state.current_identity_session_generation(), generation);
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn setup_returns_the_recoverable_phrase_once_with_the_same_json_shape() {

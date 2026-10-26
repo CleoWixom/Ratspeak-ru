@@ -103,7 +103,6 @@ pub(crate) const LOCK_FREE: &[&str] = &[
     "api_version",
     "api_startup_progress",
     "api_setup_status",
-    "api_setup_complete",
     "api_setup_restart",
     "api_set_foreground",
     "api_factory_reset",
@@ -196,6 +195,39 @@ mod tests {
     use tauri::test::{
         INVOKE_KEY, MockRuntime, get_ipc_response, mock_builder, mock_context, noop_assets,
     };
+
+    #[test]
+    fn setup_admission_allows_first_run_and_rejects_a_locked_identity() {
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+        let pool = crate::db::init_pool(root.path()).unwrap();
+        crate::db::init_schema(&pool).unwrap();
+        let state = crate::state::AppState::new(
+            config,
+            pool,
+            std::sync::Arc::new(ratspeak_core::NoopEmitter),
+            std::sync::Arc::new(ratspeak_core::NoopNotifier),
+        );
+        assert!(super::refusal(&state, "api_setup_complete").is_none());
+
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        crate::db::save_identity(
+            &state.db,
+            hash,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "Personal",
+            "Alice",
+        );
+        crate::db::set_active_identity(&state.db, hash).unwrap();
+        assert!(super::refusal(&state, "api_setup_complete").is_none());
+
+        state.set_hw_locked(Some(hash.to_owned()));
+        assert_eq!(
+            super::refusal(&state, "api_setup_complete").unwrap().code,
+            "locked"
+        );
+    }
 
     fn invoke(window: &tauri::WebviewWindow<MockRuntime>, command: &str) -> Result<Value, Value> {
         get_ipc_response(
