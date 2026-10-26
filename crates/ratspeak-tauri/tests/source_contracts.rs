@@ -2881,7 +2881,8 @@ fn games_ui_uses_runtime_manifests_and_accessible_atomic_actions() {
     assert!(games_css.contains(".ttt-cell:focus-visible"));
     assert!(games_css.contains(".chess-square:focus-visible"));
     assert!(games_css.contains(".four-lane-action:focus-visible"));
-    assert!(games_css.contains("background: var(--surface-scrim);"));
+    assert!(games_css.contains("background: rgba(var(--theme-page-rgb), 0.85);"));
+    assert!(!games_css.contains("var(--surface-overlay)"));
     assert!(
         !games_css.contains(".game-modal"),
         "Games must use the shared bottom sheet instead of a parallel legacy modal"

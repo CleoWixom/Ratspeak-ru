@@ -771,7 +771,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: var(--surface-scrim);
+    background: rgba(var(--theme-page-rgb), 0.85);
     backdrop-filter: blur(3px);
     -webkit-backdrop-filter: blur(3px);
     border-radius: var(--radius-lg);
@@ -874,7 +874,7 @@
 .ttt-game-over-overlay {
     position: absolute; inset: 0;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
-    background: var(--surface-scrim);
+    background: rgba(var(--theme-page-rgb), 0.85);
     backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
     border-radius: var(--radius-xl); z-index: 2; gap: 6px;
     pointer-events: none;
@@ -1128,7 +1128,7 @@
     justify-content: center;
     padding: var(--space-6);
     border-radius: var(--radius-xl);
-    background: var(--surface-scrim);
+    background: rgba(var(--theme-page-rgb), 0.85);
     backdrop-filter: blur(4px);
     -webkit-backdrop-filter: blur(4px);
     color: var(--text-primary);
@@ -1160,14 +1160,23 @@
 .chess-board-wrap {
     --chess-gap: 4px;
     --chess-row-height: 1.75rem;
-    --chess-tray-height: 18px;
+    --chess-tray-height: 26px;
     --chess-chrome: calc(2 * var(--chess-row-height) + 2 * var(--chess-tray-height) + 4 * var(--chess-gap));
+    /* Tray inks follow the well, not the page. */
+    --chess-tray-ink-dark: var(--text-primary);
+    --chess-tray-ink-light: var(--bg-primary);
+    --chess-tray-shade: var(--bg-dark);
     position: relative;
     display: flex;
     flex-direction: column;
     align-items: stretch;
     gap: var(--chess-gap);
     width: min(100%, 450px);
+}
+[data-theme="dark"] .chess-board-wrap {
+    --chess-tray-ink-dark: var(--bg-primary);
+    --chess-tray-ink-light: var(--text-primary);
+    --chess-tray-shade: var(--bg-primary);
 }
 
 .chess-player-row {
@@ -1195,6 +1204,7 @@
     background: currentColor;
     box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.14);
     flex-shrink: 0;
+    margin-left: 3px;
 }
 .chess-player-name {
     display: inline-flex;
@@ -1205,26 +1215,50 @@
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+/* Plain names truncate; Ratspeak names already do via .ratspeak-name-text. */
+.chess-player-name > bdi { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .chess-material-pill {
     display: inline-block;
-    padding: 1px 6px;
+    padding: 0 5px;
     border-radius: var(--radius-sm);
-    background: rgba(var(--accent-rgb), 0.14);
-    color: var(--accent);
-    font-size: 0.75em;
+    background: var(--accent-bg);
+    color: var(--text-primary);
+    font-size: var(--text-2xs);
     font-weight: 700;
-    line-height: 1.2;
+    line-height: 1.45;
+    font-variant-numeric: tabular-nums;
 }
 
+/* Wells contrast with the pieces they hold: light tone for black pieces, deep tone for white. */
 .chess-captured-tray {
     display: flex;
     flex: none;
-    gap: 1px;
+    align-self: flex-start;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
     height: var(--chess-tray-height);
-    padding: 0 8px;
+    padding: 0 6px;
+    border: 1px solid var(--border-control);
+    border-radius: var(--radius-md);
+    background: var(--chess-light);
+    color: var(--chess-tray-ink-dark);
     overflow: hidden;
 }
-.chess-captured-piece { flex: 0 1 auto; min-width: 0; width: 18px; height: 18px; opacity: 0.72; }
+.chess-captured-tray[data-side="b"] {
+    background: color-mix(in oklab, var(--chess-dark) 40%, var(--chess-tray-shade));
+    color: var(--chess-tray-ink-light);
+}
+.chess-captured-tray:empty { visibility: hidden; }
+.chess-captured-group { display: inline-flex; flex: none; align-items: center; }
+.chess-captured-piece { flex: none; width: 22px; height: 22px; }
+.chess-captured-count {
+    margin-left: 1px;
+    font-size: var(--text-2xs);
+    font-weight: var(--type-weight-bold);
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+}
 
 .chess-board {
     display: grid;
@@ -1239,7 +1273,7 @@
     background:
         linear-gradient(135deg, rgba(var(--ble-accent-rgb), 0.24), rgba(var(--accent-rgb), 0.18)),
         var(--chess-border);
-    box-shadow: 0 18px 38px rgba(0,0,0,0.22), 0 0 0 1px rgba(255,255,255,0.06);
+    box-shadow: var(--shadow-md), 0 0 0 1px rgba(255,255,255,0.06);
     user-select: none;
     -webkit-user-select: none;
     touch-action: manipulation;
@@ -1365,7 +1399,7 @@
 .chess-board-overlay {
     position: absolute; inset: 0;
     display: flex; align-items: center; justify-content: center;
-    background: var(--surface-overlay);
+    background: rgba(var(--theme-page-rgb), 0.85);
     backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
     border-radius: var(--radius-md); z-index: 2;
     font-weight: 600; color: var(--text-primary); text-align: center;
@@ -1376,8 +1410,8 @@
     position: absolute; inset: 0;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     background:
-        linear-gradient(135deg, rgba(var(--accent-rgb), 0.18), rgba(var(--ble-accent-rgb), 0.12)),
-        var(--surface-overlay);
+        linear-gradient(135deg, rgba(var(--accent-rgb), 0.12), rgba(var(--ble-accent-rgb), 0.08)),
+        rgba(var(--theme-page-rgb), 0.85);
     backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
     border-radius: var(--radius-md); z-index: 2; gap: 6px;
     pointer-events: none;
@@ -1399,7 +1433,6 @@
 .game-over-overlay.draw .chess-game-over-text { color: var(--status-warning-fg); }
 
 @media (max-width: 480px) {
-    .chess-captured-piece { width: 15px; height: 15px; }
     .chess-player-row { font-size: var(--text-xs); }
     .chess-coord { font-size: 0.6em; }
     .four-board-wrap {

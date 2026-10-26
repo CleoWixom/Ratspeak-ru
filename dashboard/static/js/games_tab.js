@@ -999,23 +999,27 @@
              + (captured.q || 0) * 9;
     }
 
+    // One icon per kind plus a ×N count; side 'w' shows the black pieces White captured.
     function _renderCapturedTray(captured, side) {
-        // side 'w' shows the black pieces White has captured.
         var otherColor = (side === 'w') ? 'b' : 'w';
-        var order = ['q','r','b','n','p']; // high-value first
-        var html = '<div class="chess-captured-tray" data-side="' + side + '">';
-        var any = false;
+        var order = ['q', 'r', 'b', 'n', 'p']; // high-value first
+        var names = { q: 'queen', r: 'rook', b: 'bishop', n: 'knight', p: 'pawn' };
+        var groups = '';
+        var spoken = [];
         for (var i = 0; i < order.length; i++) {
             var kind = order[i];
             var count = captured[kind] || 0;
-            for (var j = 0; j < count; j++) {
-                html += '<svg class="chess-captured-piece" viewBox="0 0 45 45" aria-hidden="true">' +
-                    '<use href="/static/assets/chess-pieces.svg#' + otherColor + kind + '"/></svg>';
-                any = true;
-            }
+            if (!count) continue;
+            groups += '<span class="chess-captured-group">' +
+                '<svg class="chess-captured-piece" viewBox="0 0 45 45" aria-hidden="true">' +
+                '<use href="/static/assets/chess-pieces.svg#' + otherColor + kind + '"/></svg>' +
+                (count > 1 ? '<span class="chess-captured-count" aria-hidden="true">×' + count + '</span>' : '') +
+                '</span>';
+            spoken.push(count + ' ' + names[kind] + (count > 1 ? 's' : ''));
         }
-        html += '</div>';
-        return any ? html : '<div class="chess-captured-tray" data-side="' + side + '"></div>';
+        if (!groups) return '<div class="chess-captured-tray" data-side="' + side + '"></div>';
+        return '<div class="chess-captured-tray" data-side="' + side + '" role="img" aria-label="' +
+            (side === 'w' ? 'White' : 'Black') + ' captured: ' + spoken.join(', ') + '">' + groups + '</div>';
     }
 
     function _renderChessBoard(session) {
