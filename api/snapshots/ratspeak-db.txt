@@ -421,6 +421,7 @@ pub fn ratspeak_db::db::touch_identity_activity_for_service(&ratspeak_db::DbPool
 pub fn ratspeak_db::db::touch_identity_activity_for_services(&ratspeak_db::DbPool, &[(alloc::string::String, f64, core::option::Option<alloc::string::String>, core::option::Option<alloc::string::String>)], core::option::Option<&str>, &[&str], bool) -> usize
 pub fn ratspeak_db::db::touch_identity_activity_updates(&ratspeak_db::DbPool, &[ratspeak_db::IdentityActivityUpdate]) -> usize
 pub fn ratspeak_db::db::touch_identity_last_heard(&ratspeak_db::DbPool, &str, f64) -> bool
+pub fn ratspeak_db::db::try_save_identity(&ratspeak_db::DbPool, &str, &str, &str, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::db::try_save_message(&ratspeak_db::DbPool, &str, &str, &str, &str, &str, f64, &str, &str, &str, &str, &str, &str, &str, &str, &str, core::option::Option<&str>) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::db::try_save_message_with_audio(&ratspeak_db::DbPool, &str, &str, &str, &str, &str, f64, &str, &str, &str, &str, &str, &str, &str, &str, &str, core::option::Option<&str>, core::option::Option<u8>, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::db::try_save_message_with_audio_conn(&rusqlite::Connection, &str, &str, &str, &str, &str, f64, &str, &str, &str, &str, &str, &str, &str, &str, &str, core::option::Option<&str>, core::option::Option<u8>, &str) -> core::result::Result<(), alloc::string::String>
@@ -780,6 +781,7 @@ pub fn ratspeak_db::touch_identity_activity_for_service(&ratspeak_db::DbPool, &[
 pub fn ratspeak_db::touch_identity_activity_for_services(&ratspeak_db::DbPool, &[(alloc::string::String, f64, core::option::Option<alloc::string::String>, core::option::Option<alloc::string::String>)], core::option::Option<&str>, &[&str], bool) -> usize
 pub fn ratspeak_db::touch_identity_activity_updates(&ratspeak_db::DbPool, &[ratspeak_db::IdentityActivityUpdate]) -> usize
 pub fn ratspeak_db::touch_identity_last_heard(&ratspeak_db::DbPool, &str, f64) -> bool
+pub fn ratspeak_db::try_save_identity(&ratspeak_db::DbPool, &str, &str, &str, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::try_save_message(&ratspeak_db::DbPool, &str, &str, &str, &str, &str, f64, &str, &str, &str, &str, &str, &str, &str, &str, &str, core::option::Option<&str>) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::try_save_message_with_audio(&ratspeak_db::DbPool, &str, &str, &str, &str, &str, f64, &str, &str, &str, &str, &str, &str, &str, &str, &str, core::option::Option<&str>, core::option::Option<u8>, &str) -> core::result::Result<(), alloc::string::String>
 pub fn ratspeak_db::try_save_message_with_audio_conn(&rusqlite::Connection, &str, &str, &str, &str, &str, f64, &str, &str, &str, &str, &str, &str, &str, &str, &str, core::option::Option<&str>, core::option::Option<u8>, &str) -> core::result::Result<(), alloc::string::String>

@@ -1019,36 +1019,42 @@ async fn import_identity_request(
     .await
 }
 
+/// A failed identity creation, as the window shows it. A phrase that could
+/// not be stored has a code of its own: no identity was created without it.
+pub(crate) fn identity_import_error(error: crate::lxmf::IdentityImportError) -> AppError {
+    match error {
+        crate::lxmf::IdentityImportError::Phrase(error) => {
+            tracing::error!(%error, "identity not created: its recovery phrase was not stored");
+            AppError::new(
+                "phrase_not_saved",
+                "Ratspeak couldn't save the recovery phrase, so it didn't create the identity. \
+                 Make sure this device has free storage, then try again.",
+            )
+        }
+        error => AppError::bad_request(error.to_string()),
+    }
+}
+
 fn persist_parsed_identity_import(
     state: Arc<AppState>,
     parsed: ParsedIdentityImport,
     nickname: String,
     mnemonic: Option<Zeroizing<String>>,
-) -> Result<(String, String), String> {
-    let result = {
-        let lxmf = state.lxmf.lock().map_err(|_| "Lock error".to_string())?;
-        if let Some(manager) = lxmf.as_ref() {
-            manager.import_identity(&parsed.key_bytes, &nickname, &state.db)
-        } else {
-            crate::lxmf::LxmfManager::import_identity_to_data_dir(
-                &state.config.data_dir,
-                &parsed.key_bytes,
-                &nickname,
-                &state.db,
-            )
-        }
-        .map_err(|error| error.to_string())?
-    };
-    if let Some(phrase) = mnemonic.as_deref().map(String::as_str) {
-        let seed_dir = state.config.data_dir.join("identities").join(&result.0);
-        if ratspeak_runtime::vault::store_plaintext_seed(&seed_dir, phrase).is_err() {
-            tracing::warn!(
-                reason = "write_failed",
-                "could not store recovery-phrase sidecar"
-            );
-        }
-    }
-    Ok(result)
+) -> AppResult<(String, String)> {
+    // A recoverable identity is created with its stored phrase or not at all.
+    let job = mnemonic
+        .as_ref()
+        .map(|_| vault::try_acquire_job())
+        .transpose()
+        .map_err(|e| AppError::service_unavailable(e.to_string()))?;
+    crate::lxmf::LxmfManager::import_identity_with_phrase(
+        &state.config.data_dir,
+        &parsed.key_bytes,
+        mnemonic.as_deref().map(String::as_str).zip(job.as_ref()),
+        &nickname,
+        &state.db,
+    )
+    .map_err(identity_import_error)
 }
 
 // The production-used seam lets regression tests pause preparation or the
@@ -1068,7 +1074,7 @@ where
             ParsedIdentityImport,
             String,
             Option<Zeroizing<String>>,
-        ) -> Result<(String, String), String>
+        ) -> AppResult<(String, String)>
         + Send
         + 'static,
 {
@@ -1105,8 +1111,7 @@ where
         persist(worker_state, parsed, nickname, mnemonic)
     })
     .await
-    .map_err(|_| AppError::internal("import_identity task panicked"))?
-    .map_err(AppError::bad_request)?;
+    .map_err(|_| AppError::internal("import_identity task panicked"))??;
 
     // Reuse this exact lifecycle owner. A nested acquisition would deadlock,
     // while releasing it here would allow reset to erase the just-imported row.
@@ -2213,66 +2218,71 @@ pub(super) mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Vault admission is process-wide, so the seed worker's tests hold the
+    // vault serial from the start, not from inside the timed wait.
+    #[test]
     #[cfg(feature = "seed")]
-    async fn identity_mutation_cancelled_import_keeps_reset_blocked_until_seed_worker_finishes() {
-        let (_root, state) = mutation_state();
-        let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
-        let identity = Identity::from_private_key(&key[..]).unwrap();
-        let hash = hex::encode(identity.hash);
-        let request_fence = state.activity_request_fence();
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let worker_state = Arc::clone(&state);
-        let import = tokio::spawn(async move {
-            import_identity_after_parse(
-                worker_state,
-                None,
-                Some(phrase),
-                request_fence,
-                std::future::ready(Ok(parsed_key(key.to_vec(), None))),
-                move |state, parsed, nickname, mnemonic| {
-                    ready_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    let _serial = VAULT_TEST_SERIAL.lock().unwrap();
-                    persist_parsed_identity_import(state, parsed, nickname, mnemonic)
-                },
-            )
-            .await
-        });
-        ready_rx.await.unwrap();
-        import.abort();
-        assert!(import.await.unwrap_err().is_cancelled());
-        let reset_state = Arc::clone(&state);
-        let reset_hash = hash.clone();
-        let mut reset = tokio::spawn(async move {
-            let _lifecycle = reset_state.identity_switch_lock.lock_owned().await;
-            crate::lxmf::clear_identity_storage_namespace(&reset_state.config.data_dir).unwrap();
-            db::delete_identity(&reset_state.db, &reset_hash, true).unwrap();
-        });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(40), &mut reset)
+    fn identity_mutation_cancelled_import_keeps_reset_blocked_until_seed_worker_finishes() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        test_runtime().block_on(async {
+            let (_root, state) = mutation_state();
+            let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
+            let identity = Identity::from_private_key(&key[..]).unwrap();
+            let hash = hex::encode(identity.hash);
+            let request_fence = state.activity_request_fence();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let worker_state = Arc::clone(&state);
+            let import = tokio::spawn(async move {
+                import_identity_after_parse(
+                    worker_state,
+                    None,
+                    Some(phrase),
+                    request_fence,
+                    std::future::ready(Ok(parsed_key(key.to_vec(), None))),
+                    move |state, parsed, nickname, mnemonic| {
+                        ready_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        persist_parsed_identity_import(state, parsed, nickname, mnemonic)
+                    },
+                )
                 .await
-                .is_err()
-        );
-        release_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), reset)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            !state
-                .config
-                .data_dir
-                .join("identities")
-                .join(&hash)
-                .exists()
-        );
-        assert!(db::get_identity(&state.db, &hash).is_none());
-        assert!(
-            db::get_active_identity(&state.db).unwrap().is_none(),
-            "cancelled import must not later activate or resurrect its row"
-        );
+            });
+            ready_rx.await.unwrap();
+            import.abort();
+            assert!(import.await.unwrap_err().is_cancelled());
+            let reset_state = Arc::clone(&state);
+            let reset_hash = hash.clone();
+            let mut reset = tokio::spawn(async move {
+                let _lifecycle = reset_state.identity_switch_lock.lock_owned().await;
+                crate::lxmf::clear_identity_storage_namespace(&reset_state.config.data_dir)
+                    .unwrap();
+                db::delete_identity(&reset_state.db, &reset_hash, true).unwrap();
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(40), &mut reset)
+                    .await
+                    .is_err()
+            );
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), reset)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !state
+                    .config
+                    .data_dir
+                    .join("identities")
+                    .join(&hash)
+                    .exists()
+            );
+            assert!(db::get_identity(&state.db, &hash).is_none());
+            assert!(
+                db::get_active_identity(&state.db).unwrap().is_none(),
+                "cancelled import must not later activate or resurrect its row"
+            );
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2349,49 +2359,135 @@ pub(super) mod tests {
         assert!(db::get_all_identities(&state.db).is_empty());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[test]
     #[cfg(feature = "seed")]
-    async fn identity_mutation_explicit_and_backup_seeds_commit_with_first_activation() {
-        for explicit in [true, false] {
+    fn identity_mutation_explicit_and_backup_seeds_commit_with_first_activation() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        test_runtime().block_on(async {
+            for explicit in [true, false] {
+                let (_root, state) = mutation_state();
+                let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
+                let identity = Identity::from_private_key(&key[..]).unwrap();
+                let hash = hex::encode(identity.hash);
+                let parsed = parsed_key(key.to_vec(), (!explicit).then_some(phrase.clone()));
+                let value = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    import_identity_after_parse(
+                        Arc::clone(&state),
+                        None,
+                        explicit.then_some(phrase),
+                        state.activity_request_fence(),
+                        std::future::ready(Ok(parsed)),
+                        persist_parsed_identity_import,
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(value["hash"], hash);
+                assert_eq!(value["activated"], true);
+                assert!(
+                    state
+                        .config
+                        .data_dir
+                        .join("identities")
+                        .join(&hash)
+                        .join("identity.seed")
+                        .is_file()
+                );
+                assert!(db::get_identity(&state.db, &hash).is_some());
+                assert_eq!(
+                    db::get_active_identity(&state.db).unwrap().unwrap()["hash"],
+                    hash
+                );
+            }
+        });
+    }
+
+    /// Asserts that no part of `hash` was created: no row, no activation and
+    /// no key, vault or phrase file.
+    fn assert_no_identity(state: &AppState, hash: &str) {
+        assert!(db::get_identity(&state.db, hash).is_none(), "listed");
+        assert!(
+            db::get_active_identity(&state.db).unwrap().is_none(),
+            "active"
+        );
+        let profile = state.config.data_dir.join("identities").join(hash);
+        assert!(!identity_material_exists(&profile), "key left behind");
+        assert!(
+            !profile.join("identity.seed").is_file(),
+            "phrase left behind"
+        );
+    }
+
+    async fn import_recoverable(
+        state: &Arc<AppState>,
+        key: &[u8],
+        phrase: &Zeroizing<String>,
+    ) -> AppResult<Value> {
+        import_identity_after_parse(
+            Arc::clone(state),
+            None,
+            Some(phrase.clone()),
+            state.activity_request_fence(),
+            std::future::ready(Ok(parsed_key(key.to_vec(), None))),
+            persist_parsed_identity_import,
+        )
+        .await
+    }
+
+    // A recoverable identity is created with its stored phrase or not at
+    // all: while another identity encryption holds the vault, nothing is.
+    #[test]
+    #[cfg(feature = "seed")]
+    fn a_recoverable_identity_is_not_created_while_the_vault_is_busy() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        test_runtime().block_on(async {
             let (_root, state) = mutation_state();
             let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
-            let identity = Identity::from_private_key(&key[..]).unwrap();
-            let hash = hex::encode(identity.hash);
-            let parsed = parsed_key(key.to_vec(), (!explicit).then_some(phrase.clone()));
-            let value = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                import_identity_after_parse(
-                    Arc::clone(&state),
-                    None,
-                    explicit.then_some(phrase),
-                    state.activity_request_fence(),
-                    std::future::ready(Ok(parsed)),
-                    |state, parsed, nickname, mnemonic| {
-                        let _serial = VAULT_TEST_SERIAL.lock().unwrap();
-                        persist_parsed_identity_import(state, parsed, nickname, mnemonic)
-                    },
-                ),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(value["hash"], hash);
-            assert_eq!(value["activated"], true);
-            assert!(
-                state
-                    .config
-                    .data_dir
-                    .join("identities")
-                    .join(&hash)
-                    .join("identity.seed")
-                    .is_file()
-            );
-            assert!(db::get_identity(&state.db, &hash).is_some());
+            let hash = hex::encode(Identity::from_private_key(&key[..]).unwrap().hash);
+            let busy = vault::try_acquire_job().unwrap();
+            let refused = import_recoverable(&state, &key[..], &phrase).await;
+            assert_eq!(refused.unwrap_err().code, "service_unavailable");
+            assert_no_identity(&state, &hash);
+
+            drop(busy);
+            let created = import_recoverable(&state, &key[..], &phrase).await.unwrap();
             assert_eq!(
-                db::get_active_identity(&state.db).unwrap().unwrap()["hash"],
-                hash
+                (&created["hash"], &created["activated"]),
+                (&json!(hash), &json!(true))
             );
-        }
+            let profile = state.config.data_dir.join("identities").join(&hash);
+            assert_eq!(vault::reveal_mnemonic(&profile, None).unwrap(), phrase);
+        });
+    }
+
+    // A phrase that cannot be written leaves no identity behind, and the same
+    // identity is created with its phrase once it can be.
+    #[test]
+    #[cfg(feature = "seed")]
+    fn a_recoverable_identity_is_not_created_when_its_phrase_cannot_be_written() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        test_runtime().block_on(async {
+            let (_root, state) = mutation_state();
+            let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
+            let hash = hex::encode(Identity::from_private_key(&key[..]).unwrap().hash);
+            let profile = state.config.data_dir.join("identities").join(&hash);
+            let blocked = profile.join("identity.seed");
+            std::fs::create_dir_all(blocked.join("occupied")).unwrap();
+            let failed = import_recoverable(&state, &key[..], &phrase).await;
+            assert_eq!(failed.unwrap_err().code, "phrase_not_saved");
+            assert_no_identity(&state, &hash);
+            assert!(
+                blocked.join("occupied").is_dir(),
+                "only its own files are removed"
+            );
+
+            std::fs::remove_dir_all(&blocked).unwrap();
+            let created = import_recoverable(&state, &key[..], &phrase).await.unwrap();
+            assert_eq!(created["activated"], true);
+            assert_eq!(vault::reveal_mnemonic(&profile, None).unwrap(), phrase);
+        });
     }
 
     fn private_key_bytes() -> Vec<u8> {

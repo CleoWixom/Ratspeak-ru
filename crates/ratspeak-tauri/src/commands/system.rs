@@ -144,6 +144,9 @@ pub async fn api_setup_complete(
             .to_string();
         (hash, lxmf_hash, None)
     } else {
+        // The phrase shown below is stored with the identity, or neither is.
+        let job = ratspeak_runtime::vault::try_acquire_job()
+            .map_err(|e| AppError::service_unavailable(e.to_string()))?;
         let (m, key) = match ratspeak_runtime::generate_recoverable_key() {
             Ok(v) => v,
             Err(e) => return Ok(json!({ "ok": false, "error": e })),
@@ -151,19 +154,23 @@ pub async fn api_setup_complete(
         let write_dir = state.config.data_dir.clone();
         let write_db = state.db.clone();
         let write_nick = display_name.clone();
+        let write_phrase = m.clone();
         let write = tokio::task::spawn_blocking(move || {
-            crate::lxmf::LxmfManager::import_identity_to_data_dir(
+            crate::lxmf::LxmfManager::import_identity_with_phrase(
                 &write_dir,
                 &key[..],
+                Some((write_phrase.as_str(), &job)),
                 &write_nick,
                 &write_db,
             )
-            .map_err(|e| e.to_string())
         })
         .await
         .map_err(|_| AppError::internal("setup write task panicked"))?;
         let (hash, lxmf_hash) = match write {
             Ok(t) => t,
+            Err(error @ crate::lxmf::IdentityImportError::Phrase(_)) => {
+                return Err(super::identity::identity_import_error(error));
+            }
             Err(e) => {
                 return Ok(
                     json!({ "ok": false, "error": format!("Failed to create identity: {e}") }),
@@ -182,14 +189,6 @@ pub async fn api_setup_complete(
             .await
             .map_err(|_| AppError::internal("identity activation task failed"))?
             .map_err(AppError::internal)?;
-        // Persist the phrase so the first identity can re-display it later too.
-        let seed_dir = state.config.data_dir.join("identities").join(&hash);
-        if ratspeak_runtime::vault::store_plaintext_seed(&seed_dir, &m).is_err() {
-            tracing::warn!(
-                reason = "write_failed",
-                "could not store recovery-phrase sidecar at setup"
-            );
-        }
         (hash, lxmf_hash, Some(m))
     };
 
@@ -991,6 +990,73 @@ mod tests {
                         "display_name": "Ann",
                         "mnemonic": null,
                     })
+                );
+            });
+    }
+
+    /// Identity key, vault or phrase files under `data_dir`'s identities.
+    fn identity_files(data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(data_dir.join("identities"))
+            .unwrap()
+            .flatten()
+            .flat_map(|entry| {
+                ["identity", "identity.enc", "identity.seed"].map(|name| entry.path().join(name))
+            })
+            .filter(|path| path.exists())
+            .collect()
+    }
+
+    // Setup succeeds only once the phrase it shows is stored: while another
+    // identity encryption holds the vault, it creates nothing.
+    #[test]
+    fn setup_creates_no_identity_until_its_recovery_phrase_can_be_stored() {
+        let _serial = super::super::identity::tests::VAULT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use tauri::Manager;
+
+                let root = tempfile::tempdir().unwrap();
+                crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+                let config =
+                    crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+                let pool = db::init_pool(root.path()).unwrap();
+                db::init_schema(&pool).unwrap();
+                let state = Arc::new(AppState::new(
+                    config,
+                    pool,
+                    Arc::new(ratspeak_core::NoopEmitter),
+                    Arc::new(ratspeak_core::NoopNotifier),
+                ));
+                let app = tauri::test::mock_builder()
+                    .manage(Arc::clone(&state))
+                    .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                    .unwrap();
+                let busy = ratspeak_runtime::vault::try_acquire_job().unwrap();
+                let refused =
+                    api_setup_complete(app.state(), SetupCompleteArgs { display_name: None }).await;
+                assert_eq!(refused.unwrap_err().code, "service_unavailable");
+                assert!(db::get_all_identities(&state.db).is_empty());
+                assert!(db::get_active_identity(&state.db).unwrap().is_none());
+                assert!(identity_files(&state.config.data_dir).is_empty());
+
+                drop(busy);
+                let created =
+                    api_setup_complete(app.state(), SetupCompleteArgs { display_name: None })
+                        .await
+                        .unwrap();
+                let hash = created["identity_hash"].as_str().unwrap();
+                let directory = state.config.data_dir.join("identities").join(hash);
+                assert_eq!(
+                    ratspeak_runtime::vault::reveal_mnemonic(&directory, None)
+                        .unwrap()
+                        .as_str(),
+                    created["mnemonic"].as_str().unwrap()
                 );
             });
     }

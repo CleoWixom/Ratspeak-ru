@@ -2062,11 +2062,19 @@ pub fn save_identity(
     nickname: &str,
     display_name: &str,
 ) {
+    let _ = try_save_identity(pool, hash_hex, lxmf_hash, nickname, display_name);
+}
+
+/// As `save_identity`, reporting a row that was not written.
+pub fn try_save_identity(
+    pool: &DbPool,
+    hash_hex: &str,
+    lxmf_hash: &str,
+    nickname: &str,
+    display_name: &str,
+) -> Result<(), String> {
     let _write = IdentityTablesWrite;
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
     let now = now_ts();
     // ON CONFLICT closes the race between two "not exists" → INSERT callers.
     // Only an activation marks an identity used.
@@ -2081,7 +2089,8 @@ pub fn save_identity(
              display_name = excluded.display_name",
         params![hash_hex, lxmf_hash, nickname, display_name, now],
     )
-    .ok();
+    .map_err(|e| format!("identity: {e}"))?;
+    Ok(())
 }
 
 pub fn set_identity_propagation_node(

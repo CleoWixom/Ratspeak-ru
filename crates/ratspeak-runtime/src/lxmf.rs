@@ -1983,6 +1983,42 @@ pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Why an identity was not imported. Nothing it wrote is left behind.
+#[derive(Debug, thiserror::Error)]
+pub enum IdentityImportError {
+    #[error("Identity already exists")]
+    Exists,
+    #[error("{0}")]
+    InvalidKey(String),
+    /// Its recovery phrase could not be stored.
+    #[error("recovery phrase not stored: {0}")]
+    Phrase(crate::vault::VaultError),
+    #[error("{0}")]
+    Storage(String),
+}
+
+/// Takes back what a failed import wrote. A namespace it created goes whole,
+/// through its recorded deletion, which a restart finishes; in one that was
+/// there before, only the files it created go.
+fn discard_failed_import(ratspeak_dir: &Path, hash: &str, new_namespace: bool, created: &[&Path]) {
+    if new_namespace {
+        let retired = data_root_for_identity_namespace(ratspeak_dir)
+            .and_then(|root| established_storage_namespace(&root))
+            .and_then(|witness| retire_identity_namespace(ratspeak_dir, hash, true, &witness));
+        match retired {
+            Ok(()) => return,
+            Err(error) => tracing::warn!(%error, "could not retire a failed import's namespace"),
+        }
+    }
+    for path in created {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(%error, "could not remove a failed import's file"),
+        }
+    }
+}
+
 /// Leaves `dir` to its owner alone, as a fresh profile's folders are. Unix
 /// only; elsewhere the platform's own folders already are.
 pub fn make_private(dir: &Path) -> std::io::Result<()> {
@@ -2436,32 +2472,85 @@ impl LxmfManager {
         nickname: &str,
         db_pool: &DbPool,
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self::import_identity_with_phrase(
+            ratspeak_dir,
+            key_bytes,
+            None,
+            nickname,
+            db_pool,
+        )?)
+    }
+
+    /// Imports a private identity, with the recovery phrase it derives from
+    /// when it has one. The phrase is stored and read back before the key,
+    /// and the row comes last: an identity that fails leaves none of them.
+    pub fn import_identity_with_phrase(
+        ratspeak_dir: &Path,
+        key_bytes: &[u8],
+        phrase: Option<(&str, &crate::vault::VaultJob)>,
+        nickname: &str,
+        db_pool: &DbPool,
+    ) -> Result<(String, String), IdentityImportError> {
         if key_bytes.len() != 64 {
-            return Err("Identity key must be exactly 64 bytes".into());
+            return Err(IdentityImportError::InvalidKey(
+                "Identity key must be exactly 64 bytes".into(),
+            ));
         }
 
         let identity = Identity::from_private_key(key_bytes)
-            .map_err(|e| format!("Invalid identity key: {e}"))?;
+            .map_err(|e| IdentityImportError::InvalidKey(format!("Invalid identity key: {e}")))?;
         let hash_hex = hex::encode(identity.hash);
 
         let id_dir = ratspeak_dir.join("identities").join(&hash_hex);
-        if id_dir.join("identity").exists() {
-            return Err("Identity already exists".into());
+        let key_path = id_dir.join("identity");
+        if key_path.exists() {
+            return Err(IdentityImportError::Exists);
         }
 
         let lxmf_dest =
             Destination::hash_from_name_and_identity(LXMF_APP_NAME, Some(&identity.hash));
         let lxmf_hex = hex::encode(lxmf_dest);
 
-        initialize_identity_storage_namespace(ratspeak_dir, &hash_hex)?;
-        identity.to_file(&id_dir.join("identity"))?;
+        let storage =
+            |error: &dyn std::fmt::Display| IdentityImportError::Storage(error.to_string());
+        let new_namespace = !id_dir.try_exists().map_err(|e| storage(&e))?;
+        initialize_identity_storage_namespace(ratspeak_dir, &hash_hex).map_err(|e| storage(&e))?;
+        let discard = |created: &[&Path]| {
+            discard_failed_import(ratspeak_dir, &hash_hex, new_namespace, created);
+        };
+        let seed_path = id_dir.join(crate::vault::SEED_FILE);
+        let mut created = Vec::new();
+        if let Some((phrase, job)) = phrase {
+            let seed_existed = seed_path.try_exists().map_err(|e| storage(&e))?;
+            if !seed_existed {
+                created.push(seed_path.as_path());
+            }
+            if let Err(error) = job.store_plaintext_seed(&id_dir, phrase) {
+                // An uncertain or unverified write may have left this phrase.
+                if seed_existed && matches!(error, crate::vault::VaultError::RecoveryRequired(_)) {
+                    created.push(seed_path.as_path());
+                }
+                discard(&created);
+                return Err(IdentityImportError::Phrase(error));
+            }
+        }
+        created.push(key_path.as_path());
+        if let Err(error) = identity.to_file(&key_path) {
+            discard(&created);
+            return Err(storage(&error));
+        }
 
         let display_name = if nickname.is_empty() {
             format!("!Ratspeak.org-{}", &lxmf_hex[..6])
         } else {
             nickname.to_string()
         };
-        db::save_identity(db_pool, &hash_hex, &lxmf_hex, nickname, &display_name);
+        if let Err(error) =
+            db::try_save_identity(db_pool, &hash_hex, &lxmf_hex, nickname, &display_name)
+        {
+            discard(&created);
+            return Err(storage(&error));
+        }
 
         tracing::info!(identity = %crate::short_id(&hash_hex), "Imported identity");
         Ok((hash_hex, lxmf_hex))
@@ -10975,6 +11064,32 @@ mod tests {
         LxmfManager::purge_identity_profile(&tmp, &mgr.identity_hash, true).unwrap();
 
         assert!(!id_dir.exists());
+    }
+
+    // An identity is created with its row or not at all: a row that cannot
+    // be written takes the key written before it along.
+    #[test]
+    fn an_imported_identity_whose_row_cannot_be_written_leaves_no_key() {
+        let root = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(root.path()).unwrap();
+        let pool = db::init_pool(root.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        pool.get()
+            .unwrap()
+            .execute_batch("DROP TABLE identities")
+            .unwrap();
+        let identity = Identity::new();
+        let key = identity.get_private_key().unwrap();
+        let ratspeak_dir = root.path().join(".ratspeak");
+
+        let result = LxmfManager::import_identity_to_data_dir(&ratspeak_dir, &key[..], "A", &pool);
+
+        assert!(result.is_err());
+        let profile = ratspeak_dir
+            .join("identities")
+            .join(hex::encode(identity.hash));
+        assert!(!profile.join("identity").exists());
+        assert!(!profile.exists(), "the namespace it created stays");
     }
 
     #[test]

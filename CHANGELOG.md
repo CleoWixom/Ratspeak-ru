@@ -33,6 +33,7 @@ changes that materially affect how an artifact is reproduced.
 - Ratspeak keeps its data folder and desktop diagnostic logs private to your user account, and copying the shared-instance access configuration asks for your identity's PIN, or a confirmation when it has none.
 - The Linux packages' USB radio rule gives access to the user signed in at the computer, and applies to radios that are already plugged in.
 - Notification previews can show the sender and message, only the sender, or neither; a call always shows who is calling. On Android and iOS, switching identities or a lock removes the identity's alerts, and a call that rings during a switch no longer alerts under the next identity.
+- Creating, importing or restoring an identity with a recovery phrase saves the phrase first. If it can't be saved, Ratspeak says so and creates no identity, instead of one whose phrase can never be shown again.
 - Showing the recovery phrase or exporting an identity's key or backup asks for the identity's PIN, or a confirmation when it has none, and works while the identity is locked; backups of PIN-protected identities keep their recovery phrase. Copied recovery phrases and access configurations clear from the clipboard after a minute and stay out of clipboard history where the system allows.
 
 ### Build and compatibility

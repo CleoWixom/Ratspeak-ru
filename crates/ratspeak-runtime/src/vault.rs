@@ -26,7 +26,7 @@ pub const MAX_HEX_IMPORT_BYTES: usize = 2 * MAX_IDENTITY_IMPORT_BYTES;
 pub const MAX_OUTER_WHITESPACE_BYTES: usize = 4096;
 pub const MAX_PASSCODE_BYTES: usize = 1024;
 pub const MAX_SEED_BYTES: usize = 4096;
-const SEED_FILE: &str = "identity.seed";
+pub(crate) const SEED_FILE: &str = "identity.seed";
 static JOB_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 thread_local! {
@@ -457,6 +457,19 @@ impl VaultJob {
         read_seed(&id_dir.join(SEED_FILE))?
             .ok_or_else(|| VaultError::InvalidFormat("no recovery phrase stored".into()))
     }
+    /// Stores `mnemonic` as `id_dir`'s plaintext recovery phrase and reads it
+    /// back; a passcode identity keeps its phrase in its vault instead.
+    pub fn store_plaintext_seed(&self, id_dir: &Path, mnemonic: &str) -> Result<(), VaultError> {
+        if id_dir.join("identity.hwid").exists() {
+            return Err(VaultError::InvalidFormat(
+                "hardware identity has no stored phrase".into(),
+            ));
+        }
+        if id_dir.join("identity.enc").exists() {
+            return Ok(());
+        }
+        write_seed_file(&id_dir.join(SEED_FILE), mnemonic.trim())
+    }
     pub fn prepare_protection(
         &self,
         id_dir: &Path,
@@ -769,16 +782,7 @@ fn write_seed_file(path: &Path, phrase: &str) -> Result<(), VaultError> {
     Ok(())
 }
 pub fn store_plaintext_seed(id_dir: &Path, mnemonic: &str) -> Result<(), VaultError> {
-    let _job = try_acquire_job()?;
-    if id_dir.join("identity.hwid").exists() {
-        return Err(VaultError::InvalidFormat(
-            "hardware identity has no stored phrase".into(),
-        ));
-    }
-    if id_dir.join("identity.enc").exists() {
-        return Ok(());
-    }
-    write_seed_file(&id_dir.join(SEED_FILE), mnemonic.trim())
+    try_acquire_job()?.store_plaintext_seed(id_dir, mnemonic)
 }
 pub fn has_stored_mnemonic(id_dir: &Path) -> bool {
     let enc = id_dir.join("identity.enc");
