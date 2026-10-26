@@ -1072,7 +1072,23 @@
         position: relative;
     }
 
-    .games-detail-board { justify-content: center; }
+    /* A game takes the whole screen, as a conversation does. */
+    body.view-game-detail {
+        overflow: hidden;
+        overscroll-behavior: none;
+    }
+    body.view-game-detail .bottom-bar,
+    body.view-game-detail .header {
+        display: none;
+    }
+    body.view-game-detail .app-layout {
+        height: var(--app-height, 100vh);
+        height: var(--app-height, 100dvh);
+        padding-bottom: 0;
+    }
+    body.view-game-detail .main-content {
+        padding-bottom: 0;
+    }
 
     #panel-interfaces { display: none; }
 
@@ -2207,11 +2223,6 @@
         background: var(--surface-page);
         border-top: 1px solid var(--border-row);
         padding: var(--space-6);
-    }
-
-    .chess-board-grid, .ttt-grid {
-        width: min(320px, 85vw);
-        height: min(320px, 85vw);
     }
 
     .games-detail-controls {

@@ -905,6 +905,7 @@ body.image-viewer-open {
     }
     .lxst-call-global[hidden],
     body.view-chat-detail .lxst-call-global,
+    body.view-game-detail .lxst-call-global,
     .keyboard-open .lxst-call-global {
         display: none;
     }

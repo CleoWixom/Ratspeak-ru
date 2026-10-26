@@ -581,12 +581,11 @@
 
         var html = '';
 
-        html += '<button class="mobile-back-btn games-back-btn" aria-label="Back to games list">' +
-            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>' +
-        '</button>';
-
         html += '<div class="games-detail-header ' + themeClass + '">' +
             '<div class="games-detail-heading">' +
+                '<button class="mobile-back-btn games-back-btn" aria-label="Back to games list">' +
+                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>' +
+                '</button>' +
                 '<span class="games-detail-icon">' + _gameIconMarkup(appId) + '</span>' +
                 '<span class="games-detail-copy">' +
                     '<span class="games-detail-title">' + escapeHtml(_gameName(appId)) + '</span>' +
@@ -715,13 +714,12 @@
             var canPlayCell = isMyTurn && cell === '_';
             html += '<button type="button" role="gridcell" class="' + classes + '" data-cell-index="' + i + '" aria-label="' + cellLabel + '" aria-disabled="' + (canPlayCell ? 'false' : 'true') + '"' + (canPlayCell ? '' : ' tabindex="-1"') + '>' + display + '</button>';
         }
-        html += '</div>';
-
-        html += '<div class="ttt-player-label' + (oTurnActive ? ' active-turn' : '') + '">' + oPlayer + '</div>';
-
         if (winCells && status === 'completed') {
             html += _renderWinLine(winCells);
         }
+        html += '</div>';
+
+        html += '<div class="ttt-player-label' + (oTurnActive ? ' active-turn' : '') + '">' + oPlayer + '</div>';
 
         if (status === 'pending') {
             var isPendingReceived = !_isMe(session, session.challenger);
@@ -756,7 +754,7 @@
         var coords = cells.map(function(c) {
             return { x: (c % 3) * 33.33 + 16.67, y: Math.floor(c / 3) * 33.33 + 16.67 };
         });
-        return '<svg class="ttt-win-line" viewBox="0 0 100 100" preserveAspectRatio="none">' +
+        return '<svg class="ttt-win-line" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">' +
             '<line x1="' + coords[0].x + '%" y1="' + coords[0].y + '%" ' +
             'x2="' + coords[2].x + '%" y2="' + coords[2].y + '%" ' +
             'stroke="var(--accent)" stroke-width="3" stroke-linecap="round" opacity="0.7">' +

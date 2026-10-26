@@ -154,6 +154,17 @@ assert(/\.four-token-a\s*\{[\s\S]*?background:\s*var\(--accent\)/.test(gamesCss)
     'Four in a Row sides must differ by solid-node versus ring geometry');
 assert(/prefers-reduced-motion:[^)]*reduce[\s\S]*?\.four-token[\s\S]*?animation:\s*none\s*!important/.test(gamesCss),
     'Four in a Row placement and win motion must honor reduced motion');
+assert(!/\.games-detail-board\s*\{[^}]*overflow:\s*hidden/.test(gamesCss) &&
+    !/100s?vh - 2\d\dpx/.test(gamesCss),
+    'game boards must never clip or guess the surrounding chrome from the viewport height');
+assert(/@supports \(width: 1cqmin\)\s*\{\s*\.games-detail-board\s*\{\s*container-type:\s*size;/.test(gamesCss) &&
+    /\.ttt-board-wrap\s*\{\s*width:\s*clamp\([^;]*100cqh - var\(--ttt-chrome\)/.test(gamesCss) &&
+    /\.chess-board-wrap\s*\{\s*width:\s*clamp\([^;]*100cqh - var\(--chess-chrome\)/.test(gamesCss) &&
+    /\.four-board-wrap\s*\{\s*width:\s*clamp\([^;]*\(100cqh - var\(--four-chrome\)\) \* 7 \/ 6/.test(gamesCss),
+    'game boards must fit the space between the status line and the controls');
+assert(/body\.view-game-detail \.bottom-bar,\s*body\.view-game-detail \.header\s*\{\s*display:\s*none;/
+    .test(sourceByName['13-responsive.css']),
+    'an open game must take the whole phone screen, as a conversation does');
 
 var paletteCss = sourceByName['00-palettes.css'];
 var themeSource = fs.readFileSync(path.join(dashboardRoot, 'static', 'js', 'theme.js'), 'utf8');
