@@ -12,6 +12,7 @@
 - Radios that reject a setting now say which one.
 - Improved identity switching, so messages and contacts always stay with the right identity.
 - Showing your recovery phrase or exporting a key now asks for your PIN, and copied phrases clear after a minute.
+- Fixed exported files on desktop being named `download`.
 - Fixed recovery phrases not being saved in rare cases.
 - Improved compatibility with the latest Python Reticulum and LXMF.
 - Fixed downloading messages from propagation nodes that hold many messages.
