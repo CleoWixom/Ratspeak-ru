@@ -6372,18 +6372,19 @@ fn release_workflows_build_once_and_publish_only_after_complete_aggregation() {
         .as_array()
         .expect("component array");
     let release_note_fragments = [
-        "voice messages for compatible handhelds",
-        "recording format selected automatically",
-        "Codec2 support for compatible low-bandwidth voice calls",
-        "Windows Bluetooth discovery and reconnection",
-        "Android Bluetooth cleanup when permissions are revoked",
-        "Kept recorded clips available for retry",
-        "prevented duplicate voice messages after an uncertain send result",
-        "leaving a chat or changing identities",
-        "Removed legacy text fallbacks for message reactions",
-        "Source builds require Rust 1.89 or later",
-        "Compact recordings are limited to 15 seconds",
-        "Some attachments sent to NomadNet may appear delivered",
+        "Auto-Lock for passcode-protected identities",
+        "how much notifications show",
+        "radios reconnect faster and show why they can't connect",
+        "removing it from Android's Bluetooth settings",
+        "Radios that reject a setting now say which one",
+        "messages and contacts always stay with the right identity",
+        "exporting a key now asks for your PIN",
+        "copied phrases clear after a minute",
+        "Fixed recovery phrases not being saved in rare cases",
+        "latest Python Reticulum and LXMF",
+        "propagation nodes that hold many messages",
+        "USB radios are now available only to the signed-in user",
+        "delete any old `99-ratspeak.rules` you copied by hand",
     ];
 
     for workflow_path in [

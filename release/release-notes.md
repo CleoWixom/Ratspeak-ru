@@ -1,23 +1,21 @@
-## v1.0.34
+## v1.0.35
 
 ### Added
 
-- Added voice messages for compatible handhelds, with the recording format selected automatically.
-- Added Codec2 support for compatible low-bandwidth voice calls.
+- Added Auto-Lock for passcode-protected identities.
+- Added a setting for how much notifications show.
 
 ### Fixed and improved
 
-- Improved Windows Bluetooth discovery and reconnection, including saved devices missing from scan results.
-- Fixed Android Bluetooth cleanup when permissions are revoked.
-- Kept recorded clips available for retry and prevented duplicate voice messages after an uncertain send result.
-- Improved recording limits, voice controls, and handling when leaving a chat or changing identities.
-- Removed legacy text fallbacks for message reactions.
+- Improved Bluetooth on Android: radios reconnect faster and show why they can't connect.
+- Fixed pairing a radio again after removing it from Android's Bluetooth settings.
+- Radios that reject a setting now say which one.
+- Improved identity switching, so messages and contacts always stay with the right identity.
+- Showing your recovery phrase or exporting a key now asks for your PIN, and copied phrases clear after a minute.
+- Fixed recovery phrases not being saved in rare cases.
+- Improved compatibility with the latest Python Reticulum and LXMF.
+- Fixed downloading messages from propagation nodes that hold many messages.
 
 ### Build and compatibility
 
-- Source builds require Rust 1.89 or later.
-- Compact recordings are limited to 15 seconds. Receive the handheld's announce before recording so the app can select its compatible format.
-
-### Known issue
-
-- Some attachments sent to NomadNet may appear delivered without being saved by the receiver due to an upstream Python Reticulum issue.
+- Linux: USB radios are now available only to the signed-in user. The rule is now `70-ratspeak.rules`; delete any old `99-ratspeak.rules` you copied by hand.

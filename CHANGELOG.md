@@ -5,45 +5,27 @@ changes that materially affect how an artifact is reproduced.
 
 ## [Unreleased]
 
+## [1.0.35] - 2026-10-26
+
+### Added
+
+- Added Auto-Lock for passcode-protected identities.
+- Added a setting for how much notifications show.
+
 ### Fixed and improved
 
-- Bluetooth radios that are off, out of range or need pairing again now say why, with Connection Help, instead of always showing "Waiting for radio".
-- A radio that rejects its settings, such as TX power below an amplifier's minimum, stops with the setting named and an Edit action, on Bluetooth, USB, serial and TCP.
-- Resuming or editing a radio that is away keeps it enabled and connects when it returns, instead of pausing or reverting it after two minutes.
-- Desktop serial and TCP radios that are unplugged or busy keep retrying and show why: radio not found, port access denied or port in use.
-- Android reconnects to a returning Bluetooth radio within seconds using background auto-connect, instead of retrying as rarely as every 10 minutes.
-- Fixed Android Bluetooth radio sessions dropping when the app reconnected slowly.
-- Fixed propagation pickup and purge when many messages are stored on a relay.
-- Preserved unknown interface locations and restored discovery announcements.
-- Bounded background announcements at flow-controlled radio writers.
-- Ratspeak warns at startup when its data is on a network drive or in temporary memory, where messages and keys may not survive a crash or restart.
-- Deleting all messages or contacts now clears them from every screen at once, and blocked users stay blocked.
-- Creating, importing or restoring an identity no longer fails at random while the app is busy, and reading a channel or bringing the app forward no longer drops an announce.
-- A failed identity switch or security key activation brings the previous identity back online and shows why, instead of leaving the app offline mid-switch.
-- Removing the active hardware identity, or starting with no identity selected, opens the most recently used one that still opens; a protected one asks for its PIN.
-- Messages and game moves received during an identity switch stay with the identity they were sent to and never show under the next one.
-- After an identity switch the new identity's contacts show at once, instead of an empty contact list until the view is reopened.
-- Renames, status changes and blocks made during an identity switch are refused instead of landing on the next identity, and a rename never announces the old name afterwards. A network block or unblock that a switch interrupts completes once its identity runs again.
-- Ratspeak won't open data that another Ratspeak app is using or that a newer version saved, and says what to do instead. Drives that can't lock get a warning.
-- Opportunistic messages use the whole encrypted packet, as in Python LXMF, and leave room for a stamp only when one is attached; larger messages are sent and shown as Direct.
-- A PIN-protected identity asks for its PIN again after you switch to another identity and back.
-- If the identity that takes over after removing a hardware identity can't load, Ratspeak leaves no identity active instead of one without a network.
-- An identity that can't load no longer leaves Ratspeak looking ready without messaging, and a failed switch to it no longer makes it the identity a later start opens.
-- Auto-Lock now locks passcode identities too, and counts time the device slept, so a lock that fell due during sleep happens within seconds of waking. If you turned on the hardware auto-lock, passcode identities now lock after the same time.
-- Auto-Lock locks an identity even when its network is stopped or failed to start, and adding a PIN to the open identity starts its Auto-Lock.
-- While an identity is locked, its messages, contacts and other data stay out of the app until you unlock it.
-- Resetting, reprovisioning or restoring the security key of the active hardware identity keeps that identity locked, instead of opening its data without a PIN.
-- On the desktop, saving an identity export or backup says whether the file was saved, instead of only that the save prompt opened.
-- Ratspeak keeps its data folder and desktop diagnostic logs private to your user account, and copying the shared-instance access configuration asks for your identity's PIN, or a confirmation when it has none.
-- The Linux packages' USB radio rule gives access to the user signed in at the computer, and applies to radios that are already plugged in.
-- Notification previews can show the sender and message, only the sender, or neither; a call always shows who is calling. On Android and iOS, switching identities or a lock removes the identity's alerts, and a call that rings during a switch no longer alerts under the next identity.
-- Creating, importing or restoring an identity with a recovery phrase saves the phrase first. If it can't be saved, Ratspeak says so and creates no identity, instead of one whose phrase can never be shown again.
-- Showing the recovery phrase or exporting an identity's key or backup asks for the identity's PIN, or a confirmation when it has none, and works while the identity is locked; backups of PIN-protected identities keep their recovery phrase. Copied recovery phrases and access configurations clear from the clipboard after a minute and stay out of clipboard history where the system allows.
+- Improved Bluetooth on Android: radios reconnect faster and show why they can't connect.
+- Fixed pairing a radio again after removing it from Android's Bluetooth settings.
+- Radios that reject a setting now say which one.
+- Improved identity switching, so messages and contacts always stay with the right identity.
+- Showing your recovery phrase or exporting a key now asks for your PIN, and copied phrases clear after a minute.
+- Fixed recovery phrases not being saved in rare cases.
+- Improved compatibility with the latest Python Reticulum and LXMF.
+- Fixed downloading messages from propagation nodes that hold many messages.
 
 ### Build and compatibility
 
-- Updated the coordinated source graph to rsReticulum 1.3.0 (`~1.3.0`), including
-  the nullable discovery coordinate API migration.
+- Linux: USB radios are now available only to the signed-in user. The rule is now `70-ratspeak.rules`; delete any old `99-ratspeak.rules` you copied by hand.
 
 ## [1.0.34] - 2026-10-10
 
