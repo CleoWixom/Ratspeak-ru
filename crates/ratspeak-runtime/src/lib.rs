@@ -9281,6 +9281,9 @@ mod identity_session_tests {
     // this stays in the library's tests.
     #[tokio::test]
     async fn auto_lock_locks_either_kind_and_starts_a_new_identity_session() {
+        let _hosts = crate::hosted_propagation::get_tests::GET_TEST_LOCK
+            .lock()
+            .await;
         for kind in ["hardware", "passcode"] {
             let recorder = Arc::new(Recorder::default());
             let withdrawals = Arc::new(Withdrawals::default());
@@ -9347,6 +9350,9 @@ mod identity_session_tests {
     // waits on the network, never runs with the identity still open.
     #[tokio::test]
     async fn an_auto_lock_refuses_the_identitys_data_before_its_teardown() {
+        let _hosts = crate::hosted_propagation::get_tests::GET_TEST_LOCK
+            .lock()
+            .await;
         let witness = Arc::new(LockWitness::default());
         let (session, lock) = armed_session(
             "passcode",
@@ -9368,6 +9374,9 @@ mod identity_session_tests {
     // The network stopping leaves the identity active, and it still locks.
     #[tokio::test]
     async fn an_auto_lock_locks_an_active_identity_whose_network_stopped() {
+        let _hosts = crate::hosted_propagation::get_tests::GET_TEST_LOCK
+            .lock()
+            .await;
         let recorder = Arc::new(Recorder::default());
         let (session, lock) = armed_session(
             "passcode",

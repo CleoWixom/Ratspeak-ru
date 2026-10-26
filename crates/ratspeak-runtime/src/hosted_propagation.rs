@@ -358,10 +358,12 @@ pub(crate) async fn run(
 }
 
 #[cfg(test)]
-mod get_tests {
+pub(crate) mod get_tests {
     use super::*;
     use std::sync::atomic::Ordering;
-    static GET_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Also held by the library's tests that tear a session down: a teardown
+    /// quiesces every host, and these tests wait that out only so long.
+    pub(crate) static GET_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     fn ready_state() -> Arc<AppState> {
         let (state, _) = crate::inbound_pipeline_tests::pipeline_state();
         state
