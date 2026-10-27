@@ -5,6 +5,14 @@ changes that materially affect how an artifact is reproduced.
 
 ## [Unreleased]
 
+### Added in the Ratspeak-ru fork
+
+- Russian interface layer (`dashboard/static/locales/ru.*`) with plural-aware templates and `tools/i18n` for maintaining it or adding languages.
+- Connection links `ratspeak://tcp` and `ratspeak://radio` that pre-fill Network → Connections → Internet/TCP or Radio, with optional IFAC network name and passphrase. A link never connects by itself. A link shared as plain text through the Android share sheet opens the same form. See `docs/connection-links.md` and `tools/connection_link.py`.
+- Share QR code in the connection menu for Internet/TCP and Radio connections.
+- Export and import of contacts and Internet/TCP connections in Settings → Identity. IFAC passphrases are included only on request; the file is not encrypted.
+- Announce propagation radar in Network → Activity: hops as rings, interfaces as sectors, destinations as dots, with waves for new announces.
+
 ### Fixed and improved
 
 - Bluetooth radios that are off, out of range or need pairing again now say why, with Connection Help, instead of always showing "Waiting for radio".
