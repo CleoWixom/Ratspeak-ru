@@ -12,6 +12,7 @@ changes that materially affect how an artifact is reproduced.
 - Share QR code in the connection menu for Internet/TCP and Radio connections.
 - Export and import of contacts and Internet/TCP connections in Settings → Identity. IFAC passphrases are included only on request; the file is not encrypted.
 - Announce propagation radar in Network → Activity: hops as rings, interfaces as sectors, destinations as dots, with waves for new announces.
+- Route to a contact: a Route action in the conversation menu and the contact sheet shows the known path (hops, interface, next hop, time left) and can request it again from the network.
 
 ### Fixed and improved
 

@@ -992,6 +992,13 @@
 }
 
 /* Announce propagation radar: node in the centre, rings are hops, sectors are interfaces. */
+/* Route sheet rows. */
+.route-lookup-rows { display: flex; flex-direction: column; gap: var(--space-2); }
+.route-lookup-row { display: flex; justify-content: space-between; gap: var(--space-4); font-size: var(--text-sm); }
+.route-lookup-label { color: var(--text-muted); }
+.route-lookup-value { color: var(--text-primary); text-align: right; overflow-wrap: anywhere; }
+.route-lookup-note { margin: var(--space-4) var(--space-7) 0; min-height: 1.4em; line-height: var(--type-leading-copy); }
+
 .announce-radar-card {
     border-bottom: 1px solid var(--divider);
     background: var(--surface-sunken);

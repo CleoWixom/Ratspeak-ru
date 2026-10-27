@@ -9597,6 +9597,20 @@ fn native_connection_links_prefill_forms_and_never_connect_on_their_own() {
     let radar =
         read_source(root.join("dashboard/static/js/announce_radar.js")).expect("announce radar");
     assert!(index.contains("/static/js/announce_radar.js"));
+
+    // Route lookup uses the existing path commands and is reachable from both
+    // the conversation menu and the contact sheet.
+    let route =
+        read_source(root.join("dashboard/static/js/route_lookup.js")).expect("route lookup");
+    assert!(index.contains("/static/js/route_lookup.js"));
+    assert!(route.contains("'api_path_query'") && route.contains("'request_path'"));
+    for menu in ["lxmf.js", "connections.js"] {
+        let source = read_source(root.join("dashboard/static/js").join(menu)).expect(menu);
+        assert!(
+            source.contains("openRouteSheet("),
+            "{menu} must offer Route"
+        );
+    }
     assert!(index.contains("announce-radar-canvas"));
     assert!(health.contains("announceRadarUpdate(data.path_table || [])"));
     assert!(health.contains("announceRadarPulse(data)"));

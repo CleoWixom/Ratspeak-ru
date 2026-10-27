@@ -1,0 +1,15 @@
+{
+"Could not read the route": "Не удалось прочитать маршрут",
+"Could not request the route": "Не удалось запросить маршрут",
+"Expires in": "Истекает через",
+"Find route": "Найти маршрут",
+"Invalid contact address": "Некорректный адрес контакта",
+"Next hop": "Следующий узел",
+"No path known": "Путь неизвестен",
+"No route found. The contact may be offline or out of reach.": "Маршрут не найден. Возможно, контакт не в сети или вне зоны досягаемости.",
+"Path known": "Путь известен",
+"Route found": "Маршрут найден",
+"Route to contact": "Маршрут до контакта",
+"Searching for a route…": "Поиск маршрута…",
+"The network is not available": "Сеть недоступна"
+}

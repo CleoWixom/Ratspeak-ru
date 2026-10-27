@@ -745,7 +745,13 @@ function showConnectionDetailSheet(hash, options) {
                 confirmBlockPeer(h);
                 return;
             }
+            var routeName = '';
+            _connsView().forEach(function(c) { if (c.hash === h) routeName = c.display_name || ''; });
             actionPopover(this, [{
+                label: 'Route',
+                icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="18" r="2"/><circle cx="19" cy="6" r="2"/><path d="M7 18h6a4 4 0 0 0 0-8h-2a4 4 0 0 1 0-8"/><path d="M17 6h-2"/></svg>',
+                onSelect: function() { closeConnectionDetailSheet(); openRouteSheet(h, routeName); }
+            }, {
                 label: 'Block',
                 danger: true,
                 icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>',
