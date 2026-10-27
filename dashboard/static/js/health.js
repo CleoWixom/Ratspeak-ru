@@ -1720,6 +1720,7 @@ function _scheduleAnnounceRender() {
 }
 RS.listen('announce_received', function(data) {
     announceCache.unshift(data);
+    if (typeof announceRadarPulse === 'function') announceRadarPulse(data);
     if (announceCache.length > 200) announceCache.length = 200;
     // rAF coalesce — a busy hub floods hundreds of announces per second.
     _scheduleAnnounceRender();
@@ -1737,6 +1738,7 @@ renderStats = function(data) {
     _origRenderStats(data);
     updateInterfaceHistory(data.interface_stats || data);
     renderPathTable(data.path_table || [], data);
+    if (typeof announceRadarUpdate === 'function') announceRadarUpdate(data.path_table || []);
     renderNetworkOverview(data);
     renderTrafficTable(data.rate_table || []);
     // Re-render from cached config so online status + bytes stay in sync.

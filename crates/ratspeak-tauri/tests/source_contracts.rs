@@ -9592,6 +9592,15 @@ fn native_connection_links_prefill_forms_and_never_connect_on_their_own() {
     assert!(index.contains("settings-export-contacts-btn"));
     assert!(index.contains("settings-import-contacts-btn"));
     assert!(index.contains("/static/js/contacts_backup.js"));
+
+    // The announce radar draws only from data the app already has.
+    let radar =
+        read_source(root.join("dashboard/static/js/announce_radar.js")).expect("announce radar");
+    assert!(index.contains("/static/js/announce_radar.js"));
+    assert!(index.contains("announce-radar-canvas"));
+    assert!(health.contains("announceRadarUpdate(data.path_table || [])"));
+    assert!(health.contains("announceRadarPulse(data)"));
+    assert!(!radar.contains("RS.invoke("));
     for command in [
         "add_contact",
         "add_tcp_connection",

@@ -918,6 +918,20 @@
                     </div>
 
                     <div class="network-activity" id="network-activity">
+                        <div class="announce-radar-card" id="announce-radar-card">
+                            <div class="announce-radar-header" role="button" tabindex="0" aria-expanded="true">
+                                <svg class="announce-radar-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4"/><path d="M7.8 16.2a6 6 0 0 1 0-8.4"/><path d="M19 5a10 10 0 0 1 0 14"/><path d="M5 19a10 10 0 0 1 0-14"/></svg>
+                                <span class="announce-radar-title">Announce propagation</span>
+                                <span class="announce-radar-summary" id="announce-radar-summary">0</span>
+                                <svg class="announce-radar-chevron" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+                            </div>
+                            <div class="announce-radar-body">
+                                <canvas id="announce-radar-canvas" class="announce-radar-canvas" aria-label="Announce propagation radar"></canvas>
+                                <div class="announce-radar-tip inline-hint" id="announce-radar-tip">Tap a dot to see its details.</div>
+                                <div class="announce-radar-legend" id="announce-radar-legend"></div>
+                                <div class="announce-radar-rate inline-hint">Announces in the last minute: <span id="announce-radar-rate">0</span></div>
+                            </div>
+                        </div>
                         <div class="system-drops-card" id="system-drops-card" style="display:none;">
                             <div class="system-drops-header" role="button" tabindex="0" aria-expanded="false">
                                 <svg class="system-drops-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -2113,6 +2127,7 @@
 <script src="/static/js/events.js?v=ui-20260924-4"></script>
 <script src="/static/js/activity.js?v=ui-20260924-4"></script>
 <script src="/static/js/health.js?v=ui-20260924-4"></script>
+<script src="/static/js/announce_radar.js?v=ui-20260924-4"></script>
 <script src="/static/js/modals.js?v=ui-20260924-4"></script>
 <script src="/static/js/emoji_data.js?v=ui-20260924-4"></script>
 <script src="/static/js/emoji_picker.js?v=ui-20260924-4"></script>
