@@ -207,6 +207,9 @@ pub(crate) fn accept_shared_text(app: &AppHandle, text: &str) -> bool {
 
 /// Register the running-app listener before sampling the cold-start value.
 pub(crate) fn install(app: &mut tauri::App) {
+    // Managed here, not in lib.rs, so the fork needs no edit around the Builder chain.
+    app.manage(NativeConnectionLinkInbox::default());
+
     let listener_app = app.handle().clone();
     app.deep_link().on_open_url(move |event| {
         enqueue_native_connection_links(&listener_app, event.urls());

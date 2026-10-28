@@ -99,17 +99,6 @@
    "why": "Native connection-link inbox module."
   },
   {
-   "id": "lib-manage",
-   "type": "insert_after",
-   "file": "src-tauri/src/lib.rs",
-   "anchor": ".manage(channel_deep_link::NativeChannelShareInbox::default());",
-   "lines": [
-    "    let builder = builder.manage(connection_deep_link::NativeConnectionLinkInbox::default());"
-   ],
-   "marker": "NativeConnectionLinkInbox::default()",
-   "why": "State for native connection links."
-  },
-  {
    "id": "lib-android-runtime",
    "type": "insert_after",
    "file": "src-tauri/src/lib.rs",

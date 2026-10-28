@@ -37,7 +37,7 @@ fn native_connection_links_prefill_forms_and_never_connect_on_their_own() {
     assert!(bridge.contains("RS.invoke('ack_native_connection_link',"));
     assert!(bridge.contains("'native_connection_link_available'"));
     assert!(!bridge.contains("on_open_url"));
-    assert!(lib.contains("connection_deep_link::NativeConnectionLinkInbox::default()"));
+    assert!(native.contains("app.manage(NativeConnectionLinkInbox::default())"));
     assert!(lib.contains("connection_deep_link::peek_native_connection_link"));
     assert!(lib.contains("connection_deep_link::ack_native_connection_link"));
     assert!(lib.contains("connection_deep_link::validate_connection_link"));
