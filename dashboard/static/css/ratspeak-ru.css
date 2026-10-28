@@ -77,3 +77,9 @@
     overflow-wrap: anywhere;
 }
 
+
+/* Text size presets: 50/70/90 + 100..140 = eight cards. */
+.settings-type-presets { grid-template-columns: repeat(8, minmax(52px, 96px)); }
+@media (max-width: 768px) {
+    .settings-type-presets { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}

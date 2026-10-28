@@ -29,6 +29,8 @@ var anchors = [
     ['dashboard/static/js/modals.js', 'function _rnodeApplyRadioControls'],
     ['dashboard/index.html', 'id="settings-backup-identity-btn"'],
     ['dashboard/index.html', 'id="network-activity"'],
+    ['dashboard/index.html', 'name="settings-text-scale" value="100"'],
+    ['dashboard/static/js/text_scale.js', 'window.RS.textScale = {'],
     ['dashboard/index.html', '/static/js/ru_loader.js']
 ];
 anchors.forEach(function(pair) {
@@ -163,3 +165,35 @@ async function runLoader(anchors) {
     assert.strictEqual(bare.appended.filter(function(n) { return n.tag === 'script'; }).length, 7);
     console.log('fork overlay passed');
 })().catch(function(error) { console.error(error); process.exit(1); });
+
+// ---- ru_text_scale.js: 50/70/90 presets on top of upstream text_scale.js ----
+(function() {
+    var store = {};
+    var root = { style: {}, dataset: {} };
+    var ctx = {
+        window: { CustomEvent: function(n, o) { this.type = n; this.detail = o.detail; }, dispatchEvent: function() {}, RS: {} },
+        document: { documentElement: root, addEventListener: function() {} },
+        localStorage: { getItem: function(k) { return k in store ? store[k] : null; },
+                        setItem: function(k, v) { store[k] = String(v); },
+                        removeItem: function(k) { delete store[k]; } },
+        console: console
+    };
+    ctx.CustomEvent = ctx.window.CustomEvent;
+    ctx.window.document = ctx.document; ctx.window.localStorage = ctx.localStorage;
+    vm.createContext(ctx);
+    vm.runInContext(read('dashboard/static/js/text_scale.js'), ctx);
+    ctx.RS = ctx.window.RS;
+    vm.runInContext(read('dashboard/static/js/ru_text_scale.js').replace('window.RS', 'window.RS'), ctx);
+    var ts = ctx.window.RS.textScale;
+    assert.strictEqual(ts.normalize(60), 50);
+    assert.strictEqual(ts.normalize(80), 70);
+    assert.strictEqual(ts.normalize(104), 100);
+    assert.strictEqual(ts.commit(70), 70);
+    assert.strictEqual(root.style.fontSize, '70%');
+    assert.strictEqual(ts.commit(100), 70, 'backend echo of 100 keeps the small choice');
+    assert.strictEqual(ts.get(), 70);
+    delete store['ratspeak-ru-text-scale'];
+    assert.strictEqual(ts.commit(120), 120);
+    assert.strictEqual(ts.get(), 120);
+    console.log('ru_text_scale ok');
+})();

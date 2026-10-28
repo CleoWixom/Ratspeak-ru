@@ -15,6 +15,7 @@
         '/static/js/contacts_backup.js',
         '/static/js/announce_radar.js',
         '/static/js/route_lookup.js',
+        '/static/js/ru_text_scale.js',
         '/static/js/ru_extensions.js'
     ];
 
@@ -50,6 +51,15 @@
             '</div>' +
         '</div>';
 
+    function textScalePreset(v) {
+        return '<label class="settings-type-preset" data-scale="' + v + '">' +
+            '<input type="radio" name="settings-text-scale" value="' + v + '">' +
+            '<span class="settings-type-preset-card">' +
+                '<span class="settings-type-preset-sample" aria-hidden="true">Aa</span>' +
+                '<span class="settings-type-preset-value">' + v + '%</span>' +
+            '</span></label>';
+    }
+
     function injectStyles() {
         if (document.getElementById('ratspeak-ru-styles')) return;
         var link = document.createElement('link');
@@ -68,6 +78,15 @@
             row.insertAdjacentHTML('afterend', SETTINGS_ROWS);
         } else if (!row) {
             console.warn(TAG, 'missing-anchor', 'settings-backup-identity-btn');
+        }
+
+        // Text size 50/70/90%: added before upstream's DOMContentLoaded handler binds the radios.
+        var first = document.querySelector('input[name="settings-text-scale"][value="100"]');
+        var firstLabel = first && first.closest('.settings-type-preset');
+        if (firstLabel && !document.querySelector('input[name="settings-text-scale"][value="50"]')) {
+            firstLabel.insertAdjacentHTML('beforebegin', textScalePreset(50) + textScalePreset(70) + textScalePreset(90));
+        } else if (!firstLabel) {
+            console.warn(TAG, 'missing-anchor', 'settings-text-scale');
         }
 
         var activity = document.getElementById('network-activity');
