@@ -98,7 +98,11 @@ fn fork_frontend_is_loaded_by_one_hook_and_only_offers_validated_actions() {
     assert!(extensions.contains("openConnectionQrShare(ifaceType, ifaceName)"));
 
     // Contacts and connections backup only goes through the normal add commands.
-    for command in ["add_contact", "add_tcp_connection", "add_backbone_connection"] {
+    for command in [
+        "add_contact",
+        "add_tcp_connection",
+        "add_backbone_connection",
+    ] {
         assert!(backup.contains(command), "import must use {command}");
     }
 
