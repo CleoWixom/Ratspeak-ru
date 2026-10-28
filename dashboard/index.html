@@ -918,20 +918,6 @@
                     </div>
 
                     <div class="network-activity" id="network-activity">
-                        <div class="announce-radar-card" id="announce-radar-card">
-                            <div class="announce-radar-header" role="button" tabindex="0" aria-expanded="true">
-                                <svg class="announce-radar-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4"/><path d="M7.8 16.2a6 6 0 0 1 0-8.4"/><path d="M19 5a10 10 0 0 1 0 14"/><path d="M5 19a10 10 0 0 1 0-14"/></svg>
-                                <span class="announce-radar-title">Announce propagation</span>
-                                <span class="announce-radar-summary" id="announce-radar-summary">0</span>
-                                <svg class="announce-radar-chevron" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
-                            </div>
-                            <div class="announce-radar-body">
-                                <canvas id="announce-radar-canvas" class="announce-radar-canvas" aria-label="Announce propagation radar"></canvas>
-                                <div class="announce-radar-tip inline-hint" id="announce-radar-tip">Tap a dot to see its details.</div>
-                                <div class="announce-radar-legend" id="announce-radar-legend"></div>
-                                <div class="announce-radar-rate inline-hint">Announces in the last minute: <span id="announce-radar-rate">0</span></div>
-                            </div>
-                        </div>
                         <div class="system-drops-card" id="system-drops-card" style="display:none;">
                             <div class="system-drops-header" role="button" tabindex="0" aria-expanded="false">
                                 <svg class="system-drops-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1018,7 +1004,6 @@
                 <button class="rs-dialog-confirm" id="identity-modal-confirm">Create</button>
             </div>
         </div>
-        <input type="file" id="contacts-backup-file-input" accept=".json,application/json,text/plain" style="display:none;">
         <input type="file" id="identity-file-input" accept=".rsi,.rniid,.key,.identity,.bin,application/json,application/octet-stream,text/plain" style="display:none;">
 
         <div class="bottom-sheet-overlay" id="hw-modal-overlay"></div>
@@ -1438,20 +1423,6 @@
                                     <span class="settings-row-desc">Export the active software identity as a Ratspeak backup or Reticulum key.</span>
                                 </div>
                                 <button class="selector-badge selector-badge-no-caret" id="settings-backup-identity-btn">Export</button>
-                            </div>
-                            <div class="settings-row">
-                                <div class="settings-row-info">
-                                    <span class="settings-row-label">Export Contacts &amp; Connections</span>
-                                    <span class="settings-row-desc">Save your contacts and all Internet/TCP connections to a file.</span>
-                                </div>
-                                <button class="selector-badge selector-badge-no-caret" id="settings-export-contacts-btn">Export</button>
-                            </div>
-                            <div class="settings-row">
-                                <div class="settings-row-info">
-                                    <span class="settings-row-label">Import Contacts &amp; Connections</span>
-                                    <span class="settings-row-desc">Add contacts and Internet/TCP connections from a file. Existing ones are kept.</span>
-                                </div>
-                                <button class="selector-badge selector-badge-no-caret" id="settings-import-contacts-btn">Import</button>
                             </div>
                             <div class="settings-row">
                                 <div class="settings-row-info">
@@ -2127,16 +2098,12 @@
 <script src="/static/js/events.js?v=ui-20260924-4"></script>
 <script src="/static/js/activity.js?v=ui-20260924-4"></script>
 <script src="/static/js/health.js?v=ui-20260924-4"></script>
-<script src="/static/js/announce_radar.js?v=ui-20260924-4"></script>
 <script src="/static/js/modals.js?v=ui-20260924-4"></script>
 <script src="/static/js/emoji_data.js?v=ui-20260924-4"></script>
 <script src="/static/js/emoji_picker.js?v=ui-20260924-4"></script>
 <script src="/static/js/voice_ringtones.js?v=ui-20260924-4"></script>
 <script src="/static/js/vendor/jsQR.js"></script>
 <script src="/static/js/contact_card.js?v=ui-20260924-4"></script>
-<script src="/static/js/contacts_backup.js?v=ui-20260924-4"></script>
-<script src="/static/js/connection_qr.js?v=ui-20260924-4"></script>
-<script src="/static/js/route_lookup.js?v=ui-20260924-4"></script>
 <script src="/static/js/lxmf.js?v=ui-20260924-4"></script>
 <script src="/static/js/message_search.js?v=ui-20260924-4"></script>
 <script src="/static/js/voice_memos.js?v=ui-20260924-4"></script>
@@ -2151,7 +2118,7 @@
 <script src="/static/js/four_in_a_row_view.js?v=ui-20260924-4"></script>
 <script src="/static/js/games_tab.js?v=ui-20260924-4"></script>
 <script src="/static/js/native_channel_share.js?v=ui-20260924-4"></script>
-<script src="/static/js/native_connection_link.js?v=ui-20260924-4"></script>
+<script src="/static/js/ru_loader.js?v=ui-20260924-4"></script>
 <script src="/static/js/text_shares.js?v=ui-20260924-4"></script>
 <script src="/static/js/tauri_events.js?v=ui-20260924-4"></script>
 <script src="/static/js/init_dom_handlers.js?v=ui-20260924-4"></script>

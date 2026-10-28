@@ -108,7 +108,7 @@
                 <data android:scheme="ratspeak" />
                 <data android:host="channel" />
             </intent-filter>
-            <!-- Connection links: ratspeak://tcp (Internet/TCP) and
+            <!-- Ratspeak-ru connection links: ratspeak://tcp (Internet/TCP) and
                  ratspeak://radio (LoRa radio parameters). -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />

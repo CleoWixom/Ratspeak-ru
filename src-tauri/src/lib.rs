@@ -985,9 +985,9 @@ pub fn run() {
 
     let linux_webkit_dmabuf_workaround = apply_linux_webkit_rendering_workarounds();
 
-    let builder = tauri::Builder::default()
-        .manage(channel_deep_link::NativeChannelShareInbox::default())
-        .manage(connection_deep_link::NativeConnectionLinkInbox::default());
+    let builder =
+        tauri::Builder::default().manage(channel_deep_link::NativeChannelShareInbox::default());
+    let builder = builder.manage(connection_deep_link::NativeConnectionLinkInbox::default());
 
     // Tauri requires single-instance to be the first plugin when it forwards
     // secondary-process deep-link arguments into the primary process.

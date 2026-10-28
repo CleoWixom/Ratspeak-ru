@@ -1,0 +1,198 @@
+{
+ "version": 1,
+ "comment": "Every edit the Ratspeak-ru fork makes inside an upstream file. Applied by fork/apply_hooks.py.",
+ "hooks": [
+  {
+   "id": "workflows-sibling-repos",
+   "type": "regex_replace",
+   "files": ".github/workflows/*.yml",
+   "pattern": "\\$\\{\\{ github\\.repository_owner \\}\\}/(rsReticulum|rsLXMF|rsLXST|lrgp-rs)",
+   "replacement": "ratspeak/\\1",
+   "why": "Sibling repositories are fetched from ratspeak/, not from the owner of the fork."
+  },
+  {
+   "id": "index-i18n-scripts",
+   "type": "insert_before",
+   "file": "dashboard/index.html",
+   "anchor": "<script src=\"/static/js/state.js",
+   "lines": [
+    "<script src=\"/static/locales/ru.js@@Q@@\"></script>",
+    "<script src=\"/static/js/i18n.js@@Q@@\"></script>"
+   ],
+   "marker": "/static/js/i18n.js",
+   "why": "Runtime translation layer must run before the app scripts."
+  },
+  {
+   "id": "index-fork-loader",
+   "type": "insert_after",
+   "file": "dashboard/index.html",
+   "anchor": "<script src=\"/static/js/native_channel_share.js",
+   "lines": [
+    "<script src=\"/static/js/ru_loader.js@@Q@@\"></script>"
+   ],
+   "marker": "/static/js/ru_loader.js",
+   "why": "Single entry point that loads every other fork script, style and UI block."
+  },
+  {
+   "id": "gradle-app-id-suffix",
+   "type": "insert_after",
+   "file": "src-tauri/gen/android/app/build.gradle.kts",
+   "anchor": "applicationId = \"org.ratspeak.android\"",
+   "lines": [
+    "        // Optional side-by-side install (fork builds): -PratspeakAppIdSuffix=.ru",
+    "        (project.findProperty(\"ratspeakAppIdSuffix\") as String?)?.takeIf { it.isNotBlank() }?.let { applicationIdSuffix = it }"
+   ],
+   "marker": "ratspeakAppIdSuffix",
+   "why": "Lets a fork build install next to the official app."
+  },
+  {
+   "id": "manifest-connection-links",
+   "type": "insert_after",
+   "offset": 1,
+   "file": "src-tauri/gen/android/app/src/main/AndroidManifest.xml",
+   "anchor": "<data android:host=\"channel\" />",
+   "lines": [
+    "            <!-- Ratspeak-ru connection links: ratspeak://tcp (Internet/TCP) and",
+    "                 ratspeak://radio (LoRa radio parameters). -->",
+    "            <intent-filter>",
+    "                <action android:name=\"android.intent.action.VIEW\" />",
+    "                <action android:name=\"org.chromium.arc.intent.action.VIEW\" />",
+    "                <category android:name=\"android.intent.category.DEFAULT\" />",
+    "                <category android:name=\"android.intent.category.BROWSABLE\" />",
+    "                <data android:scheme=\"ratspeak\" />",
+    "                <data android:host=\"tcp\" />",
+    "                <data android:host=\"radio\" />",
+    "            </intent-filter>"
+   ],
+   "marker": "android:host=\"tcp\"",
+   "why": "Opens the app for ratspeak://tcp and ratspeak://radio links."
+  },
+  {
+   "id": "commands-mod",
+   "type": "insert_after",
+   "file": "crates/ratspeak-tauri/src/commands/mod.rs",
+   "anchor": "pub mod channels;",
+   "lines": [
+    "pub mod connection_link;"
+   ],
+   "marker": "pub mod connection_link;",
+   "why": "Registers the connection link parser module."
+  },
+  {
+   "id": "api-snapshot",
+   "type": "insert_before",
+   "file": "api/snapshots/ratspeak-tauri.txt",
+   "anchor": "pub mod ratspeak_tauri::commands::contact_card",
+   "lines_file": "api_snapshot_connection_link.txt",
+   "marker": "commands::connection_link",
+   "why": "Reviewed public-API snapshot entry for the new module."
+  },
+  {
+   "id": "lib-mod",
+   "type": "insert_after",
+   "file": "src-tauri/src/lib.rs",
+   "anchor": "mod channel_deep_link;",
+   "lines": [
+    "mod connection_deep_link;"
+   ],
+   "marker": "mod connection_deep_link;",
+   "why": "Native connection-link inbox module."
+  },
+  {
+   "id": "lib-manage",
+   "type": "insert_after",
+   "file": "src-tauri/src/lib.rs",
+   "anchor": ".manage(channel_deep_link::NativeChannelShareInbox::default());",
+   "lines": [
+    "    let builder = builder.manage(connection_deep_link::NativeConnectionLinkInbox::default());"
+   ],
+   "marker": "NativeConnectionLinkInbox::default()",
+   "why": "State for native connection links."
+  },
+  {
+   "id": "lib-android-runtime",
+   "type": "insert_after",
+   "file": "src-tauri/src/lib.rs",
+   "anchor": "channel_deep_link::configure_android_runtime(context.config_mut());",
+   "lines": [
+    "        connection_deep_link::extend_android_runtime(context.config_mut());"
+   ],
+   "marker": "connection_deep_link::extend_android_runtime",
+   "why": "Android deep-link filter hosts for tcp and radio."
+  },
+  {
+   "id": "lib-handlers",
+   "type": "insert_after",
+   "file": "src-tauri/src/lib.rs",
+   "anchor": "channel_deep_link::ack_native_channel_share,",
+   "lines": [
+    "            connection_deep_link::peek_native_connection_link,",
+    "            connection_deep_link::ack_native_connection_link,",
+    "            connection_deep_link::validate_connection_link,"
+   ],
+   "marker": "connection_deep_link::peek_native_connection_link",
+   "why": "IPC commands for connection links."
+  },
+  {
+   "id": "lib-install",
+   "type": "insert_after",
+   "file": "src-tauri/src/lib.rs",
+   "anchor": "channel_deep_link::install(app);",
+   "lines": [
+    "            connection_deep_link::install(app);"
+   ],
+   "marker": "connection_deep_link::install",
+   "why": "Start the native connection-link listener."
+  },
+  {
+   "id": "android-lifecycle-notify",
+   "type": "insert_after",
+   "file": "src-tauri/src/android_lifecycle.rs",
+   "anchor": "crate::channel_deep_link::notify_pending(app);",
+   "lines": [
+    "                crate::connection_deep_link::notify_pending(app);"
+   ],
+   "marker": "crate::connection_deep_link::notify_pending",
+   "why": "Re-signal a pending link once the activity is ready."
+  },
+  {
+   "id": "text-share-connection-links",
+   "type": "replace_block",
+   "file": "src-tauri/src/text_share/android.rs",
+   "old": [
+    "        transaction(|inbox| inbox.accept(&id, &text, &subject))?;",
+    "        Ok::<_, String>(())",
+    "    })();",
+    "    if result.is_ok() {",
+    "        notify();",
+    "    }"
+   ],
+   "new": [
+    "        // Ratspeak-ru: a shared connection link opens the add-connection form",
+    "        // instead of becoming a message draft.",
+    "        if APP",
+    "            .get()",
+    "            .is_some_and(|app| crate::connection_deep_link::accept_shared_text(app, &text))",
+    "        {",
+    "            return Ok::<_, String>(false);",
+    "        }",
+    "        transaction(|inbox| inbox.accept(&id, &text, &subject))?;",
+    "        Ok::<_, String>(true)",
+    "    })();",
+    "    if matches!(result, Ok(true)) {",
+    "        notify();",
+    "    }"
+   ],
+   "marker": "connection_deep_link::accept_shared_text",
+   "why": "A link shared as text opens the connection form instead of a draft."
+  },
+  {
+   "id": "api-stability-meta",
+   "type": "api_meta",
+   "file": "api/stability.json",
+   "package": "ratspeak-tauri",
+   "snapshot": "api/snapshots/ratspeak-tauri.txt",
+   "why": "Keeps the item count and hash of the reviewed snapshot in step."
+  }
+ ]
+}

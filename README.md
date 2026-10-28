@@ -2,17 +2,13 @@
 
 <img src="src-tauri/icons/128x128.png" width="88" height="88" alt="Ratspeak logo">
 
-# Ratspeak-ru
-
-**Неофициальный форк [Ratspeak](https://github.com/ratspeak/Ratspeak): русский интерфейс и дополнительные функции подключения.**<br>
-*Unofficial fork of [Ratspeak](https://github.com/ratspeak/Ratspeak): Russian UI and extra connection features.*
+# Ratspeak
 
 Ratspeak is a native desktop and mobile client for E2EE conversations over
 Reticulum, a new type of mesh networking. Ratspeak gives you messaging, file/image sharing, voice calls and voice messages (experimental), Channels, LoRa capability, WiFi, BLE, TCP, offline messaging, turn-based games, and more.
 
 [Click here for iOS TestFlight Public Beta!](https://testflight.apple.com/join/AzzW4Jg6)
 
-[Upstream](https://github.com/ratspeak/Ratspeak) |
 [Docs](https://docs.ratspeak.org/) |
 [Build from source](https://docs.ratspeak.org/docs/reference/building-from-source) |
 [rsReticulum](https://github.com/ratspeak/rsReticulum) |
@@ -23,62 +19,12 @@ Reticulum, a new type of mesh networking. Ratspeak gives you messaging, file/ima
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
 [![Status](https://img.shields.io/badge/status-alpha-yellow.svg)](#current-state)
-[![Fork of ratspeak/Ratspeak](https://img.shields.io/badge/fork%20of-ratspeak%2FRatspeak-lightgrey.svg)](https://github.com/ratspeak/Ratspeak)
 
 <img src="docs/readme/ratspeak-showcase.png" alt="Ratspeak running on desktop and mobile" width="100%">
 
 ###### *Note: Ratspeak is currently in ALPHA. If you are looking for a more stable<br> experience, waiting for a later stable release is recommended.*
 
 </div>
-
-## О форке
-
-Этот репозиторий — **форк** [ratspeak/Ratspeak](https://github.com/ratspeak/Ratspeak),
-не официальная версия проекта. Авторы оригинала не отвечают за изменения форка;
-вопросы по ним задавайте в [Issues этого репозитория](https://github.com/CleoWixom/Ratspeak-ru/issues),
-а не в основном проекте. Сетевой стек, шифрование и протоколы не менялись:
-форк добавляет перевод и функции вокруг подключений и контактов, поэтому остаётся
-совместимым с обычным Ratspeak и остальной сетью Reticulum.
-
-Лицензия прежняя: AGPL-3.0-or-later. Изменения форка распространяются на тех же
-условиях, исходный текст открыт в этом репозитории. Установочные пакеты,
-TestFlight и сайт ratspeak.org выше относятся к оригиналу и **не содержат**
-функций форка. Debug-APK форка собирает workflow *Android debug APK* в GitHub Actions.
-
-### Что добавлено в форке
-
-- **Русский интерфейс.** Перевод работает отдельным слоем и не меняет логику
-  приложения: словарь `dashboard/static/locales/ru.*` (более 2500 строк), шаблоны для
-  динамических сообщений с правильными окончаниями («1 контакт, 2 контакта, 5 контактов»).
-  Язык берётся из системы или из `localStorage['ratspeak_lang']` (`en` отключает перевод).
-  Инструменты для обновления перевода и добавления других языков:
-  [`tools/i18n`](tools/i18n/README.md).
-- **Ссылки подключения (deep link).** `ratspeak://tcp?...` и `ratspeak://radio?...`
-  открывают приложение и форму **Сеть → Соединения → Интернет/TCP** или **Радио** с
-  заполненными полями: хост, порт, имя, при необходимости имя сети и парольная фраза
-  IFAC; для радио частота, полоса, SF, CR, мощность и пресеты. Ссылка ничего не
-  подключает сама, пользователь проверяет данные и нажимает «Подключить». На Android ссылка,
-  отправленная через системное «Поделиться», открывает ту же форму, а не черновик
-  сообщения. Формат и примеры: [docs/connection-links.md](docs/connection-links.md);
-  генератор и проверка ссылок: `tools/connection_link.py`.
-- **QR-код соединения.** В меню сохранённого соединения (Интернет/TCP, Радио) пункт
-  «Поделиться QR-кодом» показывает QR со ссылкой, умеет копировать ссылку и
-  отправлять картинку. Если в ссылке есть парольная фраза IFAC, приложение предупреждает,
-  что она лежит в коде открытым текстом.
-- **Экспорт и импорт контактов и подключений.** **Настройки → Идентичность →
-  Экспорт/Импорт контактов и подключений** сохраняет контакты и все подключения
-  Интернет/TCP в JSON-файл и добавляет их из файла на другом устройстве. Парольные
-  фразы IFAC попадают в файл только по явному согласию, файл не шифруется. Существующие
-  контакты и подключения не перезаписываются.
-- **Радар распространения анонсов.** **Сеть → Активность → Распространение анонсов**:
-  ваш узел в центре, кольца — хопы, сектора — интерфейсы, точки — известные получатели.
-  Новый анонс расходится волной от своей точки, а импульс идёт к центру. Данные берутся
-  из таблицы путей и событий анонсов, которые приложение уже получает.
-- **Маршрут до контакта.** В меню беседы и карточке контакта пункт «Маршрут» показывает известный
-  путь (хопы, интерфейс, следующий узел, срок жизни) и по кнопке «Найти маршрут» заново запрашивает
-  его у сети, следя за ответом.
-
-Список изменений по версиям: [CHANGELOG.md](CHANGELOG.md).
 
 ## What It Is
 
@@ -136,7 +82,7 @@ For setup help, see:
 Advanced local-stack sharing in this source tree is described in
 [Local Reticulum ownership](docs/network-ownership.md).
 
-Форк собирается так же, как оригинал. The full build guide is here:
+The full build guide is here:
 [Building from Source](https://docs.ratspeak.org/docs/reference/building-from-source).
 It covers desktop prerequisites, Android APKs, iOS signing, and the required
 sibling checkout layout.
@@ -150,17 +96,13 @@ git clone https://github.com/ratspeak/rsReticulum
 git clone https://github.com/ratspeak/rsLXMF
 git clone https://github.com/ratspeak/lrgp-rs
 git clone https://github.com/ratspeak/rsLXST   # experimental voice; skip with --no-default-features
-git clone https://github.com/CleoWixom/Ratspeak-ru Ratspeak   # форк; оригинал: https://github.com/ratspeak/Ratspeak
+git clone https://github.com/ratspeak/Ratspeak
 
 cd Ratspeak
 bash dashboard/build-css.sh
 cd src-tauri
 cargo tauri dev
 ```
-
-Соседние репозитории (`rsReticulum`, `rsLXMF`, `lrgp-rs`, `rsLXST`) берутся из оригинала: форк их не менял.
-Теги ниже относятся к релизам оригинала; сборка форка из `main` использует
-зафиксированные коммиты из `release/dependency-set.json`.
 
 To reproduce a tagged Ratspeak release starting with `v1.0.29`, check out the
 Ratspeak `vX.Y.Z` tag and the matching annotated `ratspeak-vX.Y.Z` tag in each

@@ -10,7 +10,7 @@ var vm = require('vm');
 
 var jsDir = path.join(__dirname, '..', '..', 'dashboard', 'static', 'js');
 var bridgeSource = fs.readFileSync(path.join(jsDir, 'native_connection_link.js'), 'utf8');
-var modalsSource = fs.readFileSync(path.join(jsDir, 'modals.js'), 'utf8');
+var presentersSource = fs.readFileSync(path.join(jsDir, 'connection_link_presenters.js'), 'utf8');
 
 var tcp = { kind: 'tcp', format: 'ratspeak.tcp.v1', payload: 'ratspeak://tcp?v=1&host=a.example',
     host: 'a.example', port: 4242, name: null, ifac_network_name: null, ifac_passphrase: null };
@@ -118,12 +118,7 @@ function presenterContext() {
         _rnodeSetAirtimeLimits: function(a, b) { log.airtime = [a, b]; },
         _rnodeSetInterfaceMode: function(mode) { log.mode = mode; }
     };
-    var start = modalsSource.indexOf('function _connectionLinkInt');
-    var endMarker = 'window.openNativeConnectionLink = openNativeConnectionLink;';
-    var end = modalsSource.indexOf(endMarker);
-    assert(start > 0 && end > start, 'presenter block present in modals.js');
-    vm.runInNewContext(modalsSource.slice(start, end + endMarker.length), context,
-        { filename: 'modals-connection-link.js' });
+    vm.runInNewContext(presentersSource, context, { filename: 'connection_link_presenters.js' });
     return { context: context, elements: elements, log: log };
 }
 
