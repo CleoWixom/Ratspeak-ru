@@ -1931,7 +1931,7 @@
     align-self: flex-start;
     flex: 0 0 auto;
     display: grid;
-    grid-template-columns: repeat(5, minmax(64px, 112px));
+    grid-template-columns: repeat(8, minmax(52px, 96px));
     gap: var(--space-4);
 }
 .settings-type-preset {
