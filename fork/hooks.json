@@ -68,6 +68,33 @@
    "why": "Opens the app for ratspeak://tcp and ratspeak://radio links."
   },
   {
+   "id": "manifest-lxma-scheme",
+   "type": "insert_after",
+   "offset": 1,
+   "file": "src-tauri/gen/android/app/src/main/AndroidManifest.xml",
+   "anchor": "<data android:host=\"radio\" />",
+   "lines": [
+    "            <!-- Ratspeak-ru: lxma://<hash>[.<public key>] LXMF addresses. -->",
+    "            <intent-filter>",
+    "                <action android:name=\"android.intent.action.VIEW\" />",
+    "                <action android:name=\"org.chromium.arc.intent.action.VIEW\" />",
+    "                <category android:name=\"android.intent.category.DEFAULT\" />",
+    "                <category android:name=\"android.intent.category.BROWSABLE\" />",
+    "                <data android:scheme=\"lxma\" />",
+    "            </intent-filter>"
+   ],
+   "marker": "android:scheme=\"lxma\"",
+   "why": "Opens the app for lxma:// address links."
+  },
+  {
+   "id": "desktop-lxma-scheme",
+   "type": "regex_replace",
+   "files": "src-tauri/tauri.*.conf.json",
+   "pattern": "\"ratspeak\"(\\s*\\])",
+   "replacement": "\"ratspeak\",\n          \"lxma\"\\1",
+   "why": "Registers the lxma:// scheme with the desktop deep-link plugin."
+  },
+  {
    "id": "commands-mod",
    "type": "insert_after",
    "file": "crates/ratspeak-tauri/src/commands/mod.rs",

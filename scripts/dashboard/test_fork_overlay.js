@@ -161,7 +161,7 @@ async function runLoader(anchors) {
         '/static/js/connection_link_presenters.js?v=ui-test-1', '/static/js/native_connection_link.js?v=ui-test-1',
         '/static/js/connection_qr.js?v=ui-test-1', '/static/js/contacts_backup.js?v=ui-test-1',
         '/static/js/announce_radar.js?v=ui-test-1', '/static/js/route_lookup.js?v=ui-test-1',
-        '/static/js/ru_text_scale.js?v=ui-test-1', '/static/js/ru_peer_views.js?v=ui-test-1', '/static/js/ru_extensions.js?v=ui-test-1']);
+        '/static/js/ru_text_scale.js?v=ui-test-1', '/static/js/ru_peer_views.js?v=ui-test-1', '/static/js/ru_lxma.js?v=ui-test-1', '/static/js/ru_extensions.js?v=ui-test-1']);
     assert.strictEqual(full.html.scale[0], 'beforebegin');
     ['50', '70', '90'].forEach(function(v) { assert(full.html.scale[1].indexOf('value="' + v + '"') !== -1); });
     assert(full.appended.some(function(n) { return n.tag === 'input' && n.id === 'contacts-backup-file-input'; }));
@@ -170,7 +170,7 @@ async function runLoader(anchors) {
     // Missing anchors cost one feature each, never the loader.
     var bare = await runLoader({});
     assert.strictEqual(bare.warnings.length, 3);
-    assert.strictEqual(bare.appended.filter(function(n) { return n.tag === 'script'; }).length, 9);
+    assert.strictEqual(bare.appended.filter(function(n) { return n.tag === 'script'; }).length, 10);
     console.log('fork overlay passed');
 })().catch(function(error) { console.error(error); process.exit(1); });
 
@@ -223,4 +223,36 @@ async function runLoader(anchors) {
     assert.strictEqual(byContacts.map(function(g) { return g.key + ':' + g.hashes.join(''); }).join('|'), 'contact:ac|other:bd');
     assert.strictEqual(v.planGroups([], 'status').length, 0);
     console.log('ru_peer_views ok');
+})();
+
+// ---- ru_lxma.js: parser and native-target presenter ----
+(function() {
+    var prompts = [], invoked = [];
+    var doc = { addEventListener: function() {} };
+    var ctx = {
+        window: { RS: { invokeOrToast: function(cmd, args) { invoked.push([cmd, args]); } } },
+        document: doc, Event: function() {},
+        rsPromptContact: function(opts) { prompts.push(opts); return Promise.resolve({ hash: opts.defaultHash, display_name: 'Bob' }); }
+    };
+    ctx.window.openNativeConnectionLink = function() { return 'upstream'; };
+    vm.createContext(ctx);
+    vm.runInContext(read('dashboard/static/js/ru_lxma.js'), ctx);
+    var parse = ctx.window.RuLxma.parse;
+    var h = '0123456789abcdef0123456789abcdef', k = 'ab'.repeat(64);
+    var a = parse('lxma://' + h);
+    assert.strictEqual(a.hash, h); assert.strictEqual(a.publicKey, null);
+    var b = parse('LXMA://' + h.toUpperCase() + '.' + k);
+    assert.strictEqual(b.hash, h); assert.strictEqual(b.publicKey, k);
+    assert(parse('lxma://' + h + '/'));
+    ['lxma://', 'lxma://abc', 'lxma://' + h + '00', 'lxma://' + h + '.', 'lxma://' + h + '.' + k.slice(1),
+     'lxma://' + h + '.' + k + '.' + k, 'lxma://' + h + '?x=1', ' lxma://' + h, 'https://example.com', 'lxma://' + h.slice(1) + 'z'
+    ].forEach(function(bad) { assert.strictEqual(parse(bad), null, bad); });
+    assert.strictEqual(ctx.window.openNativeConnectionLink({ kind: 'tcp' }), 'upstream');
+    assert.strictEqual(ctx.window.openNativeConnectionLink({ kind: 'lxma', hash: h, public_key: null }), true);
+    assert.strictEqual(prompts[0].defaultHash, h);
+    Promise.resolve().then(function() {}).then(function() {
+        assert.strictEqual(invoked[0][0], 'add_contact');
+        assert.strictEqual(invoked[0][1].args.hash, h);
+        console.log('ru_lxma ok');
+    });
 })();

@@ -36,6 +36,8 @@ pub(crate) fn extend_android_runtime(config: &mut tauri::Config) {
         for host in ["tcp", "radio"] {
             list.push(serde_json::json!({ "scheme": ["ratspeak"], "host": host }));
         }
+        // `lxma://<hash>[.<public key>]` carries the address in the host slot, so no host filter.
+        list.push(serde_json::json!({ "scheme": ["lxma"] }));
     }
 }
 
@@ -280,6 +282,18 @@ mod tests {
     const TCP_A: &str = "ratspeak://tcp?v=1&host=a.example&port=4242";
     const TCP_B: &str = "ratspeak://tcp?v=1&host=b.example&ifac_name=net&ifac_pass=secret";
     const RADIO: &str = "ratspeak://radio?v=1&region=europe&preset=medium_fast";
+    const LXMA: &str = "lxma://0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn lxma_link_is_accepted_and_shared_text_is_consumed() {
+        let inbox = NativeConnectionLinkInbox::default();
+        assert!(inbox.accept_payloads([LXMA]));
+        let delivery = inbox.peek().expect("lxma link");
+        assert!(
+            matches!(delivery.target, ConnectionLinkTarget::Lxma(ref t) if t.public_key.is_none())
+        );
+        assert_eq!(shared_text_link(&format!("  {LXMA}\n")), Some(LXMA));
+    }
 
     #[test]
     fn android_runtime_filter_adds_connection_hosts_next_to_channel() {
@@ -288,11 +302,15 @@ mod tests {
         crate::channel_deep_link::configure_android_runtime(&mut config);
         extend_android_runtime(&mut config);
         let mobile = config.plugins.0["deep-link"]["mobile"].as_array().unwrap();
-        let hosts: Vec<_> = mobile.iter().map(|e| e["host"].as_str().unwrap()).collect();
+        let hosts: Vec<_> = mobile.iter().filter_map(|e| e["host"].as_str()).collect();
         assert_eq!(hosts, ["channel", "tcp", "radio"]);
         assert!(mobile
             .iter()
+            .filter(|e| e["host"].is_string())
             .all(|e| e["scheme"] == serde_json::json!(["ratspeak"])));
+        assert!(mobile
+            .iter()
+            .any(|e| e["scheme"] == serde_json::json!(["lxma"]) && e["host"].is_null()));
     }
 
     #[test]
