@@ -4,6 +4,7 @@
 (function() {
     'use strict';
 
+    var TAG = 'ratspeak-ru';
     var query = (document.currentScript && document.currentScript.src.split('?')[1]) || '';
     function versioned(path) { return query ? path + '?' + query : path; }
 
@@ -20,14 +21,14 @@
     var SETTINGS_ROWS =
         '<div class="settings-row" id="ru-export-contacts-row">' +
             '<div class="settings-row-info">' +
-                '<span class="settings-row-label">Export Contacts &amp; Connections</span>' +
+                '<span class="settings-row-label">Export Contacts & Connections</span>' +
                 '<span class="settings-row-desc">Save your contacts and all Internet/TCP connections to a file.</span>' +
             '</div>' +
             '<button class="selector-badge selector-badge-no-caret" id="settings-export-contacts-btn">Export</button>' +
         '</div>' +
         '<div class="settings-row" id="ru-import-contacts-row">' +
             '<div class="settings-row-info">' +
-                '<span class="settings-row-label">Import Contacts &amp; Connections</span>' +
+                '<span class="settings-row-label">Import Contacts & Connections</span>' +
                 '<span class="settings-row-desc">Add contacts and Internet/TCP connections from a file. Existing ones are kept.</span>' +
             '</div>' +
             '<button class="selector-badge selector-badge-no-caret" id="settings-import-contacts-btn">Import</button>' +
@@ -66,14 +67,14 @@
         if (row && !document.getElementById('settings-export-contacts-btn')) {
             row.insertAdjacentHTML('afterend', SETTINGS_ROWS);
         } else if (!row) {
-            console.warn('[ratspeak-ru] identity settings anchor not found; contacts export/import hidden');
+            console.warn(TAG, 'missing-anchor', 'settings-backup-identity-btn');
         }
 
         var activity = document.getElementById('network-activity');
         if (activity && !document.getElementById('announce-radar-card')) {
             activity.insertAdjacentHTML('afterbegin', RADAR_CARD);
         } else if (!activity) {
-            console.warn('[ratspeak-ru] network activity anchor not found; announce radar hidden');
+            console.warn(TAG, 'missing-anchor', 'network-activity');
         }
 
         if (!document.getElementById('contacts-backup-file-input')) {
@@ -92,7 +93,7 @@
         script.src = versioned(SCRIPTS[index]);
         script.onload = function() { loadScripts(index + 1); };
         script.onerror = function() {
-            console.warn('[ratspeak-ru] could not load ' + SCRIPTS[index]);
+            console.warn(TAG, 'load-failed', SCRIPTS[index]);
             loadScripts(index + 1);
         };
         document.body.appendChild(script);
