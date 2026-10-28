@@ -145,7 +145,6 @@ window.RATSPEAK_I18N = {
  "Announce history": "История анонсов",
  "Announce history cleared": "История анонсов очищена",
  "Announce propagation": "Распространение анонсов",
- "Announce propagation radar": "Радар распространения анонсов",
  "Announce queued": "Анонс поставлен в очередь",
  "Announce Ratspeak usage": "Анонсировать использование Ratspeak",
  "Announce this hub": "Анонсировать этот хаб",

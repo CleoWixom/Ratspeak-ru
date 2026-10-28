@@ -1,0 +1,106 @@
+/* Ratspeak-ru fork styles. Loaded by ru_loader.js; upstream stylesheets are not modified. */
+/* Route sheet rows. */
+.route-lookup-rows { display: flex; flex-direction: column; gap: var(--space-2); }
+.route-lookup-row { display: flex; justify-content: space-between; gap: var(--space-4); font-size: var(--text-sm); }
+.route-lookup-label { color: var(--text-muted); }
+.route-lookup-value { color: var(--text-primary); text-align: right; overflow-wrap: anywhere; }
+.route-lookup-note { margin: var(--space-4) var(--space-7) 0; min-height: 1.4em; line-height: var(--type-leading-copy); }
+
+/* Announce propagation radar: node in the centre, rings are hops, sectors are interfaces. */
+.announce-radar-card {
+    border-bottom: 1px solid var(--divider);
+    background: var(--surface-sunken);
+    flex-shrink: 0;
+}
+.announce-radar-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-4) var(--space-5);
+    cursor: pointer;
+    color: var(--text-primary);
+}
+.announce-radar-icon { flex-shrink: 0; color: rgb(var(--accent-rgb)); }
+.announce-radar-title {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--type-row-title-size);
+    font-weight: var(--type-weight-semibold);
+}
+.announce-radar-summary {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+    font-variant-numeric: tabular-nums;
+}
+.announce-radar-chevron {
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    color: var(--text-muted);
+    transition: transform var(--transition-base);
+}
+.announce-radar-card.collapsed .announce-radar-chevron { transform: rotate(-90deg); }
+.announce-radar-card.collapsed .announce-radar-body { display: none; }
+.announce-radar-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: 0 var(--space-5) var(--space-4);
+}
+.announce-radar-canvas {
+    display: block;
+    width: 100%;
+    height: 280px;
+    touch-action: manipulation;
+}
+.announce-radar-tip { min-height: 1.4em; overflow-wrap: anywhere; }
+.announce-radar-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-4);
+    font-size: var(--text-xs);
+    color: var(--text-secondary, var(--text-muted));
+}
+.announce-radar-legend-item { display: inline-flex; align-items: center; gap: var(--space-2); }
+.announce-radar-dot { width: 8px; height: 8px; border-radius: var(--radius-full); display: inline-block; }
+.announce-radar-count { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+@media (max-width: 768px) {
+    .announce-radar-canvas { height: 240px; }
+}
+
+/* Notes under the QR code line up with the address block above them. */
+.contact-share-sheet .inline-warning,
+.contact-share-sheet .inline-hint {
+    margin: var(--space-4) var(--space-7) 0;
+    line-height: var(--type-leading-copy);
+    overflow-wrap: anywhere;
+}
+
+
+/* Text size presets: 50/70/90 + 100..140 = eight cards. */
+.settings-type-presets { grid-template-columns: repeat(8, minmax(52px, 96px)); }
+@media (max-width: 768px) {
+    .settings-type-presets { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+
+/* Home peers panel: display modes (ru_peer_views.js). */
+.ru-peers-view-select { max-width: 11rem; margin-right: var(--space-2); }
+.ru-peer-group-head {
+    display: flex; width: 100%; align-items: center; gap: var(--space-2);
+    padding: var(--space-2) var(--space-7); background: transparent; border: 0;
+    border-bottom: 1px solid var(--border, rgba(127, 127, 127, 0.2));
+    color: var(--text-muted, inherit); font-size: 0.8em; text-align: left; cursor: pointer;
+}
+.ru-peer-group-head::before { content: '▾'; }
+.ru-peer-group.collapsed > .ru-peer-group-head::before { content: '▸'; }
+.ru-peer-group.collapsed > .ru-peer-group-body { display: none; }
+.ru-peers-mode-list .dashboard-peers-avatar,
+.ru-peers-mode-list .dashboard-peers-status,
+.ru-peers-mode-list .dashboard-peers-actions { display: none; }
+.ru-peers-mode-list .dashboard-peers-row { padding-top: var(--space-1); padding-bottom: var(--space-1); }
+.ru-peers-mode-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--space-3); padding: var(--space-3); }
+.ru-peers-mode-tiles .dashboard-peers-row { border: 1px solid var(--border, rgba(127, 127, 127, 0.2)); border-radius: 8px; }
+.ru-peers-mode-tiles .dashboard-peers-status,
+.ru-peers-mode-tiles .dashboard-peers-hops { display: none; }
+.ru-peers-mode-tiles .dashboard-peers-empty { grid-column: 1 / -1; }

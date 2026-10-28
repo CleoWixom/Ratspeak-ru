@@ -108,7 +108,7 @@
                 <data android:scheme="ratspeak" />
                 <data android:host="channel" />
             </intent-filter>
-            <!-- Connection links: ratspeak://tcp (Internet/TCP) and
+            <!-- Ratspeak-ru connection links: ratspeak://tcp (Internet/TCP) and
                  ratspeak://radio (LoRa radio parameters). -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
@@ -118,6 +118,14 @@
                 <data android:scheme="ratspeak" />
                 <data android:host="tcp" />
                 <data android:host="radio" />
+            </intent-filter>
+            <!-- Ratspeak-ru: lxma://<hash>[.<public key>] LXMF addresses. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <action android:name="org.chromium.arc.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="lxma" />
             </intent-filter>
         </activity>
 

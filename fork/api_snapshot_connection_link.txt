@@ -1,0 +1,32 @@
+pub mod ratspeak_tauri::commands::connection_link
+pub enum ratspeak_tauri::commands::connection_link::ConnectionLinkTarget
+pub ratspeak_tauri::commands::connection_link::ConnectionLinkTarget::Radio(ratspeak_tauri::commands::connection_link::RadioLinkTarget)
+pub ratspeak_tauri::commands::connection_link::ConnectionLinkTarget::Tcp(ratspeak_tauri::commands::connection_link::TcpLinkTarget)
+pub struct ratspeak_tauri::commands::connection_link::RadioLinkTarget
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::airtime_limit_long: core::option::Option<f64>
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::airtime_limit_short: core::option::Option<f64>
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::bandwidth: u64
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::coding_rate: u8
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::custom_params: bool
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::format: &'static str
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::frequency: u64
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::mode: core::option::Option<alloc::string::String>
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::name: core::option::Option<alloc::string::String>
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::payload: alloc::string::String
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::preset_key: core::option::Option<alloc::string::String>
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::region_key: core::option::Option<alloc::string::String>
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::spreading_factor: u8
+pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::tx_power: i8
+pub struct ratspeak_tauri::commands::connection_link::TcpLinkTarget
+pub ratspeak_tauri::commands::connection_link::TcpLinkTarget::format: &'static str
+pub ratspeak_tauri::commands::connection_link::TcpLinkTarget::host: alloc::string::String
+pub ratspeak_tauri::commands::connection_link::TcpLinkTarget::ifac_network_name: core::option::Option<alloc::string::String>
+pub ratspeak_tauri::commands::connection_link::TcpLinkTarget::ifac_passphrase: core::option::Option<alloc::string::String>
+pub ratspeak_tauri::commands::connection_link::TcpLinkTarget::name: core::option::Option<alloc::string::String>
+pub ratspeak_tauri::commands::connection_link::TcpLinkTarget::payload: alloc::string::String
+pub ratspeak_tauri::commands::connection_link::TcpLinkTarget::port: u16
+impl core::fmt::Debug for ratspeak_tauri::commands::connection_link::TcpLinkTarget
+pub fn ratspeak_tauri::commands::connection_link::TcpLinkTarget::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn ratspeak_tauri::commands::connection_link::build_radio_preset_link(&str, &str, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<ratspeak_tauri::commands::connection_link::RadioLinkTarget, alloc::string::String>
+pub fn ratspeak_tauri::commands::connection_link::build_tcp_link(&str, u16, core::option::Option<&str>, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<ratspeak_tauri::commands::connection_link::TcpLinkTarget, alloc::string::String>
+pub fn ratspeak_tauri::commands::connection_link::parse_connection_link(&str) -> core::result::Result<ratspeak_tauri::commands::connection_link::ConnectionLinkTarget, alloc::string::String>

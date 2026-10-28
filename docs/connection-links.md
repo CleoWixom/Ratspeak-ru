@@ -70,3 +70,17 @@ python3 tools/connection_link.py check "ratspeak://tcp?v=1&host=rns.example.org"
 - Ссылка проверяется тем же Rust-парсером (`validate_connection_link`), что и входящие.
   Формат QR вмещает до 241 байта: если имя не помещается, оно опускается, а если не помещаются
   сами данные, показывается ошибка.
+
+## `lxma://` addresses
+
+`lxma://<32 hex destination hash>` and `lxma://<32 hex destination hash>.<128 hex public key>`
+open the **Add contact** dialog with the hash filled in; nothing is added until the user confirms.
+The parser (`parse_lxma` in `connection_link.rs`, mirrored by `RuLxma.parse` in `ru_lxma.js`) accepts
+only that exact shape: hex of the right length (any case, stored lowercase), an optional single
+trailing `/`, no query, path, userinfo or whitespace.
+
+Delivery uses the same inbox as `ratspeak://tcp` / `ratspeak://radio`: the Android manifest filter
+and deep-link runtime filter (scheme `lxma`, no host), the desktop `schemes` list, the Android share
+sheet (a shared text that is exactly one link), and links tapped or pasted inside the app.
+The public key is validated and carried in the target, but the backend `add_contact` command
+only takes the hash today, so the key is not stored yet.

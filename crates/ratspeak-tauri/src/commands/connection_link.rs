@@ -46,6 +46,59 @@ const RADIO_MODES: &[&str] = &["full", "gateway", "access_point", "boundary", "r
 pub enum ConnectionLinkTarget {
     Tcp(TcpLinkTarget),
     Radio(RadioLinkTarget),
+    Lxma(LxmaLinkTarget),
+}
+
+/// `lxma://<32 hex destination hash>` or `lxma://<hash>.<128 hex public key>`.
+/// Carries only validated, lowercase hex; opening one just pre-fills "Add contact".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LxmaLinkTarget {
+    pub payload: String,
+    pub hash: String,
+    pub public_key: Option<String>,
+}
+
+const LXMA_PREFIX: &str = "lxma://";
+const LXMA_HASH_HEX_LEN: usize = 32;
+const LXMA_PUBLIC_KEY_HEX_LEN: usize = 128;
+
+fn has_lxma_scheme(payload: &str) -> bool {
+    payload
+        .get(..LXMA_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(LXMA_PREFIX))
+}
+
+fn lxma_hex(part: &str, len: usize) -> Option<String> {
+    (part.len() == len && part.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| part.to_ascii_lowercase())
+}
+
+fn parse_lxma(payload: &str) -> Result<LxmaLinkTarget, String> {
+    const INVALID: &str = "Not a valid lxma:// address";
+    let well_formed = payload == payload.trim()
+        && !payload.is_empty()
+        && payload.len() <= CONNECTION_LINK_MAX_BYTES;
+    if !well_formed {
+        return Err(INVALID.into());
+    }
+    let rest = &payload[LXMA_PREFIX.len()..];
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let (hash_part, key_part) = match rest.split_once('.') {
+        Some((hash, key)) => (hash, Some(key)),
+        None => (rest, None),
+    };
+    let hash = lxma_hex(hash_part, LXMA_HASH_HEX_LEN).ok_or_else(|| INVALID.to_string())?;
+    let public_key = match key_part {
+        Some(key) => Some(
+            lxma_hex(key, LXMA_PUBLIC_KEY_HEX_LEN).ok_or_else(|| INVALID.to_string())?,
+        ),
+        None => None,
+    };
+    Ok(LxmaLinkTarget {
+        payload: payload.to_string(),
+        hash,
+        public_key,
+    })
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -97,6 +150,9 @@ pub struct RadioLinkTarget {
 
 /// Parse one canonical Ratspeak connection link (TCP or radio).
 pub fn parse_connection_link(payload: &str) -> Result<ConnectionLinkTarget, String> {
+    if has_lxma_scheme(payload) {
+        return parse_lxma(payload).map(ConnectionLinkTarget::Lxma);
+    }
     let url = parse_envelope(payload)?;
     match url.host_str() {
         Some(CONNECTION_LINK_HOST_TCP) => parse_tcp(payload, &url).map(ConnectionLinkTarget::Tcp),
@@ -477,6 +533,52 @@ pub fn build_radio_preset_link(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LXMA_HASH: &str = "0123456789abcdef0123456789abcdef";
+
+    fn lxma_key() -> String {
+        "ab".repeat(64)
+    }
+
+    #[test]
+    fn lxma_accepts_hash_and_hash_with_public_key() {
+        let plain = match parse_connection_link(&format!("lxma://{LXMA_HASH}")).unwrap() {
+            ConnectionLinkTarget::Lxma(t) => t,
+            other => panic!("expected lxma, got {other:?}"),
+        };
+        assert_eq!(plain.hash, LXMA_HASH);
+        assert_eq!(plain.public_key, None);
+
+        let keyed = format!("LXMA://{}.{}", LXMA_HASH.to_uppercase(), lxma_key());
+        match parse_connection_link(&keyed).unwrap() {
+            ConnectionLinkTarget::Lxma(t) => {
+                assert_eq!(t.hash, LXMA_HASH);
+                assert_eq!(t.public_key.as_deref(), Some(lxma_key().as_str()));
+            }
+            other => panic!("expected lxma, got {other:?}"),
+        }
+        assert!(parse_connection_link(&format!("lxma://{LXMA_HASH}/")).is_ok());
+    }
+
+    #[test]
+    fn lxma_rejects_malformed_addresses() {
+        let key = lxma_key();
+        for bad in [
+            "lxma://".to_string(),
+            "lxma://abc".to_string(),
+            format!("lxma://{LXMA_HASH}00"),
+            format!("lxma://{}z", &LXMA_HASH[..31]),
+            format!("lxma://{LXMA_HASH}."),
+            format!("lxma://{LXMA_HASH}.{}", &key[..127]),
+            format!("lxma://{LXMA_HASH}.{key}.{key}"),
+            format!("lxma://{LXMA_HASH}?x=1"),
+            format!("lxma://{LXMA_HASH}/path"),
+            format!(" lxma://{LXMA_HASH}"),
+            format!("lxma://user@{LXMA_HASH}"),
+        ] {
+            assert!(parse_connection_link(&bad).is_err(), "must reject {bad:?}");
+        }
+    }
 
     fn tcp(link: &str) -> TcpLinkTarget {
         match parse_connection_link(link).expect("valid link") {
