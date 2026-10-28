@@ -143,7 +143,8 @@ function fakeDom(anchors) {
 async function runLoader(anchors) {
     var dom = fakeDom(anchors), warnings = [];
     vm.runInNewContext(read('dashboard/static/js/ru_loader.js'), { document: dom.document,
-        console: { warn: function(m) { warnings.push(m); } }, setTimeout: setTimeout });
+        window: { RS: { diag: function(level, tag) { assert.strictEqual(level, 'warn'); warnings.push(tag); } } },
+        setTimeout: setTimeout });
     for (var i = 0; i < 30; i++) await new Promise(function(r) { setTimeout(r, 1); });
     dom.warnings = warnings;
     return dom;

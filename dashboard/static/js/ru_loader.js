@@ -5,6 +5,14 @@
     'use strict';
 
     var TAG = 'ratspeak-ru';
+
+    // Diagnostics go through RS.diag (silent unless enabled), not straight to the browser log.
+    function warn() {
+        var rs = window.RS;
+        if (rs && typeof rs.diag === 'function') {
+            rs.diag.apply(rs, ['warn'].concat([].slice.call(arguments)));
+        }
+    }
     var query = (document.currentScript && document.currentScript.src.split('?')[1]) || '';
     function versioned(path) { return query ? path + '?' + query : path; }
 
@@ -77,7 +85,7 @@
         if (row && !document.getElementById('settings-export-contacts-btn')) {
             row.insertAdjacentHTML('afterend', SETTINGS_ROWS);
         } else if (!row) {
-            console.warn(TAG, 'missing-anchor', 'settings-backup-identity-btn');
+            warn(TAG, 'missing-anchor', 'settings-backup-identity-btn');
         }
 
         // Text size 50/70/90%: added before upstream's DOMContentLoaded handler binds the radios.
@@ -86,14 +94,14 @@
         if (firstLabel && !document.querySelector('input[name="settings-text-scale"][value="50"]')) {
             firstLabel.insertAdjacentHTML('beforebegin', textScalePreset(50) + textScalePreset(70) + textScalePreset(90));
         } else if (!firstLabel) {
-            console.warn(TAG, 'missing-anchor', 'settings-text-scale');
+            warn(TAG, 'missing-anchor', 'settings-text-scale');
         }
 
         var activity = document.getElementById('network-activity');
         if (activity && !document.getElementById('announce-radar-card')) {
             activity.insertAdjacentHTML('afterbegin', RADAR_CARD);
         } else if (!activity) {
-            console.warn(TAG, 'missing-anchor', 'network-activity');
+            warn(TAG, 'missing-anchor', 'network-activity');
         }
 
         if (!document.getElementById('contacts-backup-file-input')) {
@@ -112,7 +120,7 @@
         script.src = versioned(SCRIPTS[index]);
         script.onload = function() { loadScripts(index + 1); };
         script.onerror = function() {
-            console.warn(TAG, 'load-failed', SCRIPTS[index]);
+            warn(TAG, 'load-failed', SCRIPTS[index]);
             loadScripts(index + 1);
         };
         document.body.appendChild(script);
