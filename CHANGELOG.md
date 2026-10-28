@@ -11,6 +11,7 @@ changes that materially affect how an artifact is reproduced.
 - Connection links `ratspeak://tcp` and `ratspeak://radio` that pre-fill Network → Connections → Internet/TCP or Radio, with optional IFAC network name and passphrase. A link never connects by itself. A link shared as plain text through the Android share sheet opens the same form. See `docs/connection-links.md` and `tools/connection_link.py`.
 - Share QR code in the connection menu for Internet/TCP and Radio connections.
 - Export and import of contacts and Internet/TCP connections in Settings → Identity. IFAC passphrases are included only on request; the file is not encrypted.
+- Battleship (Морской бой): a two-player LRGP game with hidden fleets. Fleets are committed with SHA-256 before the first shot and revealed at the end so both sides can verify every answer; a dishonest answer ends the game in the verifier's favor. Ratspeak-only: peers on other clients cannot play it.
 - Announce propagation radar in Network → Activity: hops as rings, interfaces as sectors, destinations as dots, with waves for new announces.
 - Route to a contact: a Route action in the conversation menu and the contact sheet shows the known path (hops, interface, next hop, time left) and can request it again from the network.
 

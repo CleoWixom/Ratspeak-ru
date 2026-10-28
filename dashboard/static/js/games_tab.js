@@ -1780,6 +1780,7 @@
                 { app_id: 'ttt', display_name: 'Tic-Tac-Toe', icon: 'ttt', session_type: 'turn_based' },
                 { app_id: 'chess', display_name: 'Chess', icon: 'chess', session_type: 'turn_based' },
                 { app_id: 'four_in_a_row', display_name: 'Four in a Row', icon: 'four_in_a_row', session_type: 'turn_based' },
+                { app_id: 'battleship', display_name: 'Battleship', icon: 'battleship', session_type: 'turn_based' },
             ];
         }
         manifests.sort(function(a, b) {

@@ -9,6 +9,7 @@
 pub mod activity;
 pub mod announce;
 pub mod announce_handlers;
+mod battleship;
 pub mod blackhole;
 pub mod channel_hub;
 pub mod channels;

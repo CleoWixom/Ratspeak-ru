@@ -72,6 +72,8 @@ tracing = { workspace = true }
 crossbeam-channel = "0.5"
 indexmap = "2"
 hex = { workspace = true }
+# Battleship fleet commitments (SHA-256); already in the lockfile transitively.
+sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 image = { workspace = true }
 # Passcode at-rest encryption of software identities (P3).

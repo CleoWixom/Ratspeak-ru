@@ -247,7 +247,7 @@ impl PreparedGame {
             return Err(SuppressionReason::Quota);
         }
         drop(connection);
-        let working = lrgp::router::LrgpRouter::with_builtin_apps();
+        let working = crate::battleship::lrgp_router();
         if let Some((session, _)) = &prior {
             working
                 .restore_session(session.clone())

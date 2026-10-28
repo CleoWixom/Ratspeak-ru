@@ -2972,11 +2972,86 @@ fn games_transport_uses_native_lxmf_fields_and_a_durable_outbox() {
         rust_function_block(&runtime, "complete_authenticated_lxmf_delivery_proof");
     assert!(proof_completion.contains(".lrgp_msg_to_session"));
     assert!(proof_completion.contains("update_game_session_delivery_state("));
-    assert!(state.contains("LrgpRouter::with_builtin_apps()"));
+    // One registry function adds Ratspeak's own games on top of the LRGP
+    // built-ins; live dispatch, admission and hydration must all use it.
+    let battleship = read_source(repo_root().join("crates/ratspeak-runtime/src/battleship.rs"))
+        .expect("battleship engine");
+    assert!(state.contains("crate::battleship::lrgp_router()"));
+    assert!(battleship.contains("LrgpRouter::with_builtin_apps()"));
+    assert!(battleship.contains("router.register(Box::new(BattleshipApp::new()))"));
+    let admission =
+        read_source(repo_root().join("crates/ratspeak-runtime/src/inbound_admission/game.rs"))
+            .expect("game admission");
+    assert!(admission.contains("crate::battleship::lrgp_router()"));
+    assert!(!admission.contains("LrgpRouter::with_builtin_apps()"));
     assert!(!state.contains("register(Box::new(lrgp::apps::tictactoe"));
     for field in ["validation", "preferred_delivery", "ttl"] {
         assert!(games.contains(&format!("\"{field}\": manifest.{field}")));
     }
+}
+
+/// Battleship hides each fleet behind a commitment. These guards keep the
+/// secret fleet/salt off the wire and the view thin: it never computes game
+/// outcomes, only pre-fills intents the Rust engine validates.
+#[test]
+fn battleship_keeps_secrets_local_and_the_view_protocol_thin() {
+    let root = repo_root();
+    let engine = read_source(root.join("crates/ratspeak-runtime/src/battleship.rs"))
+        .expect("battleship engine");
+    let runtime_lib =
+        read_source(root.join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime lib");
+    let view =
+        read_source(root.join("dashboard/static/js/battleship_view.js")).expect("battleship view");
+    let index = read_source(root.join("dashboard/index.html")).expect("dashboard index");
+    let games_js = read_source(root.join("dashboard/static/js/games_tab.js")).expect("games tab");
+    let production = engine.split("#[cfg(test)]").next().unwrap();
+
+    // The module stays private so the reviewed public API does not change.
+    assert!(runtime_lib.contains("\nmod battleship;\n"));
+    assert!(!runtime_lib.contains("pub mod battleship"));
+    assert!(production.contains("pub(crate) fn lrgp_router()"));
+
+    // Commitments are bound to the session and player and hashed with SHA-256.
+    assert!(production.contains("ratspeak.battleship.v1"));
+    assert!(production.contains("hasher.update(session_id.as_bytes())"));
+    assert!(production.contains("hasher.update(player.as_bytes())"));
+    // Only the commitment is written to a commit payload; the local fleet and
+    // salt are copied to the wire only inside the reveal branch.
+    assert!(production.contains("(\"h\".into(), rmpv::Value::Binary(digest.to_vec()))"));
+    let reveal_branch = production
+        .split("// Reveal: the loser's carries the final answer.")
+        .nth(1)
+        .expect("reveal branch");
+    assert!(reveal_branch.contains("rmpv::Value::Binary(game.my_fleet.clone())"));
+    let before_reveal = production
+        .split("// Reveal: the loser's carries the final answer.")
+        .next()
+        .unwrap();
+    assert!(!before_reveal.contains("Binary(game.my_salt"));
+    assert!(!before_reveal.contains("Binary(game.my_fleet"));
+    // Wire validation rejects unknown keys by exact-key matching.
+    assert!(production.contains("fn exact_keys("));
+    assert!(production.contains("fn validate_wire_payload("));
+    // The router rolls back rejected inbound actions, so handlers validate
+    // before mutating and never save a half-applied move.
+    assert!(production.contains("fn rollback_session("));
+
+    assert!(view.contains("var APP_ID = 'battleship';"));
+    assert!(view.contains("RS.games.views.register(APP_ID"));
+    assert!(!view.contains("localStorage"));
+    assert!(!view.contains("sessionStorage"));
+    // The view only pre-fills intents and never reads hashes or salts.
+    assert!(!view.contains("my_salt"));
+    assert!(view.contains("context.sendMove({ k: 'c', p: fleet }"));
+    assert!(view.contains("context.sendMove({ k: 'f', c: cell }"));
+    assert!(view.contains("context.sendMove({ k: 'r' })"));
+
+    let registry = index.find("/static/js/game_registry.js").unwrap();
+    let four = index.find("/static/js/four_in_a_row_view.js").unwrap();
+    let battleship = index.find("/static/js/battleship_view.js").unwrap();
+    let games = index.find("/static/js/games_tab.js").unwrap();
+    assert!(registry < battleship && four < battleship && battleship < games);
+    assert!(games_js.contains("app_id: 'battleship', display_name: 'Battleship'"));
 }
 
 #[test]
