@@ -33,8 +33,16 @@ ROOT = HERE.parent
 UPSTREAM_URL = "https://github.com/ratspeak/Ratspeak.git"
 
 
+def identity(repo: Path) -> list[str]:
+    """git needs a committer identity even for `merge --no-commit`; borrow one when unset."""
+    probe = subprocess.run(["git", "config", "user.email"], cwd=repo, capture_output=True, text=True)
+    if probe.stdout.strip():
+        return []
+    return ["-c", "user.name=ratspeak-ru-sync", "-c", "user.email=noreply@example.invalid"]
+
+
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+    result = subprocess.run(["git", *identity(repo), *args], cwd=repo, capture_output=True, text=True)
     if check and result.returncode != 0:
         raise SystemExit(f"git {' '.join(args)} failed:\n{result.stderr or result.stdout}")
     return result
@@ -82,7 +90,6 @@ def new_translation_keys(repo: Path) -> list[str]:
 
 
 def sync(repo: Path, ref: str, tests: bool, commit: bool) -> int:
-    git(repo, "remote", "get-url", "upstream", check=False)
     if git(repo, "remote", "get-url", "upstream", check=False).returncode != 0:
         git(repo, "remote", "add", "upstream", UPSTREAM_URL)
     print("fetching upstream ...")
@@ -96,6 +103,9 @@ def sync(repo: Path, ref: str, tests: bool, commit: bool) -> int:
 
     merge = git(repo, "merge", "--no-commit", "--no-ff", target, check=False)
     problems = conflicted(repo)
+    if merge.returncode != 0 and not problems:
+        print(f"git merge failed without conflicts:\n{merge.stderr or merge.stdout}", file=sys.stderr)
+        return 5
     managed = hook_files(repo)
     unresolved = [f for f in problems if f not in managed]
     if unresolved:
@@ -145,9 +155,7 @@ def sync(repo: Path, ref: str, tests: bool, commit: bool) -> int:
         print("\ndashboard tests: all passed")
 
     if commit:
-        config = git(repo, "config", "user.name", check=False).stdout.strip()
-        ident = [] if config else ["-c", "user.name=ratspeak-ru-sync", "-c", "user.email=noreply@example.invalid"]
-        git(repo, *ident, "commit", "-q", "-m", f"Merge upstream {target} into Ratspeak-ru")
+        git(repo, "commit", "-q", "-m", f"Merge upstream {target} into Ratspeak-ru")
         print(f"\nmerged {target}: {git(repo, 'rev-parse', '--short', 'HEAD').stdout.strip()}")
     return 0
 
