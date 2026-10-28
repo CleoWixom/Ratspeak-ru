@@ -26,6 +26,7 @@
         '/static/js/ru_text_scale.js',
         '/static/js/ru_peer_views.js',
         '/static/js/ru_lxma.js',
+        '/static/js/ru_geo.js',
         '/static/js/ru_extensions.js'
     ];
 

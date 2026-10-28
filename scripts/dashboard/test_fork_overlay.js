@@ -161,7 +161,7 @@ async function runLoader(anchors) {
         '/static/js/connection_link_presenters.js?v=ui-test-1', '/static/js/native_connection_link.js?v=ui-test-1',
         '/static/js/connection_qr.js?v=ui-test-1', '/static/js/contacts_backup.js?v=ui-test-1',
         '/static/js/announce_radar.js?v=ui-test-1', '/static/js/route_lookup.js?v=ui-test-1',
-        '/static/js/ru_text_scale.js?v=ui-test-1', '/static/js/ru_peer_views.js?v=ui-test-1', '/static/js/ru_lxma.js?v=ui-test-1', '/static/js/ru_extensions.js?v=ui-test-1']);
+        '/static/js/ru_text_scale.js?v=ui-test-1', '/static/js/ru_peer_views.js?v=ui-test-1', '/static/js/ru_lxma.js?v=ui-test-1', '/static/js/ru_geo.js?v=ui-test-1', '/static/js/ru_extensions.js?v=ui-test-1']);
     assert.strictEqual(full.html.scale[0], 'beforebegin');
     ['50', '70', '90'].forEach(function(v) { assert(full.html.scale[1].indexOf('value="' + v + '"') !== -1); });
     assert(full.appended.some(function(n) { return n.tag === 'input' && n.id === 'contacts-backup-file-input'; }));
@@ -170,7 +170,7 @@ async function runLoader(anchors) {
     // Missing anchors cost one feature each, never the loader.
     var bare = await runLoader({});
     assert.strictEqual(bare.warnings.length, 3);
-    assert.strictEqual(bare.appended.filter(function(n) { return n.tag === 'script'; }).length, 10);
+    assert.strictEqual(bare.appended.filter(function(n) { return n.tag === 'script'; }).length, 11);
     console.log('fork overlay passed');
 })().catch(function(error) { console.error(error); process.exit(1); });
 
@@ -255,4 +255,43 @@ async function runLoader(anchors) {
         assert.strictEqual(invoked[0][1].args.hash, h);
         console.log('ru_lxma ok');
     });
+})();
+
+// ---- ru_geo.js: fix validation, throttling, config ----
+(function() {
+    var store = {};
+    var ctx = {
+        window: { addEventListener: function() {}, dispatchEvent: function() {}, CustomEvent: function() {} },
+        document: { readyState: 'complete', getElementById: function() { return null; } },
+        localStorage: { getItem: function(k) { return k in store ? store[k] : null; }, setItem: function(k, v) { store[k] = String(v); } },
+        navigator: { language: 'en' }, setInterval: function() {}, Date: Date, Math: Math, JSON: JSON,
+        CustomEvent: function() {}
+    };
+    vm.createContext(ctx);
+    vm.runInContext(read('dashboard/static/js/ru_geo.js'), ctx);
+    var geo = ctx.window.RuGeo, p = geo._pure;
+    assert.strictEqual(p.normalizeFix({ latitude: 91, longitude: 0 }, 'phone', 1), null);
+    assert.strictEqual(p.normalizeFix({ latitude: 0, longitude: 181 }, 'phone', 1), null);
+    assert.strictEqual(p.normalizeFix({ latitude: 'x', longitude: 0 }, 'phone', 1), null);
+    assert.strictEqual(p.normalizeFix(null, 'phone', 1), null);
+    var fix = p.normalizeFix({ lat: 55.75, lon: 37.62, acc: 12 }, 'radio', 5);
+    assert.strictEqual(fix.lat, 55.75); assert.strictEqual(fix.acc, 12); assert.strictEqual(fix.source, 'radio'); assert.strictEqual(fix.alt, null);
+    var d = p.distanceM({ lat: 0, lon: 0 }, { lat: 0, lon: 1 });
+    assert(d > 111000 && d < 111400, String(d));
+    var a = { lat: 10, lon: 10, ts: 0 };
+    assert.strictEqual(p.shouldAccept(null, a), true);
+    assert.strictEqual(p.shouldAccept(a, { lat: 10, lon: 10.00001, ts: 1000 }), false);
+    assert.strictEqual(p.shouldAccept(a, { lat: 10.001, lon: 10, ts: 1000 }), true);
+    assert.strictEqual(p.shouldAccept(a, { lat: 10, lon: 10, ts: 5000 }), true);
+    assert.strictEqual(geo.config().enabled, false);
+    geo.setSource('radio');
+    assert.strictEqual(geo.config().source, 'radio');
+    assert.strictEqual(geo.pushRadioFix({ lat: 1, lon: 1 }), false, 'ignored while disabled');
+    geo.setEnabled(true);
+    assert.strictEqual(geo.pushRadioFix({ lat: 1, lon: 1 }), true);
+    assert.strictEqual(geo.get().source, 'radio');
+    geo.setEnabled(false);
+    assert.strictEqual(geo.get(), null);
+    assert.strictEqual(JSON.parse(store['ratspeak-ru-geo']).enabled, false);
+    console.log('ru_geo ok');
 })();
