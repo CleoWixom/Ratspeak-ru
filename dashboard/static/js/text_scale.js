@@ -2,35 +2,23 @@
     'use strict';
 
     var STORAGE_KEY = 'rs-text-scale-percent';
-    var MIN = 50;
-    var DEFAULT = 100;
+    var MIN = 100;
     var MAX = 140;
     var STEP = 10;
-    // Допустимые значения: 50/70/90 (уменьшение) и 100..140 с шагом 10.
-    var ALLOWED = [50, 70, 90, 100, 110, 120, 130, 140];
 
     function normalize(value) {
         var numeric = Number(value);
-        if (!Number.isFinite(numeric)) numeric = DEFAULT;
+        if (!Number.isFinite(numeric)) numeric = MIN;
         numeric = Math.max(MIN, Math.min(MAX, numeric));
-        var best = ALLOWED[0];
-        for (var i = 1; i < ALLOWED.length; i++) {
-            if (Math.abs(ALLOWED[i] - numeric) < Math.abs(best - numeric)) best = ALLOWED[i];
-        }
-        return best;
+        return Math.round((numeric - MIN) / STEP) * STEP + MIN;
     }
 
     function storedValue() {
-        try {
-            var raw = localStorage.getItem(STORAGE_KEY);
-            if (raw !== null) return normalize(raw);
-        } catch (_) {}
-        return DEFAULT;
+        try { return normalize(localStorage.getItem(STORAGE_KEY)); } catch (_) {}
+        return MIN;
     }
 
     function tier(percent) {
-        if (percent <= 70) return 'small';
-        if (percent < 100) return 'compact';
         if (percent >= 140) return 'xlarge';
         if (percent >= 130) return 'large';
         if (percent >= 120) return 'medium';
@@ -46,7 +34,7 @@
 
         if (committed) {
             try {
-                if (percent === DEFAULT) localStorage.removeItem(STORAGE_KEY);
+                if (percent === MIN) localStorage.removeItem(STORAGE_KEY);
                 else localStorage.setItem(STORAGE_KEY, String(percent));
             } catch (_) {}
         }
@@ -62,8 +50,6 @@
     window.RS = window.RS || {};
     window.RS.textScale = {
         MIN: MIN,
-        DEFAULT: DEFAULT,
-        ALLOWED: ALLOWED,
         MAX: MAX,
         STEP: STEP,
         get: function() {
@@ -71,7 +57,7 @@
         },
         preview: function(value) { return apply(value, false, true); },
         commit: function(value) { return apply(value, true, true); },
-        reset: function() { return apply(DEFAULT, true, true); },
+        reset: function() { return apply(MIN, true, true); },
         normalize: normalize
     };
 

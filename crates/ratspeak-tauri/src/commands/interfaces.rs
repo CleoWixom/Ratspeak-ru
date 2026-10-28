@@ -1166,7 +1166,7 @@ pub async fn api_app_settings(state: State<'_, Arc<AppState>>) -> AppResult<Valu
             db::get_setting(&p, "hide_known_spam_peers").is_none_or(|value| value != "false");
         let text_scale_percent = db::get_setting(&p, "text_scale_percent")
             .and_then(|value| value.parse::<u16>().ok())
-            .map(normalize_text_scale)
+            .map(|value| (value.clamp(100, 140) + 5) / 10 * 10)
             .unwrap_or(100);
         let theme_family = db::get_setting(&p, "theme_family")
             .and_then(|value| normalize_theme_family(&value).map(str::to_string))
@@ -1401,19 +1401,9 @@ mod native_theme_tests {
     }
 }
 
-/// Допустимые значения размера текста: 50/70/90 и 100..=140 с шагом 10.
-fn normalize_text_scale(value: u16) -> u16 {
-    const ALLOWED: [u16; 8] = [50, 70, 90, 100, 110, 120, 130, 140];
-    let v = value.clamp(50, 140);
-    *ALLOWED
-        .iter()
-        .min_by_key(|candidate| candidate.abs_diff(v))
-        .unwrap_or(&100)
-}
-
 #[tauri::command]
 pub async fn set_text_scale(state: State<'_, Arc<AppState>>, percent: u16) -> AppResult<Value> {
-    let percent = normalize_text_scale(percent);
+    let percent = (percent.clamp(100, 140) + 5) / 10 * 10;
     db::spawn_db(state.db.clone(), move |p| {
         db::try_set_setting(&p, "text_scale_percent", &percent.to_string())
     })
