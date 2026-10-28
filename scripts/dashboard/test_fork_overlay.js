@@ -118,6 +118,7 @@ function fakeDom(anchors) {
     function element(tag) { return { tag: tag, style: {}, setAttribute: function() {} }; }
     var row = { insertAdjacentHTML: function(where, text) { html.row = [where, text]; } };
     var activity = { insertAdjacentHTML: function(where, text) { html.activity = [where, text]; } };
+    var presetLabel = { insertAdjacentHTML: function(where, text) { html.scale = [where, text]; } };
     var document = {
         currentScript: { src: '/static/js/ru_loader.js?v=ui-test-1' },
         head: { appendChild: function(node) { styles.push(node); } },
@@ -126,6 +127,10 @@ function fakeDom(anchors) {
             if (node.tag === 'script') setTimeout(function() { node.onload(); }, 0);
         } },
         createElement: element,
+        querySelector: function(sel) {
+            if (sel.indexOf('value="100"') !== -1 && anchors.scale) return { closest: function() { return presetLabel; } };
+            return null;
+        },
         getElementById: function(id) {
             if (registry[id]) return registry[id];
             if (id === 'settings-backup-identity-btn' && anchors.settings) return { closest: function() { return row; } };
@@ -144,7 +149,7 @@ async function runLoader(anchors) {
     return dom;
 }
 (async function() {
-    var full = await runLoader({ settings: true, activity: true });
+    var full = await runLoader({ settings: true, activity: true, scale: true });
     assert.strictEqual(full.styles[0].href, '/static/css/ratspeak-ru.css?v=ui-test-1');
     assert.strictEqual(full.html.row[0], 'afterend');
     assert(full.html.row[1].indexOf('settings-export-contacts-btn') !== -1 && full.html.row[1].indexOf('settings-import-contacts-btn') !== -1);
@@ -155,14 +160,16 @@ async function runLoader(anchors) {
         '/static/js/connection_link_presenters.js?v=ui-test-1', '/static/js/native_connection_link.js?v=ui-test-1',
         '/static/js/connection_qr.js?v=ui-test-1', '/static/js/contacts_backup.js?v=ui-test-1',
         '/static/js/announce_radar.js?v=ui-test-1', '/static/js/route_lookup.js?v=ui-test-1',
-        '/static/js/ru_extensions.js?v=ui-test-1']);
+        '/static/js/ru_text_scale.js?v=ui-test-1', '/static/js/ru_extensions.js?v=ui-test-1']);
+    assert.strictEqual(full.html.scale[0], 'beforebegin');
+    ['50', '70', '90'].forEach(function(v) { assert(full.html.scale[1].indexOf('value="' + v + '"') !== -1); });
     assert(full.appended.some(function(n) { return n.tag === 'input' && n.id === 'contacts-backup-file-input'; }));
     assert.strictEqual(full.warnings.length, 0);
 
     // Missing anchors cost one feature each, never the loader.
     var bare = await runLoader({});
-    assert.strictEqual(bare.warnings.length, 2);
-    assert.strictEqual(bare.appended.filter(function(n) { return n.tag === 'script'; }).length, 7);
+    assert.strictEqual(bare.warnings.length, 3);
+    assert.strictEqual(bare.appended.filter(function(n) { return n.tag === 'script'; }).length, 8);
     console.log('fork overlay passed');
 })().catch(function(error) { console.error(error); process.exit(1); });
 
