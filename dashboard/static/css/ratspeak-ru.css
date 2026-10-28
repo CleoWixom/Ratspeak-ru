@@ -83,3 +83,24 @@
 @media (max-width: 768px) {
     .settings-type-presets { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
+
+/* Home peers panel: display modes (ru_peer_views.js). */
+.ru-peers-view-select { max-width: 11rem; margin-right: var(--space-2); }
+.ru-peer-group-head {
+    display: flex; width: 100%; align-items: center; gap: var(--space-2);
+    padding: var(--space-2) var(--space-7); background: transparent; border: 0;
+    border-bottom: 1px solid var(--border, rgba(127, 127, 127, 0.2));
+    color: var(--text-muted, inherit); font-size: 0.8em; text-align: left; cursor: pointer;
+}
+.ru-peer-group-head::before { content: '▾'; }
+.ru-peer-group.collapsed > .ru-peer-group-head::before { content: '▸'; }
+.ru-peer-group.collapsed > .ru-peer-group-body { display: none; }
+.ru-peers-mode-list .dashboard-peers-avatar,
+.ru-peers-mode-list .dashboard-peers-status,
+.ru-peers-mode-list .dashboard-peers-actions { display: none; }
+.ru-peers-mode-list .dashboard-peers-row { padding-top: var(--space-1); padding-bottom: var(--space-1); }
+.ru-peers-mode-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--space-3); padding: var(--space-3); }
+.ru-peers-mode-tiles .dashboard-peers-row { border: 1px solid var(--border, rgba(127, 127, 127, 0.2)); border-radius: 8px; }
+.ru-peers-mode-tiles .dashboard-peers-status,
+.ru-peers-mode-tiles .dashboard-peers-hops { display: none; }
+.ru-peers-mode-tiles .dashboard-peers-empty { grid-column: 1 / -1; }

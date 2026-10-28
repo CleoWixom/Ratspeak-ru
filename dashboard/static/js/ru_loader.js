@@ -24,6 +24,7 @@
         '/static/js/announce_radar.js',
         '/static/js/route_lookup.js',
         '/static/js/ru_text_scale.js',
+        '/static/js/ru_peer_views.js',
         '/static/js/ru_extensions.js'
     ];
 
