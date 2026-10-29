@@ -113,3 +113,85 @@ fn fork_frontend_is_loaded_by_one_hook_and_only_offers_validated_actions() {
     assert!(route.contains("'api_path_query'") && route.contains("'request_path'"));
     assert!(extensions.contains("openRouteSheet("));
 }
+
+/// Battleship is a fork-only game. It must stay out of upstream-owned files
+/// except through the three one-line hooks, keep each fleet secret behind a
+/// commitment, and keep the view thin (the Rust engine decides every outcome).
+#[test]
+fn battleship_is_a_hooked_fork_module_that_keeps_fleets_secret() {
+    let engine = source("crates/ratspeak-runtime/src/battleship.rs");
+    let production = engine.split("#[cfg(test)]").next().unwrap();
+    let runtime_lib = source("crates/ratspeak-runtime/src/lib.rs");
+    let state = source("crates/ratspeak-runtime/src/state.rs");
+    let admission = source("crates/ratspeak-runtime/src/inbound_admission/game.rs");
+    let runtime_manifest = source("crates/ratspeak-runtime/Cargo.toml");
+    let hooks = source("fork/hooks.json");
+    let view = source("dashboard/static/js/ru_battleship.js");
+    let loader = source("dashboard/static/js/ru_loader.js");
+    let css = source("dashboard/static/css/ratspeak-ru.css");
+    let index = source("dashboard/index.html");
+
+    // Hooks: the module is private (public API snapshot untouched), and the
+    // game is registered where upstream builds a router, before hydration.
+    for id in [
+        "runtime-mod-battleship",
+        "state-register-battleship",
+        "admission-register-battleship",
+    ] {
+        assert!(hooks.contains(id), "missing hook {id}");
+    }
+    assert!(runtime_lib.contains("\nmod battleship;\n"));
+    assert!(!runtime_lib.contains("pub mod battleship"));
+    let router_line = state
+        .find("let lrgp_router = lrgp::router::LrgpRouter::with_builtin_apps();")
+        .expect("upstream router construction");
+    let register_line = state
+        .find("crate::battleship::register(&lrgp_router);")
+        .expect("battleship registration hook");
+    let restore_loop = state
+        .find("lrgp_router.restore_session(session)")
+        .expect("hydration loop");
+    assert!(router_line < register_line && register_line < restore_loop);
+    assert!(
+        state.contains("#[cfg(not(test))]\n        crate::battleship::register(&lrgp_router);")
+    );
+    assert!(admission.contains("crate::battleship::register(&working);"));
+
+    // No new dependency: SHA-256 comes from rns-crypto, so upstream's
+    // manifests, lockfile and API baseline stay byte-identical.
+    assert!(!runtime_manifest.contains("sha2"));
+    assert!(production.contains("rns_crypto::sha::sha256(&input)"));
+    assert!(production.contains("pub(crate) const APP_ID: &str = \"ru_battleship\";"));
+
+    // Commitments bind the session and player; only the commit payload's
+    // digest is sent before the reveal.
+    assert!(production.contains("ratspeak.battleship.v1"));
+    assert!(production.contains("input.extend_from_slice(session_id.as_bytes())"));
+    assert!(production.contains("input.extend_from_slice(player.as_bytes())"));
+    assert!(production.contains("(\"h\".into(), rmpv::Value::Binary(digest.to_vec()))"));
+    let reveal_marker = "// Reveal: the loser's carries the final answer.";
+    let (before_reveal, reveal_branch) = production.split_once(reveal_marker).expect("reveal");
+    assert!(reveal_branch.contains("rmpv::Value::Binary(game.my_fleet.clone())"));
+    assert!(!before_reveal.contains("Binary(game.my_salt"));
+    assert!(!before_reveal.contains("Binary(game.my_fleet"));
+    assert!(production.contains("fn exact_keys("));
+    assert!(production.contains("fn rollback_session("));
+
+    // The view only pre-fills intents and never touches salts or storage.
+    assert!(view.contains("var APP_ID = 'ru_battleship';"));
+    assert!(view.contains("RS.games.views.register(APP_ID"));
+    for forbidden in ["my_salt", "localStorage", "sessionStorage"] {
+        assert!(!view.contains(forbidden), "view must not use {forbidden}");
+    }
+    assert!(view.contains("context.sendMove({ k: 'c', p: fleet }"));
+    assert!(view.contains("context.sendMove({ k: 'f', c: cell }"));
+    assert!(view.contains("context.sendMove({ k: 'r' })"));
+
+    // Loaded only through the fork loader; upstream's index.html is not edited
+    // for it and its stylesheet stays untouched.
+    assert!(loader.contains("'/static/js/ru_battleship.js'"));
+    assert!(!index.contains("ru_battleship"));
+    assert!(css.contains(".games-theme-ru_battleship"));
+    let upstream_css = source("dashboard/static/css/11-games.css");
+    assert!(!upstream_css.contains("bs-cell"));
+}

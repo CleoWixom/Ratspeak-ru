@@ -802,6 +802,8 @@ impl AppState {
         // LRGP owns the canonical built-in registry. A new built-in game must
         // not require a second hard-coded registration list in Ratspeak.
         let lrgp_router = lrgp::router::LrgpRouter::with_builtin_apps();
+        #[cfg(not(test))]
+        crate::battleship::register(&lrgp_router);
         for session in crate::db::load_game_sessions(&db) {
             let app_id = session.app_id.clone();
             let session_id = session.session_id.clone();

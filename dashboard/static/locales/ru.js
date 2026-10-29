@@ -204,6 +204,7 @@ window.RATSPEAK_I18N = {
  "Available hubs": "Доступные хабы",
  "Available inbox nodes": "Доступные узлы входящих",
  "Awaiting a signed identity announce": "Ожидание подписанного анонса идентичности",
+ "awaiting answer": "ждём ответ",
  "awaiting proof": "ожидание подтверждения",
  "Back": "Назад",
  "Back to channels": "Назад к каналам",
@@ -235,6 +236,7 @@ window.RATSPEAK_I18N = {
  "Battery access could not be checked. Review Android settings.": "Не удалось проверить доступ к батарее. Проверьте настройки Android.",
  "Battery optimization can delay background messages. Review Android settings.": "Оптимизация батареи может задерживать фоновые сообщения. Проверьте настройки Android.",
  "Battery optimization is off. Android or the device maker can still stop Ratspeak.": "Оптимизация батареи выключена. Android или производитель устройства всё равно могут остановить Ratspeak.",
+ "Battleship": "Морской бой",
  "became stale": "устарело",
  "Best for mobile radios. Choose another mode only when this RNode has a fixed routing role.": "Лучше всего для мобильных радио. Выбирайте другой режим, только если у этого RNode фиксированная роль маршрутизации.",
  "Bind Address": "Адрес привязки",
@@ -313,6 +315,7 @@ window.RATSPEAK_I18N = {
  "Cannot remove the original identity": "Нельзя удалить исходную идентичность",
  "Capture": "Съёмка",
  "Capture detail": "Детали записи",
+ "Carrier": "Авианосец",
  "Central-only — scanning for peers…": "Только central — сканирование пиров…",
  "Challenge cancelled": "Вызов отменён",
  "Challenge received!": "Получен вызов!",
@@ -674,6 +677,7 @@ window.RATSPEAK_I18N = {
  "Create without a key": "Создать без ключа",
  "Created for this session": "Создано для этого сеанса",
  "Creating...": "Создание...",
+ "Cruiser": "Крейсер",
  "Current": "Текущий",
  "Current identity": "Текущая идентичность",
  "current identity": "текущая идентичность",
@@ -717,6 +721,7 @@ window.RATSPEAK_I18N = {
  "Deriving encryption keys...": "Вычисление ключей шифрования...",
  "Dest Hash": "Хеш назначения",
  "Destination": "Назначение",
+ "Destroyer": "Эсминец",
  "detail changed": "детали изменены",
  "Developer and reset controls": "Инструменты разработчика и сброс",
  "Developer Mode": "Режим разработчика",
@@ -801,6 +806,10 @@ window.RATSPEAK_I18N = {
  "End": "Завершить",
  "Ending call": "Завершение звонка",
  "Endpoint": "Конечная точка",
+ "Enemy fleet": "Флот соперника",
+ "enemy miss": "промах соперника",
+ "enemy ship (revealed)": "корабль соперника (раскрыт)",
+ "Enemy waters": "Воды соперника",
  "Enter": "Войти",
  "Enter a 32-character hexadecimal destination hash.": "Введите хеш назначения — 32 шестнадцатеричных символа.",
  "Enter a 32-character hexadecimal hub address.": "Введите адрес хаба — 32 шестнадцатеричных символа.",
@@ -905,6 +914,7 @@ window.RATSPEAK_I18N = {
  "Firmware": "Прошивка",
  "Firmware update needed": "Требуется обновление прошивки",
  "First heard": "Впервые замечен",
+ "Fleet ready. Tap Ready to lock it in, or rearrange it first.": "Флот готов. Нажмите «Готово», чтобы зафиксировать его, или сначала переставьте корабли.",
  "Four in a Row": "Четыре в ряд",
  "Frequency": "Частота",
  "Frequency not supported": "Частота не поддерживается",
@@ -916,6 +926,7 @@ window.RATSPEAK_I18N = {
  "Game challenge": "Вызов на игру",
  "Game challenge from": "Вызов на игру от",
  "Game could not be removed": "Не удалось удалить игру",
+ "Game ended: fleet check failed": "Игра окончена: проверка флота не пройдена",
  "Game state could not be saved": "Не удалось сохранить состояние игры",
  "Game update": "Обновление игры",
  "Game update from": "Обновление игры от",
@@ -1646,6 +1657,7 @@ window.RATSPEAK_I18N = {
  "PIN-encrypted .rsi private-key backup with display-name metadata.": "Резервная копия приватного ключа .rsi, зашифрованная PIN-кодом, с метаданными отображаемого имени.",
  "ping sent": "ping отправлен",
  "PINs don't match.": "PIN-коды не совпадают.",
+ "Place your fleet": "Расставьте флот",
  "Play preview": "Прослушать",
  "Play voice message": "Воспроизвести голосовое сообщение",
  "Please enter a host address": "Введите адрес хоста",
@@ -1710,6 +1722,7 @@ window.RATSPEAK_I18N = {
  "Radio not found. Check that it is on, charged, and not connected elsewhere. Retrying...": "Радио не найдено. Проверьте, что оно включено, заряжено и не подключено к другому устройству. Повторная попытка...",
  "Radio not supported": "Радио не поддерживается",
  "Radio service unavailable": "Радиослужба недоступна",
+ "Random": "Случайно",
  "Rate": "Скорость",
  "Ratspeak": "Ratspeak",
  "Ratspeak - Dashboard": "Ratspeak — Панель",
@@ -1936,6 +1949,7 @@ window.RATSPEAK_I18N = {
  "Reveal": "Показать",
  "Reveal recovery phrase": "Показать фразу восстановления",
  "Reveal the active identity's 12-word recovery phrase.": "Показать фразу восстановления из 12 слов для активной идентичности.",
+ "Revealing your fleet…": "Раскрываем ваш флот…",
  "Review": "Проверить",
  "Review a copied Ratspeak link": "Проверить скопированную ссылку Ratspeak",
  "Review connection": "Проверить подключение",
@@ -2158,6 +2172,7 @@ window.RATSPEAK_I18N = {
  "Storing in Offline Inbox…": "Сохранение в офлайн-входящих…",
  "Storing message in Offline Inbox": "Сохранение сообщения в офлайн-входящих",
  "Storing move in Offline Inbox…": "Сохранение хода в офлайн-входящих…",
+ "Submarine": "Подлодка",
  "Summarized": "Сводка",
  "Support": "Поддержка",
  "Supports action-style channel posts": "Поддерживает публикации в канале в стиле действий",
@@ -2357,7 +2372,7 @@ window.RATSPEAK_I18N = {
  "Unix socket (Linux)": "Unix-сокет (Linux)",
  "Unknown": "Неизвестно",
  "Unknown caller": "Неизвестный абонент",
- "unknown error": "неизвестная ошибка",
+ "unknown error": "неизвестно",
  "Unknown error": "Неизвестная ошибка",
  "Unknown identity": "Неизвестная идентичность",
  "Unless marked official, a hub is run and moderated by someone else. Ratspeak may not be able to remove its content.": "Если хаб не помечен как официальный, им управляет и модерирует кто-то другой. Ratspeak может не суметь удалить его содержимое.",
@@ -2435,6 +2450,7 @@ window.RATSPEAK_I18N = {
  "Verified": "Подтверждено",
  "Verify recovery manifest": "Проверить манифест восстановления",
  "Verifying": "Проверка",
+ "Verifying the fleet…": "Проверяем флот…",
  "Via": "Через",
  "Vibration": "Вибрация",
  "Video": "Видео",
@@ -2503,6 +2519,7 @@ window.RATSPEAK_I18N = {
  "Waiting for the shared instance; reconnecting automatically": "Ожидание общего экземпляра; автоматическое переподключение",
  "Waiting for USB": "Ожидание USB",
  "Waiting messages will be checked again.": "Ожидающие сообщения будут проверены снова.",
+ "Warship": "Линкор",
  "was not confirmed": "не подтверждено",
  "Welcome & guidance": "Приветствие и рекомендации",
  "welcome accepted": "приветствие принято",
@@ -2539,6 +2556,7 @@ window.RATSPEAK_I18N = {
  "You lost!": "Вы проиграли!",
  "You Lost!": "Вы проиграли!",
  "You resigned": "Вы сдались",
+ "You won — opponent’s answers were not honest": "Вы выиграли: ответы соперника были нечестными",
  "You won!": "Вы выиграли!",
  "You Won!": "Вы выиграли!",
  "You're on the latest version of Ratspeak, no update available.": "У вас последняя версия Ratspeak, обновлений нет.",
@@ -2546,12 +2564,17 @@ window.RATSPEAK_I18N = {
  "Your controls": "Ваши элементы управления",
  "your current hub": "ваш текущий хаб",
  "Your firewall or router may need to allow this port.": "Возможно, вашему файрволу или маршрутизатору нужно разрешить этот порт.",
+ "Your fleet": "Ваш флот",
+ "Your fleet placement": "Расстановка вашего флота",
  "Your hub": "Ваш хаб",
  "Your Identity": "Ваша идентичность",
  "Your messages": "Ваши сообщения",
  "Your nickname": "Ваш псевдоним",
+ "your ship": "ваш корабль",
+ "your ship, hit": "ваш корабль, попадание",
  "Your turn": "Ваш ход",
  "Your turn ·": "Ваш ход ·",
+ "Your turn · fire!": "Ваш ход · огонь!",
  "You’re already in": "Вы уже в",
  "YubiKey not detected. Please make sure it's a YubiKey 5+ running the latest firmware.": "YubiKey не обнаружен. Убедитесь, что это YubiKey 5+ с последней прошивкой.",
  "YubiKey serial": "Серийный номер YubiKey",
@@ -2566,6 +2589,9 @@ window.RATSPEAK_I18N = {
  "— running as central only": "— работает только в роли central",
  "’s turn": ": ход соперника",
  "’s turn ·": ": ход соперника ·",
+ "Rotate: vertical": "Поворот: вертикально",
+ "Rotate: horizontal": "Поворот: горизонтально",
+ "Ships to place": "Корабли для расстановки",
  "Nothing is attached at this interface's port. Check that the RNode is plugged in, and edit the interface if its port name changed. Ratspeak keeps trying.": "К порту этого интерфейса ничего не подключено. Проверьте, что RNode подключён, и измените интерфейс, если имя порта изменилось. Ratspeak продолжает попытки.",
  "Put the RNode in Bluetooth pairing mode, then choose Retry Connection and enter the PIN it shows.": "Переведите RNode в режим Bluetooth-сопряжения, затем выберите «Повторить подключение» и введите показанный PIN.",
  "Ratspeak cannot reach this RNode over Bluetooth. Check that it is powered on and charged (an e-paper screen keeps its last image when the battery is empty), that its Bluetooth is enabled (installing RNode firmware can turn it off), and that no other phone or computer is connected to it. Ratspeak keeps trying, and tries again right away when you return to the app.": "Ratspeak не может связаться с этим RNode по Bluetooth. Проверьте, что он включён и заряжен (экран на электронных чернилах сохраняет последнее изображение при разряженной батарее), что его Bluetooth включён (установка прошивки RNode может его отключить) и что к нему не подключён другой телефон или компьютер. Ratspeak продолжает попытки и повторяет их сразу при возврате в приложение.",
@@ -2631,6 +2657,10 @@ window.RATSPEAK_I18N_PATTERNS = [
   "Добавить {0:контакт|контакта|контактов} и {1:подключение|подключения|подключений}? Уже существующие записи будут пропущены."
  ],
  [
+  "^Tap\\ the\\ grid\\ to\\ place\\ the\\ ([\\s\\S]*?)\\ \\(([\\s\\S]*?)\\ cells\\)\\.\\ Tap\\ a\\ placed\\ ship\\ to\\ pick\\ it\\ up\\.$",
+  "Нажмите на сетку, чтобы разместить: {0} ({1:клетка|клетки|клеток}). Нажмите на размещённый корабль, чтобы поднять его."
+ ],
+ [
   "^Block\\ \"([\\s\\S]*?)\"\\?\\ Their\\ channel\\ messages\\ and\\ member\\ entry\\ will\\ be\\ hidden\\.$",
   "Заблокировать «{0}»? Его сообщения в каналах и запись в списке участников будут скрыты."
  ],
@@ -2653,6 +2683,10 @@ window.RATSPEAK_I18N_PATTERNS = [
  [
   "^Identity\\ created,\\ but\\ the\\ PIN\\ could\\ not\\ be\\ set:\\ ([\\s\\S]*?)$",
   "Идентичность создана, но PIN не удалось задать: {0}"
+ ],
+ [
+  "^Fleet\\ locked\\ in\\.\\ Waiting\\ for\\ ([\\s\\S]*?)\\ to\\ place\\ theirs…$",
+  "Флот зафиксирован. Ждём, пока {0} расставит свой…"
  ],
  [
   "^Bluetooth\\ Peer:\\ ([\\s\\S]*?)\\ —\\ running\\ as\\ central\\ only$",
@@ -2767,6 +2801,10 @@ window.RATSPEAK_I18N_PATTERNS = [
   "Открыт диалог сохранения для {0}"
  ],
  [
+  "^([\\s\\S]*?):\\ enemy\\ ship\\ \\(revealed\\)$",
+  "{0}: корабль соперника (раскрыт)"
+ ],
+ [
   "^Game\\ action\\ rejected:\\ ([\\s\\S]*?)$",
   "Игровое действие отклонено: {0}"
  ],
@@ -2795,6 +2833,10 @@ window.RATSPEAK_I18N_PATTERNS = [
   "Запрос путей: {0}…"
  ],
  [
+  "^Waiting\\ for\\ ([\\s\\S]*?)’s\\ fleet$",
+  "Ожидание флота: {0}"
+ ],
+ [
   "^Member\\ details\\ for\\ ([\\s\\S]*?)$",
   "Сведения об участнике {0}"
  ],
@@ -2819,6 +2861,10 @@ window.RATSPEAK_I18N_PATTERNS = [
   "Сведения о {0}{1}"
  ],
  [
+  "^([\\s\\S]*?):\\ awaiting\\ answer$",
+  "{0}: ждём ответ"
+ ],
+ [
   "^Could\\ not\\ copy:\\ ([\\s\\S]*?)$",
   "Не удалось скопировать: {0}"
  ],
@@ -2829,6 +2875,10 @@ window.RATSPEAK_I18N_PATTERNS = [
  [
   "^Reconnecting\\ to\\ ([\\s\\S]*?)$",
   "Переподключение к {0}"
+ ],
+ [
+  "^([\\s\\S]*?):\\ your\\ ship,\\ hit$",
+  "{0}: ваш корабль, попадание"
  ],
  [
   "^Click\\ to\\ copy:\\ ([\\s\\S]*?)$",
@@ -2863,6 +2913,10 @@ window.RATSPEAK_I18N_PATTERNS = [
   "Ожидание: {0}"
  ],
  [
+  "^([\\s\\S]*?):\\ enemy\\ miss$",
+  "{0}: промах соперника"
+ ],
+ [
   "^Latest\\ ([\\s\\S]*?)\\ of\\ ([\\s\\S]*?)$",
   "Последние {0} из {1}"
  ],
@@ -2883,6 +2937,10 @@ window.RATSPEAK_I18N_PATTERNS = [
   "Проверка {0}…"
  ],
  [
+  "^([\\s\\S]*?):\\ your\\ ship$",
+  "{0}: ваш корабль"
+ ],
+ [
   "^Use\\ ([\\s\\S]*?)\\ theme$",
   "Использовать тему: {0}"
  ],
@@ -2897,6 +2955,14 @@ window.RATSPEAK_I18N_PATTERNS = [
  [
   "^([\\s\\S]*?)([\\s\\S]*?)\\ reaction$",
   "{0}{1} реакция"
+ ],
+ [
+  "^([\\s\\S]*?)’s\\ waters$",
+  "Воды: {0}"
+ ],
+ [
+  "^([\\s\\S]*?):\\ unknown$",
+  "{0}: неизвестно"
  ],
  [
   "^\\[Alert\\]\\ ([\\s\\S]*?)$",
@@ -2915,6 +2981,18 @@ window.RATSPEAK_I18N_PATTERNS = [
   "Обновить: {0}"
  ],
  [
+  "^Hits\\ ([\\s\\S]*?)/17$",
+  "Попадания {0}/17"
+ ],
+ [
+  "^Fire\\ at\\ ([\\s\\S]*?)$",
+  "Выстрел по {0}"
+ ],
+ [
+  "^([\\s\\S]*?),\\ afloat$",
+  "{0}, на плаву"
+ ],
+ [
   "^Leave\\ ([\\s\\S]*?)\\?$",
   "Покинуть {0}?"
  ],
@@ -2931,6 +3009,22 @@ window.RATSPEAK_I18N_PATTERNS = [
   "Непрочитанных: {0}{1}"
  ],
  [
+  "^([\\s\\S]*?)’s\\ turn$",
+  "Ход: {0}"
+ ],
+ [
+  "^Sunk\\ ([\\s\\S]*?)/5$",
+  "Потоплено {0}/5"
+ ],
+ [
+  "^([\\s\\S]*?):\\ water$",
+  "{0}: вода"
+ ],
+ [
+  "^([\\s\\S]*?):\\ empty$",
+  "{0}: пусто"
+ ],
+ [
   "^Open:\\ ([\\s\\S]*?)$",
   "Открыть: {0}"
  ],
@@ -2941,6 +3035,14 @@ window.RATSPEAK_I18N_PATTERNS = [
  [
   "^([\\s\\S]*?)\\ saved$",
   "{0}: сохранено"
+ ],
+ [
+  "^([\\s\\S]*?),\\ sunk$",
+  "{0}, потоплен"
+ ],
+ [
+  "^([\\s\\S]*?):\\ miss$",
+  "{0}: промах"
  ],
  [
   "^Copy\\ ([\\s\\S]*?)$",
@@ -2979,7 +3081,19 @@ window.RATSPEAK_I18N_PATTERNS = [
   "{0} д назад"
  ],
  [
+  "^([\\s\\S]*?)\\ ·\\ ([\\s\\S]*?)\\ ✓$",
+  "{0} · {1} ✓"
+ ],
+ [
+  "^([\\s\\S]*?):\\ hit$",
+  "{0}: попадание"
+ ],
+ [
   "^([\\s\\S]*?)\\ hop([\\s\\S]*?)$",
   "{0:прыжок|прыжка|прыжков}"
+ ],
+ [
+  "^([\\s\\S]*?)\\ ·\\ ([\\s\\S]*?)$",
+  "{0} · {1}"
  ]
 ];

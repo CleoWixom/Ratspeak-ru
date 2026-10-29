@@ -115,6 +115,40 @@
    "why": "Reviewed public-API snapshot entry for the new module."
   },
   {
+   "id": "runtime-mod-battleship",
+   "type": "insert_after",
+   "file": "crates/ratspeak-runtime/src/lib.rs",
+   "anchor": "pub mod announce_handlers;",
+   "lines": [
+    "mod battleship;"
+   ],
+   "marker": "mod battleship;",
+   "why": "Declares the fork-only Battleship game module (private, so the public API snapshot is unchanged)."
+  },
+  {
+   "id": "state-register-battleship",
+   "type": "insert_after",
+   "file": "crates/ratspeak-runtime/src/state.rs",
+   "anchor": "let lrgp_router = lrgp::router::LrgpRouter::with_builtin_apps();",
+   "lines": [
+    "        #[cfg(not(test))]",
+    "        crate::battleship::register(&lrgp_router);"
+   ],
+   "marker": "crate::battleship::register(&lrgp_router)",
+   "why": "Registers Battleship before durable sessions are restored. Skipped in this crate's own unit tests because upstream's test pins the exact built-in set."
+  },
+  {
+   "id": "admission-register-battleship",
+   "type": "insert_after",
+   "file": "crates/ratspeak-runtime/src/inbound_admission/game.rs",
+   "anchor": "let working = lrgp::router::LrgpRouter::with_builtin_apps();",
+   "lines": [
+    "        crate::battleship::register(&working);"
+   ],
+   "marker": "crate::battleship::register(&working)",
+   "why": "Inbound admission replays a game on a scratch router; it must know Battleship or valid moves would be dropped."
+  },
+  {
    "id": "lib-mod",
    "type": "insert_after",
    "file": "src-tauri/src/lib.rs",
