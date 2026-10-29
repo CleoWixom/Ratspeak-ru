@@ -89,9 +89,9 @@ fn parse_lxma(payload: &str) -> Result<LxmaLinkTarget, String> {
     };
     let hash = lxma_hex(hash_part, LXMA_HASH_HEX_LEN).ok_or_else(|| INVALID.to_string())?;
     let public_key = match key_part {
-        Some(key) => Some(
-            lxma_hex(key, LXMA_PUBLIC_KEY_HEX_LEN).ok_or_else(|| INVALID.to_string())?,
-        ),
+        Some(key) => {
+            Some(lxma_hex(key, LXMA_PUBLIC_KEY_HEX_LEN).ok_or_else(|| INVALID.to_string())?)
+        }
         None => None,
     };
     Ok(LxmaLinkTarget {
