@@ -7,6 +7,7 @@ pub ratspeak_db::admission::AdmissionDbError::CommitUncertain(alloc::string::Str
 pub ratspeak_db::admission::AdmissionDbError::LedgerFull
 pub ratspeak_db::admission::AdmissionDbError::MissingEffect
 pub ratspeak_db::admission::AdmissionDbError::NoIdentity
+pub ratspeak_db::admission::AdmissionDbError::StillSending
 pub ratspeak_db::admission::AdmissionDbError::TooLarge
 pub ratspeak_db::admission::AdmissionDbError::Unavailable(alloc::string::String)
 impl core::convert::From<rusqlite::error::Error> for ratspeak_db::admission::AdmissionDbError
@@ -42,6 +43,7 @@ pub fn ratspeak_db::admission::DurableInboundStore::complete_deleted_artifacts(&
 pub fn ratspeak_db::admission::DurableInboundStore::delete_game_session(&self, &str, &str, u64) -> core::result::Result<bool, ratspeak_db::admission::AdmissionDbError>
 pub fn ratspeak_db::admission::DurableInboundStore::delete_messages(&self, &str, core::option::Option<&str>, u64) -> core::result::Result<(), ratspeak_db::admission::AdmissionDbError>
 pub fn ratspeak_db::admission::DurableInboundStore::delete_messages_guarded(&self, &ratspeak_db::admission::AdmissionGuard, &str, core::option::Option<&str>, u64) -> core::result::Result<ratspeak_db::admission::MessageDeletionArtifacts, ratspeak_db::admission::AdmissionDbError>
+pub fn ratspeak_db::admission::DurableInboundStore::delete_selected_messages_guarded(&self, &ratspeak_db::admission::AdmissionGuard, &str, &str, &[alloc::string::String], u64) -> core::result::Result<(ratspeak_db::admission::MessageDeletionArtifacts, alloc::vec::Vec<alloc::string::String>), ratspeak_db::admission::AdmissionDbError>
 pub fn ratspeak_db::admission::DurableInboundStore::from_pool(&ratspeak_db::DbPool) -> core::result::Result<Self, ratspeak_db::admission::AdmissionDbError>
 pub fn ratspeak_db::admission::DurableInboundStore::pending_deleted_artifacts(&self, &ratspeak_db::admission::AdmissionGuard, core::option::Option<&str>, i64, usize) -> core::result::Result<alloc::vec::Vec<ratspeak_db::admission::PendingDeletedArtifact>, ratspeak_db::admission::AdmissionDbError>
 pub fn ratspeak_db::admission::DurableInboundStore::policy_state(&self, &str) -> core::result::Result<(alloc::vec::Vec<alloc::string::String>, u64), ratspeak_db::admission::AdmissionDbError>
@@ -84,6 +86,7 @@ pub ratspeak_db::admission::SuppressionRow::identity: alloc::string::String
 pub ratspeak_db::admission::SuppressionRow::node: [u8; 16]
 pub ratspeak_db::admission::SuppressionRow::transient_id: [u8; 32]
 pub const ratspeak_db::admission::MAX_PROJECTION_BINDINGS: usize
+pub const ratspeak_db::admission::MAX_SELECTED_DELETION: usize
 pub const ratspeak_db::admission::NATIVE_DB_HEADROOM: usize
 pub const ratspeak_db::admission::POLICY_RECEIPT_SECONDS: u64
 pub fn ratspeak_db::admission::bounded_json(&impl serde_core::ser::Serialize, usize) -> core::result::Result<alloc::string::String, ratspeak_db::admission::AdmissionDbError>

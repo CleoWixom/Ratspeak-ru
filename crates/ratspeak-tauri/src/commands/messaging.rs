@@ -2493,6 +2493,81 @@ pub async fn delete_conversation(
     Ok(json!({ "hash": dest_hash, "unread_total": total }))
 }
 
+/// Deletes the given messages of one conversation on this device only.
+#[tauri::command]
+pub async fn delete_messages(
+    state: State<'_, Arc<AppState>>,
+    hash: String,
+    ids: Vec<String>,
+) -> AppResult<Value> {
+    let dest_hash = sanitize_text(&hash, 128).to_ascii_lowercase();
+    if !validate_hex(&dest_hash, 16, 64) {
+        return Err(AppError::bad_request("Invalid identity hash"));
+    }
+    if ids.is_empty() || ids.len() > db::admission::MAX_SELECTED_DELETION {
+        return Err(AppError::bad_request("Invalid message selection"));
+    }
+    // Inbound rows carry the LXMF hash, outbound rows their client id.
+    let mut ids = ids
+        .iter()
+        .map(|id| {
+            if validate_hex(id, 64, 64) {
+                Ok(id.to_ascii_lowercase())
+            } else {
+                normalize_lxmf_client_msg_id(Some(id))
+                    .map(Option::unwrap_or_default)
+                    .map_err(|_| AppError::bad_request("Invalid message id"))
+            }
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    ids.sort_unstable();
+    ids.dedup();
+    let generation = state.current_identity_session_generation();
+    let deletion =
+        ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await;
+    if state.current_identity_session_generation() != generation {
+        return Err(AppError::conflict("Identity changed"));
+    }
+    let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
+
+    let st: Arc<AppState> = Arc::clone(&state);
+    let dh = dest_hash.clone();
+    let id_c = identity_id.clone();
+    let (deleted, total, files) = tokio::task::spawn_blocking(move || {
+        let _deletion = deletion;
+        let (removed, deleted) = ratspeak_runtime::propagation_recovery::delete_selected_messages(
+            &st, &id_c, &dh, &ids,
+        )?;
+        let files = removed.remove_files();
+        let total: i64 = db::get_all_unread_counts(&st.db, &id_c).values().sum();
+        Ok::<_, db::admission::AdmissionDbError>((deleted, total, files))
+    })
+    .await
+    .map_err(|_| AppError::internal("message deletion worker failed"))?
+    .map_err(|error| match error {
+        db::admission::AdmissionDbError::StillSending => {
+            AppError::conflict("Cancel sending before deleting this message")
+        }
+        error => AppError::database_unavailable(error.to_string()),
+    })?;
+
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
+    if generation != state.current_identity_session_generation() {
+        return Ok(json!({ "hash": dest_hash, "deleted": deleted.len() }));
+    }
+    state.emit_to_all(
+        "messages_deleted",
+        json!({ "hash": dest_hash, "ids": deleted }),
+    );
+    state.emit_to_all("unread_total", json!({ "count": total }));
+    broadcast_conversations(Arc::clone(&state));
+    files.map_err(super::shared::files_not_removed)?;
+    Ok(json!({ "hash": dest_hash, "deleted": deleted.len(), "unread_total": total }))
+}
+
 #[tauri::command]
 pub async fn api_files(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
     let files = if let Ok(lxmf) = state.lxmf.lock() {

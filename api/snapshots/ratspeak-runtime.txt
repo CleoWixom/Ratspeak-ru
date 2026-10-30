@@ -1879,6 +1879,7 @@ impl core::ops::drop::Drop for ratspeak_runtime::propagation_recovery::DownloadD
 pub fn ratspeak_runtime::propagation_recovery::DownloadDeletionGuard::drop(&mut self)
 pub async fn ratspeak_runtime::propagation_recovery::begin_download_deletion(alloc::sync::Arc<ratspeak_runtime::state::AppState>) -> ratspeak_runtime::propagation_recovery::DownloadDeletionGuard
 pub fn ratspeak_runtime::propagation_recovery::delete_messages(&ratspeak_runtime::state::AppState, &str, core::option::Option<&str>) -> core::result::Result<ratspeak_runtime::propagation_recovery::DeletedMessages, ratspeak_db::admission::AdmissionDbError>
+pub fn ratspeak_runtime::propagation_recovery::delete_selected_messages(&ratspeak_runtime::state::AppState, &str, &str, &[alloc::string::String]) -> core::result::Result<(ratspeak_runtime::propagation_recovery::DeletedMessages, alloc::vec::Vec<alloc::string::String>), ratspeak_db::admission::AdmissionDbError>
 pub fn ratspeak_runtime::propagation_recovery::invalidate_downloads(&ratspeak_runtime::state::AppState)
 pub async fn ratspeak_runtime::propagation_recovery::recover_host(alloc::sync::Arc<ratspeak_runtime::state::AppState>, alloc::string::String, bool, core::option::Option<(std::path::PathBuf, [u8; 32])>) -> core::result::Result<serde_json::value::Value, alloc::string::String>
 pub async fn ratspeak_runtime::propagation_recovery::retry_deferred_downloads(alloc::sync::Arc<ratspeak_runtime::state::AppState>) -> core::result::Result<(), alloc::string::String>

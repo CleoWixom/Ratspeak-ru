@@ -11,6 +11,7 @@ pub const NATIVE_DB_HEADROOM: usize = 64 * 1024 * 1024;
 pub const POLICY_RECEIPT_SECONDS: u64 = 90 * 86400;
 const MAX_POLICY_PER_IDENTITY: i64 = 16_384;
 const MAX_POLICY_GLOBAL: i64 = 65_536;
+pub const MAX_SELECTED_DELETION: usize = 500;
 
 /// A receipt plus the retained archive and media that must be revalidated.
 pub type RecoverableAdmission = (AdmissionReceipt, Option<String>, Vec<FileReference>);
@@ -76,6 +77,8 @@ pub enum AdmissionDbError {
     MissingEffect,
     #[error("no active identity")]
     NoIdentity,
+    #[error("a selected message is still sending")]
+    StillSending,
 }
 impl From<rusqlite::Error> for AdmissionDbError {
     fn from(error: rusqlite::Error) -> Self {
@@ -821,6 +824,36 @@ impl DurableInboundStore {
         peer: Option<&str>,
         now: u64,
     ) -> Result<MessageDeletionArtifacts, AdmissionDbError> {
+        self.delete_scoped(identity, peer, None, now)
+            .map(|(artifacts, _)| artifacts)
+    }
+
+    /// As `delete_messages_guarded`, limited to `ids` among the identity's
+    /// messages with `peer`; other ids are ignored. Refuses the whole set
+    /// while any of them is still sending. Also returns the ids deleted.
+    pub fn delete_selected_messages_guarded(
+        &self,
+        _guard: &AdmissionGuard,
+        identity: &str,
+        peer: &str,
+        ids: &[String],
+        now: u64,
+    ) -> Result<(MessageDeletionArtifacts, Vec<String>), AdmissionDbError> {
+        if ids.len() > MAX_SELECTED_DELETION {
+            return Err(AdmissionDbError::TooLarge);
+        }
+        let ids = serde_json::to_string(ids).map_err(|_| AdmissionDbError::TooLarge)?;
+        self.delete_scoped(identity, Some(peer), Some(&ids), now)
+    }
+
+    fn delete_scoped(
+        &self,
+        identity: &str,
+        peer: Option<&str>,
+        ids: Option<&str>,
+        now: u64,
+    ) -> Result<(MessageDeletionArtifacts, Vec<String>), AdmissionDbError> {
+        const SCOPE: &str = "identity_id=?1 AND (?2 IS NULL OR source=?2 OR destination=?2) AND (?3 IS NULL OR id IN (SELECT value FROM json_each(?3)))";
         fn text(row: &rusqlite::Row<'_>, column: usize, limit: usize) -> rusqlite::Result<String> {
             let value = row.get_ref(column)?.as_str()?;
             if value.len() > limit {
@@ -841,10 +874,21 @@ impl DurableInboundStore {
         }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut artifacts = MessageDeletionArtifacts::default();
+        // Matches the outbound states the client can still cancel.
+        if ids.is_some()
+            && tx.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM messages WHERE {SCOPE} AND direction='outbound' AND state NOT IN ('delivered','propagated','failed','cancelled','rejected','timeout','read') AND NOT (state='sent' AND lower(COALESCE(delivery_method,''))<>'direct'))"),
+                params![identity, peer, ids],
+                |row| row.get::<_, bool>(0),
+            )?
         {
-            let mut stmt=tx.prepare("SELECT id,identity_id,attachment_stored_name,image_stored_name,audio_stored_name FROM messages WHERE identity_id=?1 AND (?2 IS NULL OR source=?2 OR destination=?2)")?;
-            let rows = stmt.query_map(params![identity, peer], |row| {
+            return Err(AdmissionDbError::StillSending);
+        }
+        let mut artifacts = MessageDeletionArtifacts::default();
+        let mut deleted = Vec::new();
+        {
+            let mut stmt = tx.prepare(&format!("SELECT id,identity_id,attachment_stored_name,image_stored_name,audio_stored_name FROM messages WHERE {SCOPE}"))?;
+            let rows = stmt.query_map(params![identity, peer, ids], |row| {
                 Ok((
                     text(row, 0, 128)?,
                     text(row, 1, 128)?,
@@ -883,6 +927,9 @@ impl DurableInboundStore {
                         });
                     }
                 }
+                if ids.is_some() {
+                    deleted.push(id);
+                }
             }
         }
         for artifact in &artifacts.media {
@@ -891,8 +938,17 @@ impl DurableInboundStore {
         for artifact in &artifacts.archives {
             tx.execute("INSERT INTO lxmf_deleted_artifacts(identity_id,kind,path) VALUES(?1,'archive',?2) ON CONFLICT(identity_id,kind,path) DO NOTHING",params![artifact.identity,artifact.path])?;
         }
-        tx.execute("DELETE FROM messages WHERE identity_id=?1 AND (?2 IS NULL OR source=?2 OR destination=?2)",params![identity,peer])?;
-        if let Some(peer) = peer {
+        tx.execute(
+            &format!("DELETE FROM reactions WHERE identity_id=?1 AND message_id IN (SELECT id FROM messages WHERE {SCOPE})"),
+            params![identity, peer, ids],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM messages WHERE {SCOPE}"),
+            params![identity, peer, ids],
+        )?;
+        if let Some(peer) = peer
+            && ids.is_none()
+        {
             tx.execute(
                 "DELETE FROM hidden_conversations WHERE identity_id=?1 AND dest_hash=?2",
                 params![identity, peer],
@@ -904,7 +960,8 @@ impl DurableInboundStore {
         artifacts.media.dedup();
         artifacts.archives.sort();
         artifacts.archives.dedup();
-        Ok(artifacts)
+        deleted.sort();
+        Ok((artifacts, deleted))
     }
 }
 
@@ -1254,6 +1311,180 @@ mod tests {
             })
             .unwrap();
         assert_eq!(tombstones, 0);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// A "received" message is inbound; any other state is outbound.
+    fn message(
+        pool: &crate::db::DbPool,
+        identity: &str,
+        peer: &str,
+        id: &str,
+        (state, method): (&str, Option<&str>),
+        stored: &str,
+    ) {
+        let (source, destination, direction) = if state == "received" {
+            (peer, "local", "inbound")
+        } else {
+            ("local", peer, "outbound")
+        };
+        crate::db::try_save_message(
+            pool,
+            id,
+            source,
+            destination,
+            "text",
+            "",
+            1.0,
+            state,
+            direction,
+            identity,
+            if stored.is_empty() { "" } else { "file" },
+            stored,
+            "",
+            "",
+            "",
+            "",
+            method,
+        )
+        .unwrap();
+        crate::db::save_reaction(pool, id, peer, "👍", identity);
+    }
+
+    fn count(pool: &crate::db::DbPool, sql: &str) -> i64 {
+        pool.get()
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn selected_deletion_stays_within_identity_and_peer() {
+        let _serial = SERIAL.lock().unwrap();
+        let (path, pool, store) = fixture();
+        let (a, b) = ("11".repeat(16), "22".repeat(16));
+        let [m1, m3, other] = [1u8, 3, 4].map(|n| hex::encode([n; 32]));
+        let m2 = format!("out_{}", hex::encode([2u8; 16]));
+        message(&pool, &a, "peer", &m1, ("received", None), "m1.bin");
+        message(&pool, &a, "peer", &m2, ("delivered", None), "m2.bin");
+        message(&pool, &a, "peer", &m3, ("received", None), "");
+        message(&pool, &a, "other", &other, ("received", None), "");
+        message(&pool, &b, "peer", &m1, ("received", None), "m1.bin");
+        let guard = try_reserve_admission().unwrap();
+        let ids = [&m1, &m2, &other, &"ff".repeat(32)].map(|id| id.to_string());
+        let (artifacts, deleted) = store
+            .delete_selected_messages_guarded(&guard, &a, "peer", &ids, 1001)
+            .unwrap();
+        assert_eq!(deleted, vec![m1.clone(), m2.clone()]);
+        assert_eq!(
+            artifacts.media,
+            ["m1.bin", "m2.bin"].map(|path| DeletedArtifact {
+                identity: a.clone(),
+                path: path.into()
+            })
+        );
+        assert!(!crate::db::message_exists_for_identity(&pool, &m1, &a));
+        assert!(!crate::db::message_exists_for_identity(&pool, &m2, &a));
+        assert!(crate::db::message_exists_for_identity(&pool, &m3, &a));
+        assert!(crate::db::message_exists_for_identity(&pool, &other, &a));
+        assert!(crate::db::message_exists_for_identity(&pool, &m1, &b));
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM lxmf_user_deleted"),
+            1,
+            "tombstones only for deleted downloadable rows"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                &format!("SELECT COUNT(*) FROM reactions WHERE identity_id='{a}'")
+            ),
+            2
+        );
+        assert_eq!(
+            crate::db::get_reactions_for_message(&pool, &m1, &b).len(),
+            1
+        );
+        assert_eq!(
+            store
+                .pending_deleted_artifacts(&guard, Some(&b), 0, 256)
+                .unwrap()
+                .len(),
+            0
+        );
+        let too_many = vec![m3.clone(); MAX_SELECTED_DELETION + 1];
+        assert!(matches!(
+            store.delete_selected_messages_guarded(&guard, &a, "peer", &too_many, 1001),
+            Err(AdmissionDbError::TooLarge)
+        ));
+        drop(guard);
+        drop(store);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn selected_deletion_refuses_the_whole_set_while_one_is_sending() {
+        let _serial = SERIAL.lock().unwrap();
+        let (path, pool, store) = fixture();
+        let a = "11".repeat(16);
+        let [done, pending, direct, opportunistic, read] =
+            [1u8, 2, 3, 4, 5].map(|n| format!("out_{}", hex::encode([n; 16])));
+        message(&pool, &a, "peer", &done, ("failed", None), "");
+        message(&pool, &a, "peer", &pending, ("sending", None), "");
+        message(&pool, &a, "peer", &direct, ("sent", Some("direct")), "");
+        message(&pool, &a, "peer", &opportunistic, ("sent", None), "");
+        message(&pool, &a, "peer", &read, ("read", None), "");
+        let guard = try_reserve_admission().unwrap();
+        for sending in [&pending, &direct] {
+            let ids = [done.clone(), sending.clone()];
+            assert!(matches!(
+                store.delete_selected_messages_guarded(&guard, &a, "peer", &ids, 1001),
+                Err(AdmissionDbError::StillSending)
+            ));
+        }
+        assert!(crate::db::message_exists_for_identity(&pool, &done, &a));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM lxmf_user_deleted"), 0);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM reactions"), 5);
+        let ids = [done.clone(), opportunistic.clone(), read.clone()];
+        let (_, deleted) = store
+            .delete_selected_messages_guarded(&guard, &a, "peer", &ids, 1001)
+            .unwrap();
+        assert_eq!(deleted.len(), 3);
+        drop(guard);
+        drop(store);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn conversation_deletion_also_drops_its_reactions() {
+        let _serial = SERIAL.lock().unwrap();
+        let (path, pool, store) = fixture();
+        let (a, b) = ("11".repeat(16), "22".repeat(16));
+        let [m1, m2] = [1u8, 2].map(|n| hex::encode([n; 32]));
+        message(&pool, &a, "peer", &m1, ("received", None), "");
+        message(&pool, &a, "other", &m2, ("received", None), "");
+        message(&pool, &b, "peer", &m1, ("received", None), "");
+        crate::db::hide_conversation(&pool, "peer", &a);
+        store.delete_messages(&a, Some("peer"), 1000).unwrap();
+        assert!(crate::db::get_reactions_for_message(&pool, &m1, &a).is_empty());
+        assert_eq!(
+            crate::db::get_reactions_for_message(&pool, &m2, &a).len(),
+            1
+        );
+        assert_eq!(
+            crate::db::get_reactions_for_message(&pool, &m1, &b).len(),
+            1
+        );
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM hidden_conversations"), 0);
+        store.delete_messages(&a, None, 1000).unwrap();
+        assert!(crate::db::get_reactions_for_message(&pool, &m2, &a).is_empty());
+        assert_eq!(
+            crate::db::get_reactions_for_message(&pool, &m1, &b).len(),
+            1
+        );
+        drop(store);
+        drop(pool);
         let _ = std::fs::remove_dir_all(path);
     }
 

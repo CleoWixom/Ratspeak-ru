@@ -227,6 +227,7 @@ fn commands() -> impl Fn(tauri::ipc::Invoke<MockRuntime>) -> bool + Send + Sync 
         ratspeak_tauri::commands::system::api_clear_contacts,
         ratspeak_tauri::commands::system::api_reset_database,
         ratspeak_tauri::commands::messaging::delete_conversation,
+        ratspeak_tauri::commands::messaging::delete_messages,
         ratspeak_tauri::commands::contacts::api_contacts,
         ratspeak_tauri::commands::contacts::add_contact,
         ratspeak_tauri::commands::contacts::block_contact,
@@ -297,6 +298,10 @@ fn bulk_deletes_refuse_when_no_identity_is_active() {
         ("api_clear_contacts", json!({})),
         ("api_reset_database", json!({})),
         ("delete_conversation", json!({ "hash": PEER })),
+        (
+            "delete_messages",
+            json!({ "hash": PEER, "ids": ["ab".repeat(32)] }),
+        ),
     ] {
         let fixture = Fixture::without_active_identity(false);
         let result = fixture.invoke(command, body);
@@ -454,6 +459,109 @@ fn bulk_deletes_publish_the_lists_they_changed() {
             "{command}"
         );
     }
+}
+
+#[test]
+fn delete_messages_removes_only_the_selected_messages() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::new(Some(A), false);
+    let pool = &fixture.state.db;
+    let [selected, kept] = ["01", "02"].map(|byte| byte.repeat(32));
+    let [sent, sending] = ["05", "03"].map(|byte| format!("out_{}", byte.repeat(16)));
+    for (id, state, stored) in [
+        (&selected, "received", "selected.bin"),
+        (&kept, "received", ""),
+        (&sent, "delivered", "sent.bin"),
+        (&sending, "sending", ""),
+    ] {
+        let (source, destination, direction) = if state == "received" {
+            (PEER, A, "inbound")
+        } else {
+            (A, PEER, "outbound")
+        };
+        db::try_save_message(
+            pool,
+            id,
+            source,
+            destination,
+            "hi",
+            "",
+            2.0,
+            state,
+            direction,
+            A,
+            stored,
+            stored,
+            "",
+            "",
+            "",
+            "",
+            None,
+        )
+        .unwrap();
+        db::save_reaction(pool, id, PEER, "👍", A);
+    }
+    let files = media_dir(&fixture.state.config, A);
+    for name in ["selected.bin", "sent.bin"] {
+        std::fs::write(files.join(name), b"media").unwrap();
+    }
+
+    let missing = "04".repeat(32);
+    let result = fixture
+        .invoke(
+            "delete_messages",
+            json!({ "hash": PEER, "ids": [selected.to_uppercase(), &selected, &sent, missing] }),
+        )
+        .unwrap();
+    let unread: i64 = db::get_all_unread_counts(pool, A).values().sum();
+    assert_eq!(
+        result,
+        json!({ "hash": PEER, "deleted": 2, "unread_total": unread })
+    );
+    assert_eq!(
+        fixture.last_event("messages_deleted"),
+        Some(json!({ "hash": PEER, "ids": [&selected, &sent] }))
+    );
+    assert_eq!(
+        fixture.last_event("unread_total"),
+        Some(json!({ "count": unread }))
+    );
+    fixture.wait_for_event("conversations_update");
+    for (id, name) in [(&selected, "selected.bin"), (&sent, "sent.bin")] {
+        assert!(!files.join(name).exists(), "{name}");
+        assert!(
+            db::get_reactions_for_message(pool, id, A).is_empty(),
+            "{id}"
+        );
+    }
+    assert_eq!(db::get_reactions_for_message(pool, &kept, A).len(), 1);
+    assert_eq!(db::get_conversation(pool, PEER, A, 10).len(), 3);
+    assert_eq!(db::get_conversation(pool, PEER, B, 10).len(), 1);
+
+    let refused = fixture
+        .invoke(
+            "delete_messages",
+            json!({ "hash": PEER, "ids": [&kept, sending] }),
+        )
+        .unwrap_err();
+    assert_eq!(refused["code"], "conflict");
+    assert_eq!(db::get_conversation(pool, PEER, A, 10).len(), 3);
+
+    let too_many = vec![kept.clone(); 501];
+    for ids in [
+        json!([]),
+        json!(["not-hex"]),
+        json!(["out_xyz"]),
+        json!(too_many),
+    ] {
+        let refused = fixture
+            .invoke("delete_messages", json!({ "hash": PEER, "ids": ids }))
+            .unwrap_err();
+        assert_eq!(refused["code"], "bad_request");
+    }
+    assert_eq!(db::get_conversation(pool, PEER, A, 10).len(), 3);
 }
 
 #[test]

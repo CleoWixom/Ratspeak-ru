@@ -105,6 +105,16 @@ pub fn delete_messages(
     crate::inbound_admission::delete_messages(state, identity, peer)
 }
 
+/// `delete_messages` for chosen `ids` with `peer`; also returns the ids deleted.
+pub fn delete_selected_messages(
+    state: &AppState,
+    identity: &str,
+    peer: &str,
+    ids: &[String],
+) -> Result<(DeletedMessages, Vec<String>), crate::db::admission::AdmissionDbError> {
+    crate::inbound_admission::delete_selected_messages(state, identity, peer, ids)
+}
+
 pub async fn retry_deferred_downloads(state: Arc<AppState>) -> Result<(), String> {
     let generation = state.current_identity_session_generation();
     tokio::spawn(async move {

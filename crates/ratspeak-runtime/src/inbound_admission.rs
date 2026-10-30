@@ -699,10 +699,36 @@ pub(crate) fn delete_messages(
     identity: &str,
     peer: Option<&str>,
 ) -> Result<DeletedMessages, AdmissionDbError> {
+    delete_with(state, |store, guard| {
+        store
+            .delete_messages_guarded(guard, identity, peer, now())
+            .map(|artifacts| (artifacts, ()))
+    })
+    .map(|(deleted, ())| deleted)
+}
+
+pub(crate) fn delete_selected_messages(
+    state: &AppState,
+    identity: &str,
+    peer: &str,
+    ids: &[String],
+) -> Result<(DeletedMessages, Vec<String>), AdmissionDbError> {
+    delete_with(state, |store, guard| {
+        store.delete_selected_messages_guarded(guard, identity, peer, ids, now())
+    })
+}
+
+fn delete_with<T>(
+    state: &AppState,
+    delete: impl FnOnce(
+        &DurableInboundStore,
+        &AdmissionGuard,
+    ) -> Result<(db::admission::MessageDeletionArtifacts, T), AdmissionDbError>,
+) -> Result<(DeletedMessages, T), AdmissionDbError> {
     let guard = try_reserve_admission()?;
     let store = DurableInboundStore::from_pool(&state.db)?;
-    let artifacts = match store.delete_messages_guarded(&guard, identity, peer, now()) {
-        Ok(artifacts) => artifacts,
+    let (artifacts, value) = match delete(&store, &guard) {
+        Ok(deleted) => deleted,
         Err(error) => {
             // An uncertain commit may have deleted them all the same.
             if matches!(error, AdmissionDbError::CommitUncertain(_)) {
@@ -713,12 +739,15 @@ pub(crate) fn delete_messages(
     };
     // A list read before the commit is stale now, whatever happens to the files.
     state.invalidate_conversation_lists();
-    Ok(DeletedMessages {
-        guard,
-        store,
-        artifacts,
-        data_dir: state.config.data_dir.clone(),
-    })
+    Ok((
+        DeletedMessages {
+            guard,
+            store,
+            artifacts,
+            data_dir: state.config.data_dir.clone(),
+        },
+        value,
+    ))
 }
 fn reconcile_intents(
     store: &DurableInboundStore,

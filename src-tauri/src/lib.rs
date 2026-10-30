@@ -1186,6 +1186,7 @@ pub fn run() {
                 ratspeak_tauri::commands::messaging::mark_read,
                 ratspeak_tauri::commands::messaging::hide_conversation,
                 ratspeak_tauri::commands::messaging::delete_conversation,
+                ratspeak_tauri::commands::messaging::delete_messages,
                 ratspeak_tauri::commands::contacts::api_contacts,
                 ratspeak_tauri::commands::contacts::api_blocked_contacts,
                 ratspeak_tauri::commands::peers::api_get_peers_snapshot,
