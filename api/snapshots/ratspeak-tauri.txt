@@ -251,8 +251,13 @@ pub async fn ratspeak_tauri::commands::channels::send_channel_message(tauri::sta
 pub async fn ratspeak_tauri::commands::channels::set_channel_room_notification_level(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::channels::SetChannelRoomNotificationLevelArgs) -> ratspeak_tauri::error::AppResult<ratspeak_tauri::commands::channels::ChannelRoomStateUpdate>
 pub mod ratspeak_tauri::commands::connection_link
 pub enum ratspeak_tauri::commands::connection_link::ConnectionLinkTarget
+pub ratspeak_tauri::commands::connection_link::ConnectionLinkTarget::Lxma(ratspeak_tauri::commands::connection_link::LxmaLinkTarget)
 pub ratspeak_tauri::commands::connection_link::ConnectionLinkTarget::Radio(ratspeak_tauri::commands::connection_link::RadioLinkTarget)
 pub ratspeak_tauri::commands::connection_link::ConnectionLinkTarget::Tcp(ratspeak_tauri::commands::connection_link::TcpLinkTarget)
+pub struct ratspeak_tauri::commands::connection_link::LxmaLinkTarget
+pub ratspeak_tauri::commands::connection_link::LxmaLinkTarget::hash: alloc::string::String
+pub ratspeak_tauri::commands::connection_link::LxmaLinkTarget::payload: alloc::string::String
+pub ratspeak_tauri::commands::connection_link::LxmaLinkTarget::public_key: core::option::Option<alloc::string::String>
 pub struct ratspeak_tauri::commands::connection_link::RadioLinkTarget
 pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::airtime_limit_long: core::option::Option<f64>
 pub ratspeak_tauri::commands::connection_link::RadioLinkTarget::airtime_limit_short: core::option::Option<f64>

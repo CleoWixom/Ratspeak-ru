@@ -95,6 +95,14 @@
    "why": "Registers the lxma:// scheme with the desktop deep-link plugin."
   },
   {
+   "id": "contracts-lxma-desktop-scheme",
+   "type": "regex_replace",
+   "files": "crates/ratspeak-tauri/tests/source_contracts.rs",
+   "pattern": "serde_json::json!\\(\\[\"ratspeak\"\\]\\)",
+   "replacement": "serde_json::json!([\"ratspeak\", \"lxma\"])",
+   "why": "Upstream's contract pins the desktop deep-link schemes to [\"ratspeak\"]; the fork also registers lxma (desktop-lxma-scheme)."
+  },
+  {
    "id": "commands-mod",
    "type": "insert_after",
    "file": "crates/ratspeak-tauri/src/commands/mod.rs",
