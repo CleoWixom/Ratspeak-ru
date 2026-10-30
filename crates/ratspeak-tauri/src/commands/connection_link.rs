@@ -89,9 +89,9 @@ fn parse_lxma(payload: &str) -> Result<LxmaLinkTarget, String> {
     };
     let hash = lxma_hex(hash_part, LXMA_HASH_HEX_LEN).ok_or_else(|| INVALID.to_string())?;
     let public_key = match key_part {
-        Some(key) => Some(
-            lxma_hex(key, LXMA_PUBLIC_KEY_HEX_LEN).ok_or_else(|| INVALID.to_string())?,
-        ),
+        Some(key) => {
+            Some(lxma_hex(key, LXMA_PUBLIC_KEY_HEX_LEN).ok_or_else(|| INVALID.to_string())?)
+        }
         None => None,
     };
     Ok(LxmaLinkTarget {
@@ -498,7 +498,10 @@ pub fn build_tcp_link(
     }
     match parse_connection_link(url.as_str())? {
         ConnectionLinkTarget::Tcp(target) => Ok(target),
-        ConnectionLinkTarget::Radio(_) => Err("Could not create a TCP link".into()),
+        // The builder only emits `ratspeak://tcp`; any other kind is a bug.
+        ConnectionLinkTarget::Radio(_) | ConnectionLinkTarget::Lxma(_) => {
+            Err("Could not create a TCP link".into())
+        }
     }
 }
 
@@ -526,7 +529,10 @@ pub fn build_radio_preset_link(
     }
     match parse_connection_link(url.as_str())? {
         ConnectionLinkTarget::Radio(target) => Ok(target),
-        ConnectionLinkTarget::Tcp(_) => Err("Could not create a radio link".into()),
+        // The builder only emits `ratspeak://radio`; any other kind is a bug.
+        ConnectionLinkTarget::Tcp(_) | ConnectionLinkTarget::Lxma(_) => {
+            Err("Could not create a radio link".into())
+        }
     }
 }
 

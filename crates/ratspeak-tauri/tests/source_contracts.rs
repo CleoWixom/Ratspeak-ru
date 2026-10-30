@@ -592,7 +592,7 @@ fn native_channel_share_lifecycle_uses_rust_inbox_and_requires_preview() {
         .expect("valid desktop Tauri config");
         assert_eq!(
             config["plugins"]["deep-link"]["desktop"]["schemes"],
-            serde_json::json!(["ratspeak"])
+            serde_json::json!(["ratspeak", "lxma"])
         );
         assert!(config["plugins"]["deep-link"]["mobile"].is_null());
     }
