@@ -78,6 +78,7 @@ function fire() { const batch = [...timers.values()]; timers.clear(); batch.forE
         _canonicalConversationHash: hash => hash,
         _msgReactions: {}, _messagesClearedCount: 0, cacheGet: () => null,
         renderConversation() {},
+        _clearMessageSelection() { return false; },
         _mergeConversationMessages: (_hash, messages) => messages,
         cacheSet() { cacheWrites++; }
     });

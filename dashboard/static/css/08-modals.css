@@ -1811,7 +1811,7 @@
     padding: var(--space-8) var(--space-6);
     text-align: center;
     color: var(--text-muted);
-    font-size: 0.85rem;
+    font-size: var(--type-empty-hint-size);
 }
 
 .about-drag-handle {

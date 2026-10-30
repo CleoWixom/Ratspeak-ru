@@ -791,9 +791,12 @@ var metaSource = lxmfSource.slice(
 );
 assert(metaSource.indexOf('msg-actions-trigger') < metaSource.indexOf('msg-time'),
     'the plus action must render to the left of the timestamp');
-assert(messagingCss.includes('.msg-context-actions > :last-child:nth-child(odd)') &&
-       messagingCss.includes('grid-column: 1 / -1;'),
-    'an odd final action must span the dialog instead of leaving a visual hole');
+assert(/\.msg-context-actions\s*\{[\s\S]*?flex-direction:\s*column;/.test(messagingCss) &&
+       messagingCss.includes('.msg-ctx-btn + .msg-ctx-btn { border-top: 1px solid var(--divider); }'),
+    'actions must stack as full-width rows so any count of actions leaves no visual hole');
+assert(lxmfSource.includes("reactBar.className = 'msg-action-panel msg-quick-react'") &&
+       lxmfSource.includes("actions.className = 'msg-action-panel msg-context-actions'"),
+    'reactions and actions must be separately placeable panels');
 assert(!messagingCss.includes('.msg-text-selection-guide') &&
        !lxmfSource.includes('Text selected. Adjust the selection or choose Done.') &&
        !lxmfSource.includes('<span>Select Text</span>') &&

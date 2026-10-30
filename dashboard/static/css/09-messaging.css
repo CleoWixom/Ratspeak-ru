@@ -166,6 +166,68 @@
     z-index: calc(var(--z-modal) + 1);
     filter: none;
 }
+.lxmf-messages.msg-select-mode .lxmf-msg,
+.lxmf-messages.msg-select-mode .msg-reactions {
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+.lxmf-messages.msg-select-mode .msg-row.msg-selected {
+    background: var(--accent-a05);
+    border-radius: var(--radius-md);
+}
+.lxmf-messages.msg-select-mode .msg-row:not(.msg-selected) .lxmf-msg:hover .msg-select-check {
+    border-color: var(--accent);
+}
+.lxmf-messages.msg-select-mode .msg-actions-trigger { display: none; }
+.lxmf-messages.msg-action-mode.msg-select-mode .msg-row.msg-selected { opacity: 0.6; }
+.lxmf-messages.msg-select-mode .lxmf-msg,
+.msg-row.msg-action-selected .lxmf-msg { position: relative; }
+/* Check sits in the bubble's open-side gutter, hugging the bubble. */
+.msg-select-check {
+    position: absolute;
+    top: 50%;
+    width: 24px;
+    height: 24px;
+    margin-top: -12px;
+    padding: 0;
+    box-sizing: border-box;
+    border: 2px solid var(--border-control);
+    border-radius: var(--radius-full);
+    background: var(--bg-primary);
+    cursor: pointer;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+.msg-select-check::before {
+    content: "";
+    position: absolute;
+    inset: -10px;
+}
+.msg-row.inbound .msg-select-check { left: calc(100% + 12px); }
+.msg-row.outbound .msg-select-check { right: calc(100% + 12px); }
+.msg-row.msg-selected .msg-select-check {
+    border-color: var(--accent);
+    background: var(--accent);
+}
+.msg-row.msg-selected .msg-select-check::after {
+    content: "";
+    position: absolute;
+    left: 6px;
+    top: 2px;
+    width: 6px;
+    height: 11px;
+    border: solid var(--on-accent);
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+}
+.msg-select-check:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 3px;
+}
+@media (prefers-reduced-motion: reduce) {
+    .msg-row.msg-action-selected .lxmf-msg,
+    .quick-react-emoji:active { transform: none; }
+    .lxmf-select-bar { animation: none; }
+}
 .msg-row.msg-action-selected .lxmf-msg {
     transform: translateY(-1px) scale(1.015);
     box-shadow: 0 10px 30px rgba(0,0,0,0.35);
@@ -436,8 +498,8 @@ body.image-viewer-open {
     align-items: center;
     justify-content: flex-end;
     gap: var(--space-2);
-    font-size: var(--text-2xs);
-    color: var(--text-muted);
+    font-size: var(--type-msg-meta-size);
+    color: var(--text-secondary);
     margin-top: var(--space-2);
 }
 .msg-send-progress {
@@ -447,7 +509,7 @@ body.image-viewer-open {
 }
 .msg-send-cancel-inline {
     min-width: 0;
-    height: 18px;
+    min-height: 18px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -570,6 +632,60 @@ body.image-viewer-open {
     color: var(--status-online-fg);
     background: rgba(var(--status-online-rgb), 0.12);
 }
+/* Selection bar: sits flush under the chat header while messages are selected. */
+.lxmf-select-bar {
+    display: flex;
+    align-items: stretch;
+    min-height: var(--touch-target);
+    margin-top: calc(-1 * var(--space-3));
+    padding: 0 var(--sar) 0 var(--sal);
+    background: var(--surface-panel);
+    border-bottom: 1px solid var(--divider);
+    animation: msgSelectBarIn 150ms ease-out both;
+}
+.lxmf-select-bar[hidden] { display: none; }
+@keyframes msgSelectBarIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: none; }
+}
+/* Two equal halves, each label centred, one divider between them. */
+.lxmf-select-bar-btn {
+    position: relative;
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: var(--touch-target);
+    padding: 0 var(--space-4);
+    border: 0;
+    border-radius: 0;
+    text-align: center;
+    background: none;
+    color: var(--accent);
+    font-family: var(--font-sans);
+    font-size: var(--type-menu-item-size);
+    font-weight: var(--type-weight-medium);
+    white-space: nowrap;
+    cursor: pointer;
+}
+.lxmf-select-bar-btn:hover { background: var(--hover-subtle); }
+.lxmf-select-bar-btn:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -2px;
+}
+.lxmf-select-delete-btn::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 25%;
+    bottom: 25%;
+    width: 1px;
+    background: var(--divider-strong);
+}
+.lxmf-select-delete-btn {
+    color: var(--status-error-fg);
+    font-weight: var(--type-weight-semibold);
+    font-variant-numeric: tabular-nums;
+}
+.lxmf-select-delete-btn:hover { background: rgba(var(--status-error-rgb), 0.1); }
 .lxst-call-btn.is-connecting {
     color: var(--status-info-fg);
     background: rgba(var(--status-info-rgb), 0.10);
@@ -1855,86 +1971,158 @@ html[data-input-modality="touch"] .msg-ctx-btn {
         min-height: var(--touch-target);
     }
 }
+/* Message actions: a reactions capsule and an action card, placed
+   independently around the selected message by _layoutMessageActionPanels. */
 .msg-context-menu {
-    position: fixed; z-index: calc(var(--z-modal) + 3);
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    box-shadow: 0 4px 24px rgba(0,0,0,0.4);
-    padding: var(--space-4);
-    min-width: 220px;
-    max-width: calc(100vw - 20px);
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-modal) + 3);
+    pointer-events: none;
     user-select: none;
     -webkit-user-select: none;
+    --msg-react-size: 36px;
+    --msg-react-glyph: 22px;
+    --msg-action-row: 36px;
+    --msg-action-icon: 16px;
+}
+html[data-input-modality="touch"] .msg-context-menu {
+    --msg-react-size: var(--touch-target);
+    --msg-react-glyph: 26px;
+    --msg-action-row: 48px;
+    --msg-action-icon: 20px;
+}
+@media (hover: none) and (pointer: coarse) {
+    .msg-context-menu {
+        --msg-react-size: var(--touch-target);
+        --msg-react-glyph: 26px;
+        --msg-action-row: 48px;
+        --msg-action-icon: 20px;
+    }
+}
+.msg-action-panel {
+    position: fixed;
+    top: 0;
+    left: 0;
+    pointer-events: auto;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-popover);
+    transform-origin: var(--msg-panel-origin, top left);
+    animation: msgActionPanelIn 160ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+@keyframes msgActionPanelIn {
+    from { opacity: 0; transform: translateY(var(--msg-panel-shift, -4px)) scale(0.96); }
+    to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .msg-action-panel { animation: msgActionPanelFade 100ms ease-out both; }
+    @keyframes msgActionPanelFade { from { opacity: 0; } to { opacity: 1; } }
 }
 .msg-quick-react {
-    display: flex; gap: 4px; padding: 4px 0;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: var(--space-2);
+    display: flex;
+    gap: 2px;
+    padding: 4px;
+    border-radius: var(--radius-pill);
+    max-width: calc(100vw - 24px);
 }
 .quick-react-emoji,
 .quick-react-plus {
+    flex: 0 1 var(--msg-react-size);
+    min-width: 32px;
+    height: var(--msg-react-size);
+    padding: 0;
     border: 0;
+    border-radius: var(--radius-full);
     background: transparent;
     color: var(--text-primary);
-    font-family: var(--font-sans);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
 }
 .quick-react-emoji {
-    font-size: var(--text-2xl); cursor: pointer; padding: 4px 6px; border-radius: var(--radius-sm);
-    transition: background var(--transition-fast);
+    font-size: var(--msg-react-glyph);
     line-height: 1;
 }
-.quick-react-emoji:hover { background: var(--overlay-white-hover); }
+.quick-react-emoji:hover,
+.quick-react-plus:hover { background: var(--hover-medium); }
+.quick-react-emoji:active { transform: scale(0.9); }
 .quick-react-emoji[aria-pressed="true"] {
     background: var(--accent-bg);
     box-shadow: inset 0 0 0 1px var(--accent-border);
 }
 .quick-react-plus {
-    font-size: var(--text-xl); cursor: pointer; padding: 4px 8px; border-radius: var(--radius-sm);
-    color: var(--text-muted); font-weight: 700;
-    display: flex; align-items: center; justify-content: center;
-    transition: background var(--transition-fast), color var(--transition-fast);
+    color: var(--text-secondary);
+    background: var(--hover-subtle);
 }
-.quick-react-plus:hover { background: var(--overlay-white-hover); color: var(--text-primary); }
+.quick-react-plus:hover { color: var(--text-primary); }
+.quick-react-plus svg {
+    width: 20px;
+    height: 20px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+}
 .msg-context-actions {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 6px;
+    display: flex;
+    flex-direction: column;
+    min-width: 200px;
+    max-width: calc(100vw - 24px);
+    border-radius: var(--radius-2xl);
+    overflow: hidden;
 }
-.msg-context-actions > :last-child:nth-child(odd) {
-    grid-column: 1 / -1;
+html[data-input-modality="touch"] .msg-context-actions { min-width: 240px; }
+@media (hover: none) and (pointer: coarse) {
+    .msg-context-actions { min-width: 240px; }
 }
 .msg-ctx-btn {
-    flex: 1; padding: 8px 10px;
-    background: rgba(255,255,255,0.05);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    color: var(--text-primary);
-    font-size: var(--text-sm); cursor: pointer;
-    transition: background var(--transition-fast);
-    font-family: var(--font-sans);
-    display: inline-flex;
+    display: flex;
     align-items: center;
-    justify-content: center;
-    gap: 6px;
-    min-height: 36px;
+    gap: 12px;
+    width: 100%;
+    min-height: var(--msg-action-row);
+    padding: 0 16px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: var(--type-menu-item-size);
+    font-weight: var(--type-weight-regular);
+    text-align: left;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background var(--transition-fast);
 }
-.msg-ctx-btn:hover { background: var(--overlay-white-hover); }
-.msg-ctx-btn:focus-visible,
-.quick-react-emoji:focus-visible,
-.quick-react-plus:focus-visible {
-    outline: 2px solid var(--focus-ring);
-    outline-offset: 2px;
+.msg-ctx-btn + .msg-ctx-btn { border-top: 1px solid var(--divider); }
+.msg-ctx-btn:hover,
+.msg-ctx-btn:active { background: var(--hover-medium); }
+/* Focus shows only once the tray is driven from the keyboard, as a soft
+   highlight rather than a ring. */
+.msg-context-menu .msg-ctx-btn:focus,
+.msg-context-menu .quick-react-emoji:focus,
+.msg-context-menu .quick-react-plus:focus { outline: none; }
+.msg-context-menu.msg-action-keyboard .msg-ctx-btn:focus {
+    background: var(--accent-a12);
+}
+.msg-context-menu.msg-action-keyboard .msg-ctx-btn:focus svg { color: var(--accent); }
+.msg-context-menu.msg-action-keyboard .quick-react-emoji:focus,
+.msg-context-menu.msg-action-keyboard .quick-react-plus:focus {
+    background: var(--accent-a12);
+    box-shadow: inset 0 0 0 1.5px var(--accent-a40);
 }
 .msg-ctx-btn svg {
-    width: 16px;
-    height: 16px;
+    width: var(--msg-action-icon);
+    height: var(--msg-action-icon);
     fill: none;
     stroke: currentColor;
     stroke-width: 2;
     stroke-linecap: round;
     stroke-linejoin: round;
     flex-shrink: 0;
+    color: var(--text-secondary);
 }
 
 .reply-preview-bar {
@@ -1948,7 +2136,7 @@ html[data-input-modality="touch"] .msg-ctx-btn {
 }
 .reply-preview-content { display: flex; flex-direction: column; gap: 2px; flex: 1; overflow: hidden; }
 .reply-preview-sender { font-weight: 600; color: var(--accent); font-size: var(--text-xs); }
-.reply-preview-text { font-size: var(--text-sm); color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reply-preview-text { font-size: var(--type-msg-quote-size); color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .reply-preview-close {
     background: none; border: none; color: var(--text-secondary);
     cursor: pointer; font-size: var(--text-xl); padding: 0 4px;
@@ -1967,7 +2155,7 @@ html[data-input-modality="touch"] .msg-ctx-btn {
     flex-shrink: 0;
 }
 .reply-quote-text {
-    font-size: var(--text-sm); color: var(--text-secondary);
+    font-size: var(--type-msg-quote-size); color: var(--text-secondary);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .msg-reply-quote:hover { background: rgba(255,255,255,0.08); }
@@ -2003,12 +2191,13 @@ html[data-input-modality="touch"] .msg-ctx-btn {
 .conv-preview .msg-state-icon svg { width: 10px; height: 10px; }
 
 .conv-unread-badge {
-    min-width: 18px;
-    height: 18px;
+    min-width: 1.5em;
+    min-height: 1.5em;
+    line-height: 1.25;
     display: flex;
     align-items: center;
     justify-content: center;
-    border-radius: 9px;
+    border-radius: var(--radius-pill);
 }
 
 .conv-name.is-hash {

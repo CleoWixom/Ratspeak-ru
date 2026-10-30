@@ -289,7 +289,7 @@ fn channels_keep_hubs_live_only_and_wire_bounded_local_history_across_the_produc
         ".channel-room-row-title,\n    .channel-hub-row-title {\n        font-size: var(--mobile-list-title-size);"
     ));
     assert!(responsive_css.contains(
-        ".channel-event-text {\n        color: var(--text-primary);\n        font-size: 1rem;"
+        ".channel-event-text {\n        color: var(--text-primary);\n        font-size: var(--text-base);"
     ));
     assert!(responsive_css.contains(".channel-system-event {\n        margin: var(--space-6) 0;"));
     assert!(channels_css.contains(".channel-members-scrim"));
@@ -1543,10 +1543,10 @@ fn text_scale_presets_are_durable_and_backend_validated() {
 
     assert!(settings.contains("RS.invoke('set_text_scale'"));
     assert!(settings.contains("data.text_scale_percent"));
-    assert!(scale.contains("var MAX = 140"));
+    assert!(scale.contains("var MAX = 150"));
     assert!(interfaces.contains("pub async fn set_text_scale"));
     assert!(interfaces.contains("\"text_scale_percent\""));
-    assert!(interfaces.contains("(percent.clamp(100, 140) + 5) / 10 * 10"));
+    assert!(interfaces.contains("(percent.clamp(90, 150) + 5) / 10 * 10"));
     assert!(tauri_lib.contains("set_text_scale"));
     assert!(index.contains("/static/style.css?v=ui-20260924-4"));
     assert!(views_css.contains(".settings-theme-family-row > .settings-row-info"));
@@ -6934,7 +6934,7 @@ fn mobile_settings_use_section_drilldown_instead_of_stacked_panels() {
     assert!(
         responsive_css.contains(".settings-detail-mode .settings-panel.settings-panel-selected")
     );
-    assert!(responsive_css.contains(".settings-row-label {\n        font-size: 1rem;"));
+    assert!(responsive_css.contains(".settings-row-label {\n        font-size: var(--text-base);"));
 }
 
 #[test]
@@ -7041,9 +7041,9 @@ fn mobile_primary_lists_share_readable_row_scale() {
 
     assert!(responsive_css.contains("--mobile-list-avatar-size: 44px;"));
     assert!(responsive_css.contains("--mobile-list-min-height: 58px;"));
-    assert!(responsive_css.contains("--mobile-list-title-size: 1rem;"));
-    assert!(responsive_css.contains("--mobile-list-detail-size: 0.875rem;"));
-    assert!(responsive_css.contains("--mobile-list-meta-size: 0.8125rem;"));
+    assert!(responsive_css.contains("--mobile-list-title-size: var(--text-base);"));
+    assert!(responsive_css.contains("--mobile-list-detail-size: var(--text-sm);"));
+    assert!(responsive_css.contains("--mobile-list-meta-size: var(--text-xs);"));
     assert!(responsive_css.contains(
         ".conv-row,\n    .contacts-row,\n    .identity-list-item,\n    .games-session-row"
     ));
@@ -7884,7 +7884,8 @@ fn message_actions_stage_touch_selection_and_preserve_accessible_actions() {
     assert!(lxmf.contains("var mediaAction = _messageMediaContextAction(msgData);"));
     assert!(!lxmf.contains("<span>Select Text</span>"));
     assert!(!lxmf.contains("data-message-action', 'select-text"));
-    assert!(lxmf.contains("<span>Copy Message</span>"));
+    assert!(lxmf.contains("<span>Copy</span>"));
+    assert!(lxmf.contains("(isSelected ? 'Deselect' : 'Select')"));
     assert!(lxmf.contains("label: canCopyImage ? 'Copy Image' : 'Save Image'"));
     assert!(lxmf.contains("label: 'Save File'"));
     assert!(lxmf.contains("menu.setAttribute('role', 'dialog')"));
@@ -7952,9 +7953,12 @@ fn message_actions_stage_touch_selection_and_preserve_accessible_actions() {
     assert!(messaging_css.contains(".msg-actions-trigger.msg-actions-trigger-mobile-hidden"));
     assert!(messaging_css.contains("clip-path: inset(50%);"));
     assert!(!messaging_css.contains(".msg-text-selection-guide"));
-    assert!(messaging_css.contains(".msg-context-actions > :last-child:nth-child(odd)"));
-    assert!(messaging_css.contains("grid-column: 1 / -1;"));
-    assert!(messaging_css.contains("position: fixed; z-index: calc(var(--z-modal) + 3);"));
+    assert!(
+        messaging_css
+            .contains(".msg-ctx-btn + .msg-ctx-btn { border-top: 1px solid var(--divider); }")
+    );
+    assert!(messaging_css.contains("z-index: calc(var(--z-modal) + 3);"));
+    assert!(lxmf.contains("function _layoutMessageActionPanels(state, allowScroll)"));
     assert!(nav.contains("RS.closeMessageActionMenu()"));
 
     assert!(runtime.contains("RATSPEAK_CHAT_CUSTOM_TYPE"));

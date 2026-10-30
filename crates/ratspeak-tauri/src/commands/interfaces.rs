@@ -1164,10 +1164,7 @@ pub async fn api_app_settings(state: State<'_, Arc<AppState>>) -> AppResult<Valu
             .is_none_or(|value| value != "false");
         let hide_known_spam_peers =
             db::get_setting(&p, "hide_known_spam_peers").is_none_or(|value| value != "false");
-        let text_scale_percent = db::get_setting(&p, "text_scale_percent")
-            .and_then(|value| value.parse::<u16>().ok())
-            .map(|value| (value.clamp(100, 140) + 5) / 10 * 10)
-            .unwrap_or(100);
+        let text_scale_percent = stored_text_scale(&p);
         let theme_family = db::get_setting(&p, "theme_family")
             .and_then(|value| normalize_theme_family(&value).map(str::to_string))
             .unwrap_or_else(|| DEFAULT_THEME_FAMILY.to_string());
@@ -1401,11 +1398,84 @@ mod native_theme_tests {
     }
 }
 
+const TEXT_SCALE_BASIS: &str = "2";
+
+/// Percent of the standard type scale (100 = platform default size).
+fn normalize_text_scale(percent: u16) -> u16 {
+    (percent.clamp(90, 150) + 5) / 10 * 10
+}
+
+/// Presets saved before the standard scale were one step larger for the same
+/// size; move them down once so nobody ends up smaller than they chose.
+fn stored_text_scale(pool: &db::DbPool) -> u16 {
+    let stored = db::get_setting(pool, "text_scale_percent").and_then(|v| v.parse::<u16>().ok());
+    if db::get_setting(pool, "text_scale_basis").as_deref() == Some(TEXT_SCALE_BASIS) {
+        return stored.map_or(100, normalize_text_scale);
+    }
+    let migrated = stored.map_or(100, |v| normalize_text_scale(v.saturating_sub(10)).max(100));
+    if text_scale_settings_save(pool, migrated).is_err() {
+        tracing::warn!(reason = "persist_failed", "text size migration not saved");
+    }
+    migrated
+}
+
+fn text_scale_settings_save(pool: &db::DbPool, percent: u16) -> Result<(), String> {
+    db::try_set_settings(
+        pool,
+        &[
+            ("text_scale_percent".to_string(), percent.to_string()),
+            ("text_scale_basis".to_string(), TEXT_SCALE_BASIS.to_string()),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod text_scale_tests {
+    use super::*;
+
+    fn memory_pool() -> db::DbPool {
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        db::init_schema(&pool).unwrap();
+        pool
+    }
+
+    #[test]
+    fn presets_clamp_to_standard_scale_steps() {
+        assert_eq!(normalize_text_scale(0), 90);
+        assert_eq!(normalize_text_scale(104), 100);
+        assert_eq!(normalize_text_scale(105), 110);
+        assert_eq!(normalize_text_scale(500), 150);
+    }
+
+    #[test]
+    fn legacy_presets_move_down_one_step_once() {
+        for (legacy, migrated) in [(100, 100), (110, 100), (120, 110), (130, 120), (140, 130)] {
+            let pool = memory_pool();
+            db::try_set_setting(&pool, "text_scale_percent", &legacy.to_string()).unwrap();
+            assert_eq!(stored_text_scale(&pool), migrated);
+            assert_eq!(
+                stored_text_scale(&pool),
+                migrated,
+                "migration must not repeat"
+            );
+        }
+        let fresh = memory_pool();
+        assert_eq!(stored_text_scale(&fresh), 100);
+        text_scale_settings_save(&fresh, 90).unwrap();
+        assert_eq!(
+            stored_text_scale(&fresh),
+            90,
+            "new-scale choices are never migrated"
+        );
+    }
+}
+
 #[tauri::command]
 pub async fn set_text_scale(state: State<'_, Arc<AppState>>, percent: u16) -> AppResult<Value> {
-    let percent = (percent.clamp(100, 140) + 5) / 10 * 10;
+    let percent = normalize_text_scale(percent);
     db::spawn_db(state.db.clone(), move |p| {
-        db::try_set_setting(&p, "text_scale_percent", &percent.to_string())
+        text_scale_settings_save(&p, percent)
     })
     .await
     .map_err(|_| AppError::internal("set_text_scale db task panicked"))?

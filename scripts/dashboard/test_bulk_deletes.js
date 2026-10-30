@@ -215,6 +215,7 @@ vm.runInContext(
             },
         },
         renderConversation: function() {},
+        _clearMessageSelection: function() { return false; },
         clearReplyTarget: function() {},
         _resetConversationList: function() {},
         _reloadPeersAfterCacheClear: function() {},

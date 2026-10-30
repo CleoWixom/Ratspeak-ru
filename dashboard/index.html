@@ -511,6 +511,11 @@
                                 </button>
                             </div>
                         </div>
+                        <div class="lxmf-select-bar" id="lxmf-select-bar" role="toolbar" aria-label="Selected messages" hidden>
+                            <button class="lxmf-select-bar-btn" id="lxmf-select-cancel-btn" type="button">Cancel</button>
+                            <span class="sr-only" id="lxmf-select-status" aria-live="polite"></span>
+                            <button class="lxmf-select-bar-btn lxmf-select-delete-btn" id="lxmf-select-delete-btn" type="button">Delete</button>
+                        </div>
                         <div class="lxst-call-strip" id="lxst-call-strip" hidden aria-live="polite">
                             <div class="lxst-call-strip-indicator" aria-hidden="true">
                                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.8 19.8 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.12 4.2 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.12.91.33 1.8.63 2.65a2 2 0 0 1-.45 2.11L8.09 9.69a16 16 0 0 0 6.22 6.22l1.21-1.2a2 2 0 0 1 2.11-.45c.85.3 1.74.51 2.65.63A2 2 0 0 1 22 16.92z"/></svg>
@@ -1279,6 +1284,13 @@
                                     <span class="settings-row-desc" id="settings-text-scale-desc">Choose a comfortable reading size without enlarging controls or touch targets.</span>
                                 </div>
                                 <fieldset class="settings-type-presets" aria-labelledby="settings-text-scale-label" aria-describedby="settings-text-scale-desc">
+                                    <label class="settings-type-preset" data-scale="90">
+                                        <input type="radio" name="settings-text-scale" value="90">
+                                        <span class="settings-type-preset-card">
+                                            <span class="settings-type-preset-sample" aria-hidden="true">Aa</span>
+                                            <span class="settings-type-preset-value">90%</span>
+                                        </span>
+                                    </label>
                                     <label class="settings-type-preset" data-scale="100">
                                         <input type="radio" name="settings-text-scale" value="100" checked>
                                         <span class="settings-type-preset-card">
@@ -1312,6 +1324,13 @@
                                         <span class="settings-type-preset-card">
                                             <span class="settings-type-preset-sample" aria-hidden="true">Aa</span>
                                             <span class="settings-type-preset-value">140%</span>
+                                        </span>
+                                    </label>
+                                    <label class="settings-type-preset" data-scale="150">
+                                        <input type="radio" name="settings-text-scale" value="150">
+                                        <span class="settings-type-preset-card">
+                                            <span class="settings-type-preset-sample" aria-hidden="true">Aa</span>
+                                            <span class="settings-type-preset-value">150%</span>
                                         </span>
                                     </label>
                                 </fieldset>
