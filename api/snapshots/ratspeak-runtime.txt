@@ -1505,6 +1505,7 @@ pub ratspeak_runtime::lxmf::AttachmentMessageRequest::identity_id: &'a str
 pub ratspeak_runtime::lxmf::AttachmentMessageRequest::image_mime: &'a str
 pub ratspeak_runtime::lxmf::AttachmentMessageRequest::is_image: bool
 pub ratspeak_runtime::lxmf::AttachmentMessageRequest::preference: ratspeak_runtime::lxmf::DeliveryPreference
+pub ratspeak_runtime::lxmf::AttachmentMessageRequest::renderer: core::option::Option<u8>
 pub ratspeak_runtime::lxmf::AttachmentMessageRequest::staged_path: core::option::Option<&'a std::path::Path>
 pub ratspeak_runtime::lxmf::AttachmentMessageRequest::title: &'a str
 pub struct ratspeak_runtime::lxmf::AudioMessageRequest<'a>
@@ -1695,6 +1696,7 @@ pub ratspeak_runtime::lxmf::MessageSendRequest::dest_hash_hex: &'a str
 pub ratspeak_runtime::lxmf::MessageSendRequest::identity_id: &'a str
 pub ratspeak_runtime::lxmf::MessageSendRequest::preference: ratspeak_runtime::lxmf::DeliveryPreference
 pub ratspeak_runtime::lxmf::MessageSendRequest::profile: ratspeak_runtime::lxmf::DeliveryProfile
+pub ratspeak_runtime::lxmf::MessageSendRequest::renderer: core::option::Option<u8>
 pub ratspeak_runtime::lxmf::MessageSendRequest::title: &'a str
 pub struct ratspeak_runtime::lxmf::PropagationDecryptContext
 impl ratspeak_runtime::lxmf::PropagationDecryptContext
@@ -1714,6 +1716,7 @@ pub ratspeak_runtime::lxmf::ReplyMessageSendRequest::dest_hash_hex: &'a str
 pub ratspeak_runtime::lxmf::ReplyMessageSendRequest::identity_id: &'a str
 pub ratspeak_runtime::lxmf::ReplyMessageSendRequest::preference: ratspeak_runtime::lxmf::DeliveryPreference
 pub ratspeak_runtime::lxmf::ReplyMessageSendRequest::profile: ratspeak_runtime::lxmf::DeliveryProfile
+pub ratspeak_runtime::lxmf::ReplyMessageSendRequest::renderer: core::option::Option<u8>
 pub ratspeak_runtime::lxmf::ReplyMessageSendRequest::reply_to_id: &'a str
 pub ratspeak_runtime::lxmf::ReplyMessageSendRequest::reply_to_preview: &'a str
 pub ratspeak_runtime::lxmf::ReplyMessageSendRequest::title: &'a str

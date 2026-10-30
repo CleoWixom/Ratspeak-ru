@@ -8,7 +8,7 @@ use tokio::task::JoinError;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 
-pub(crate) const SCHEMA_VERSION: i64 = 45;
+pub(crate) const SCHEMA_VERSION: i64 = 46;
 
 const VOICE_FORMAT_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS conversation_voice_formats (
@@ -31,6 +31,7 @@ pub const ATTACHMENT_UNAVAILABLE_STORED_NAME: &str = "!unavailable";
 // locked across fresh schema creation and migrations.
 const MESSAGE_AUDIO_MODE_COLUMN_INDEX: usize = 22;
 const MESSAGE_AUDIO_STORED_NAME_COLUMN_INDEX: usize = 23;
+const MESSAGE_RENDERER_COLUMN_INDEX: usize = 24;
 
 const IDENTITY_SELECT_COLUMNS: &str = "hash,
     lxmf_hash,
@@ -290,6 +291,7 @@ CREATE TABLE IF NOT EXISTS messages (
     delivery_method TEXT,
     audio_mode INTEGER CHECK (audio_mode IS NULL OR audio_mode BETWEEN 0 AND 255),
     audio_stored_name TEXT NOT NULL DEFAULT '',
+    renderer INTEGER CHECK (renderer IS NULL OR renderer BETWEEN 0 AND 255),
     PRIMARY KEY (id, identity_id)
 );
 
@@ -1956,6 +1958,25 @@ fn run_migrations(conn: &Connection, from_version: i64) -> Result<(), rusqlite::
         })?;
     }
 
+    if from_version < 46 {
+        migration_step(conn, 46, |conn| {
+            if table_exists(conn, "messages")?
+                && !get_column_names(conn, "messages")?
+                    .iter()
+                    .any(|column| column == "renderer")
+            {
+                conn.execute_batch(
+                    "ALTER TABLE messages
+                     ADD COLUMN renderer INTEGER
+                     CHECK (renderer IS NULL OR renderer BETWEEN 0 AND 255);",
+                )?;
+            }
+            conn.execute_batch("UPDATE schema_version SET version = 46;")?;
+            tracing::info!("Migrated to schema version 46 (LXMF message renderer)");
+            Ok(())
+        })?;
+    }
+
     Ok(())
 }
 
@@ -2959,6 +2980,7 @@ pub fn save_message(
         delivery_method,
         None,
         "",
+        None,
     );
 }
 
@@ -2989,6 +3011,7 @@ pub fn save_message_with_audio(
     delivery_method: Option<&str>,
     audio_mode: Option<u8>,
     audio_stored_name: &str,
+    renderer: Option<u8>,
 ) {
     if let Err(error) = try_save_message_with_audio(
         pool,
@@ -3010,6 +3033,7 @@ pub fn save_message_with_audio(
         delivery_method,
         audio_mode,
         audio_stored_name,
+        renderer,
     ) {
         tracing::warn!(error, "failed to persist message");
     }
@@ -3057,6 +3081,7 @@ pub fn try_save_message(
         delivery_method,
         None,
         "",
+        None,
     )
 }
 
@@ -3082,6 +3107,7 @@ pub fn try_save_message_with_audio(
     delivery_method: Option<&str>,
     audio_mode: Option<u8>,
     audio_stored_name: &str,
+    renderer: Option<u8>,
 ) -> Result<(), String> {
     let conn = pool.get().map_err(|error| error.to_string())?;
     try_save_message_with_audio_conn(
@@ -3104,6 +3130,7 @@ pub fn try_save_message_with_audio(
         delivery_method,
         audio_mode,
         audio_stored_name,
+        renderer,
     )
 }
 
@@ -3129,6 +3156,7 @@ pub fn try_save_message_with_audio_conn(
     delivery_method: Option<&str>,
     audio_mode: Option<u8>,
     audio_stored_name: &str,
+    renderer: Option<u8>,
 ) -> Result<(), String> {
     if identity_id.is_empty() {
         return Err("no active identity".into());
@@ -3150,9 +3178,10 @@ pub fn try_save_message_with_audio_conn(
         .map_err(|error| error.to_string())?;
     } else {
         let audio_mode = audio_mode.map(i64::from);
+        let renderer = renderer.map(i64::from);
         conn.execute(
-            "INSERT INTO messages (id, source, destination, content, title, timestamp, state, direction, identity_id, attachment_name, attachment_stored_name, image_name, image_stored_name, reply_to_id, reply_to_preview, delivery_method, audio_mode, audio_stored_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-            params![msg_id, source, destination, content, title, timestamp, state, direction, identity_id, attachment_name, attachment_stored_name, image_name, image_stored_name, reply_to_id, reply_to_preview, delivery_method, audio_mode, audio_stored_name],
+            "INSERT INTO messages (id, source, destination, content, title, timestamp, state, direction, identity_id, attachment_name, attachment_stored_name, image_name, image_stored_name, reply_to_id, reply_to_preview, delivery_method, audio_mode, audio_stored_name, renderer) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            params![msg_id, source, destination, content, title, timestamp, state, direction, identity_id, attachment_name, attachment_stored_name, image_name, image_stored_name, reply_to_id, reply_to_preview, delivery_method, audio_mode, audio_stored_name, renderer],
         ).map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -9470,6 +9499,9 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value
     let audio_stored_name = row
         .get::<_, String>(MESSAGE_AUDIO_STORED_NAME_COLUMN_INDEX)
         .unwrap_or_default();
+    let renderer = row
+        .get::<_, Option<i64>>(MESSAGE_RENDERER_COLUMN_INDEX)?
+        .and_then(|renderer| u8::try_from(renderer).ok());
 
     // Reshape flat columns to nested `msg.image` / `msg.attachments`.
     let image_json = (!image_stored_name.is_empty()).then(|| {
@@ -9538,6 +9570,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value
         "game_action": row.get::<_, String>(19).unwrap_or_default(),
         "game_move_san": row.get::<_, String>(20).unwrap_or_default(),
         "delivery_method": row.get::<_, Option<String>>(21)?,
+        "renderer": renderer,
     }))
 }
 
@@ -9675,6 +9708,7 @@ mod audio_message_tests {
             Some("direct"),
             Some(0x10),
             "stored-audio.opus",
+            Some(2),
         );
 
         let messages = get_conversation(&pool, "source", "identity", 10);
@@ -9682,6 +9716,7 @@ mod audio_message_tests {
         assert_eq!(messages[0]["audio"]["mode"], 0x10);
         assert_eq!(messages[0]["audio"]["stored_name"], "stored-audio.opus");
         assert_eq!(messages[0]["audio"]["supported"], true);
+        assert_eq!(messages[0]["renderer"], 2);
         assert!(messages[0]["attachments"].is_null());
         assert!(messages[0]["image"].is_null());
     }
@@ -9717,6 +9752,7 @@ mod audio_message_tests {
                 None,
                 Some(mode),
                 stored_name,
+                None,
             );
         }
 
@@ -9728,6 +9764,7 @@ mod audio_message_tests {
         assert_eq!(unknown["audio"]["mode"], 0xfe);
         assert_eq!(unknown["audio"]["stored_name"], "opaque-audio.bin");
         assert_eq!(unknown["audio"]["supported"], false);
+        assert!(unknown["renderer"].is_null());
 
         let unavailable = messages
             .iter()
@@ -9767,6 +9804,7 @@ mod audio_message_tests {
                 None,
                 Some(0x10),
                 stored_name,
+                None,
             );
         }
 
@@ -11209,9 +11247,12 @@ mod migration_tests {
             Some("audio_stored_name")
         );
         assert_eq!(
-            message_cols.len(),
-            MESSAGE_AUDIO_STORED_NAME_COLUMN_INDEX + 1
+            message_cols
+                .get(MESSAGE_RENDERER_COLUMN_INDEX)
+                .map(String::as_str),
+            Some("renderer")
         );
+        assert_eq!(message_cols.len(), MESSAGE_RENDERER_COLUMN_INDEX + 1);
     }
 
     #[test]
@@ -11532,7 +11573,8 @@ mod migration_tests {
         {
             let conn = pool.get().unwrap();
             conn.execute_batch(
-                "ALTER TABLE messages DROP COLUMN audio_stored_name;
+                "ALTER TABLE messages DROP COLUMN renderer;
+                 ALTER TABLE messages DROP COLUMN audio_stored_name;
                  ALTER TABLE messages DROP COLUMN audio_mode;
                  UPDATE schema_version SET version = 42;",
             )
@@ -11555,7 +11597,7 @@ mod migration_tests {
                 .map(String::as_str),
             Some("audio_stored_name")
         );
-        assert_eq!(columns.len(), MESSAGE_AUDIO_STORED_NAME_COLUMN_INDEX + 1);
+        assert_eq!(columns.len(), MESSAGE_RENDERER_COLUMN_INDEX + 1);
         conn.execute(
             "INSERT INTO messages (
                 id, source, destination, timestamp, identity_id
@@ -11571,6 +11613,52 @@ mod migration_tests {
             )
             .unwrap();
         assert_eq!(defaults, (None, String::new()));
+    }
+
+    #[test]
+    fn migration_46_adds_nullable_renderer_and_keeps_rows() {
+        let pool = empty_pool();
+        init_schema(&pool).unwrap();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages DROP COLUMN renderer;
+                 INSERT INTO messages (id, source, destination, content, timestamp, identity_id)
+                 VALUES ('pre-renderer', 'source', 'destination', '**kept**', 1.0, 'identity');
+                 UPDATE schema_version SET version = 45;",
+            )
+            .unwrap();
+        }
+
+        init_schema(&pool).unwrap();
+        assert_eq!(read_schema_version(&pool), SCHEMA_VERSION);
+        let conn = pool.get().unwrap();
+        let columns = get_column_names(&conn, "messages").unwrap();
+        assert_eq!(
+            columns
+                .get(MESSAGE_RENDERER_COLUMN_INDEX)
+                .map(String::as_str),
+            Some("renderer")
+        );
+        assert_eq!(columns.len(), MESSAGE_RENDERER_COLUMN_INDEX + 1);
+        let kept: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT content, renderer FROM messages WHERE id = 'pre-renderer'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, ("**kept**".to_string(), None));
+        assert!(
+            conn.execute(
+                "UPDATE messages SET renderer = 256 WHERE id = 'pre-renderer'",
+                []
+            )
+            .is_err()
+        );
+        drop(conn);
+        let messages = get_conversation(&pool, "source", "identity", 10);
+        assert!(messages[0]["renderer"].is_null());
     }
 
     /// T1-8: blackhole requests queued for an identity do not survive its

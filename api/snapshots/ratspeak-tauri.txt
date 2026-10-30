@@ -465,8 +465,10 @@ pub async fn ratspeak_tauri::commands::interfaces::api_list_network_interfaces()
 pub async fn ratspeak_tauri::commands::interfaces::api_notification_settings(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::api_rnode_presets() -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::api_serial_ports() -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
+pub async fn ratspeak_tauri::commands::interfaces::api_trusted_link_hosts(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::apply_network_type_change(alloc::sync::Arc<ratspeak_runtime::state::AppState>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::apply_network_type_change_transition(alloc::sync::Arc<ratspeak_runtime::state::AppState>, alloc::string::String, u64) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
+pub async fn ratspeak_tauri::commands::interfaces::clear_trusted_link_hosts(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::disable_auto_interface(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, core::option::Option<alloc::string::String>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::enable_auto_interface(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, core::option::Option<alloc::string::String>, core::option::Option<ratspeak_runtime::rns_config::AutoInterfaceOptions>) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::migrate_interface_ifac_units(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::interfaces::IfacUnitMigrationArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
@@ -495,6 +497,8 @@ pub async fn ratspeak_tauri::commands::interfaces::set_peers_sort(tauri::state::
 pub async fn ratspeak_tauri::commands::interfaces::set_text_scale(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, u16) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::set_transport_mode(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::interfaces::TransportModeArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub fn ratspeak_tauri::commands::interfaces::spawn_auto_event_broadcaster(&alloc::sync::Arc<ratspeak_runtime::state::AppState>)
+pub async fn ratspeak_tauri::commands::interfaces::trust_link_host(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
+pub async fn ratspeak_tauri::commands::interfaces::untrust_link_host(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::update_backbone_connection(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::interfaces::UpdateBackboneConnectionArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::update_backbone_server(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::interfaces::UpdateBackboneServerArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::interfaces::update_lora_interface(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, ratspeak_tauri::commands::interfaces::UpdateLoraArgs) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
@@ -532,6 +536,7 @@ pub ratspeak_tauri::commands::messaging::SendLxmfArgs::client_msg_id: core::opti
 pub ratspeak_tauri::commands::messaging::SendLxmfArgs::content: alloc::string::String
 pub ratspeak_tauri::commands::messaging::SendLxmfArgs::delivery_method: core::option::Option<alloc::string::String>
 pub ratspeak_tauri::commands::messaging::SendLxmfArgs::dest_hash: alloc::string::String
+pub ratspeak_tauri::commands::messaging::SendLxmfArgs::renderer: core::option::Option<u8>
 pub ratspeak_tauri::commands::messaging::SendLxmfArgs::title: core::option::Option<alloc::string::String>
 pub struct ratspeak_tauri::commands::messaging::SendPropagatedArgs
 pub ratspeak_tauri::commands::messaging::SendPropagatedArgs::client_msg_id: core::option::Option<alloc::string::String>
@@ -549,6 +554,7 @@ pub ratspeak_tauri::commands::messaging::SendReplyArgs::client_msg_id: core::opt
 pub ratspeak_tauri::commands::messaging::SendReplyArgs::content: alloc::string::String
 pub ratspeak_tauri::commands::messaging::SendReplyArgs::delivery_method: core::option::Option<alloc::string::String>
 pub ratspeak_tauri::commands::messaging::SendReplyArgs::dest_hash: alloc::string::String
+pub ratspeak_tauri::commands::messaging::SendReplyArgs::renderer: core::option::Option<u8>
 pub ratspeak_tauri::commands::messaging::SendReplyArgs::reply_to_id: core::option::Option<alloc::string::String>
 pub ratspeak_tauri::commands::messaging::SendReplyArgs::reply_to_preview: core::option::Option<alloc::string::String>
 pub struct ratspeak_tauri::commands::messaging::SendStagedAttachmentArgs
@@ -556,6 +562,7 @@ pub ratspeak_tauri::commands::messaging::SendStagedAttachmentArgs::client_msg_id
 pub ratspeak_tauri::commands::messaging::SendStagedAttachmentArgs::content: core::option::Option<alloc::string::String>
 pub ratspeak_tauri::commands::messaging::SendStagedAttachmentArgs::delivery_method: core::option::Option<alloc::string::String>
 pub ratspeak_tauri::commands::messaging::SendStagedAttachmentArgs::dest_hash: alloc::string::String
+pub ratspeak_tauri::commands::messaging::SendStagedAttachmentArgs::renderer: core::option::Option<u8>
 pub ratspeak_tauri::commands::messaging::SendStagedAttachmentArgs::staging_token: alloc::string::String
 pub struct ratspeak_tauri::commands::messaging::SendWithAttachmentArgs
 pub ratspeak_tauri::commands::messaging::SendWithAttachmentArgs::client_msg_id: core::option::Option<alloc::string::String>
@@ -566,6 +573,7 @@ pub ratspeak_tauri::commands::messaging::SendWithAttachmentArgs::file_data: core
 pub ratspeak_tauri::commands::messaging::SendWithAttachmentArgs::file_name: core::option::Option<alloc::string::String>
 pub ratspeak_tauri::commands::messaging::SendWithAttachmentArgs::image_data: core::option::Option<alloc::string::String>
 pub ratspeak_tauri::commands::messaging::SendWithAttachmentArgs::image_mime: core::option::Option<alloc::string::String>
+pub ratspeak_tauri::commands::messaging::SendWithAttachmentArgs::renderer: core::option::Option<u8>
 pub async fn ratspeak_tauri::commands::messaging::api_conversation(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<serde_json::value::Value>
 pub async fn ratspeak_tauri::commands::messaging::api_file_metadata(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String) -> ratspeak_tauri::error::AppResult<ratspeak_tauri::commands::messaging::FileMetadata>
 pub async fn ratspeak_tauri::commands::messaging::api_file_read_chunk(tauri::state::State<'_, alloc::sync::Arc<ratspeak_runtime::state::AppState>>, alloc::string::String, u64, usize) -> ratspeak_tauri::error::AppResult<tauri::ipc::Response>

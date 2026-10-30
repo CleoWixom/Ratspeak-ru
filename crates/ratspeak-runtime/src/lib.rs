@@ -22,6 +22,7 @@ mod inbound_admission;
 mod link_accounting;
 pub mod lxmf;
 pub mod lxmf_persistence;
+mod markdown_plain;
 pub mod messaging;
 pub mod mobile_platform;
 pub mod network_ownership;
@@ -682,7 +683,19 @@ pub(crate) fn contact_label_from_db(
         .unwrap_or_else(|| compact_hash_label(source_hash))
 }
 
-fn notification_body(content: &str, has_attachment: bool) -> String {
+fn notification_body(content: &str, renderer: Option<u8>, has_attachment: bool) -> String {
+    let plain;
+    let content = if renderer == Some(lxmf_core::constants::RENDERER_MARKDOWN) {
+        // The preview keeps 120 chars; bound the stripping work to a short head.
+        let head = (0..=content.len().min(4096))
+            .rev()
+            .find(|&end| content.is_char_boundary(end))
+            .map_or("", |end| &content[..end]);
+        plain = markdown_plain::markdown_to_plain_text(head);
+        plain.as_str()
+    } else {
+        content
+    };
     let trimmed = content.trim();
     let lower = trimmed.to_ascii_lowercase();
     if has_attachment && lower.starts_with("[file:") && trimmed.ends_with(']') {
@@ -709,6 +722,7 @@ pub(crate) fn notify_inbound_message_if_background(
     source_hash: &str,
     label: &str,
     content: &str,
+    renderer: Option<u8>,
     has_attachment: bool,
 ) {
     if !state.should_surface_native_notification() {
@@ -717,7 +731,7 @@ pub(crate) fn notify_inbound_message_if_background(
 
     state.emit_native_notification(ratspeak_core::NativeNotification::message(
         format!("Message from {label}"),
-        notification_body(content, has_attachment),
+        notification_body(content, renderer, has_attachment),
         format!("lxmf:{source_hash}"),
         stable_notification_id(source_hash, 1_000),
     ));
@@ -5515,6 +5529,7 @@ async fn process_inbound_lxmf(
 
     let received_at = next_chat_observed_timestamp(state, &source_hash, &identity_id).await;
     let (reply_to_id, reply_to_preview) = inbound_reply_fields(chat_extension.as_ref());
+    let renderer = lxmf::message_renderer(&msg);
     // The receiver's media is written to its own files with the row that
     // names it, in one blocking task off the manager lock.
     let saved = {
@@ -5567,6 +5582,7 @@ async fn process_inbound_lxmf(
                     .as_ref()
                     .map(|audio| audio.stored_name.as_str())
                     .unwrap_or(""),
+                renderer,
             );
             if saved.is_err() {
                 remove_inbound_media_after_persistence_failure(
@@ -5623,6 +5639,7 @@ async fn process_inbound_lxmf(
         "direction": "inbound",
         "reply_to_id": reply_to_id,
         "reply_to_preview": reply_to_preview,
+        "renderer": renderer,
     });
     if let Some(ref att) = attachment_file {
         let obj = event_data.as_object_mut().unwrap();
@@ -5659,6 +5676,7 @@ async fn process_inbound_lxmf(
         &source_hash,
         &source_display_name,
         &messaging::message_display_text(&msg.title_text(), &msg.content_text()),
+        renderer,
         attachment_file.is_some() || audio_file.is_some(),
     );
     state.emit_to_all("lxmf_message", event_data);
@@ -9733,12 +9751,34 @@ mod notification_tests {
     #[test]
     fn attachment_notifications_hide_wire_fallback_without_legacy_media_inference() {
         assert_eq!(
-            notification_body("[File: field-notes.pdf]", true),
+            notification_body("[File: field-notes.pdf]", None, true),
             "New attachment"
         );
         assert_eq!(
-            notification_body("Please review\n[File: field-notes.pdf]", true),
+            notification_body("Please review\n[File: field-notes.pdf]", None, true),
             "Please review"
+        );
+    }
+
+    #[test]
+    fn markdown_notifications_are_plain_text_only_for_the_markdown_renderer() {
+        let body = "## Plan\n**ship** it, see [notes](https://x.org) ||twist||";
+        assert_eq!(
+            notification_body(body, Some(lxmf_core::constants::RENDERER_MARKDOWN), false),
+            "Plan\nship it, see notes [Spoiler]"
+        );
+        assert_eq!(notification_body(body, None, false), body);
+        assert_eq!(
+            notification_body(body, Some(lxmf_core::constants::RENDERER_MICRON), false),
+            body
+        );
+        assert_eq!(
+            notification_body(
+                "```\n```",
+                Some(lxmf_core::constants::RENDERER_MARKDOWN),
+                true
+            ),
+            "New attachment"
         );
     }
 
@@ -9763,6 +9803,7 @@ mod notification_tests {
             "abcd1234abcd1234",
             &contact_label_from_db(&state.db, "abcd1234abcd1234", "identity-a"),
             "hello from mesh",
+            None,
             false,
         );
 
@@ -9780,6 +9821,7 @@ mod notification_tests {
             "abcd1234abcd1234",
             &contact_label_from_db(&state.db, "abcd1234abcd1234", "identity-a"),
             "foreground",
+            None,
             false,
         );
         assert_eq!(notifier.notifications.lock().unwrap().len(), 1);
@@ -9794,6 +9836,7 @@ mod notification_tests {
             "abcd1234abcd1234",
             &contact_label_from_db(&state.db, "abcd1234abcd1234", "identity-a"),
             "disabled",
+            None,
             false,
         );
         assert_eq!(notifier.notifications.lock().unwrap().len(), 1);

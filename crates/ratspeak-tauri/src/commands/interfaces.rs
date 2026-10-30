@@ -1489,6 +1489,234 @@ pub async fn set_text_scale(state: State<'_, Arc<AppState>>, percent: u16) -> Ap
     Ok(json!({ "percent": percent }))
 }
 
+const TRUSTED_LINK_HOSTS_SETTING: &str = "trusted_link_hosts";
+const MAX_TRUSTED_LINK_HOSTS: usize = 200;
+
+// Serializes the read-modify-write of the stored host list.
+static TRUSTED_LINK_HOSTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// ASCII-lowercase DNS name (A-labels, so `xn--` IDNs pass), trailing dot
+/// dropped; a leading `www.` folds into the bare host.
+fn normalize_link_host(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let lower = trimmed
+        .strip_suffix('.')
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
+    let host = match lower.strip_prefix("www.") {
+        Some(rest) if rest.contains('.') => rest.to_string(),
+        _ => lower,
+    };
+    let valid = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        });
+    valid.then_some(host)
+}
+
+fn decode_trusted_link_hosts(stored: Option<&str>) -> Vec<String> {
+    let raw: Vec<Value> = stored
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default();
+    let mut hosts = Vec::with_capacity(raw.len().min(MAX_TRUSTED_LINK_HOSTS));
+    for host in raw
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(normalize_link_host)
+    {
+        push_trusted_link_host(&mut hosts, host);
+    }
+    hosts
+}
+
+/// Adds or refreshes `host` as the newest entry, evicting the oldest past the cap.
+fn push_trusted_link_host(hosts: &mut Vec<String>, host: String) {
+    hosts.retain(|existing| *existing != host);
+    hosts.push(host);
+    if hosts.len() > MAX_TRUSTED_LINK_HOSTS {
+        hosts.drain(..hosts.len() - MAX_TRUSTED_LINK_HOSTS);
+    }
+}
+
+fn stored_trusted_link_hosts(pool: &db::DbPool) -> Result<Vec<String>, String> {
+    let stored = db::get_settings(pool, &[TRUSTED_LINK_HOSTS_SETTING])?;
+    Ok(decode_trusted_link_hosts(
+        stored.get(TRUSTED_LINK_HOSTS_SETTING).map(String::as_str),
+    ))
+}
+
+fn update_trusted_link_hosts(
+    pool: &db::DbPool,
+    update: impl FnOnce(&mut Vec<String>),
+) -> Result<Vec<String>, String> {
+    let _guard = TRUSTED_LINK_HOSTS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut hosts = stored_trusted_link_hosts(pool)?;
+    update(&mut hosts);
+    let encoded = serde_json::to_string(&hosts).map_err(|error| error.to_string())?;
+    db::try_set_settings(pool, &[(TRUSTED_LINK_HOSTS_SETTING.to_string(), encoded)])?;
+    Ok(hosts)
+}
+
+async fn save_trusted_link_hosts(
+    state: &AppState,
+    update: impl FnOnce(&mut Vec<String>) + Send + 'static,
+) -> AppResult<Value> {
+    let hosts = db::spawn_db(state.db.clone(), move |p| {
+        update_trusted_link_hosts(&p, update)
+    })
+    .await
+    .map_err(|_| AppError::internal("trusted link hosts db task panicked"))?
+    .map_err(|error| {
+        AppError::database_unavailable(format!("Failed to save trusted links: {error}"))
+    })?;
+    state.emit_to_all(
+        "app_settings_updated",
+        json!({ "trusted_link_hosts": hosts }),
+    );
+    Ok(json!({ "hosts": hosts }))
+}
+
+#[tauri::command]
+pub async fn api_trusted_link_hosts(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    let hosts = db::spawn_db(state.db.clone(), |p| stored_trusted_link_hosts(&p))
+        .await
+        .map_err(|_| AppError::internal("trusted link hosts db task panicked"))?
+        .map_err(|error| {
+            AppError::database_unavailable(format!("Failed to read trusted links: {error}"))
+        })?;
+    Ok(json!({ "hosts": hosts }))
+}
+
+#[tauri::command]
+pub async fn trust_link_host(state: State<'_, Arc<AppState>>, host: String) -> AppResult<Value> {
+    let host = normalize_link_host(&host).ok_or_else(|| AppError::bad_request("Invalid host"))?;
+    save_trusted_link_hosts(&state, move |hosts| push_trusted_link_host(hosts, host)).await
+}
+
+#[tauri::command]
+pub async fn untrust_link_host(state: State<'_, Arc<AppState>>, host: String) -> AppResult<Value> {
+    let host = normalize_link_host(&host).ok_or_else(|| AppError::bad_request("Invalid host"))?;
+    save_trusted_link_hosts(&state, move |hosts| {
+        hosts.retain(|existing| *existing != host)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn clear_trusted_link_hosts(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    save_trusted_link_hosts(&state, Vec::clear).await
+}
+
+#[cfg(test)]
+mod trusted_link_host_tests {
+    use super::*;
+
+    fn memory_pool() -> db::DbPool {
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        db::init_schema(&pool).unwrap();
+        pool
+    }
+
+    #[test]
+    fn hosts_normalize_to_lowercase_dns_names() {
+        for (raw, expected) in [
+            ("Example.COM", "example.com"),
+            ("example.com.", "example.com"),
+            (" docs.ratspeak.org ", "docs.ratspeak.org"),
+            ("xn--bcher-kva.example", "xn--bcher-kva.example"),
+            ("localhost", "localhost"),
+            ("10.0.0.1", "10.0.0.1"),
+            ("WWW.Example.org", "example.org"),
+            ("www.com", "www.com"),
+        ] {
+            assert_eq!(normalize_link_host(raw).as_deref(), Some(expected), "{raw}");
+        }
+        let too_long = format!("{}.com", vec!["a".repeat(63); 4].join("."));
+        let long_label = format!("{}.com", "a".repeat(64));
+        for raw in [
+            "",
+            ".",
+            "a..b",
+            ".example.com",
+            "-bad.com",
+            "bad-.com",
+            "exa mple.com",
+            "bücher.de",
+            "user@example.com",
+            "example.com:443",
+            "https://example.com",
+            "[::1]",
+            too_long.as_str(),
+            long_label.as_str(),
+        ] {
+            assert_eq!(normalize_link_host(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn adding_dedupes_to_newest_and_evicts_oldest_past_cap() {
+        let mut hosts = Vec::new();
+        for index in 0..MAX_TRUSTED_LINK_HOSTS {
+            push_trusted_link_host(&mut hosts, format!("h{index}.example"));
+        }
+        push_trusted_link_host(&mut hosts, "h0.example".into());
+        assert_eq!(hosts.len(), MAX_TRUSTED_LINK_HOSTS);
+        assert_eq!(hosts.first().map(String::as_str), Some("h1.example"));
+        assert_eq!(hosts.last().map(String::as_str), Some("h0.example"));
+
+        push_trusted_link_host(&mut hosts, "new.example".into());
+        assert_eq!(hosts.len(), MAX_TRUSTED_LINK_HOSTS);
+        assert_eq!(hosts.first().map(String::as_str), Some("h2.example"));
+        assert_eq!(hosts.last().map(String::as_str), Some("new.example"));
+    }
+
+    #[test]
+    fn stored_hosts_round_trip_and_tolerate_bad_rows() {
+        let pool = memory_pool();
+        assert!(stored_trusted_link_hosts(&pool).unwrap().is_empty());
+        update_trusted_link_hosts(&pool, |hosts| {
+            push_trusted_link_host(hosts, "a.example".into());
+            push_trusted_link_host(hosts, "b.example".into());
+        })
+        .unwrap();
+        assert_eq!(
+            stored_trusted_link_hosts(&pool).unwrap(),
+            ["a.example", "b.example"]
+        );
+        let removed =
+            update_trusted_link_hosts(&pool, |hosts| hosts.retain(|h| h != "a.example")).unwrap();
+        assert_eq!(removed, ["b.example"]);
+        assert!(
+            update_trusted_link_hosts(&pool, Vec::clear)
+                .unwrap()
+                .is_empty()
+        );
+
+        db::try_set_setting(
+            &pool,
+            TRUSTED_LINK_HOSTS_SETTING,
+            r#"["B.example.", "bad host", 7, "b.example", "c.example"]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stored_trusted_link_hosts(&pool).unwrap(),
+            ["b.example", "c.example"]
+        );
+        db::try_set_setting(&pool, TRUSTED_LINK_HOSTS_SETTING, "not json").unwrap();
+        assert!(stored_trusted_link_hosts(&pool).unwrap().is_empty());
+    }
+}
+
 #[tauri::command]
 pub async fn set_activity_identity_protection(
     state: State<'_, Arc<AppState>>,

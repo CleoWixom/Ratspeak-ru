@@ -78,7 +78,8 @@ pub async fn build_conversations_payload(state: &AppState) -> Option<Value> {
                         substr(m.content, 1, 60) AS preview,
                         m.timestamp,
                         m.direction,
-                        substr(m.title, 1, 60)
+                        substr(m.title, 1, 60),
+                        m.renderer
                  FROM messages m
                  WHERE m.identity_id = ?1
                    AND m.rowid IN (
@@ -150,10 +151,14 @@ pub async fn build_conversations_payload(state: &AppState) -> Option<Value> {
                 row.get::<_, String>(4)
                     .unwrap_or_else(|_| "outbound".into()),
                 row.get::<_, String>(5).unwrap_or_default(),
+                row.get::<_, Option<i64>>(6)
+                    .ok()
+                    .flatten()
+                    .and_then(|renderer| u8::try_from(renderer).ok()),
             ))
         }) {
             for r in rows.flatten() {
-                let (source, destination, content, timestamp, direction, title) = r;
+                let (source, destination, content, timestamp, direction, title, renderer) = r;
                 let preview: String = message_display_text(&title, &content)
                     .chars()
                     .take(60)
@@ -197,6 +202,7 @@ pub async fn build_conversations_payload(state: &AppState) -> Option<Value> {
                             "hash": other,
                             "display_name": display_name,
                             "last_message": preview,
+                            "preview_renderer": renderer,
                             "last_direction": direction,
                             "timestamp": timestamp,
                             "unread": unread_counts.get(&other).copied().unwrap_or(0),

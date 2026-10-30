@@ -370,6 +370,9 @@ pub struct SendLxmfArgs {
     /// Echoed back in `lxmf_step` so the optimistic UI row reconciles.
     #[serde(default)]
     pub client_msg_id: Option<String>,
+    /// LXMF FIELD_RENDERER; see [`parse_message_renderer`].
+    #[serde(default)]
+    pub renderer: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -379,6 +382,17 @@ pub struct CancelLxmfMessageArgs {
 
 pub(crate) fn parse_delivery_preference(value: Option<&str>) -> DeliveryPreference {
     DeliveryPreference::parse(value)
+}
+
+/// Markdown is the only renderer Ratspeak sends; plain (0) sends no field.
+pub(crate) fn parse_message_renderer(value: Option<u8>) -> AppResult<Option<u8>> {
+    match value {
+        None | Some(lxmf_core::constants::RENDERER_PLAIN) => Ok(None),
+        Some(lxmf_core::constants::RENDERER_MARKDOWN) => {
+            Ok(Some(lxmf_core::constants::RENDERER_MARKDOWN))
+        }
+        Some(_) => Err(AppError::bad_request("Unsupported message renderer")),
+    }
 }
 
 pub(crate) fn propagation_node_configured(state: &AppState) -> bool {
@@ -531,6 +545,7 @@ pub async fn send_lxmf_message(
     let title = sanitize_text(args.title.as_deref().unwrap_or(""), 256);
     let delivery_pref = parse_delivery_preference(args.delivery_method.as_deref());
     let client_msg_id = normalize_lxmf_client_msg_id(args.client_msg_id.as_deref())?;
+    let renderer = parse_message_renderer(args.renderer)?;
 
     if !validate_hex(&dest_hash, 16, 64) {
         emit_lxmf_send_error(
@@ -595,6 +610,7 @@ pub async fn send_lxmf_message(
                     identity_id: &id_c,
                     preference: delivery_pref,
                     profile: DeliveryProfile::Message,
+                    renderer,
                 })
                 .ok()
         })
@@ -790,6 +806,8 @@ pub struct SendReplyArgs {
     pub delivery_method: Option<String>,
     #[serde(default)]
     pub client_msg_id: Option<String>,
+    #[serde(default)]
+    pub renderer: Option<u8>,
 }
 
 #[tauri::command]
@@ -813,6 +831,7 @@ pub async fn send_lxmf_reply(
         .unwrap_or_else(|| reply_to_id.clone());
     let delivery_pref = parse_delivery_preference(args.delivery_method.as_deref());
     let client_msg_id = normalize_lxmf_client_msg_id(args.client_msg_id.as_deref())?;
+    let renderer = parse_message_renderer(args.renderer)?;
 
     if !validate_hex(&dest_hash, 16, 64) || content.is_empty() {
         state.emit_to_all(
@@ -866,6 +885,7 @@ pub async fn send_lxmf_reply(
                 identity_id: &id_c,
                 preference: delivery_pref,
                 profile: DeliveryProfile::Message,
+                renderer,
             })
         })
     })
@@ -1065,6 +1085,8 @@ pub struct SendWithAttachmentArgs {
     pub file_name: Option<String>,
     #[serde(default)]
     pub client_msg_id: Option<String>,
+    #[serde(default)]
+    pub renderer: Option<u8>,
 }
 
 enum AttachmentLeaseOwner {
@@ -1094,6 +1116,7 @@ async fn queue_prepared_attachment(
     dest_hash: String,
     content: String,
     delivery_pref: DeliveryPreference,
+    renderer: Option<u8>,
     client_msg_id: Option<String>,
     file_name: String,
     file_bytes: Vec<u8>,
@@ -1155,6 +1178,7 @@ async fn queue_prepared_attachment(
                         db_pool: &st.db,
                         identity_id: &identity_id,
                         preference: delivery_pref,
+                        renderer,
                     },
                 ),
             )
@@ -1586,6 +1610,7 @@ pub async fn send_lxmf_with_attachment(
     let content = sanitize_message_content(args.content.as_deref().unwrap_or(""))?;
     let delivery_pref = parse_delivery_preference(args.delivery_method.as_deref());
     let client_msg_id = normalize_lxmf_client_msg_id(args.client_msg_id.as_deref())?;
+    let renderer = parse_message_renderer(args.renderer)?;
 
     let is_image = args.image_data.as_deref().is_some_and(|s| !s.is_empty());
     let image_mime = if is_image {
@@ -1702,6 +1727,7 @@ pub async fn send_lxmf_with_attachment(
         dest_hash,
         content,
         delivery_pref,
+        renderer,
         client_msg_id,
         file_name,
         file_bytes,
@@ -2069,6 +2095,8 @@ pub struct SendStagedAttachmentArgs {
     pub staging_token: String,
     #[serde(default)]
     pub client_msg_id: Option<String>,
+    #[serde(default)]
+    pub renderer: Option<u8>,
 }
 
 #[tauri::command]
@@ -2080,6 +2108,7 @@ pub async fn send_lxmf_with_staged_attachment(
     let content = sanitize_message_content(args.content.as_deref().unwrap_or(""))?;
     let delivery_pref = parse_delivery_preference(args.delivery_method.as_deref());
     let client_msg_id = normalize_lxmf_client_msg_id(args.client_msg_id.as_deref())?;
+    let renderer = parse_message_renderer(args.renderer)?;
     if !validate_hex(&dest_hash, 16, 64) {
         return Err(AppError::new(
             "invalid_destination",
@@ -2130,6 +2159,7 @@ pub async fn send_lxmf_with_staged_attachment(
         dest_hash,
         content,
         delivery_pref,
+        renderer,
         client_msg_id,
         file_name,
         file_bytes,

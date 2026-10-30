@@ -958,6 +958,7 @@ enum Projection {
         content: String,
         reply: String,
         preview: String,
+        renderer: Option<u8>,
     },
     Reaction {
         target: String,
@@ -1007,6 +1008,7 @@ impl Projection {
             content: msg.content_text().into_owned(),
             reply,
             preview,
+            renderer: lxmf::message_renderer(msg),
         })
     }
     fn bindings(&self) -> Vec<usize> {
@@ -1016,6 +1018,7 @@ impl Projection {
                 content,
                 reply,
                 preview,
+                ..
             } => vec![title.len(), content.len(), reply.len(), preview.len()],
             Self::Reaction { target, emoji, .. } => vec![target.len(), emoji.len()],
             Self::Service => Vec::new(),
@@ -1178,7 +1181,7 @@ fn commit_message(
                     }
                     Ok(EffectCommit::Applied("reaction"))
                 }
-                Projection::Chat { title, content, reply, preview } => {
+                Projection::Chat { title, content, reply, preview, renderer } => {
                     let attachment = media.iter().find(|item| !item.image && item.audio.is_none());
                     let image = media.iter().find(|item| item.image);
                     let audio = media.iter().find(|item| item.audio.is_some());
@@ -1186,7 +1189,7 @@ fn commit_message(
                         content, title, timestamp, "received", "inbound", &identity,
                         attachment.map_or("", |v| v.name.as_str()), attachment.map_or("", |v| v.stored.as_str()),
                         image.map_or("", |v| v.name.as_str()), image.map_or("", |v| v.stored.as_str()), reply, preview,
-                        Some("propagated"), audio.and_then(|v| v.audio), audio.map_or("", |v| v.stored.as_str())).map_err(storage)?;
+                        Some("propagated"), audio.and_then(|v| v.audio), audio.map_or("", |v| v.stored.as_str()), *renderer).map_err(storage)?;
                     connection.execute("DELETE FROM hidden_conversations WHERE identity_id=?1 AND dest_hash=?2",params![identity,source])?;
                     Ok(EffectCommit::Applied("message"))
                 }
@@ -1375,6 +1378,7 @@ pub(crate) async fn admit_download(
             content,
             reply,
             preview,
+            renderer,
         } => {
             let notification: String = if content.trim().is_empty() {
                 &title
@@ -1394,6 +1398,7 @@ pub(crate) async fn admit_download(
             event["title"] = serde_json::Value::String(title);
             event["reply_to_id"] = serde_json::Value::String(reply);
             event["reply_to_preview"] = serde_json::Value::String(preview);
+            event["renderer"] = json!(renderer);
             if let Some(fields) = event.as_object_mut() {
                 fields.extend(output.display_media);
             }
@@ -1408,6 +1413,7 @@ pub(crate) async fn admit_download(
                 source,
                 identity: identity.clone(),
                 preview: notification,
+                renderer,
                 attachment: has_attachment,
             });
             crate::record_activity_if_current(state, activity, || {
@@ -1461,6 +1467,7 @@ struct ChatRefresh {
     source: String,
     identity: String,
     preview: String,
+    renderer: Option<u8>,
     attachment: bool,
 }
 
@@ -1473,6 +1480,7 @@ async fn refresh_chat(state: Arc<AppState>, refresh: ChatRefresh) {
         source,
         identity,
         preview,
+        renderer,
         attachment,
     } = refresh;
     let lists = crate::read_inbound_lists(&state, &source, &identity, &message_id).await;
@@ -1499,6 +1507,7 @@ async fn refresh_chat(state: Arc<AppState>, refresh: ChatRefresh) {
                 &source,
                 &lists.label,
                 &preview,
+                renderer,
                 attachment,
             );
         }
@@ -2065,6 +2074,7 @@ mod tests {
             source,
             identity,
             preview: "downloaded".into(),
+            renderer: None,
             attachment: false,
         }
     }

@@ -116,6 +116,34 @@ fn encode_msgpack_value(value: &rmpv::Value) -> Vec<u8> {
     buf
 }
 
+/// FIELD_RENDERER is a native MessagePack integer on the wire, never bin.
+fn renderer_custom_field(renderer: u8) -> (u8, Vec<u8>) {
+    (
+        lxmf_core::constants::FIELD_RENDERER,
+        encode_msgpack_value(&rmpv::Value::from(renderer)),
+    )
+}
+
+/// Inbound FIELD_RENDERER; only an unsigned MessagePack integer in 0..=255 counts.
+pub(crate) fn message_renderer(msg: &LxMessage) -> Option<u8> {
+    renderer_from_encoded(
+        msg.get_field(lxmf_core::constants::FIELD_RENDERER)?
+            .encoded(),
+    )
+}
+
+fn renderer_from_encoded(mut encoded: &[u8]) -> Option<u8> {
+    // Integer markers only, so no other value shape is ever decoded.
+    if !matches!(encoded.first()?, 0x00..=0x7f | 0xcc..=0xcf | 0xd0..=0xd3) {
+        return None;
+    }
+    let value = rmpv::decode::read_value(&mut encoded).ok()?;
+    if !encoded.is_empty() {
+        return None;
+    }
+    u8::try_from(value.as_u64()?).ok()
+}
+
 pub fn get_ratspeak_announce_app_data(
     display_name: Option<&str>,
     stamp_cost: Option<u8>,
@@ -913,6 +941,7 @@ pub struct AttachmentMessageRequest<'a> {
     pub db_pool: &'a DbPool,
     pub identity_id: &'a str,
     pub preference: DeliveryPreference,
+    pub renderer: Option<u8>,
 }
 
 /// Fully-specified first-class LXMF audio send request with an explicit wire mode.
@@ -1058,6 +1087,7 @@ pub struct MessageSendRequest<'a> {
     pub identity_id: &'a str,
     pub preference: DeliveryPreference,
     pub profile: DeliveryProfile,
+    pub renderer: Option<u8>,
 }
 
 pub struct ReplyMessageSendRequest<'a> {
@@ -1070,6 +1100,7 @@ pub struct ReplyMessageSendRequest<'a> {
     pub identity_id: &'a str,
     pub preference: DeliveryPreference,
     pub profile: DeliveryProfile,
+    pub renderer: Option<u8>,
 }
 
 struct MessageWithMethodRequest<'a> {
@@ -1083,6 +1114,7 @@ struct MessageWithMethodRequest<'a> {
     profile: DeliveryProfile,
     reply_to_id: Option<&'a str>,
     reply_to_preview: Option<&'a str>,
+    renderer: Option<u8>,
 }
 
 pub struct ReactionSendRequest<'a> {
@@ -2698,9 +2730,12 @@ impl LxmfManager {
         msg.include_ticket = true;
 
         for (field_id, bytes) in custom_fields {
-            // FIELD_REACTION is a native msgpack dict on the wire; everything
-            // else we emit packs as bin.
-            if *field_id == lxmf_core::constants::FIELD_REACTION {
+            // FIELD_REACTION (dict) and FIELD_RENDERER (int) are native msgpack
+            // on the wire; everything else we emit packs as bin.
+            if matches!(
+                *field_id,
+                lxmf_core::constants::FIELD_REACTION | lxmf_core::constants::FIELD_RENDERER
+            ) {
                 msg.set_msgpack_field(*field_id, bytes.clone()).ok()?;
             } else {
                 msg.set_field(*field_id, bytes.clone()).ok()?;
@@ -2730,6 +2765,7 @@ impl LxmfManager {
             identity_id,
             preference: DeliveryPreference::Auto,
             profile: DeliveryProfile::Message,
+            renderer: None,
         })
     }
 
@@ -2764,6 +2800,7 @@ impl LxmfManager {
             profile: request.profile,
             reply_to_id: None,
             reply_to_preview: None,
+            renderer: request.renderer,
         })
         .ok_or(LxmfSubmissionFailure::PreparationFailed)
     }
@@ -2790,6 +2827,7 @@ impl LxmfManager {
             profile: request.profile,
             reply_to_id: Some(request.reply_to_id),
             reply_to_preview: Some(request.reply_to_preview),
+            renderer: request.renderer,
         })
         .map(|queued| queued.message_id)
     }
@@ -2820,6 +2858,7 @@ impl LxmfManager {
             profile: DeliveryProfile::Message,
             reply_to_id: None,
             reply_to_preview: None,
+            renderer: None,
         })
         .map(|queued| queued.message_id)
     }
@@ -2839,10 +2878,11 @@ impl LxmfManager {
             profile,
             reply_to_id,
             reply_to_preview,
+            renderer,
         } = request;
         let reply_to_id = reply_to_id.unwrap_or("");
         let reply_to_preview = reply_to_preview.unwrap_or("");
-        let custom_fields = if reply_to_id.is_empty() {
+        let mut custom_fields = if reply_to_id.is_empty() {
             Vec::new()
         } else {
             ratspeak_chat_custom_fields(&RatspeakChatExtension::Reply {
@@ -2852,6 +2892,7 @@ impl LxmfManager {
             })
             .unwrap_or_default()
         };
+        custom_fields.extend(renderer.map(renderer_custom_field));
         let mut msg = self.create_message_with_custom_fields(
             dest_hash_hex,
             content,
@@ -2884,7 +2925,7 @@ impl LxmfManager {
 
         // The manager lock is still held here, so the router cannot advance
         // this freshly accepted message before its local history row exists.
-        db::save_message(
+        db::save_message_with_audio(
             db_pool,
             &msg_id,
             &self.lxmf_hash,
@@ -2902,6 +2943,9 @@ impl LxmfManager {
             reply_to_id,
             reply_to_preview,
             Some(delivery_method_name(method)),
+            None,
+            "",
+            renderer,
         );
 
         Some(LxmfQueuedMessage {
@@ -2974,6 +3018,7 @@ impl LxmfManager {
             db_pool,
             identity_id,
             preference,
+            renderer,
         } = request;
 
         let dest_bytes =
@@ -3004,6 +3049,10 @@ impl LxmfManager {
                 .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         } else {
             msg.set_file_attachment_field(file_name, file_bytes)
+                .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
+        }
+        if let Some((field_id, bytes)) = renderer.map(renderer_custom_field) {
+            msg.set_msgpack_field(field_id, bytes)
                 .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         }
 
@@ -3057,7 +3106,7 @@ impl LxmfManager {
                 (file_name, stored_name.as_str(), "", "")
             };
 
-        if db::try_save_message(
+        if db::try_save_message_with_audio(
             db_pool,
             &msg_id,
             &self.lxmf_hash,
@@ -3075,6 +3124,9 @@ impl LxmfManager {
             "",
             "",
             Some(delivery_method_name(method)),
+            None,
+            "",
+            renderer,
         )
         .is_err()
         {
@@ -3217,6 +3269,7 @@ impl LxmfManager {
             Some(delivery_method_name(method)),
             Some(audio_mode),
             &stored_name,
+            None,
         )
         .is_err()
         {
@@ -8302,6 +8355,7 @@ mod tests {
                 identity_id: "identity-a",
                 preference: DeliveryPreference::Direct,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .expect("reply send");
 
@@ -11449,6 +11503,7 @@ mod tests {
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Opportunistic,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .expect("oversized opportunistic message should queue as Direct");
 
@@ -11608,6 +11663,7 @@ mod tests {
                     identity_id: &identity_id,
                     preference: DeliveryPreference::Opportunistic,
                     profile: DeliveryProfile::Message,
+                    renderer: None,
                 })
                 .unwrap();
 
@@ -11674,6 +11730,7 @@ mod tests {
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Auto,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .expect("normal Auto send");
         assert_eq!(normal.method, DeliveryMethod::Direct);
@@ -11690,6 +11747,7 @@ mod tests {
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Auto,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .expect("reply Auto send");
         let reply_hash: [u8; 32] = hex::decode(reply).unwrap().try_into().expect("reply hash");
@@ -11709,6 +11767,7 @@ mod tests {
                 db_pool: &pool,
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Auto,
+                renderer: None,
             })
             .expect("attachment Auto send");
         assert_eq!(attachment.method, DeliveryMethod::Direct);
@@ -11752,6 +11811,7 @@ mod tests {
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Direct,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .is_ok()
         );
@@ -11773,6 +11833,7 @@ mod tests {
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Auto,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .expect("no-compression Auto send");
         assert_eq!(no_compression.method, DeliveryMethod::Direct);
@@ -11793,6 +11854,7 @@ mod tests {
             identity_id: &identity_id,
             preference: DeliveryPreference::Direct,
             profile: DeliveryProfile::Message,
+            renderer: None,
         });
 
         assert_eq!(result, Err(LxmfSubmissionFailure::PreparationFailed));
@@ -12379,6 +12441,207 @@ mod tests {
         assert!(!mgr.auto_live_fallback.contains(&message_id));
     }
 
+    fn renderer_test_message(field: Option<lxmf_core::message::FieldValue>) -> LxMessage {
+        let mut draft =
+            LxMessageDraft::new([3; 16], [4; 16], "", "**hi**", DeliveryMethod::Direct).unwrap();
+        if let Some(value) = field {
+            draft
+                .set_field_value(lxmf_core::constants::FIELD_RENDERER, value)
+                .unwrap();
+        }
+        draft
+            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                &[7; 32],
+            ))
+            .unwrap()
+            .finalize(None)
+            .unwrap()
+    }
+
+    #[test]
+    fn inbound_renderer_accepts_only_unsigned_msgpack_integers() {
+        for (encoded, expected) in [
+            (&[0x02][..], Some(2)),
+            (&[0x00][..], Some(0)),
+            (&[0xcc, 0xff][..], Some(255)),
+            (&[0xcd, 0x00, 0x02][..], Some(2)),
+            (&[0xd0, 0x02][..], Some(2)),
+            (&[0xcd, 0x01, 0x00][..], None),
+            (&[0xff][..], None),
+            (&[0xd0, 0xfe][..], None),
+            (&[0xc4, 0x01, 0x02][..], None),
+            (&[0xa1, b'2'][..], None),
+            (&[0xca, 0x40, 0x00, 0x00, 0x00][..], None),
+            (&[0xc0][..], None),
+            (&[0x02, 0x02][..], None),
+            (&[][..], None),
+        ] {
+            assert_eq!(renderer_from_encoded(encoded), expected, "{encoded:02x?}");
+        }
+
+        let native = lxmf_core::message::FieldValue::MessagePack(
+            lxmf_core::message::EncodedFieldValue::new(Bytes::from_static(&[0x02])).unwrap(),
+        );
+        assert_eq!(
+            message_renderer(&renderer_test_message(Some(native))),
+            Some(2)
+        );
+        let bin = lxmf_core::message::FieldValue::Binary(Bytes::from_static(&[0x02]));
+        assert_eq!(message_renderer(&renderer_test_message(Some(bin))), None);
+        let text = lxmf_core::message::FieldValue::MessagePack(
+            lxmf_core::message::EncodedFieldValue::new(Bytes::from_static(&[0xa1, b'2'])).unwrap(),
+        );
+        assert_eq!(message_renderer(&renderer_test_message(Some(text))), None);
+        assert_eq!(message_renderer(&renderer_test_message(None)), None);
+    }
+
+    /// Python LXMF `pack()` of a Markdown message
+    /// (`tools/generate-lxmf-renderer-golden.py`).
+    #[test]
+    fn renderer_field_matches_python_lxmf_both_ways() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../testdata/lxmf-renderer-golden.json")).unwrap();
+        let packed = hex::decode(golden["packed"].as_str().unwrap()).unwrap();
+        let public_key = hex::decode(golden["source_public_key"].as_str().unwrap()).unwrap();
+        let signer = rns_crypto::ed25519::Ed25519PublicKey::from_bytes(
+            &public_key[32..].try_into().unwrap(),
+        )
+        .unwrap();
+
+        let message = LxMessage::unpack_owned(
+            Bytes::from(packed.clone()),
+            lxmf_core::message_api::MessageDecodeLimits::default(),
+        )
+        .unwrap();
+        assert!(message.verify_signature(&signer));
+        assert_eq!(message_renderer(&message), Some(2));
+
+        let content = golden["content"].as_str().unwrap();
+        let mut draft = LxMessageDraft::new(
+            packed[..16].try_into().unwrap(),
+            packed[16..32].try_into().unwrap(),
+            "",
+            content,
+            DeliveryMethod::Direct,
+        )
+        .unwrap();
+        draft
+            .set_timestamp(golden["timestamp"].as_f64().unwrap())
+            .unwrap();
+        let (field_id, bytes) = renderer_custom_field(lxmf_core::constants::RENDERER_MARKDOWN);
+        draft.set_msgpack_field(field_id, bytes).unwrap();
+        assert_eq!(draft.pack_payload().unwrap(), packed[96..]);
+    }
+
+    #[test]
+    fn markdown_sends_pack_renderer_as_native_int_and_persist_it() {
+        let pool = test_pool();
+        let mut mgr = test_manager();
+        let dest = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let reply_target = "01".repeat(32);
+
+        let text = mgr
+            .send_message_with_preference_report(MessageSendRequest {
+                dest_hash_hex: dest,
+                content: "**bold**",
+                title: "",
+                db_pool: &pool,
+                identity_id: "me",
+                preference: DeliveryPreference::Direct,
+                profile: DeliveryProfile::Message,
+                renderer: Some(lxmf_core::constants::RENDERER_MARKDOWN),
+            })
+            .expect("text queued")
+            .message_id;
+        let reply = mgr
+            .send_reply_with_preference(ReplyMessageSendRequest {
+                dest_hash_hex: dest,
+                content: "_re_",
+                title: "",
+                reply_to_id: &reply_target,
+                reply_to_preview: "original",
+                db_pool: &pool,
+                identity_id: "me",
+                preference: DeliveryPreference::Direct,
+                profile: DeliveryProfile::Message,
+                renderer: Some(lxmf_core::constants::RENDERER_MARKDOWN),
+            })
+            .expect("reply queued");
+        let attachment = mgr
+            .send_message_with_attachment_fields_preference_report(AttachmentMessageRequest {
+                dest_hash_hex: dest,
+                content: "`file`\n[File: note.txt]",
+                title: "",
+                file_name: "note.txt",
+                file_bytes: b"hello",
+                staged_path: None,
+                is_image: false,
+                image_mime: "",
+                db_pool: &pool,
+                identity_id: "me",
+                preference: DeliveryPreference::Direct,
+                renderer: Some(lxmf_core::constants::RENDERER_MARKDOWN),
+            })
+            .expect("attachment queued")
+            .message_id;
+        let plain = mgr
+            .send_message_with_preference_report(MessageSendRequest {
+                dest_hash_hex: dest,
+                content: "plain",
+                title: "",
+                db_pool: &pool,
+                identity_id: "me",
+                preference: DeliveryPreference::Direct,
+                profile: DeliveryProfile::Message,
+                renderer: None,
+            })
+            .expect("plain queued")
+            .message_id;
+
+        for id in [&text, &reply, &attachment] {
+            let message = mgr
+                .router
+                .pending_outbound
+                .iter()
+                .find(|message| hex::encode(message.message_id()) == *id)
+                .expect("pending outbound");
+            let field = message
+                .get_field(lxmf_core::constants::FIELD_RENDERER)
+                .expect("renderer field");
+            assert_eq!(field.encoded(), &[0x02]);
+            assert!(
+                message
+                    .wire_bytes()
+                    .windows(2)
+                    .any(|pair| pair == [0x0f, 0x02])
+            );
+            assert_eq!(message_renderer(message), Some(2));
+        }
+        let message = mgr
+            .router
+            .pending_outbound
+            .iter()
+            .find(|message| hex::encode(message.message_id()) == plain)
+            .expect("plain pending outbound");
+        assert!(
+            message
+                .get_field(lxmf_core::constants::FIELD_RENDERER)
+                .is_none()
+        );
+
+        let rows = db::get_conversation(&pool, dest, "me", 10);
+        let renderer = |id: &str| {
+            rows.iter()
+                .find(|row| row["id"] == id)
+                .map(|row| row["renderer"].clone())
+                .expect("stored row")
+        };
+        for id in [&text, &reply, &attachment] {
+            assert_eq!(renderer(id), 2);
+        }
+        assert!(renderer(&plain).is_null());
+    }
+
     #[test]
     fn attachment_field_uses_lxmf_string_filename_and_binary_bytes() {
         let pool = test_pool();
@@ -12398,6 +12661,7 @@ mod tests {
                 db_pool: &pool,
                 identity_id: "me",
                 preference: DeliveryPreference::Direct,
+                renderer: None,
             })
             .expect("message queued");
         assert_eq!(queued.method, DeliveryMethod::Direct);
@@ -12645,6 +12909,7 @@ mod tests {
                 db_pool: &pool,
                 identity_id: "me",
                 preference: DeliveryPreference::Direct,
+                renderer: None,
             })
             .expect("staged message queued");
 
@@ -12684,6 +12949,7 @@ mod tests {
                 db_pool: &pool,
                 identity_id: "me",
                 preference: DeliveryPreference::Propagated,
+                renderer: None,
             });
 
         assert_eq!(result, Err(LxmfSubmissionFailure::PreparationFailed));
