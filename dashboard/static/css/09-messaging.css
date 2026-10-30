@@ -166,8 +166,7 @@
     z-index: calc(var(--z-modal) + 1);
     filter: none;
 }
-.lxmf-messages.msg-select-mode .lxmf-msg,
-.lxmf-messages.msg-select-mode .msg-reactions {
+.lxmf-messages.msg-select-mode .msg-row {
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
 }
@@ -175,7 +174,7 @@
     background: var(--accent-a05);
     border-radius: var(--radius-md);
 }
-.lxmf-messages.msg-select-mode .msg-row:not(.msg-selected) .lxmf-msg:hover .msg-select-check {
+.lxmf-messages.msg-select-mode .msg-row:not(.msg-selected):hover .msg-select-check {
     border-color: var(--accent);
 }
 .lxmf-messages.msg-select-mode .msg-actions-trigger { display: none; }

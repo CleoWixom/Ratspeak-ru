@@ -5068,18 +5068,26 @@ function _applyMessageSelectBar(active, count, container) {
     }
 }
 
+// Clicks that leave the conversation end selection: the chat header, the
+// conversation list, or app navigation. Cancel, Esc and Back do too.
+var MSG_SELECTION_EXIT_SURFACES = '#lxmf-chat-header, .lxmf-sidebar, #sidebar, #bottom-bar';
+
 function _handleMessageSelectionClick(e) {
     if (!_messageSelectionActive()) return;
+    var target = e.target;
     var container = document.getElementById('lxmf-messages');
-    if (!container || !container.contains(e.target)) return;
-    // Only the message itself (bubble, its circle, its reactions) toggles;
-    // anything else in the transcript is empty space and ends selection.
-    var hit = e.target.closest ? e.target.closest('.lxmf-msg, .msg-reactions') : null;
-    var row = hit && hit.closest('.msg-row');
-    if (!row) {
-        _clearMessageSelection();
+    if (!container || !target || !container.contains(target)) {
+        // The back arrow ends selection itself and must not also leave the chat.
+        if (!_msgSelection.pending && target && target.closest &&
+                target.closest(MSG_SELECTION_EXIT_SURFACES) && !target.closest('#lxmf-back-btn')) {
+            _clearMessageSelection();
+        }
         return;
     }
+    // Anywhere on a message's row toggles it, including the space beside
+    // the bubble; the gaps between messages do nothing.
+    var row = target.closest ? target.closest('.msg-row') : null;
+    if (!row) return;
     // The click synthesized by the hold that selected this message is not a toggle.
     if (_consumePendingMessageHoldActivation(e, e.target)) return;
     e.preventDefault();

@@ -1,5 +1,5 @@
-// Bulk message selection: only the tray's Select row selects; taps toggle;
-// Cancel or a tap on empty transcript space ends it; the bar under the header
+// Bulk message selection: only the tray's Select row selects; taps anywhere on
+// a message's row toggle; Cancel or leaving the conversation ends it; the bar
 // reads "Delete" then "Delete (N)"; in-flight sends are never selectable; and
 // confirmed deletes go through delete_messages.
 const assert = require('assert');
@@ -97,17 +97,33 @@ const settle = () => new Promise((r) => setImmediate(r));
     assert.strictEqual(h.container.scrollTop, 100);
     assert.strictEqual(h.status.textContent, 'Selection cleared');
 
-    // A tap on empty transcript space (no message row) ends selection.
+    // The gaps between messages do nothing; leaving the conversation (header,
+    // conversation list, navigation) ends selection, except the back arrow,
+    // which ends it on its own, and never while the confirm is open.
+    const inside = (surface) => ({ closest: (sel) => (sel === '.msg-row' ? null : surface) });
     c._selectMessage(messages[0]);
+    h.container.contains = () => true;
+    c._handleMessageSelectionClick({ target: inside(null) });
+    assert.strictEqual(c._messageSelectionActive(), true, 'a gap between messages keeps selection');
+    h.container.contains = () => false;
+    c._handleMessageSelectionClick({ target: { closest: (sel) => (sel === '#lxmf-back-btn' ? {} : sel.includes('#lxmf-chat-header') ? {} : null) } });
+    assert.strictEqual(c._messageSelectionActive(), true, 'the back arrow handles its own exit');
     c._handleMessageSelectionClick({ target: { closest: () => null } });
-    assert.strictEqual(c._messageSelectionActive(), false);
+    assert.strictEqual(c._messageSelectionActive(), true, 'composer and other chat chrome keep selection');
+    c._msgSelection.pending = true;
+    c._handleMessageSelectionClick({ target: { closest: (sel) => (sel.includes('.lxmf-sidebar') ? {} : null) } });
+    assert.strictEqual(c._messageSelectionActive(), true, 'the confirm sheet never ends selection');
+    c._msgSelection.pending = false;
+    c._handleMessageSelectionClick({ target: { closest: (sel) => (sel.includes('.lxmf-sidebar') ? {} : null) } });
+    assert.strictEqual(c._messageSelectionActive(), false, 'the conversation list ends selection');
+    h.container.contains = () => true;
 
-    // A tap on another message toggles it instead of running its controls.
+    // A tap anywhere on another message's row toggles it instead of running its controls.
     c._selectMessage(messages[0]);
     let stopped = false;
     const bubbleB = { getAttribute: () => 'b' };
     c._handleMessageSelectionClick({
-        target: { closest: () => ({ closest: () => ({ querySelector: () => bubbleB }) }) },
+        target: { closest: () => ({ querySelector: () => bubbleB }) },
         preventDefault() {}, stopPropagation() { stopped = true; },
     });
     assert(stopped);
