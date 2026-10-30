@@ -6377,22 +6377,16 @@ fn release_workflows_build_once_and_publish_only_after_complete_aggregation() {
         .as_array()
         .expect("component array");
     let release_note_fragments = [
-        "Auto-Lock for passcode-protected identities",
-        "how much notifications show",
-        "radios reconnect faster and show why they can't connect",
-        "removing it from Android's Bluetooth settings",
-        "Radios that reject a setting now say which one",
-        "messages and contacts always stay with the right identity",
-        "exporting a key now asks for your PIN",
-        "copied phrases clear after a minute",
-        "Fixed a file name bug when exporting on desktop",
-        "Fixed recovery phrases not being saved in rare cases",
-        "latest Python Reticulum and LXMF",
-        "propagation nodes that hold many messages",
-        "Fixed game boards being cut off on phones",
-        "captured chess pieces and game results easier to see",
-        "USB radios are now available only to the signed-in user",
-        "delete any old `99-ratspeak.rules` you copied by hand",
+        "Added Markdown support to messages",
+        "put text between two bars on each side",
+        "select one or multiple messages to delete",
+        "Added outbound URL security warning",
+        "Cmd or Ctrl with B, I or E formats the selected text",
+        "changelog viewing to the in-app",
+        "Text across the app is larger and easier to read",
+        "message reaction menu now opens beside the message",
+        "Links in messages are easier to read",
+        "Locked zoom in the app outside of enlarged photos",
     ];
 
     for workflow_path in [
