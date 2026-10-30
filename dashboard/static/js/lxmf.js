@@ -3339,6 +3339,18 @@ function _messageDisplayContent(msg, hasRenderedAudio) {
     return displayContent;
 }
 
+// Copy keeps Markdown source, but spoilers still covered in this bubble stay hidden.
+function _messageCopyText(msg, content) {
+    var text = _messageDisplayContent(msg, !!(msg && msg.audio));
+    var spoilers = content && content.querySelectorAll ? content.querySelectorAll('.md-spoiler') : [];
+    if (!_messageIsMarkdown(msg) || !spoilers.length) return text;
+    var body = RS.markdown.redactSpoilers(_messageBodyContent(msg, !!msg.audio), function(i) {
+        return !!(spoilers[i] && spoilers[i].classList.contains('is-revealed'));
+    });
+    var title = ((msg && msg.title) || '').trim();
+    return title ? title + (body.trim() ? '\n\n' + body : '') : body;
+}
+
 // Previews, reply quotes and search show Markdown messages without syntax.
 function _messagePlainContent(msg, hasRenderedAudio) {
     if (!_messageIsMarkdown(msg)) return _messageDisplayContent(msg, hasRenderedAudio);
@@ -3942,7 +3954,9 @@ function renderConversation(options) {
                     var msgData = lxmfConversation.find(function(m) { return m.id === msgId; });
                     if (!msgData) return;
                     _armPendingMessageHoldActivation(bubble, msgId, touch);
-                    _showMsgContextMenu(msgData, touch.clientX, touch.clientY, bubble);
+                    _showMsgContextMenu(msgData, touch.clientX, touch.clientY, bubble, null, {
+                        linkUrl: _messageLinkUrlAt(touch.target),
+                    });
                 }
             });
             if (typeof detachLongPress === 'function') _messageLongPressDetachFns.push(detachLongPress);
@@ -3957,9 +3971,6 @@ function renderConversation(options) {
         });
         bubble.addEventListener('contextmenu', function(e) {
             var target = e.target;
-            // Pointer users retain the browser's link menu. Touch links use the
-            // same message action sheet as the rest of the bubble; otherwise a
-            // link-only message would have no practical reaction/reply target.
             var selectionExistedBeforePointer = _consumeMessagePointerContextSelection(this);
             var disposition = _messageContextMenuDisposition(
                 target,
@@ -3979,6 +3990,7 @@ function renderConversation(options) {
                 var trigger = focusDialog ? this.querySelector('.msg-actions-trigger') : null;
                 _showMsgContextMenu(msgData, e.clientX, e.clientY, this, trigger, {
                     focusDialog: focusDialog,
+                    linkUrl: _messageLinkUrlAt(target),
                 });
             }
         });
@@ -5345,9 +5357,11 @@ function _messageTouchStartsDirectControl(touch, bubble) {
     );
 }
 
-function _messageLinkUsesNativeContext(target) {
-    var isMessageLink = target && target.closest && target.closest('.rs-message-link');
-    return !!isMessageLink && document.documentElement.dataset.inputModality !== 'touch';
+// The desktop link menu offers "Open Link", which would skip the leaving-app
+// warning; pointer right-clicks open the message actions (with Copy Link).
+function _messageLinkUrlAt(target) {
+    var link = target && target.closest ? target.closest('.rs-message-link[data-url]') : null;
+    return link ? link.getAttribute('data-url') : null;
 }
 
 function _openExternalMessageLink(url) {
@@ -5531,11 +5545,11 @@ function _consumeMessagePointerContextSelection(bubble) {
 }
 
 function _messageContextMenuDisposition(target, bubble, now, selectionExistedBeforePointer) {
-    if (_messageLinkUsesNativeContext(target)) return 'native';
     // A contextmenu synthesized from the first action-opening hold belongs to
     // that exact gesture. Suppress it before considering the newly elevated
     // bubble; a real second hold has already cleared this pending record.
     if (_consumePendingMessageHoldContext(target, bubble, now)) return 'suppress';
+    if (_messageLinkUrlAt(target) && document.documentElement.dataset.inputModality !== 'touch') return 'actions';
     var selectableText = target && target.closest && target.closest('.lxmf-msg-content');
     var preserveSelection = selectionExistedBeforePointer === null ||
         typeof selectionExistedBeforePointer === 'undefined'
@@ -6016,7 +6030,7 @@ function _showMsgContextMenu(msgData, x, y, bubble, trigger, opts) {
     }
 
     var content = bubble && bubble.querySelector ? bubble.querySelector('.lxmf-msg-content') : null;
-    var messageText = _messageDisplayContent(msgData, !!(msgData && msgData.audio));
+    var messageText = _messageCopyText(msgData, content);
     var hasText = !!(content && String(messageText || '').trim());
     if (hasText) {
         var copyBtn = document.createElement('button');
@@ -6042,6 +6056,28 @@ function _showMsgContextMenu(msgData, x, y, bubble, trigger, opts) {
             });
         });
         actions.appendChild(copyBtn);
+    }
+
+    if (opts.linkUrl) {
+        var linkUrl = opts.linkUrl;
+        var copyLinkBtn = document.createElement('button');
+        copyLinkBtn.className = 'msg-ctx-btn msg-ctx-copy-link';
+        copyLinkBtn.type = 'button';
+        copyLinkBtn.setAttribute('data-message-action', 'copy-link');
+        copyLinkBtn.innerHTML = _messageActionIcon('copy') + '<span>Copy Link</span>';
+        _bindMessageFocusPreservingActivation(copyLinkBtn, function() {
+            var shouldRestoreComposer = _messageActionShouldPreserveComposer();
+            _dismissContextMenu();
+            _copyToClipboard(linkUrl).then(function(ok) {
+                showToast(ok ? 'Link copied' : 'Could not copy', ok ? 'toast-success' : 'toast-error', 1600);
+                if (typeof haptic === 'function') haptic(ok ? 'success' : 'warning');
+                _restoreLxmfComposerKeyboard(shouldRestoreComposer);
+            }).catch(function() {
+                showToast('Could not copy', 'toast-error', 1800);
+                _restoreLxmfComposerKeyboard(shouldRestoreComposer);
+            });
+        });
+        actions.appendChild(copyLinkBtn);
     }
 
     var mediaAction = _messageMediaContextAction(msgData);
@@ -6142,6 +6178,45 @@ function _handleMessageActionPointer(e) {
     }
 }
 
+var COPY_BLOCK_TAGS = /^(P|DIV|LI|PRE|BLOCKQUOTE|H1|H2|H3|UL|OL)$/;
+
+function _copyTextOf(node, out) {
+    if (node.nodeType === 3) { out.push(node.nodeValue); return; }
+    if (node.nodeType !== 1 && node.nodeType !== 11) return;
+    if (node.nodeType === 1) {
+        if (node.tagName === 'BR') { out.push('\n'); return; }
+        if (node.classList.contains('md-code-head') || node.tagName === 'BUTTON') return;
+        if (node.classList.contains('md-spoiler') && !node.classList.contains('is-revealed')) {
+            out.push('[Spoiler]');
+            return;
+        }
+    }
+    var block = node.nodeType === 1 && COPY_BLOCK_TAGS.test(node.tagName);
+    if (block && out.length && !/\n$/.test(out[out.length - 1])) out.push('\n');
+    for (var child = node.firstChild; child; child = child.nextSibling) _copyTextOf(child, out);
+    if (block) out.push('\n');
+}
+
+// WebKit copies text under user-select:none and inert, so a selection that
+// touches a covered spoiler is rewritten with [Spoiler] in its place.
+function _handleSpoilerCopy(e) {
+    var selection = window.getSelection ? window.getSelection() : null;
+    if (!selection || selection.isCollapsed || !selection.rangeCount || !e.clipboardData) return;
+    var range = selection.getRangeAt(0);
+    var container = document.getElementById('lxmf-messages');
+    if (!container || !container.contains(range.commonAncestorContainer)) return;
+    var startEl = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
+    var fragment = range.cloneContents();
+    var startCovered = startEl && startEl.closest && startEl.closest('.md-spoiler:not(.is-revealed)');
+    if (!startCovered && !fragment.querySelector('.md-spoiler:not(.is-revealed)')) return;
+    var parts = [];
+    if (startCovered) parts.push('[Spoiler]');
+    _copyTextOf(fragment, parts);
+    var text = parts.join('').replace(/\u200B?(\[Spoiler\])(\[Spoiler\])*/g, '$1').replace(/\n{3,}/g, '\n\n').trim();
+    e.clipboardData.setData('text/plain', text);
+    e.preventDefault();
+}
+
 function _handleNativeMessageCopy() {
     if (!_mobileMessageActionsUseLongPress() || !_activeContextMenu) return false;
     var active = _activeContextMenu;
@@ -6160,6 +6235,7 @@ function _handleNativeMessageCopy() {
 document.addEventListener('pointerdown', _handleMessageActionPointer, true);
 document.addEventListener('mousedown', _handleMessageActionPointer, true);
 document.addEventListener('copy', _handleNativeMessageCopy, true);
+document.addEventListener('copy', _handleSpoilerCopy, true);
 document.addEventListener('keydown', function(e) {
     if (e.key !== 'Escape') return;
     if (_dismissContextMenu() ||
@@ -7670,6 +7746,17 @@ function _wireImageViewerSwipeDismiss(viewer, stage, img) {
     });
 }
 
+// The app UI never pinch-zooms; only the expanded image viewer may. Restoring
+// maximum-scale=1 on close also snaps any viewer zoom back to 1.
+function _setPageZoomAllowed(allowed) {
+    document.documentElement.classList.toggle('page-zoom-allowed', !!allowed);
+    var meta = document.querySelector('meta[name="viewport"]');
+    if (!meta) return;
+    var content = meta.getAttribute('content') || '';
+    var zoom = allowed ? 'maximum-scale=5.0, user-scalable=yes' : 'maximum-scale=1.0, user-scalable=no';
+    meta.setAttribute('content', content.replace(/maximum-scale=[^,]*,\s*user-scalable=[^,]*/, zoom));
+}
+
 function openImageViewer(img) {
     if (!img || !img.src) return;
     var viewer = _ensureImageViewer();
@@ -7691,6 +7778,7 @@ function openImageViewer(img) {
     viewer.offsetHeight;
     viewer.classList.add('open');
     document.body.classList.add('image-viewer-open');
+    _setPageZoomAllowed(true);
 }
 
 function closeImageViewer() {
@@ -7699,6 +7787,7 @@ function closeImageViewer() {
     viewer.classList.remove('open');
     viewer.classList.remove('is-zoomed');
     document.body.classList.remove('image-viewer-open');
+    _setPageZoomAllowed(false);
     setTimeout(function() {
         if (!viewer.classList.contains('open')) {
             viewer.setAttribute('hidden', '');

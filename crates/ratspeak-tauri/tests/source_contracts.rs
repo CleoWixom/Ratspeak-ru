@@ -7817,7 +7817,10 @@ fn message_actions_stage_touch_selection_and_preserve_accessible_actions() {
     assert!(lxmf.contains("if (_activeContextMenu !== active) return;"));
     assert!(lxmf.contains("_clearNativeMessageSelection();"));
     assert!(lxmf.contains("function _messageTouchStartsDirectControl(touch, bubble)"));
-    assert!(lxmf.contains("function _messageLinkUsesNativeContext(target)"));
+    assert!(lxmf.contains("function _messageLinkUrlAt(target)"));
+    assert!(lxmf.contains(
+        "if (_messageLinkUrlAt(target) && document.documentElement.dataset.inputModality !== 'touch') return 'actions';"
+    ));
     assert!(lxmf.contains("function _rememberMessagePointerContextSelection(event, bubble)"));
     assert!(lxmf.contains("function _consumeMessagePointerContextSelection(bubble)"));
     assert!(lxmf.contains(

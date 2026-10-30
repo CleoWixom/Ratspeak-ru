@@ -16,6 +16,7 @@ changes that materially affect how an artifact is reproduced.
 - Text across the app now uses standard sizes and is easier to read; Text size now runs from 90% to 150%.
 - The message menu now opens beside the message and never covers the header or the message box.
 - Links in messages are easier to read, and pressing Enter in a dialog now does what the selected button does.
+- The app no longer zooms when pinched or double-tapped on mobile; expanded images can still be zoomed.
 
 ## [1.0.35] - 2026-10-26
 

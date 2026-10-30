@@ -620,7 +620,7 @@ function classListStub() {
         'function _consumePendingMessageHoldContext() { return pendingContext; }\n' +
         namedFunctionSource(lxmfSource, '_messageActionOwnsText') + '\n' +
         namedFunctionSource(lxmfSource, '_messageSelectionIntersectsBubble') + '\n' +
-        namedFunctionSource(lxmfSource, '_messageLinkUsesNativeContext') + '\n' +
+        namedFunctionSource(lxmfSource, '_messageLinkUrlAt') + '\n' +
         namedFunctionSource(lxmfSource, '_messageLinkActivationAllowed') + '\n' +
         namedFunctionSource(lxmfSource, '_rememberMessagePointerContextSelection') + '\n' +
         namedFunctionSource(lxmfSource, '_consumeMessagePointerContextSelection') + '\n' +
@@ -629,7 +629,7 @@ function classListStub() {
         'this.setPendingContext = function(value) { pendingContext = value; };\n' +
         'this.rememberPointerSelection = _rememberMessagePointerContextSelection;\n' +
         'this.consumePointerSelection = _consumeMessagePointerContextSelection;\n' +
-        'this.nativeLink = _messageLinkUsesNativeContext;\n' +
+        'this.linkUrl = _messageLinkUrlAt;\n' +
         'this.linkAllowed = _messageLinkActivationAllowed;\n' +
         'this.disposition = _messageContextMenuDisposition;',
         context,
@@ -638,14 +638,18 @@ function classListStub() {
     var bubble = { contains: function(candidate) { return candidate === link || candidate === text; } };
     var text;
     var link = {
+        getAttribute: function(name) { return name === 'data-url' ? 'https://example.org/' : null; },
         closest: function(selector) {
-            if (selector === '.rs-message-link' || selector === '.lxmf-msg-content') return link;
+            if (selector === '.rs-message-link[data-url]' || selector === '.lxmf-msg-content') return link;
             if (selector === '.lxmf-msg') return bubble;
             return null;
         }
     };
-    assert.strictEqual(context.nativeLink(link), true);
-    assert.strictEqual(context.disposition(link, bubble, 10), 'native');
+    assert.strictEqual(context.linkUrl(link), 'https://example.org/');
+    assert.strictEqual(context.disposition(link, bubble, 10), 'actions',
+        'pointer links open message actions; the platform menu would skip the link warning');
+    assert.strictEqual(context.disposition(link, bubble, 10, true), 'actions',
+        'a selection never hands a link to the platform menu');
     text = {
         closest: function(selector) {
             if (selector === '.lxmf-msg-content') return text;
@@ -668,7 +672,6 @@ function classListStub() {
         'a pre-existing left-drag selection must retain the native copy menu');
     selection = { isCollapsed: true, rangeCount: 0 };
     documentStub.documentElement.dataset.inputModality = 'touch';
-    assert.strictEqual(context.nativeLink(link), false);
     assert.strictEqual(context.linkAllowed(link), true);
     assert.strictEqual(context.disposition(link, bubble, 10), 'actions');
     context.setOwner(bubble);

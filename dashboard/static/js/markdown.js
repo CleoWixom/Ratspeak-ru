@@ -131,13 +131,20 @@ function parseBlocks(lines, depth) {
         if (depth < MAX_BLOCK_DEPTH && (quoteLine(s) || blockSpoilerLine(s))) {
             flush();
             var spoiler = blockSpoilerLine(s);
+            var from = line.o;
             var inner = [];
             while (i < lines.length && (spoiler ? blockSpoilerLine(lines[i].s) : quoteLine(lines[i].s))) {
                 var marker = (spoiler ? /^ {0,3}>! ?/ : /^ {0,3}> ?/).exec(lines[i].s)[0];
                 inner.push(cut(lines[i], marker.length));
                 i++;
             }
-            blocks.push({ type: spoiler ? 'spoiler' : 'quote', children: parseBlocks(inner, depth + 1) });
+            var last = lines[i - 1];
+            blocks.push({
+                type: spoiler ? 'spoiler' : 'quote',
+                children: parseBlocks(inner, depth + 1),
+                from: from,
+                to: last.o + last.s.length,
+            });
             continue;
         }
 
@@ -363,6 +370,7 @@ function parseInline(text, ctx, depth, allowLinks, base) {
                 while (SPACE.test(text.charAt(from))) from++;
                 while (SPACE.test(text.charAt(to - 1))) to--;
                 flush();
+                if (ctx.spans) ctx.spans.push({ start: base + p, end: base + shut + 2 });
                 nodes.push({ t: 'spoiler', kids: nested(from, to, allowLinks) });
                 ctx.formatted = true;
                 p = shut + 2;
@@ -435,6 +443,7 @@ function resolveDelims(nodes, delims, ctx) {
             o.n -= use;
             c.n -= use;
             if (type === 'spoiler' && ctx.spoilers) ctx.spoilers.push({ open: o.at, close: c.at });
+            if (type === 'spoiler' && ctx.spans) ctx.spans.push({ start: o.at, end: c.at + 2 });
             ctx.formatted = true;
             var kids = [];
             for (var walk = o.next; walk && walk !== c; walk = walk.next) kids.push(walk);
@@ -505,9 +514,15 @@ function inlineText(nodes, spoiler) {
 function inlineOf(lines, ctx) {
     var joined = joinLines(lines);
     var spoilers = ctx.spoilers ? [] : null;
-    var sub = { links: ctx.links, spoilers: spoilers, formatted: false };
+    var spans = ctx.spans ? [] : null;
+    var sub = { links: ctx.links, spoilers: spoilers, spans: spans, formatted: false };
     var nodes = parseInline(joined.text, sub, 0, true);
     if (sub.formatted) ctx.formatted = true;
+    if (spans) {
+        spans.forEach(function(sp) {
+            ctx.spans.push({ start: absolute(joined.map, sp.start), end: absolute(joined.map, sp.end - 1) + 1 });
+        });
+    }
     if (spoilers && spoilers.length) {
         spoilers.forEach(function(sp) {
             var atStart = sp.open === 0 || joined.text.charAt(sp.open - 1) === '\n';
@@ -536,6 +551,7 @@ function blocksHtml(blocks, ctx) {
         } else if (b.type === 'quote') {
             out += '<blockquote class="md-quote">' + blocksHtml(b.children, ctx) + '</blockquote>';
         } else if (b.type === 'spoiler') {
+            if (ctx.spans) ctx.spans.push({ start: b.from, end: b.to });
             out += '<div class="md-spoiler md-spoiler-block" ' + SPOILER_ATTRS + '>' +
                 '<div class="md-spoiler-content" aria-hidden="true" inert>' + blocksHtml(b.children, ctx) + '</div></div>';
         } else {
@@ -688,6 +704,28 @@ window.RS.markdown = {
         var placeholder = opts && opts.spoiler != null ? opts.spoiler : '[Spoiler]';
         var out = blocksText(parse(text), { links: null }, placeholder);
         return out.charAt(0) === ZWSP ? out.slice(1) : out;
+    },
+    // Copy keeps the source but replaces spoilers the reader has not revealed.
+    // `revealed(i)` takes the spoiler's document-order index (as rendered).
+    redactSpoilers: function(text, revealed) {
+        var source = String(text || '').replace(/\r\n?/g, '\n');
+        if (source.length > MAX_SOURCE) return source;
+        var ctx = { links: null, spans: [] };
+        blocksHtml(parse(source), ctx);
+        var spans = ctx.spans.sort(function(a, b) { return a.start - b.start || b.end - a.end; });
+        var cut = [];
+        var coveredUntil = -1;
+        spans.forEach(function(sp, i) {
+            if (sp.start < coveredUntil || (revealed && revealed(i))) return;
+            cut.push(sp);
+            coveredUntil = sp.end;
+        });
+        for (var k = cut.length - 1; k >= 0; k--) {
+            var start = cut[k].start;
+            if (source.charAt(start - 1) === ZWSP) start--;
+            source = source.slice(0, start) + '[Spoiler]' + source.slice(cut[k].end);
+        }
+        return source;
     },
     // Formatting decides FIELD_RENDERER on send; escapes alone never do, so
     // a bare ¯\_(ツ)_/¯ still goes out as plain text.

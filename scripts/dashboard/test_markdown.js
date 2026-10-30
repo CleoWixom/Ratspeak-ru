@@ -135,6 +135,21 @@ hostileSizes.forEach((text) => {
 assert.equal(md.render('x'.repeat(md.MAX_SOURCE + 1), { links }), null);
 assert.equal(md.prepare('**' + 'x'.repeat(md.MAX_SOURCE) + '**', { links }).markdown, false);
 
+// Copy redaction: source is kept, covered spoilers become [Spoiler], and the
+// index matches each spoiler's rendered (document) order.
+const mixed = 'Guess: \u200B>!fire lookout!< and ||two|| ok\n>! block one\n>! block two\nafter\n- item >!x!<\n||a >!b!< c||';
+assert.equal(md.redactSpoilers(mixed), 'Guess: [Spoiler] and [Spoiler] ok\n[Spoiler]\nafter\n- item [Spoiler]\n[Spoiler]');
+assert.equal(md.redactSpoilers(mixed, () => true), mixed);
+assert.equal(md.redactSpoilers(mixed, (i) => i === 1), 'Guess: [Spoiler] and ||two|| ok\n[Spoiler]\nafter\n- item [Spoiler]\n[Spoiler]');
+assert.equal(md.redactSpoilers(mixed, (i) => i !== 5), 'Guess: \u200B>!fire lookout!< and ||two|| ok\n>! block one\n>! block two\nafter\n- item >!x!<\n||a [Spoiler] c||',
+    'a revealed outer spoiler keeps a covered inner one hidden');
+assert.equal(md.redactSpoilers('`>!code!<` >!real!<'), '`>!code!<` [Spoiler]', 'code is never a spoiler');
+const order = render(mixed).match(/md-spoiler-content[^>]*>([^<]*)/g).map((t) => t.replace(/.*>/, ''));
+assert.equal(order.length, 6, 'six spoilers render, matching six redaction indexes');
+assert.deepEqual(order.slice(0, 2), ['fire lookout', 'two']);
+assert(!md.redactSpoilers(mixed, (j) => j !== 0).includes('fire lookout'), 'index 0 is the first rendered spoiler');
+assert(md.redactSpoilers(mixed, (j) => j !== 1).includes(' and [Spoiler] ok'), 'index 1 is the second rendered spoiler');
+
 // Composer shortcuts: wrap, unwrap, empty pair, multi-line, `*` vs `**`.
 context.document = { execCommand: () => false };
 context.Event = class { constructor(type) { this.type = type; } };

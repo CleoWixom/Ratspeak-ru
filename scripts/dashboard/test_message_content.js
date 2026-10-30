@@ -35,6 +35,7 @@ assert.equal(preview({content: '**Hi** ||secret||', renderer: null}), '**Hi** ||
 assert.equal(preview({title: 'T', content: '# Head', renderer: 2}), 'T\n\nHead');
 assert.equal(display({content: '# Head', renderer: 2}, false), '# Head', 'display content stays the source for Copy');
 assert(source.includes('var replyContent = _messagePlainContent(msgData, !!msgData.audio)'), 'reply quotes include titles');
-assert(source.includes('var messageText = _messageDisplayContent(msgData, !!(msgData && msgData.audio))'), 'Copy Message includes titles');
+assert(source.includes('var messageText = _messageCopyText(msgData, content);'), 'Copy goes through spoiler-aware copy text');
+assert(/function _messageCopyText\(msg, content\) \{\n    var text = _messageDisplayContent\(msg, /.test(source), 'Copy Message includes titles');
 assert(source.includes('var notifBody = _messagePlainContent(msg, !!msg.audio)'), 'browser notifications include titles');
 console.log('message title/body presentation: PASS');
