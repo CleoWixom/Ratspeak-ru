@@ -4,6 +4,7 @@
   fork/sync_upstream.py --dry-run --run-tests   try it in a throw-away worktree first
   fork/sync_upstream.py --run-tests             merge upstream/main into the current branch
   fork/sync_upstream.py --ref v1.0.40           merge a tag or any other upstream ref
+  fork/sync_upstream.py --push-tags             also publish the upstream release tags the merge brought in
 
 What it does:
   1. adds the `upstream` remote (ratspeak/Ratspeak) if needed and fetches it;
@@ -12,7 +13,10 @@ What it does:
      upstream version and re-applies the hooks (fork/apply_hooks.py), which is what a person
      would do by hand;
   4. checks that every hook is present, optionally runs the dashboard tests, lists new strings
-     that still need a Russian translation, and commits the merge.
+     that still need a Russian translation, and commits the merge;
+  5. lists the upstream release tags (vX.Y.Z) reachable from the merge that `origin` does not
+     have yet, and pushes them with --push-tags. Upstream's CI checks the previous release tag
+     (scripts/release/source-integrity.mjs), so the fork's CI fails without them.
 
 Conflicts in any other file stop the sync and are listed: that means the fork edited a file it
 should not (move that change into a fork-only file and add a hook) or upstream renamed one.
@@ -89,7 +93,23 @@ def new_translation_keys(repo: Path) -> list[str]:
     return [key for key, value in after.items() if key not in before and not value]
 
 
-def sync(repo: Path, ref: str, tests: bool, commit: bool) -> int:
+def missing_release_tags(repo: Path) -> list[str]:
+    """Upstream release tags (vX.Y.Z) reachable from HEAD that origin does not have."""
+    local = [t for t in git(repo, "tag", "--list", "v[0-9]*.[0-9]*.[0-9]*").stdout.split() if "-" not in t]
+    remote = git(repo, "ls-remote", "--tags", "origin", check=False).stdout
+    have = {line.split("refs/tags/")[1] for line in remote.splitlines()
+            if "refs/tags/" in line and not line.endswith("^{}")}
+    missing = []
+    for tag in local:
+        if tag in have:
+            continue
+        commit = git(repo, "rev-list", "-n1", tag).stdout.strip()
+        if git(repo, "merge-base", "--is-ancestor", commit, "HEAD", check=False).returncode == 0:
+            missing.append(tag)
+    return missing
+
+
+def sync(repo: Path, ref: str, tests: bool, commit: bool, push_tags: bool = False) -> int:
     if git(repo, "remote", "get-url", "upstream", check=False).returncode != 0:
         git(repo, "remote", "add", "upstream", UPSTREAM_URL)
     print("fetching upstream ...")
@@ -157,6 +177,13 @@ def sync(repo: Path, ref: str, tests: bool, commit: bool) -> int:
     if commit:
         git(repo, "commit", "-q", "-m", f"Merge upstream {target} into Ratspeak-ru")
         print(f"\nmerged {target}: {git(repo, 'rev-parse', '--short', 'HEAD').stdout.strip()}")
+        tags = missing_release_tags(repo)
+        if tags and push_tags:
+            git(repo, "push", "origin", *[f"refs/tags/{t}" for t in tags])
+            print(f"pushed upstream release tags to origin: {' '.join(tags)}")
+        elif tags:
+            print(f"\nupstream release tags origin does not have yet (CI needs them): {' '.join(tags)}")
+            print(f"  git push origin {' '.join(f'refs/tags/{t}' for t in tags)}   (or rerun with --push-tags)")
     return 0
 
 
@@ -166,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="merge in a temporary worktree and discard it")
     parser.add_argument("--run-tests", action="store_true", help="run scripts/dashboard/test_*.js after merging")
     parser.add_argument("--no-commit", action="store_true", help="leave the merged result staged")
+    parser.add_argument("--push-tags", action="store_true", help="push the upstream release tags the merge brought in to origin")
     args = parser.parse_args(argv)
 
     if args.dry_run:
@@ -184,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     if git(ROOT, "status", "--porcelain").stdout.strip():
         print("working tree is not clean; commit or stash first", file=sys.stderr)
         return 1
-    return sync(ROOT, args.ref, args.run_tests, commit=not args.no_commit)
+    return sync(ROOT, args.ref, args.run_tests, commit=not args.no_commit, push_tags=args.push_tags)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ git remote add upstream https://github.com/ratspeak/Ratspeak.git   # один р
 python3 fork/sync_upstream.py --dry-run --run-tests   # репетиция в отдельной рабочей копии
 python3 fork/sync_upstream.py --run-tests             # настоящее слияние upstream/main
 python3 fork/sync_upstream.py --ref v1.0.40           # или конкретная метка оригинала
+python3 fork/sync_upstream.py --run-tests --push-tags # то же и опубликовать релизные теги оригинала (vX.Y.Z) в форк
 ```
 
 Скрипт добавляет `upstream`, делает `git fetch`, сливает ветку, а для каждого конфликтного файла
