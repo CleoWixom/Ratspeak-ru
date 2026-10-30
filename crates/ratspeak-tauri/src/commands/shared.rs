@@ -27,6 +27,15 @@ pub(crate) async fn forget_shared_text_drafts(
         .map_err(crate::error::AppError::internal)
 }
 
+/// The messages are deleted; some of their files wait for the cleanup sweep.
+pub(crate) fn files_not_removed(error: db::admission::AdmissionDbError) -> crate::error::AppError {
+    tracing::warn!(?error, "deleted messages' files wait for the cleanup sweep");
+    crate::error::AppError::new(
+        "files_not_removed",
+        "Messages deleted. Some files could not be removed yet; Ratspeak will retry.",
+    )
+}
+
 pub(crate) fn transport_sender(
     state: &AppState,
 ) -> Option<tokio::sync::mpsc::Sender<rns_transport::messages::TransportMessage>> {
@@ -207,19 +216,21 @@ pub(crate) fn remove_stored_file_refs(
     }
 }
 
+pub(crate) use ratspeak_runtime::blackhole::TransportSender;
+
 pub(crate) async fn transport_query(
     state: &AppState,
     query: rns_transport::messages::TransportQuery,
 ) -> Option<rns_transport::messages::TransportQueryResponse> {
-    let tx = transport_sender(state)?;
-    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    tx.send(rns_transport::messages::TransportMessage::Rpc {
-        query,
-        response_tx: resp_tx,
-    })
-    .await
-    .ok()?;
-    resp_rx.await.ok()
+    transport_query_on(transport_sender(state).as_ref(), query).await
+}
+
+/// As `transport_query`, on a runtime's transport captured earlier.
+pub(crate) async fn transport_query_on(
+    tx: Option<&TransportSender>,
+    query: rns_transport::messages::TransportQuery,
+) -> Option<rns_transport::messages::TransportQueryResponse> {
+    ratspeak_runtime::blackhole::query_transport(tx, query).await
 }
 
 pub(crate) fn blackhole_reason_display(
@@ -231,17 +242,22 @@ pub(crate) fn blackhole_reason_display(
 
 // Each entry: `hash`, `reason`, `created`, `expires_in` (null = permanent),
 // `verified` (false means we have no announce backing this identity).
-pub(crate) async fn snapshot_blackhole(state: &AppState) -> Vec<Value> {
+// `None` if the runtime sent no list.
+pub(crate) async fn snapshot_blackhole(state: &AppState) -> Option<Vec<Value>> {
+    snapshot_blackhole_on(transport_sender(state).as_ref()).await
+}
+
+pub(crate) async fn snapshot_blackhole_on(tx: Option<&TransportSender>) -> Option<Vec<Value>> {
     use rns_transport::messages::{TransportQuery, TransportQueryResponse};
-    let entries = match transport_query(state, TransportQuery::GetBlackholedIdentities).await {
+    let entries = match transport_query_on(tx, TransportQuery::GetBlackholedIdentities).await {
         Some(TransportQueryResponse::BlackholeList(v)) => v,
-        _ => return Vec::new(),
+        _ => return None,
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    entries
+    let entries = entries
         .into_iter()
         .map(|e| {
             let expires_in = e.ttl.map(|t| (e.created + t - now).max(0.0));
@@ -254,41 +270,11 @@ pub(crate) async fn snapshot_blackhole(state: &AppState) -> Vec<Value> {
                 "verified": e.verified,
             })
         })
-        .collect()
+        .collect();
+    Some(entries)
 }
 
-/// Resolve a 16-byte hex blob (LXMF dest hash OR identity hash) to the canonical
-/// identity hash via rsReticulum's `recent_announces`. Returns `None` when the
-/// input is neither a known destination nor a known identity.
-pub(crate) async fn resolve_identity_hash(state: &AppState, input: [u8; 16]) -> Option<[u8; 16]> {
-    use rns_transport::messages::{TransportQuery, TransportQueryResponse};
-    match transport_query(state, TransportQuery::ResolveIdentityHash { input }).await {
-        Some(TransportQueryResponse::HashResult(opt)) => opt,
-        _ => None,
-    }
-}
-
-/// Resolve a contact's LXMF destination hash to its Reticulum identity hash.
-/// The transport announce cache is preferred, but blackholing deliberately
-/// drops paths and future announces, so contact unblock also needs the
-/// persistent `identity_activity` mapping learned before the block.
-pub(crate) async fn resolve_contact_identity_hash(
-    state: &AppState,
-    dest_hash_hex: &str,
-    input: [u8; 16],
-) -> Option<[u8; 16]> {
-    if let Some(identity_hash) = resolve_identity_hash(state, input).await {
-        return Some(identity_hash);
-    }
-
-    let dest = dest_hash_hex.to_string();
-    let db = state.db.clone();
-    let identity_hex = db::spawn_db(db, move |p| db::identity_hash_for_dest(&p, &dest))
-        .await
-        .ok()
-        .flatten()?;
-    hex_to_array16(&identity_hex)
-}
+pub(crate) use ratspeak_runtime::blackhole::resolve_contact_identity_hash;
 
 /// Batch lookup: which of the given LXMF dest hashes belong to a currently
 /// blackholed identity? Returns the set of hex-encoded dest hashes that are
@@ -311,9 +297,11 @@ pub(crate) async fn filter_blackholed_dests(
 }
 
 /// Broadcast `blackhole_update` after any mutation.
+/// Only a list the runtime sent is published.
 pub(crate) async fn broadcast_blackhole_update(state: &AppState) {
-    let entries = snapshot_blackhole(state).await;
-    state.emit_to_all("blackhole_update", json!({ "entries": entries }));
+    if let Some(entries) = snapshot_blackhole(state).await {
+        state.emit_to_all("blackhole_update", json!({ "entries": entries }));
+    }
 }
 
 pub(crate) fn normalize_transport_mode(mode: &str) -> Option<&'static str> {

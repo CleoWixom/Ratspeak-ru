@@ -35,6 +35,8 @@ var _settingsHideKnownSpamPeersBusy = false;
 var _settingsHideKnownSpamPeersEnabled = true;
 var RATSPEAK_RELEASE_LATEST_URL = 'https://api.github.com/repos/ratspeak/Ratspeak/releases/latest';
 var RATSPEAK_RELEASES_URL = 'https://github.com/ratspeak/Ratspeak/releases';
+var RATSPEAK_TESTFLIGHT_URL = 'https://testflight.apple.com/join/AzzW4Jg6';
+var RATSPEAK_RELEASE_TAG_RE = /^v?\d+(\.\d+){1,3}[0-9A-Za-z.-]*$/;
 
 window.ratspeakChannelHostingEnabled = function() {
     return !!_settingsChannelHostingEnabled;
@@ -495,19 +497,33 @@ function _settingsSetUpdateButtonsBusy(busy) {
     _settingsUpdateCheckInFlight = !!busy;
     document.querySelectorAll('.settings-update-check-btn').forEach(function(btn) {
         btn.disabled = _settingsUpdateCheckInFlight;
-        btn.textContent = _settingsUpdateCheckInFlight ? 'Checking...' : 'Check for updates';
+        btn.textContent = _settingsUpdateCheckInFlight ? 'Checking…' : 'Check for updates';
     });
+}
+
+// The busy state disables (and so blurs) the button, so dialogs can't restore focus to it themselves.
+function _settingsFocusUpdateButton() {
+    if (RS.ui && typeof RS.ui.prefersKeyboardFocus === 'function' && !RS.ui.prefersKeyboardFocus()) return;
+    var btn = document.querySelector('.settings-update-check-btn');
+    if (btn && !btn.disabled) btn.focus();
 }
 
 function _settingsShowUpdateResult(title, message) {
     if (typeof rsAlert === 'function') {
         return rsAlert({ title: title, message: message, closeText: 'Close' });
     }
-    showToast(title + ' ' + message, title === 'Update available!' ? 'toast-warning' : 'toast-info', 6000);
+    showToast(title + ' ' + message, 'toast-info', 6000);
     return Promise.resolve();
 }
 
-function _settingsLatestReleaseVersion(signal) {
+function _settingsUpdateError(kind, status) {
+    var error = new Error(kind === 'http' ? 'GitHub returned ' + status : 'Unexpected release response');
+    error.kind = kind;
+    error.status = status;
+    return error;
+}
+
+function _settingsLatestRelease(signal) {
     return fetch(RATSPEAK_RELEASE_LATEST_URL, {
         method: 'GET',
         cache: 'no-store',
@@ -516,13 +532,245 @@ function _settingsLatestReleaseVersion(signal) {
             'Accept': 'application/vnd.github+json'
         }
     }).then(function(resp) {
-        if (!resp.ok) throw new Error('GitHub returned ' + resp.status);
-        return resp.json();
+        if (!resp.ok) throw _settingsUpdateError('http', resp.status);
+        return resp.json().catch(function() { throw _settingsUpdateError('bad-response'); });
     }).then(function(data) {
-        var latest = data && (data.tag_name || data.name);
-        latest = _settingsNormalizeVersion(latest);
-        if (!latest) throw new Error('No release version returned');
-        return latest;
+        var latest = _settingsNormalizeVersion(data && (data.tag_name || data.name));
+        if (!latest) throw _settingsUpdateError('bad-response');
+        return {
+            version: latest,
+            tag: data && typeof data.tag_name === 'string' ? data.tag_name : '',
+            publishedAt: data && typeof data.published_at === 'string' ? data.published_at : '',
+            body: data && typeof data.body === 'string' ? data.body : '',
+        };
+    });
+}
+
+// Release notes arrive as Markdown; drop a leading heading that only repeats the version.
+function _settingsReleaseNotesBody(body, latestVersion) {
+    var text = String(body || '').replace(/\r\n?/g, '\n');
+    var lines = text.split('\n');
+    var i = 0;
+    while (i < lines.length && !lines[i].trim()) i++;
+    var heading = i < lines.length ? /^#{1,6}[ \t]+(.+?)[ \t#]*$/.exec(lines[i]) : null;
+    if (heading && _settingsNormalizeVersion(heading[1]) === latestVersion) {
+        i++;
+        while (i < lines.length && !lines[i].trim()) i++;
+        text = lines.slice(i).join('\n');
+    }
+    return text.trim();
+}
+
+function _settingsReleaseUrl(tag) {
+    return RATSPEAK_RELEASE_TAG_RE.test(tag || '')
+        ? RATSPEAK_RELEASES_URL + '/tag/' + encodeURIComponent(tag)
+        : RATSPEAK_RELEASES_URL;
+}
+
+function _settingsElement(tag, className, text) {
+    var el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text != null) el.textContent = text;
+    return el;
+}
+
+// The notes are untrusted remote text: they reach the page only through the
+// escaping Markdown renderer, and their links get the leaving-app warning.
+function _settingsRenderReleaseNotes(notes, body, ios) {
+    if (!body) {
+        notes.appendChild(_settingsElement('p', 'rs-update-notes-empty', 'No release notes for this version.'));
+        return;
+    }
+    if (!(window.RS && RS.markdown)) {
+        notes.classList.add('rs-release-notes-plain');
+        notes.textContent = body;
+        return;
+    }
+    var html = RS.markdown.render(body, { links: typeof _messageLinkRanges === 'function' ? _messageLinkRanges : null });
+    if (html == null) {
+        notes.appendChild(_settingsElement('p', 'rs-update-notes-empty', ios
+            ? 'These notes are too long to show here.'
+            : 'These notes are too long to show here. Get Update opens them on GitHub.'));
+        return;
+    }
+    notes.innerHTML = html;
+    notes.querySelectorAll('.md-spoiler').forEach(function(spoiler) {
+        if (typeof _revealMessageSpoiler === 'function') _revealMessageSpoiler(spoiler, true);
+    });
+    notes.addEventListener('click', function(e) {
+        var link = e.target.closest('.rs-message-link[data-url]');
+        if (link) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (typeof _confirmExternalLink === 'function') _confirmExternalLink(link.getAttribute('data-url'), link);
+            return;
+        }
+        var copy = e.target.closest('.md-code-copy');
+        if (!copy) return;
+        e.preventDefault();
+        var pre = copy.closest('.md-codeblock') && copy.closest('.md-codeblock').querySelector('.md-pre');
+        Promise.resolve(RS.copyText(pre ? pre.textContent : '')).then(function() {
+            showToast('Code copied', 'toast-success', 1800);
+        }).catch(function() {
+            showToast('Could not copy', 'toast-error', 1800);
+        });
+    });
+    notes.addEventListener('mousedown', function(e) {
+        if (e.button === 1 && e.target.closest('.rs-message-link')) e.preventDefault();
+    });
+    notes.addEventListener('auxclick', function(e) {
+        var link = e.button === 1 && e.target.closest('.rs-message-link[data-url]');
+        if (!link) return;
+        e.preventDefault();
+        if (typeof _confirmExternalLink === 'function') _confirmExternalLink(link.getAttribute('data-url'), link);
+    });
+}
+
+function _settingsShowUpdateAvailable(release, currentVersion) {
+    return new Promise(function(resolve) {
+        var ios = typeof isIOS === 'function' && isIOS();
+        var observer = null;
+        var built = _rsBuildSheet({
+            title: 'Update available',
+            ariaLabel: 'Update available',
+            sheetClass: 'rs-update-sheet',
+            nativeBackValue: null,
+        }, function() {
+            if (observer) observer.disconnect();
+            _settingsFocusUpdateButton();
+            resolve();
+        });
+        built.sheet.tabIndex = -1;
+        built.overlay.addEventListener('click', function(e) {
+            if (e.target === built.overlay) built.dismiss(null);
+        });
+        built.sheet.setAttribute('aria-describedby', 'rs-update-summary');
+
+        var summary = _settingsElement('div', 'rs-update-summary');
+        summary.id = 'rs-update-summary';
+        summary.tabIndex = -1;
+        summary.appendChild(_settingsElement('div', 'rs-update-version', 'Ratspeak ' + release.version));
+        var meta = _settingsElement('div', 'rs-update-meta');
+        var published = release.publishedAt ? new Date(release.publishedAt) : null;
+        if (published && !isNaN(published.getTime())) {
+            var time = _settingsElement('time', null,
+                'Released ' + published.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }));
+            time.setAttribute('datetime', release.publishedAt);
+            meta.appendChild(time);
+            meta.appendChild(document.createTextNode(' · '));
+        }
+        meta.appendChild(document.createTextNode("You're on " + currentVersion));
+        summary.appendChild(meta);
+        built.body.appendChild(summary);
+
+        var section = _settingsElement('section', 'rs-update-notes');
+        section.setAttribute('aria-labelledby', 'rs-update-notes-label');
+        var label = _settingsElement('h2', 'rs-update-notes-label', "What's new");
+        label.id = 'rs-update-notes-label';
+        var notes = _settingsElement('div', 'rs-release-notes md');
+        section.appendChild(label);
+        section.appendChild(notes);
+        built.body.appendChild(section);
+        _settingsRenderReleaseNotes(notes, _settingsReleaseNotesBody(release.body, release.version), ios);
+
+        built.footer.appendChild(_settingsElement('p', 'rs-update-footnote', ios
+            ? "For privacy, Ratspeak doesn't update itself. On iPhone and iPad, updates come through TestFlight."
+            : "For privacy, Ratspeak doesn't update itself. Get Update opens the release on GitHub."));
+        var closeBtn = _settingsElement('button', 'rs-dialog-cancel', 'Close');
+        closeBtn.type = 'button';
+        closeBtn.addEventListener('click', function() { built.dismiss(null); });
+        var getBtn = _settingsElement('button', 'rs-dialog-confirm', ios ? 'Open TestFlight' : 'Get Update');
+        getBtn.type = 'button';
+        getBtn.addEventListener('click', function() {
+            var failure = ios ? 'Could not open TestFlight' : 'Could not open GitHub';
+            RS.openExternalUrl(ios ? RATSPEAK_TESTFLIGHT_URL : _settingsReleaseUrl(release.tag)).then(function(opened) {
+                if (opened) built.dismiss(null);
+                else showToast(failure, 'toast-error', 3500);
+            }).catch(function() {
+                showToast(failure, 'toast-error', 3500);
+            });
+        });
+        built.footer.appendChild(closeBtn);
+        built.footer.appendChild(getBtn);
+
+        // The body is the only scroller; it becomes a labelled tab stop only when it scrolls.
+        function syncScroller() {
+            var body = built.body;
+            if (body.scrollHeight > body.clientHeight + 1) {
+                body.setAttribute('tabindex', '0');
+                body.setAttribute('role', 'region');
+                body.setAttribute('aria-label', "What's new in " + release.version);
+            } else {
+                body.removeAttribute('tabindex');
+                body.removeAttribute('role');
+                body.removeAttribute('aria-label');
+            }
+            notes.querySelectorAll('.md-pre').forEach(function(pre) {
+                if (typeof _syncCodeBlockFocus === 'function') _syncCodeBlockFocus(pre);
+            });
+        }
+
+        built.sheet.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                e.stopPropagation();
+                built.dismiss(null);
+                return;
+            }
+            if (e.key !== 'Tab') return;
+            var focusable = Array.prototype.filter.call(
+                built.sheet.querySelectorAll('a[href], button:not(:disabled), [tabindex="0"]'),
+                function(el) { return el.offsetParent !== null || el === built.body; }
+            );
+            if (!focusable.length) return;
+            var first = focusable[0];
+            var last = focusable[focusable.length - 1];
+            if (e.shiftKey && (document.activeElement === first || document.activeElement === summary)) {
+                e.preventDefault();
+                last.focus();
+            } else if (!e.shiftKey && document.activeElement === last) {
+                e.preventDefault();
+                first.focus();
+            }
+        });
+
+        RS.gestures.attachDragDismiss(built.sheet, {
+            axis: 'y',
+            blockIfScrolled: true,
+            skipIf: function(e) {
+                return !!(e.target.closest('button') || e.target.closest('a') || e.target.closest('.md-pre'));
+            },
+            parallaxOverlay: built.overlay,
+            onCommit: function() { built.dismiss(null); }
+        });
+
+        built.present();
+        syncScroller();
+        if (typeof ResizeObserver === 'function') {
+            observer = new ResizeObserver(syncScroller);
+            observer.observe(built.body);
+            observer.observe(notes);
+        }
+        summary.focus({ preventScroll: true });
+    });
+}
+
+function _settingsShowUpdateFailure(err, currentVersion) {
+    var title = "Couldn't check for updates";
+    if (err && err.kind === 'bad-response') {
+        return _settingsShowUpdateResult(title, 'GitHub sent an unexpected response. Try again later.')
+            .then(_settingsFocusUpdateButton);
+    }
+    var limited = err && err.kind === 'http' && (err.status === 403 || err.status === 429);
+    return rsConfirm({
+        title: title,
+        message: limited
+            ? 'GitHub is limiting requests right now. Try again in a few minutes.'
+            : 'Check your internet connection and try again.',
+        confirmText: 'Try Again',
+        cancelText: 'Close'
+    }).then(function(retry) {
+        if (retry) return checkRatspeakUpdate(currentVersion);
+        _settingsFocusUpdateButton();
     });
 }
 
@@ -530,42 +778,37 @@ function checkRatspeakUpdate(currentVersion) {
     currentVersion = _settingsNormalizeVersion(currentVersion || _settingsVersionValue);
     if (!currentVersion) {
         return _settingsShowUpdateResult(
-            'Update check failed',
-            'Could not determine the current Ratspeak version.'
+            "Couldn't check for updates",
+            "Ratspeak couldn't read its own version. Restart the app and try again."
         );
     }
 
     _settingsSetUpdateButtonsBusy(true);
     var progress = typeof rsProgress === 'function'
-        ? rsProgress({ title: 'Checking for updates', message: 'Contacting GitHub...' })
+        ? rsProgress({ title: 'Checking for updates', message: 'Contacting GitHub…' })
         : null;
     var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     var timeoutId = setTimeout(function() {
         if (controller) controller.abort();
     }, 12000);
 
-    return _settingsLatestReleaseVersion(controller ? controller.signal : undefined).then(function(latestVersion) {
+    return _settingsLatestRelease(controller ? controller.signal : undefined).then(function(release) {
         if (progress) progress.close();
-        if (_settingsCompareVersions(latestVersion, currentVersion) > 0) {
-            return _settingsShowUpdateResult(
-                'Update available!',
-                "You're on version " + currentVersion + ', the latest version is ' + latestVersion + '. For privacy reasons, we do not currently auto-update. Please install the latest version for your device manually.'
-            );
-        }
-        return _settingsShowUpdateResult(
-            'Up to date!',
-            "You're on the latest version of Ratspeak, no update available."
-        );
-    }).catch(function(err) {
-        if (progress) progress.close();
-        window.RS.diag('warn', '[settings] update check failed:', err);
-        return _settingsShowUpdateResult(
-            'Update check failed',
-            'Could not check for updates. Confirm your internet connection and try again, or visit ' + RATSPEAK_RELEASES_URL + ' manually.'
-        );
-    }).finally(function() {
         clearTimeout(timeoutId);
         _settingsSetUpdateButtonsBusy(false);
+        if (_settingsCompareVersions(release.version, currentVersion) > 0) {
+            return _settingsShowUpdateAvailable(release, currentVersion);
+        }
+        return _settingsShowUpdateResult(
+            "You're up to date",
+            'Ratspeak ' + currentVersion + ' is the latest version.'
+        ).then(_settingsFocusUpdateButton);
+    }, function(err) {
+        if (progress) progress.close();
+        clearTimeout(timeoutId);
+        _settingsSetUpdateButtonsBusy(false);
+        window.RS.diag('warn', '[settings] update check failed:', err);
+        return _settingsShowUpdateFailure(err, currentVersion);
     });
 }
 
@@ -573,9 +816,9 @@ function promptRatspeakUpdateCheck(currentVersion) {
     if (_settingsUpdateCheckInFlight) return;
     rsConfirm({
         title: 'Check for updates?',
-        message: 'Checking for the latest version requires an internet connection and will compare your version with the current available version. Are you sure?',
-        confirmText: 'Yes',
-        cancelText: 'No'
+        message: 'Checking for the latest version requires an internet connection and will compare your version with the current available version.',
+        confirmText: 'Continue',
+        cancelText: 'Cancel'
     }).then(function(ok) {
         if (!ok) return;
         return checkRatspeakUpdate(currentVersion);
@@ -1176,7 +1419,8 @@ function wireProfileStatusEditorTriggers() {
 }
 
 function saveIdentityStatus(nextStatus) {
-    return RS.invoke('set_identity_status', { status: nextStatus });
+    var identityId = typeof activeIdentityHash !== 'undefined' ? activeIdentityHash : null;
+    return RS.invoke('set_identity_status', { status: nextStatus, identityId: identityId });
 }
 
 function openIdentityStatusEditor() {
@@ -1629,13 +1873,16 @@ function _hwLockLabel(secs) {
     return secs + 's';
 }
 
-// Reveal the Hardware Key Auto-Lock row only when a hardware identity exists.
+// Reveal the Auto-Lock row when an identity has a PIN: a hardware key or a
+// passcode.
 function _maybeRevealHwLockRow() {
     var row = document.getElementById('hw-lock-row');
     if (!row) return;
     RS.invoke('api_list_identities').then(function(list) {
-        var hasHw = Array.isArray(list) && list.some(function(i) { return i && i.is_hardware; });
-        row.style.display = hasHw ? '' : 'none';
+        var protectedIdentity = Array.isArray(list) && list.some(function(i) {
+            return i && (i.is_hardware || i.passcode_protected);
+        });
+        row.style.display = protectedIdentity ? '' : 'none';
     }).catch(function() {});
 }
 
@@ -1644,10 +1891,10 @@ function _initHwLockSetting() {
     if (!badge) return;
     function open() {
         rsChoice({
-            title: 'Hardware Key Auto-Lock',
-            message: 'Lock your hardware identity after this much idle time. You’ll re-enter the PIN to resume.',
+            title: 'Auto-Lock',
+            message: 'Lock an identity with a PIN once this long has passed since you unlocked it. You’ll re-enter its PIN to resume.',
             choices: [
-                { label: 'OFF', value: '0', hint: 'Only locks when you quit Ratspeak.' },
+                { label: 'OFF', value: '0', hint: 'Locks when you switch identities or restart Ratspeak.' },
                 { label: '5 minutes', value: '300', hint: 'Tightest; frequent PIN prompts.' },
                 { label: '15 minutes', value: '900' },
                 { label: '30 minutes', value: '1800' },
@@ -1736,6 +1983,47 @@ function _settingsNotificationPresentation(enabled, state) {
     return _settingsNotificationActionForState(state);
 }
 
+var NOTIFICATION_PREVIEW_LABELS = {
+    name_and_message: 'Name and message',
+    name_only: 'Name only',
+    neither: 'Neither'
+};
+
+// What message alerts show. Returns the row's controls.
+function _initNotificationPreview(row, badge) {
+    function show(value) {
+        var known = Object.prototype.hasOwnProperty.call(NOTIFICATION_PREVIEW_LABELS, value);
+        var preview = known ? value : 'name_and_message';
+        badge.textContent = NOTIFICATION_PREVIEW_LABELS[preview];
+        badge.setAttribute('data-value', preview);
+    }
+    badge.addEventListener('click', function() {
+        var previous = badge.getAttribute('data-value') || 'name_and_message';
+        rsChoice({
+            title: 'Previews',
+            message: 'What message alerts show. A call always shows who is calling.',
+            choices: [
+                { label: 'Name and message', value: 'name_and_message' },
+                { label: 'Name only', value: 'name_only', hint: '“Message from Alice”, without the text.' },
+                { label: 'Neither', value: 'neither', hint: 'Just “New message”.' }
+            ]
+        }).then(function(value) {
+            if (!value || value === previous) return;
+            show(value);
+            return RS.invoke('set_notification_preview', { preview: value }).then(function(settings) {
+                show(settings && settings.preview);
+            }, function(err) {
+                show(previous);
+                showToast(toastErrorCopy(err, 'Could not change previews'), 'toast-error', 4000);
+            });
+        });
+    });
+    return {
+        show: show,
+        visible: function(enabled) { row.style.display = enabled ? '' : 'none'; }
+    };
+}
+
 function _settingsBatteryPresentation(state) {
     if (state === 'exempt') return {
         label: 'Review',
@@ -1766,6 +2054,11 @@ function _settingsBatteryPresentation(state) {
     var _notifAuthorization = 'unavailable';
     var _notifPreferenceEnabled = true;
     _notifRow.style.display = '';
+    var _previewRow = document.getElementById('settings-row-notification-preview');
+    var _previewBadge = document.getElementById('notification-preview-select');
+    var _preview = _previewRow && _previewBadge
+        ? _initNotificationPreview(_previewRow, _previewBadge)
+        : { show: function() {}, visible: function() {} };
 
     function _refreshNotificationAuthorization() {
         if (!_isMobile || typeof rsNotify === 'undefined') return;
@@ -1798,6 +2091,8 @@ function _settingsBatteryPresentation(state) {
         if (!data || data.enabled === undefined) return;
         _notifPreferenceEnabled = !!data.enabled;
         _notifToggle.checked = _notifPreferenceEnabled;
+        _preview.show(data.preview);
+        _preview.visible(_notifPreferenceEnabled);
         if (typeof rsNotify !== 'undefined') rsNotify.setEnabled(_notifPreferenceEnabled);
         if (_notifPreferenceEnabled && typeof rsNotify !== 'undefined' && rsNotify.available()) {
             _refreshNotificationAuthorization();
@@ -1809,6 +2104,7 @@ function _settingsBatteryPresentation(state) {
     _notifToggle.addEventListener('change', function() {
         var enabled = !!_notifToggle.checked;
         _notifPreferenceEnabled = enabled;
+        _preview.visible(enabled);
         if (typeof rsNotify !== 'undefined') rsNotify.setEnabled(enabled);
         RS.invoke('set_desktop_notifications', { enabled: enabled }).catch(function() {});
         if (enabled && typeof rsNotify !== 'undefined' && rsNotify.available()) {
@@ -1905,14 +2201,26 @@ if (_manageIdentitiesBtn) {
 
 syncSettingsIdentityActions();
 
+// A delete that removed the rows but left files for the cleanup sweep
+// succeeded with a caveat. Returns whether that was the case.
+function _showBulkDeleteFailure(err, failMsg) {
+    if (err && err.code === 'files_not_removed') {
+        showToast('Messages deleted. Some files could not be removed yet; Ratspeak will retry.',
+            'toast-warning', 5000);
+        return true;
+    }
+    showToast(failMsg, 'toast-error', 3000);
+    return false;
+}
+
 function clearWithConfirm(commandName, confirmMsg, successMsg, failMsg) {
     var errorMsg = failMsg || 'Operation failed.';
     rsConfirm({ message: confirmMsg, danger: true, confirmText: 'Clear' }).then(function(ok) {
         if (!ok) return;
         RS.invoke(commandName).then(function() {
             showToast(successMsg, 'toast-success', 3000);
-        }).catch(function() {
-            showToast(errorMsg, 'toast-error', 3000);
+        }).catch(function(err) {
+            _showBulkDeleteFailure(err, errorMsg);
         });
     });
 }
@@ -1951,7 +2259,7 @@ var clearContactsBtn = document.getElementById('settings-clear-contacts');
 if (clearContactsBtn) {
     clearContactsBtn.addEventListener('click', function() {
         clearWithConfirm('api_clear_contacts',
-            'Delete ALL contacts? This cannot be undone.',
+            'Delete ALL contacts? Blocked users stay blocked. This cannot be undone.',
             'All contacts deleted',
             'Could not delete contacts');
     });
@@ -1961,7 +2269,7 @@ var resetDatabaseBtn = document.getElementById('settings-reset-database');
 if (resetDatabaseBtn) {
     resetDatabaseBtn.addEventListener('click', function() {
         clearWithConfirm('api_reset_database',
-            'Clear ALL messages and contacts? This cannot be undone.',
+            'Clear ALL messages and contacts? Blocked users stay blocked. This cannot be undone.',
             'All messages and contacts cleared',
             'Could not clear messages and contacts');
     });
@@ -2130,13 +2438,13 @@ function confirmDangerAction(action, onClose) {
             fail: 'Could not delete messages'
         },
         'clear-contacts': {
-            msg: 'Delete ALL contacts? This cannot be undone.',
+            msg: 'Delete ALL contacts? Blocked users stay blocked. This cannot be undone.',
             command: 'api_clear_contacts',
             success: 'All contacts deleted',
             fail: 'Could not delete contacts'
         },
         'clear-all-data': {
-            msg: 'Clear ALL messages and contacts? This cannot be undone.',
+            msg: 'Clear ALL messages and contacts? Blocked users stay blocked. This cannot be undone.',
             command: 'api_reset_database',
             success: 'All messages and contacts cleared'
         },
@@ -2188,9 +2496,9 @@ function confirmDangerAction(action, onClose) {
         RS.invoke(cfg.command).then(function() {
             if (typeof haptic === 'function') haptic('success');
             showToast(cfg.success, 'toast-success', 3000);
-        }).catch(function() {
-            if (typeof haptic === 'function') haptic('error');
-            showToast(cfg.fail || 'Could not complete the operation', 'toast-error', 3000);
+        }).catch(function(err) {
+            var partial = _showBulkDeleteFailure(err, cfg.fail || 'Could not complete the operation');
+            if (typeof haptic === 'function') haptic(partial ? 'warning' : 'error');
         });
     });
 }
@@ -2578,6 +2886,108 @@ document.addEventListener('DOMContentLoaded', function() {
         });
         systemHeaders[i].addEventListener('keydown', handleSystemSubsectionKey);
     }
+});
+
+function updateTrustedLinksButton(hosts) {
+    var btn = document.getElementById('settings-trusted-links-btn');
+    if (!btn) return;
+    var n = hosts.length;
+    btn.textContent = n ? n + (n === 1 ? ' website' : ' websites') : 'None';
+    btn.setAttribute('aria-label', 'Trusted websites: ' + btn.textContent);
+}
+
+function openTrustedLinksSheet() {
+    var built = _rsBuildSheet({ title: 'Trusted websites' }, function() {});
+    built.sheet.classList.add('trusted-links-sheet');
+    built.overlay.addEventListener('click', function(e) {
+        if (e.target === built.overlay) built.dismiss();
+    });
+    var list = document.createElement('div');
+    list.className = 'trusted-links-list';
+    built.body.appendChild(list);
+    var clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.className = 'rs-dialog-cancel trusted-links-clear';
+    clearBtn.textContent = 'Remove All';
+    built.footer.appendChild(clearBtn);
+    var doneBtn = document.createElement('button');
+    doneBtn.type = 'button';
+    doneBtn.className = 'rs-dialog-confirm';
+    doneBtn.textContent = 'Done';
+    doneBtn.addEventListener('click', function() { built.dismiss(); });
+    built.footer.appendChild(doneBtn);
+    built.sheet.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') { e.stopPropagation(); built.dismiss(); }
+        if (e.key === 'Tab') {
+            var focusable = Array.prototype.filter.call(built.sheet.querySelectorAll('button'), function(b) { return !b.hidden; });
+            if (!focusable.length) return;
+            var first = focusable[0], last = focusable[focusable.length - 1];
+            if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+            else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        }
+    });
+
+    function render(hosts) {
+        updateTrustedLinksButton(hosts);
+        list.textContent = '';
+        clearBtn.hidden = hosts.length === 0;
+        if (!hosts.length) {
+            var empty = document.createElement('p');
+            empty.className = 'trusted-links-empty';
+            empty.textContent = 'No trusted websites. When you open a link, you can choose not to be asked again for that website.';
+            list.appendChild(empty);
+            return;
+        }
+        hosts.forEach(function(host) {
+            var row = document.createElement('div');
+            row.className = 'trusted-links-row';
+            var name = document.createElement('span');
+            name.className = 'trusted-links-host';
+            name.textContent = host;
+            var remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'selector-badge selector-badge-no-caret';
+            remove.textContent = 'Remove';
+            remove.setAttribute('aria-label', 'Remove ' + host);
+            remove.addEventListener('click', function() {
+                RS.linkTrust.remove(host).then(function(next) {
+                    render(next);
+                    showToast('Removed ' + host, 'toast-success', 1800);
+                }).catch(function() {
+                    showToast('Could not remove ' + host, 'toast-error', 2500);
+                });
+            });
+            row.appendChild(name);
+            row.appendChild(remove);
+            list.appendChild(row);
+        });
+    }
+
+    clearBtn.addEventListener('click', function() {
+        rsConfirm({
+            title: 'Remove all trusted websites?',
+            message: 'Links to these websites will ask again before opening.',
+            confirmText: 'Remove All',
+            danger: true,
+        }).then(function(ok) {
+            if (!ok) return;
+            RS.linkTrust.clear().then(render).catch(function() {
+                showToast('Could not remove websites', 'toast-error', 2500);
+            });
+        });
+    });
+
+    render(RS.linkTrust.list());
+    built.present();
+    doneBtn.focus();
+    RS.linkTrust.load().then(render);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    var btn = document.getElementById('settings-trusted-links-btn');
+    if (!btn || !(RS.linkTrust)) return;
+    btn.addEventListener('click', openTrustedLinksSheet);
+    RS.linkTrust.load().then(updateTrustedLinksButton);
 });
 
 RS.listen('contact_blocked', function() { updateBlockedCount(); });

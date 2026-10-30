@@ -400,7 +400,7 @@ impl DownloadCoordinator {
             let _ = ready.send(());
             let _ = resume.await;
         }
-        let _lifecycle = state.identity_switch_lock.lock_publication().await;
+        let _lifecycle = state.identity_switch_lock.lock_routine().await;
         if state.current_identity_session_generation() != generation || shutdown.is_triggered() {
             return;
         }
@@ -678,15 +678,76 @@ fn cleanup_deleted_batch(
     Ok((pending.last().unwrap().id, pending.len()))
 }
 
+/// Messages whose delete has committed; their files are still on disk.
+#[must_use = "files left here wait for the cleanup sweep"]
+pub struct DeletedMessages {
+    guard: AdmissionGuard,
+    store: DurableInboundStore,
+    artifacts: db::admission::MessageDeletionArtifacts,
+    data_dir: std::path::PathBuf,
+}
+
+impl DeletedMessages {
+    /// A file that cannot be removed now stays journaled for the cleanup sweep.
+    pub fn remove_files(self) -> Result<(), AdmissionDbError> {
+        cleanup_deleted_artifacts(&self.data_dir, &self.store, &self.guard, &self.artifacts)
+    }
+}
+
 pub(crate) fn delete_messages(
     state: &AppState,
     identity: &str,
     peer: Option<&str>,
-) -> Result<(), AdmissionDbError> {
+) -> Result<DeletedMessages, AdmissionDbError> {
+    delete_with(state, |store, guard| {
+        store
+            .delete_messages_guarded(guard, identity, peer, now())
+            .map(|artifacts| (artifacts, ()))
+    })
+    .map(|(deleted, ())| deleted)
+}
+
+pub(crate) fn delete_selected_messages(
+    state: &AppState,
+    identity: &str,
+    peer: &str,
+    ids: &[String],
+) -> Result<(DeletedMessages, Vec<String>), AdmissionDbError> {
+    delete_with(state, |store, guard| {
+        store.delete_selected_messages_guarded(guard, identity, peer, ids, now())
+    })
+}
+
+fn delete_with<T>(
+    state: &AppState,
+    delete: impl FnOnce(
+        &DurableInboundStore,
+        &AdmissionGuard,
+    ) -> Result<(db::admission::MessageDeletionArtifacts, T), AdmissionDbError>,
+) -> Result<(DeletedMessages, T), AdmissionDbError> {
     let guard = try_reserve_admission()?;
     let store = DurableInboundStore::from_pool(&state.db)?;
-    let artifacts = store.delete_messages_guarded(&guard, identity, peer, now())?;
-    cleanup_deleted_artifacts(&state.config.data_dir, &store, &guard, &artifacts)
+    let (artifacts, value) = match delete(&store, &guard) {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            // An uncertain commit may have deleted them all the same.
+            if matches!(error, AdmissionDbError::CommitUncertain(_)) {
+                state.invalidate_conversation_lists();
+            }
+            return Err(error);
+        }
+    };
+    // A list read before the commit is stale now, whatever happens to the files.
+    state.invalidate_conversation_lists();
+    Ok((
+        DeletedMessages {
+            guard,
+            store,
+            artifacts,
+            data_dir: state.config.data_dir.clone(),
+        },
+        value,
+    ))
 }
 fn reconcile_intents(
     store: &DurableInboundStore,
@@ -897,6 +958,7 @@ enum Projection {
         content: String,
         reply: String,
         preview: String,
+        renderer: Option<u8>,
     },
     Reaction {
         target: String,
@@ -946,6 +1008,7 @@ impl Projection {
             content: msg.content_text().into_owned(),
             reply,
             preview,
+            renderer: lxmf::message_renderer(msg),
         })
     }
     fn bindings(&self) -> Vec<usize> {
@@ -955,6 +1018,7 @@ impl Projection {
                 content,
                 reply,
                 preview,
+                ..
             } => vec![title.len(), content.len(), reply.len(), preview.len()],
             Self::Reaction { target, emoji, .. } => vec![target.len(), emoji.len()],
             Self::Service => Vec::new(),
@@ -1117,7 +1181,7 @@ fn commit_message(
                     }
                     Ok(EffectCommit::Applied("reaction"))
                 }
-                Projection::Chat { title, content, reply, preview } => {
+                Projection::Chat { title, content, reply, preview, renderer } => {
                     let attachment = media.iter().find(|item| !item.image && item.audio.is_none());
                     let image = media.iter().find(|item| item.image);
                     let audio = media.iter().find(|item| item.audio.is_some());
@@ -1125,7 +1189,7 @@ fn commit_message(
                         content, title, timestamp, "received", "inbound", &identity,
                         attachment.map_or("", |v| v.name.as_str()), attachment.map_or("", |v| v.stored.as_str()),
                         image.map_or("", |v| v.name.as_str()), image.map_or("", |v| v.stored.as_str()), reply, preview,
-                        Some("propagated"), audio.and_then(|v| v.audio), audio.map_or("", |v| v.stored.as_str())).map_err(storage)?;
+                        Some("propagated"), audio.and_then(|v| v.audio), audio.map_or("", |v| v.stored.as_str()), *renderer).map_err(storage)?;
                     connection.execute("DELETE FROM hidden_conversations WHERE identity_id=?1 AND dest_hash=?2",params![identity,source])?;
                     Ok(EffectCommit::Applied("message"))
                 }
@@ -1195,6 +1259,7 @@ pub(crate) async fn admit_download(
         return;
     }
     let scope = downloaded.scope();
+    let identity = hex::encode(scope.identity);
     let context = state.lxmf.lock().ok().and_then(|manager| {
         let manager = manager.as_ref()?;
         (manager.identity.hash == scope.identity).then(|| manager.propagation_decrypt_context())
@@ -1215,19 +1280,21 @@ pub(crate) async fn admit_download(
     };
     let worker_state = Arc::clone(state);
     let worker_shutdown = shutdown.clone();
+    let worker_identity = identity.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _job = job;
         let state = worker_state;
         let shutdown = worker_shutdown;
+        let identity = worker_identity;
         // Cancellation cannot free the raw image or processing reservation
         // while this actual worker still owns decrypted bytes and effects.
         let process = || -> Result<(LxMessage, CommitOutput, Option<lxmf_core::message::OwnedVerifiedLxMessage>), SuppressionReason> {
             if shutdown.is_triggered() || !token.is_current() || state.current_identity_session_generation() != generation { return Err(SuppressionReason::Cancelled); }
             let clear = context.decrypt(&raw).ok_or(SuppressionReason::DecryptionFailed)?;
             let msg = LxMessage::unpack_owned(Bytes::from(clear), MessageDecodeLimits::default()).map_err(|_| SuppressionReason::Malformed)?;
-            let key = state.lxmf.lock().ok().and_then(|manager| manager.as_ref().and_then(|manager| manager.inbound_source_public_key(&msg.source_hash())));
+            let key = crate::with_receiver(&state, &identity, |manager| manager.inbound_source_public_key(&msg.source_hash())).flatten();
             let verified = key.as_ref().map(|key| msg.verify(key)).transpose().map_err(|_| SuppressionReason::InvalidSignature)?;
-            if !crate::inbound_stamp_allowed(&state, &msg) { return Err(SuppressionReason::InvalidStamp); }
+            if !crate::inbound_stamp_allowed(&state, &identity, &msg) { return Err(SuppressionReason::InvalidStamp); }
             let guard = try_reserve_admission().map_err(|error| reason(&error))?;
             let projection = Projection::prepare(&state, &msg, key.is_some())?;
             let output = commit_message(&state, guard, scope, &msg, projection).map_err(|error| {
@@ -1253,9 +1320,29 @@ pub(crate) async fn admit_download(
     };
     let (output, token, message_id, source_hash, destination_hash, wire_len, _lease, ticket) =
         completed;
+    // Taken once the message is stored: a bulk delete after it moves it, so
+    // the chat refresh then publishes no lists and checks the row again.
+    let revision = state.conversation_list_revision();
+    // What the publication shows is read now, off the lifecycle lock.
+    let reactions = match &output.projection {
+        Projection::Reaction { target, .. } => {
+            let target = target.clone();
+            let identity = identity.clone();
+            db::spawn_db(state.db.clone(), move |p| {
+                db::get_reactions_for_message(&p, &target, &identity)
+            })
+            .await
+            .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let game_publication = match &output.projection {
+        Projection::Game(game) => game.read_publication(state, &identity).await,
+        _ => None,
+    };
     // The worker has exited and released quiescence ownership before waiting
     // for this lock. Shutdown can therefore never deadlock on UI publication.
-    let _lifecycle = state.identity_switch_lock.lock_publication().await;
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
     if shutdown.is_triggered()
         || !token.is_current()
         || state.current_identity_session_generation() != generation
@@ -1263,9 +1350,7 @@ pub(crate) async fn admit_download(
         return;
     }
     let disposition = output.receipt.record().disposition;
-    if let Ok(mut manager) = state.lxmf.lock()
-        && let Some(manager) = manager.as_mut()
-    {
+    crate::with_receiver(state, &identity, |manager| {
         manager.remember_committed_download(&output.receipt);
         if matches!(
             disposition,
@@ -1276,7 +1361,7 @@ pub(crate) async fn admit_download(
                 .router
                 .learn_ticket_from_inbound(&ticket.as_verified());
         }
-    }
+    });
     if token
         .resolve(DownloadAdmissionOutcome::Accepted(output.receipt))
         .is_err()
@@ -1293,6 +1378,7 @@ pub(crate) async fn admit_download(
             content,
             reply,
             preview,
+            renderer,
         } => {
             let notification: String = if content.trim().is_empty() {
                 &title
@@ -1304,19 +1390,32 @@ pub(crate) async fn admit_download(
             .collect();
             let has_attachment = !output.display_media.is_empty();
             let source = hex::encode(source_hash);
-            let identity = hex::encode(scope.identity);
-            let mut event = json!({"id":hex::encode(message_id),"source":source,
+            let message_id = hex::encode(message_id);
+            let mut event = json!({"id":message_id,"source":source,
                 "destination":hex::encode(destination_hash),"timestamp":output.timestamp,
                 "state":"received","direction":"inbound"});
             event["content"] = serde_json::Value::String(content);
             event["title"] = serde_json::Value::String(title);
             event["reply_to_id"] = serde_json::Value::String(reply);
             event["reply_to_preview"] = serde_json::Value::String(preview);
+            event["renderer"] = json!(renderer);
             if let Some(fields) = event.as_object_mut() {
                 fields.extend(output.display_media);
             }
+            // A bulk delete that committed since the admission revoked the
+            // token checked above, so the row is still there.
             state.emit_to_all("lxmf_message", event);
-            chat_refresh = Some((source, identity, notification, has_attachment));
+            chat_refresh = Some(ChatRefresh {
+                generation,
+                shutdown: shutdown.clone(),
+                revision,
+                message_id,
+                source,
+                identity: identity.clone(),
+                preview: notification,
+                renderer,
+                attachment: has_attachment,
+            });
             crate::record_activity_if_current(state, activity, || {
                 Ok(crate::producer::lxmf_inbound_accepted(
                     crate::producer::LxmfInboundAccepted {
@@ -1328,31 +1427,25 @@ pub(crate) async fn admit_download(
             });
         }
         Projection::Reaction { target, .. } => {
-            let reactions =
-                db::get_reactions_for_message(&state.db, &target, &hex::encode(scope.identity));
             state.emit_to_all(
                 "reaction_update",
                 json!({"message_id":target,"reactions":reactions}),
             );
         }
         Projection::Service => {}
-        Projection::Game(game) => game.emit(state),
+        Projection::Game(game) => {
+            if let Some(publication) = game_publication {
+                game.emit(state, publication);
+            }
+        }
     }
     drop(ticket);
     drop(_lease);
     drop(_lifecycle);
     // Keep presentation work bounded to this admitted job rather than spawning
     // an unbounded contact/FTS refresh for every item in a large download.
-    if let Some((source, identity, preview, attachment)) = chat_refresh {
-        refresh_chat(
-            state.clone(),
-            generation,
-            source,
-            identity,
-            preview,
-            attachment,
-        )
-        .await;
+    if let Some(refresh) = chat_refresh {
+        refresh_chat(state.clone(), refresh).await;
     }
 }
 
@@ -1364,45 +1457,59 @@ pub(crate) fn decode_game(
     game::decode(msg, authenticated)
 }
 
-async fn refresh_chat(
-    state: Arc<AppState>,
+/// A committed download's chat refresh, for the sessions it was admitted in.
+/// `revision` is the list revision taken once the message was stored.
+struct ChatRefresh {
     generation: u64,
+    shutdown: rns_runtime::lifecycle::ShutdownSignal,
+    revision: u64,
+    message_id: String,
     source: String,
     identity: String,
     preview: String,
+    renderer: Option<u8>,
     attachment: bool,
-) {
-    let pool = state.db.clone();
-    let identity_db = identity.clone();
-    let source_db = source.clone();
-    let result=db::spawn_db(pool,move|pool| {
-        let label=crate::contact_label_from_db(&pool,&source_db,&identity_db);
-        let contacts=db::get_all_contacts(&pool,&identity_db).into_iter().map(|c|json!({
-            "hash":c.get("dest_hash"),"display_name":c.get("display_name"),"trust":c.get("trust"),
-            "notes":c.get("notes"),"first_seen":c.get("first_seen"),"last_seen":c.get("last_seen"),"services":c.get("services")
-        })).collect::<Vec<_>>();
-        let unread:i64=db::get_all_unread_counts(&pool,&identity_db).values().sum();
-        (label,contacts,unread)
-    }).await;
-    let _lifecycle = state.identity_switch_lock.lock_publication().await;
-    if state.current_identity_session_generation() != generation
-        || state
-            .session_shutdown
-            .read()
-            .map_or(true, |s| s.is_triggered())
-    {
+}
+
+async fn refresh_chat(state: Arc<AppState>, refresh: ChatRefresh) {
+    let ChatRefresh {
+        generation,
+        shutdown,
+        revision,
+        message_id,
+        source,
+        identity,
+        preview,
+        renderer,
+        attachment,
+    } = refresh;
+    let lists = crate::read_inbound_lists(&state, &source, &identity, &message_id).await;
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
+    if state.current_identity_session_generation() != generation || shutdown.is_triggered() {
         return;
     }
-    if let Ok((label, contacts, unread)) = result {
-        state.emit_to_all("contacts_update", contacts.into());
-        state.emit_to_all("unread_total", json!({"count":unread}));
-        if state.should_surface_native_notification() {
-            state.emit_native_notification(ratspeak_core::NativeNotification::message(
-                format!("Message from {label}"),
-                crate::notification_body(&preview, attachment),
-                format!("lxmf:{source}"),
-                crate::stable_notification_id(&source, 1000),
-            ));
+    if let Some(lists) = lists {
+        // Only a bulk delete since the admission moves the revision; its own
+        // lists replace these, and the row is checked again before an alert.
+        let current = state.conversation_list_revision() == revision;
+        if current {
+            state.emit_to_all("contacts_update", lists.contacts.into());
+            state.emit_to_all("unread_total", json!({"count":lists.unread}));
+        }
+        let stored = if current {
+            lists.stored
+        } else {
+            crate::inbound_message_stored(&state, &message_id, &identity).await
+        };
+        if stored {
+            crate::notify_inbound_message_if_background(
+                &state,
+                &source,
+                &lists.label,
+                &preview,
+                renderer,
+                attachment,
+            );
         }
     }
     crate::messaging::broadcast_conversations(state.clone());
@@ -1730,7 +1837,10 @@ mod tests {
         });
         ready_rx.await.unwrap();
         let deletion = crate::propagation_recovery::begin_download_deletion(state.clone()).await;
-        delete_messages(&state, &hex::encode(identity), None).unwrap();
+        delete_messages(&state, &hex::encode(identity), None)
+            .unwrap()
+            .remove_files()
+            .unwrap();
         drop(deletion);
         resume_tx.send(()).unwrap();
         task.await.unwrap();
@@ -1829,5 +1939,208 @@ mod tests {
                 .is_empty()
         );
         assert!(reopened.receipts(&identity, now()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_committed_delete_invalidates_conversation_lists_even_when_a_file_stays() {
+        let _serial = SERIAL.lock().await;
+        let (_temp, state) = fixture();
+        let identity = hex::encode([1; 16]);
+        let msg = message("a file that stays", true);
+        commit_message(
+            &state,
+            try_reserve_admission().unwrap(),
+            scope(3),
+            &msg,
+            Projection::prepare(&state, &msg, false).unwrap(),
+        )
+        .unwrap();
+        let media = {
+            let store = DurableInboundStore::from_pool(&state.db).unwrap();
+            let rows = store.receipts(&identity, now()).unwrap();
+            state
+                .config
+                .data_dir
+                .join("identities")
+                .join(&identity)
+                .join("files")
+                .join(&rows[0].2[0].name)
+        };
+        std::fs::remove_file(&media).unwrap();
+        std::fs::create_dir(&media).unwrap();
+        std::fs::write(media.join("held"), b"media").unwrap();
+        let before = state.conversation_list_revision();
+        let _ = delete_messages(&state, &identity, None);
+        let messages: i64 = state
+            .db
+            .get()
+            .unwrap()
+            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 0);
+        assert_ne!(
+            state.conversation_list_revision(),
+            before,
+            "a list read before the delete stays publishable"
+        );
+    }
+
+    // A delete whose commit is uncertain may have happened: lists read before
+    // it are stale either way.
+    #[tokio::test]
+    async fn an_uncertain_delete_still_makes_lists_stale() {
+        let _serial = SERIAL.lock().await;
+        let (_temp, state) = fixture();
+        let identity = hex::encode([1; 16]);
+        db::try_save_message(
+            &state.db, "m1", "src", "dst", "kept?", "", 1.0, "received", "inbound", &identity, "",
+            "", "", "", "", "", None,
+        )
+        .unwrap();
+        // A deferred reference fails the delete's commit, not its statements.
+        state
+            .db
+            .get()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE commit_guard(id TEXT, identity_id TEXT, \
+                 FOREIGN KEY(id, identity_id) REFERENCES messages(id, identity_id) \
+                 DEFERRABLE INITIALLY DEFERRED); \
+                 INSERT INTO commit_guard VALUES('m1', '{identity}');"
+            ))
+            .unwrap();
+        let before = state.conversation_list_revision();
+        let error = match delete_messages(&state, &identity, None) {
+            Err(error) => error,
+            Ok(_) => panic!("the delete committed"),
+        };
+        assert!(
+            matches!(error, AdmissionDbError::CommitUncertain(_)),
+            "{error}"
+        );
+        assert_ne!(
+            state.conversation_list_revision(),
+            before,
+            "a list read before an uncertain delete stays publishable"
+        );
+    }
+
+    /// A downloaded message's sender, its unread row, and the identity it is for.
+    fn unread_download() -> (
+        Arc<AppState>,
+        Arc<crate::inbound_pipeline_tests::RecordingEmitter>,
+        String,
+        String,
+    ) {
+        let (state, emitter) = crate::inbound_pipeline_tests::pipeline_state();
+        let identity = state
+            .lxmf
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .identity_hash
+            .clone();
+        let source = "e4".repeat(16);
+        db::try_save_message(
+            &state.db,
+            &"e5".repeat(32),
+            &source,
+            &identity,
+            "downloaded",
+            "",
+            1.0,
+            "received",
+            "inbound",
+            &identity,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            Some("propagated"),
+        )
+        .unwrap();
+        (state, emitter, source, identity)
+    }
+
+    fn chat_refresh(state: &AppState, source: String, identity: String) -> ChatRefresh {
+        ChatRefresh {
+            generation: state.current_identity_session_generation(),
+            shutdown: state.session_shutdown.read().unwrap().clone(),
+            revision: state.conversation_list_revision(),
+            message_id: "e5".repeat(32),
+            source,
+            identity,
+            preview: "downloaded".into(),
+            renderer: None,
+            attachment: false,
+        }
+    }
+
+    // A refresh admitted before a bulk delete publishes no lists: the delete
+    // re-sends its own.
+    #[tokio::test]
+    async fn a_refresh_admitted_before_a_delete_publishes_no_lists() {
+        let (state, emitter, source, identity) = unread_download();
+        let refresh = chat_refresh(&state, source, identity.clone());
+        state
+            .db
+            .get()
+            .unwrap()
+            .execute("DELETE FROM messages WHERE identity_id = ?1", [&identity])
+            .unwrap();
+        state.invalidate_conversation_lists();
+        refresh_chat(state.clone(), refresh).await;
+        assert_eq!(
+            emitter.count("unread_total"),
+            0,
+            "lists published after the delete"
+        );
+        assert_eq!(emitter.count("contacts_update"), 0);
+    }
+
+    // While its lists are current, a refresh is published without the
+    // database under the lifecycle lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_current_refresh_is_published_without_the_database() {
+        let (state, emitter, source, identity) = unread_download();
+        let lifecycle = state.identity_switch_lock.lock_routine_owned().await;
+        let mut refresh = Box::pin(refresh_chat(
+            state.clone(),
+            chat_refresh(&state, source, identity),
+        ));
+        crate::inbound_pipeline_tests::drive_until_parked(&mut refresh).await;
+        let held: Vec<_> = (0..2).map(|_| state.db.get().unwrap()).collect();
+        drop(lifecycle);
+        let published = crate::inbound_pipeline_tests::finish_within(
+            &mut refresh,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        drop(held);
+        assert!(
+            published,
+            "the refresh waited on the database under the lock"
+        );
+        assert_eq!(emitter.count("unread_total"), 1);
+    }
+
+    // A refresh belongs to the runtime session its download was admitted
+    // in, even when a restart keeps the identity session.
+    #[tokio::test]
+    async fn a_refresh_from_an_ended_runtime_session_is_not_published() {
+        let (state, emitter, source, identity) = unread_download();
+        let refresh = chat_refresh(&state, source, identity);
+        state.session_shutdown.read().unwrap().trigger();
+        *state.session_shutdown.write().unwrap() = rns_runtime::lifecycle::ShutdownSignal::new();
+        refresh_chat(state.clone(), refresh).await;
+        assert_eq!(
+            emitter.count("contacts_update"),
+            0,
+            "a refresh from the ended run"
+        );
+        assert_eq!(emitter.count("unread_total"), 0);
     }
 }

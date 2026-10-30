@@ -1,0 +1,58 @@
+{
+  "source": "LXMF LXMessage.pack(), defer_stamp False",
+  "reticulum": {
+    "version": "1.5.5",
+    "commit": "7f2b3b9b524c9386316379af1313b43a5e4f7a5d"
+  },
+  "lxmf": {
+    "version": "1.2.0",
+    "commit": "c3ff2d6dc2f256daab896dadc044dd5a913ecbb7"
+  },
+  "encrypted_packet_max_content": 287,
+  "title": "",
+  "stamp_cost": 1,
+  "cases": [
+    {
+      "stamp": "none",
+      "content_length": 287,
+      "unstamped_packed_size": 399,
+      "packed_size": 399,
+      "method": "opportunistic"
+    },
+    {
+      "stamp": "none",
+      "content_length": 288,
+      "unstamped_packed_size": 400,
+      "packed_size": 400,
+      "method": "direct"
+    },
+    {
+      "stamp": "ticket",
+      "content_length": 269,
+      "unstamped_packed_size": 381,
+      "packed_size": 399,
+      "method": "opportunistic"
+    },
+    {
+      "stamp": "ticket",
+      "content_length": 270,
+      "unstamped_packed_size": 382,
+      "packed_size": 400,
+      "method": "direct"
+    },
+    {
+      "stamp": "proof_of_work",
+      "content_length": 254,
+      "unstamped_packed_size": 365,
+      "packed_size": 399,
+      "method": "opportunistic"
+    },
+    {
+      "stamp": "proof_of_work",
+      "content_length": 255,
+      "unstamped_packed_size": 366,
+      "packed_size": 400,
+      "method": "direct"
+    }
+  ]
+}

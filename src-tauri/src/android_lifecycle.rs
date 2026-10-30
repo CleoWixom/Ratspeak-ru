@@ -209,6 +209,12 @@ mod platform {
         match event {
             tauri::RunEvent::Ready => {
                 let _ = APP.set(app.clone());
+                // A core that failed to start has no session to retain, so
+                // closing its task ends the process and the next launch
+                // starts afresh.
+                if app.try_state::<ratspeak_tauri::StartupError>().is_some() {
+                    return;
+                }
                 // Activity attachment/resume can precede Tauri Ready.
                 lifecycle().transition(
                     NativeLifecycleEvent::Ready,

@@ -456,8 +456,8 @@ var RNODE_PORT_HELP = {
     port_access_denied: {
         title: 'Port access denied',
         message: 'This computer did not let Ratspeak open the radio\'s port. On Linux, ' +
-            'add your user to the group that owns it (usually dialout), then sign out and ' +
-            'back in. Ratspeak keeps trying.'
+            'add your user to the group that owns it (dialout, or uucp on Arch), then sign ' +
+            'out and back in. Ratspeak keeps trying.'
     },
     port_in_use: {
         title: 'Port in use',

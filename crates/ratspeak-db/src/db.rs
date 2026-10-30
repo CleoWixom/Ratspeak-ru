@@ -8,7 +8,7 @@ use tokio::task::JoinError;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 
-pub(crate) const SCHEMA_VERSION: i64 = 45;
+pub(crate) const SCHEMA_VERSION: i64 = 46;
 
 const VOICE_FORMAT_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS conversation_voice_formats (
@@ -31,6 +31,7 @@ pub const ATTACHMENT_UNAVAILABLE_STORED_NAME: &str = "!unavailable";
 // locked across fresh schema creation and migrations.
 const MESSAGE_AUDIO_MODE_COLUMN_INDEX: usize = 22;
 const MESSAGE_AUDIO_STORED_NAME_COLUMN_INDEX: usize = 23;
+const MESSAGE_RENDERER_COLUMN_INDEX: usize = 24;
 
 const IDENTITY_SELECT_COLUMNS: &str = "hash,
     lxmf_hash,
@@ -107,42 +108,127 @@ pub fn init_pool(data_dir: &Path) -> Result<DbPool, Box<dyn std::error::Error + 
     Ok(pool)
 }
 
-pub fn init_schema(pool: &DbPool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let conn = pool.get()?;
+/// A database written by a newer Ratspeak. [`refuse_newer_database`] and
+/// [`init_schema`] refuse it before writing anything.
+#[derive(Debug, thiserror::Error)]
+#[error("database schema {found} is newer than this build ({supported})")]
+pub struct NewerSchema {
+    pub found: i64,
+    pub supported: i64,
+}
 
+/// The recorded schema version, `None` before the schema exists. A version
+/// that cannot be read is an error, never a fresh database. Older code must
+/// never run against a schema it does not understand.
+fn understood_schema_version(
+    conn: &Connection,
+) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
     let has_schema: bool = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
         [],
         |row| row.get::<_, i64>(0),
     )? > 0;
+    if !has_schema {
+        return Ok(None);
+    }
+    let version = conn
+        .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .unwrap_or(0);
+    if version > SCHEMA_VERSION {
+        return Err(NewerSchema {
+            found: version,
+            supported: SCHEMA_VERSION,
+        }
+        .into());
+    }
+    Ok(Some(version))
+}
 
-    if has_schema {
-        let version: i64 = conn
-            .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
+/// Refuse a database written by a newer Ratspeak, or one whose version cannot
+/// be read, before anything opens it for writing. Nothing is written to the
+/// database. With no WAL or journal beside it, every committed page is in the
+/// file, which is opened as immutable and so gains no side files; otherwise
+/// the read goes through the side files already there.
+pub fn refuse_newer_database(
+    data_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ratspeak_dir = data_dir.join(".ratspeak");
+    let db_path = ratspeak_dir.join("ratspeak.db");
+    if !db_path.try_exists()? {
+        return Ok(());
+    }
+    let mut journaled = false;
+    for side_file in ["ratspeak.db-wal", "ratspeak.db-journal"] {
+        journaled |= ratspeak_dir.join(side_file).try_exists()?;
+    }
+    let read_only = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    let uri = if journaled {
+        None
+    } else {
+        immutable_uri(&db_path)
+    };
+    let immutable = uri.and_then(|uri| {
+        Connection::open_with_flags(uri, read_only | rusqlite::OpenFlags::SQLITE_OPEN_URI).ok()
+    });
+    let conn = match immutable {
+        Some(conn) => conn,
+        // A path this platform's URIs cannot express is read the plain way.
+        None => Connection::open_with_flags(&db_path, read_only)?,
+    };
+    understood_schema_version(&conn)?;
+    Ok(())
+}
 
-        if version < SCHEMA_VERSION {
-            run_migrations(&conn, version)?;
+/// `path` as an SQLite URI that opens it immutable: read-only, with no locks
+/// and no side files.
+fn immutable_uri(path: &Path) -> Option<String> {
+    let path = std::path::absolute(path).ok()?;
+    let path = path.to_str()?;
+    let mut uri = String::from(if cfg!(windows) { "file:///" } else { "file:" });
+    for byte in path.bytes() {
+        match byte {
+            b'\\' if cfg!(windows) => uri.push('/'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                uri.push(char::from(byte))
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
         }
     }
+    uri.push_str("?immutable=1");
+    Some(uri)
+}
 
-    conn.execute_batch(SCHEMA_SQL)?;
-    conn.execute_batch(crate::admission::SCHEMA_SQL)?;
-    conn.execute_batch(VOICE_FORMAT_SCHEMA_SQL)?;
-    conn.execute_batch(CHANNEL_HISTORY_SCHEMA_SQL)?;
-    conn.execute_batch(CHANNEL_ROOM_STATE_SCHEMA_SQL)?;
-    conn.execute_batch(CHANNEL_PARTICIPANT_OBSERVATION_SCHEMA_SQL)?;
-    reconcile_channel_history_usage(&conn)?;
+pub fn init_schema(pool: &DbPool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = pool.get()?;
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?;
+    if let Some(version) = understood_schema_version(&conn)?
+        && version < SCHEMA_VERSION
+    {
+        run_migrations(&conn, version)?;
+    }
+
+    // The schema and its version row commit together: a database never holds
+    // a schema without its version.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(SCHEMA_SQL)?;
+    tx.execute_batch(crate::admission::SCHEMA_SQL)?;
+    tx.execute_batch(VOICE_FORMAT_SCHEMA_SQL)?;
+    tx.execute_batch(CHANNEL_HISTORY_SCHEMA_SQL)?;
+    tx.execute_batch(CHANNEL_ROOM_STATE_SCHEMA_SQL)?;
+    tx.execute_batch(CHANNEL_PARTICIPANT_OBSERVATION_SCHEMA_SQL)?;
+    reconcile_channel_history_usage(&tx)?;
+
+    let count: i64 = tx.query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?;
     if count == 0 {
-        conn.execute(
+        tx.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             params![SCHEMA_VERSION],
         )?;
     }
+    tx.commit()?;
 
     tracing::info!("Database schema initialized (version {SCHEMA_VERSION})");
     Ok(())
@@ -205,6 +291,7 @@ CREATE TABLE IF NOT EXISTS messages (
     delivery_method TEXT,
     audio_mode INTEGER CHECK (audio_mode IS NULL OR audio_mode BETWEEN 0 AND 255),
     audio_stored_name TEXT NOT NULL DEFAULT '',
+    renderer INTEGER CHECK (renderer IS NULL OR renderer BETWEEN 0 AND 255),
     PRIMARY KEY (id, identity_id)
 );
 
@@ -1871,6 +1958,25 @@ fn run_migrations(conn: &Connection, from_version: i64) -> Result<(), rusqlite::
         })?;
     }
 
+    if from_version < 46 {
+        migration_step(conn, 46, |conn| {
+            if table_exists(conn, "messages")?
+                && !get_column_names(conn, "messages")?
+                    .iter()
+                    .any(|column| column == "renderer")
+            {
+                conn.execute_batch(
+                    "ALTER TABLE messages
+                     ADD COLUMN renderer INTEGER
+                     CHECK (renderer IS NULL OR renderer BETWEEN 0 AND 255);",
+                )?;
+            }
+            conn.execute_batch("UPDATE schema_version SET version = 46;")?;
+            tracing::info!("Migrated to schema version 46 (LXMF message renderer)");
+            Ok(())
+        })?;
+    }
+
     Ok(())
 }
 
@@ -1892,14 +1998,28 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, rusqlite::Error>
     .map(|count| count > 0)
 }
 
-pub fn get_active_identity(pool: &DbPool) -> Option<serde_json::Value> {
-    let conn = pool.get().ok()?;
+/// `Ok(None)` only when no identity is active; a failed read is an error.
+pub fn get_active_identity(pool: &DbPool) -> Result<Option<serde_json::Value>, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {IDENTITY_SELECT_COLUMNS} FROM identities WHERE is_active = 1 LIMIT 1"
         ))
-        .ok()?;
-    stmt.query_row([], row_to_identity).ok()
+        .map_err(|e| format!("prepare: {e}"))?;
+    stmt.query_row([], row_to_identity)
+        .optional()
+        .map_err(|e| format!("active identity: {e}"))
+}
+
+/// Identity hashes, most recently used first.
+pub fn identity_hashes_by_last_use(pool: &DbPool) -> Result<Vec<String>, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let mut stmt = conn
+        .prepare("SELECT hash FROM identities ORDER BY last_used DESC, created_at DESC")
+        .map_err(|e| format!("prepare: {e}"))?;
+    stmt.query_map([], |row| row.get(0))
+        .and_then(|rows| rows.collect())
+        .map_err(|e| format!("identities: {e}"))
 }
 
 pub fn get_all_identities(pool: &DbPool) -> Vec<serde_json::Value> {
@@ -1931,7 +2051,9 @@ pub fn get_identity(pool: &DbPool, hash_hex: &str) -> Option<serde_json::Value> 
 /// Process-wide identity-table generation. Bumped by every db-layer write
 /// that can change which identity is active (or its lxmf hash) so runtime
 /// caches invalidate without each caller remembering to — see
-/// `ratspeak_runtime::helpers::active_identity_id`.
+/// `ratspeak_runtime::helpers::active_identity_id`. Always after the write
+/// commits or rolls back: bumped first, a reader could cache the old row under
+/// the new generation and keep it.
 static IDENTITY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn identity_generation() -> u64 {
@@ -1939,9 +2061,19 @@ pub fn identity_generation() -> u64 {
 }
 
 /// For identity-table writes that bypass the helpers in this module
-/// (factory reset's raw table wipe).
+/// (factory reset's raw table wipe), once the write is done.
 pub fn note_identity_tables_changed() {
     IDENTITY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Bumps the identity-table generation when dropped. Declared before the
+/// connection, so it drops after the write has committed or rolled back.
+struct IdentityTablesWrite;
+
+impl Drop for IdentityTablesWrite {
+    fn drop(&mut self) {
+        note_identity_tables_changed();
+    }
 }
 
 pub fn save_identity(
@@ -1951,26 +2083,35 @@ pub fn save_identity(
     nickname: &str,
     display_name: &str,
 ) {
-    note_identity_tables_changed();
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    let _ = try_save_identity(pool, hash_hex, lxmf_hash, nickname, display_name);
+}
+
+/// As `save_identity`, reporting a row that was not written.
+pub fn try_save_identity(
+    pool: &DbPool,
+    hash_hex: &str,
+    lxmf_hash: &str,
+    nickname: &str,
+    display_name: &str,
+) -> Result<(), String> {
+    let _write = IdentityTablesWrite;
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
     let now = now_ts();
     // ON CONFLICT closes the race between two "not exists" → INSERT callers.
+    // Only an activation marks an identity used.
     conn.execute(
         "INSERT INTO identities
              (hash, lxmf_hash, nickname, display_name, created_at, last_used,
               is_active, propagation_node, propagation_enabled)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, '', 0)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, '', 0)
          ON CONFLICT(hash) DO UPDATE SET
              lxmf_hash    = excluded.lxmf_hash,
              nickname     = excluded.nickname,
-             display_name = excluded.display_name,
-             last_used    = excluded.last_used",
+             display_name = excluded.display_name",
         params![hash_hex, lxmf_hash, nickname, display_name, now],
     )
-    .ok();
+    .map_err(|e| format!("identity: {e}"))?;
+    Ok(())
 }
 
 pub fn set_identity_propagation_node(
@@ -1988,22 +2129,60 @@ pub fn set_identity_propagation_node(
 }
 
 pub fn set_active_identity(pool: &DbPool, hash_hex: &str) -> Result<(), String> {
-    note_identity_tables_changed();
+    activate(pool, hash_hex, true)
+}
+
+/// As `set_active_identity`, without counting it as a use: a switch counts
+/// it once the identity has opened.
+pub fn activate_identity(pool: &DbPool, hash_hex: &str) -> Result<(), String> {
+    activate(pool, hash_hex, false)
+}
+
+pub fn mark_identity_used(pool: &DbPool, hash_hex: &str) -> Result<(), String> {
+    let _write = IdentityTablesWrite;
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    conn.execute(
+        "UPDATE identities SET last_used = ?1 WHERE hash = ?2",
+        params![now_ts(), hash_hex],
+    )
+    .map_err(|e| format!("use: {e}"))?;
+    Ok(())
+}
+
+fn activate(pool: &DbPool, hash_hex: &str, used: bool) -> Result<(), String> {
+    let _write = IdentityTablesWrite;
     let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
-    let now = now_ts();
     let tx = conn.transaction().map_err(|e| format!("begin: {e}"))?;
     tx.execute("UPDATE identities SET is_active = 0", [])
         .map_err(|e| format!("deactivate: {e}"))?;
-    let updated = tx
-        .execute(
+    let updated = if used {
+        tx.execute(
             "UPDATE identities SET is_active = 1, last_used = ?1 WHERE hash = ?2",
-            params![now, hash_hex],
+            params![now_ts(), hash_hex],
         )
-        .map_err(|e| format!("activate: {e}"))?;
+    } else {
+        tx.execute(
+            "UPDATE identities SET is_active = 1 WHERE hash = ?1",
+            params![hash_hex],
+        )
+    }
+    .map_err(|e| format!("activate: {e}"))?;
     if updated != 1 {
         return Err("identity not found".into());
     }
     tx.commit().map_err(|e| format!("commit: {e}"))?;
+    Ok(())
+}
+
+/// Leave `hash_hex` inactive if it is the active identity.
+pub fn deactivate_identity(pool: &DbPool, hash_hex: &str) -> Result<(), String> {
+    let _write = IdentityTablesWrite;
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    conn.execute(
+        "UPDATE identities SET is_active = 0 WHERE hash = ?1",
+        params![hash_hex],
+    )
+    .map_err(|e| format!("deactivate: {e}"))?;
     Ok(())
 }
 
@@ -2177,7 +2356,7 @@ const IDENTITY_CASCADE: &[(&str, &str)] = &[
 ];
 
 pub fn delete_identity(pool: &DbPool, hash_hex: &str, cascade: bool) -> Result<(), String> {
-    note_identity_tables_changed();
+    let _write = IdentityTablesWrite;
     let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
     let tx = conn.transaction().map_err(|e| format!("begin: {e}"))?;
     if cascade {
@@ -2185,6 +2364,11 @@ pub fn delete_identity(pool: &DbPool, hash_hex: &str, cascade: bool) -> Result<(
             tx.execute(sql, params![hash_hex])
                 .map_err(|e| format!("delete {label}: {e}"))?;
         }
+        tx.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params![pending_network_lifts_key(hash_hex)],
+        )
+        .map_err(|e| format!("delete pending network lifts: {e}"))?;
     }
     tx.execute("DELETE FROM identities WHERE hash = ?1", params![hash_hex])
         .map_err(|e| format!("delete identity: {e}"))?;
@@ -2210,6 +2394,11 @@ pub fn save_contact_with_identity_pubkey(
     trust: &str,
     identity_id: &str,
 ) {
+    // A row without an identity belongs to no one.
+    if identity_id.is_empty() {
+        tracing::warn!(reason = "no_identity", "save_contact refused");
+        return;
+    }
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return,
@@ -2364,6 +2553,10 @@ pub fn get_contact(pool: &DbPool, dest_hash: &str, identity_id: &str) -> Option<
 }
 
 pub fn block_contact(pool: &DbPool, dest_hash: &str, display_name: &str, identity_id: &str) {
+    if identity_id.is_empty() {
+        tracing::warn!(reason = "no_identity", "block_contact refused");
+        return;
+    }
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => {
@@ -2517,6 +2710,10 @@ pub fn enqueue_pending_blackhole(
     reason_label: Option<&str>,
     ttl_seconds: Option<f64>,
 ) -> bool {
+    if identity_id.is_empty() {
+        tracing::warn!(reason = "no_identity", "enqueue_pending_blackhole refused");
+        return false;
+    }
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => {
@@ -2614,6 +2811,69 @@ pub fn clear_pending_blackhole(pool: &DbPool, dest_hash: &str, identity_id: &str
     )
     .map(|n| n > 0)
     .unwrap_or(false)
+}
+
+/// Unblocks whose network lift the identity's runtime never took, because it
+/// stopped. Lifted when that identity's runtime is next up. A setting, so the
+/// schema stays as it is.
+fn pending_network_lifts_key(identity_id: &str) -> String {
+    format!("pending_network_lifts:{identity_id}")
+}
+
+/// The destinations whose network block `identity_id` still has to lift.
+pub fn pending_network_lifts(pool: &DbPool, identity_id: &str) -> Vec<String> {
+    get_setting(pool, &pending_network_lifts_key(identity_id))
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+/// Adds (`lift`) or removes a pending network lift; false if it was not stored.
+fn update_pending_network_lifts(
+    pool: &DbPool,
+    identity_id: &str,
+    dest_hash: &str,
+    lift: bool,
+) -> bool {
+    if identity_id.is_empty() {
+        return false;
+    }
+    let key = pending_network_lifts_key(identity_id);
+    let Ok(mut conn) = pool.get() else {
+        return false;
+    };
+    let Ok(tx) = conn.transaction() else {
+        return false;
+    };
+    let mut lifts: Vec<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default();
+    lifts.retain(|dest| dest != dest_hash);
+    if lift {
+        lifts.push(dest_hash.to_string());
+    }
+    let written = if lifts.is_empty() {
+        tx.execute("DELETE FROM settings WHERE key = ?1", params![key])
+    } else {
+        tx.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![key, serde_json::to_string(&lifts).unwrap_or_default()],
+        )
+    };
+    written.is_ok() && tx.commit().is_ok()
+}
+
+pub fn queue_pending_network_lift(pool: &DbPool, identity_id: &str, dest_hash: &str) -> bool {
+    update_pending_network_lifts(pool, identity_id, dest_hash, true)
+}
+
+pub fn clear_pending_network_lift(pool: &DbPool, identity_id: &str, dest_hash: &str) -> bool {
+    update_pending_network_lifts(pool, identity_id, dest_hash, false)
 }
 
 pub fn get_message_delivery_method(
@@ -2720,6 +2980,7 @@ pub fn save_message(
         delivery_method,
         None,
         "",
+        None,
     );
 }
 
@@ -2750,6 +3011,7 @@ pub fn save_message_with_audio(
     delivery_method: Option<&str>,
     audio_mode: Option<u8>,
     audio_stored_name: &str,
+    renderer: Option<u8>,
 ) {
     if let Err(error) = try_save_message_with_audio(
         pool,
@@ -2771,6 +3033,7 @@ pub fn save_message_with_audio(
         delivery_method,
         audio_mode,
         audio_stored_name,
+        renderer,
     ) {
         tracing::warn!(error, "failed to persist message");
     }
@@ -2818,6 +3081,7 @@ pub fn try_save_message(
         delivery_method,
         None,
         "",
+        None,
     )
 }
 
@@ -2843,6 +3107,7 @@ pub fn try_save_message_with_audio(
     delivery_method: Option<&str>,
     audio_mode: Option<u8>,
     audio_stored_name: &str,
+    renderer: Option<u8>,
 ) -> Result<(), String> {
     let conn = pool.get().map_err(|error| error.to_string())?;
     try_save_message_with_audio_conn(
@@ -2865,6 +3130,7 @@ pub fn try_save_message_with_audio(
         delivery_method,
         audio_mode,
         audio_stored_name,
+        renderer,
     )
 }
 
@@ -2890,7 +3156,11 @@ pub fn try_save_message_with_audio_conn(
     delivery_method: Option<&str>,
     audio_mode: Option<u8>,
     audio_stored_name: &str,
+    renderer: Option<u8>,
 ) -> Result<(), String> {
+    if identity_id.is_empty() {
+        return Err("no active identity".into());
+    }
     let exists: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE id = ?1 AND identity_id = ?2",
@@ -2908,9 +3178,10 @@ pub fn try_save_message_with_audio_conn(
         .map_err(|error| error.to_string())?;
     } else {
         let audio_mode = audio_mode.map(i64::from);
+        let renderer = renderer.map(i64::from);
         conn.execute(
-            "INSERT INTO messages (id, source, destination, content, title, timestamp, state, direction, identity_id, attachment_name, attachment_stored_name, image_name, image_stored_name, reply_to_id, reply_to_preview, delivery_method, audio_mode, audio_stored_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-            params![msg_id, source, destination, content, title, timestamp, state, direction, identity_id, attachment_name, attachment_stored_name, image_name, image_stored_name, reply_to_id, reply_to_preview, delivery_method, audio_mode, audio_stored_name],
+            "INSERT INTO messages (id, source, destination, content, title, timestamp, state, direction, identity_id, attachment_name, attachment_stored_name, image_name, image_stored_name, reply_to_id, reply_to_preview, delivery_method, audio_mode, audio_stored_name, renderer) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            params![msg_id, source, destination, content, title, timestamp, state, direction, identity_id, attachment_name, attachment_stored_name, image_name, image_stored_name, reply_to_id, reply_to_preview, delivery_method, audio_mode, audio_stored_name, renderer],
         ).map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -3242,6 +3513,10 @@ pub fn cleanup_stale_outbound(pool: &DbPool, identity_id: &str) {
 }
 
 pub fn hide_conversation(pool: &DbPool, dest_hash: &str, identity_id: &str) {
+    if identity_id.is_empty() {
+        tracing::warn!(reason = "no_identity", "hide_conversation refused");
+        return;
+    }
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return,
@@ -8256,36 +8531,6 @@ pub fn save_connection_history(pool: &DbPool, host: &str, port: i64, name: &str)
     }
 }
 
-pub fn clear_all_messages(pool: &DbPool, identity_id: &str) -> Vec<String> {
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let file_refs = if identity_id.is_empty() {
-        query_message_file_refs(
-            &conn,
-            "SELECT attachment_stored_name, image_stored_name, audio_stored_name FROM messages",
-            [],
-        )
-    } else {
-        query_message_file_refs(
-            &conn,
-            "SELECT attachment_stored_name, image_stored_name, audio_stored_name FROM messages WHERE identity_id = ?1",
-            params![identity_id],
-        )
-    };
-    if identity_id.is_empty() {
-        conn.execute("DELETE FROM messages", []).ok();
-    } else {
-        conn.execute(
-            "DELETE FROM messages WHERE identity_id = ?1",
-            params![identity_id],
-        )
-        .ok();
-    }
-    file_refs
-}
-
 pub fn get_identity_file_refs(pool: &DbPool, identity_id: &str) -> Vec<String> {
     let conn = match pool.get() {
         Ok(c) => c,
@@ -8302,35 +8547,20 @@ pub fn get_identity_file_refs(pool: &DbPool, identity_id: &str) -> Vec<String> {
 }
 
 pub fn clear_all_contacts(pool: &DbPool, identity_id: &str) {
+    // An empty identity must never widen a clear to every identity.
+    if identity_id.is_empty() {
+        tracing::warn!(reason = "no_identity", "clear_all_contacts refused");
+        return;
+    }
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return,
     };
-    if identity_id.is_empty() {
-        conn.execute("DELETE FROM contacts", []).ok();
-    } else {
-        conn.execute(
-            "DELETE FROM contacts WHERE identity_id = ?1",
-            params![identity_id],
-        )
-        .ok();
-    }
-}
-
-pub fn clear_all_blocked(pool: &DbPool, identity_id: &str) {
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    if identity_id.is_empty() {
-        conn.execute("DELETE FROM blocked_contacts", []).ok();
-    } else {
-        conn.execute(
-            "DELETE FROM blocked_contacts WHERE identity_id = ?1",
-            params![identity_id],
-        )
-        .ok();
-    }
+    conn.execute(
+        "DELETE FROM contacts WHERE identity_id = ?1",
+        params![identity_id],
+    )
+    .ok();
 }
 
 pub fn get_database_stats(pool: &DbPool) -> serde_json::Value {
@@ -8354,24 +8584,6 @@ pub fn get_database_stats(pool: &DbPool) -> serde_json::Value {
         "contacts": contact_count,
         "connection_history": history_count,
     })
-}
-
-pub fn backfill_identity_id(pool: &DbPool, identity_hash: &str) {
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    conn.execute(
-        "UPDATE contacts SET identity_id = ?1 WHERE identity_id = ''",
-        params![identity_hash],
-    )
-    .ok();
-    conn.execute(
-        "UPDATE messages SET identity_id = ?1 WHERE identity_id = ''",
-        params![identity_hash],
-    )
-    .ok();
-    tracing::info!("Backfilled identity_id on existing contacts/messages");
 }
 
 pub fn save_game_session(pool: &DbPool, session: &lrgp::session::Session) -> bool {
@@ -9287,6 +9499,9 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value
     let audio_stored_name = row
         .get::<_, String>(MESSAGE_AUDIO_STORED_NAME_COLUMN_INDEX)
         .unwrap_or_default();
+    let renderer = row
+        .get::<_, Option<i64>>(MESSAGE_RENDERER_COLUMN_INDEX)?
+        .and_then(|renderer| u8::try_from(renderer).ok());
 
     // Reshape flat columns to nested `msg.image` / `msg.attachments`.
     let image_json = (!image_stored_name.is_empty()).then(|| {
@@ -9355,6 +9570,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value
         "game_action": row.get::<_, String>(19).unwrap_or_default(),
         "game_move_san": row.get::<_, String>(20).unwrap_or_default(),
         "delivery_method": row.get::<_, Option<String>>(21)?,
+        "renderer": renderer,
     }))
 }
 
@@ -9492,6 +9708,7 @@ mod audio_message_tests {
             Some("direct"),
             Some(0x10),
             "stored-audio.opus",
+            Some(2),
         );
 
         let messages = get_conversation(&pool, "source", "identity", 10);
@@ -9499,6 +9716,7 @@ mod audio_message_tests {
         assert_eq!(messages[0]["audio"]["mode"], 0x10);
         assert_eq!(messages[0]["audio"]["stored_name"], "stored-audio.opus");
         assert_eq!(messages[0]["audio"]["supported"], true);
+        assert_eq!(messages[0]["renderer"], 2);
         assert!(messages[0]["attachments"].is_null());
         assert!(messages[0]["image"].is_null());
     }
@@ -9534,6 +9752,7 @@ mod audio_message_tests {
                 None,
                 Some(mode),
                 stored_name,
+                None,
             );
         }
 
@@ -9545,6 +9764,7 @@ mod audio_message_tests {
         assert_eq!(unknown["audio"]["mode"], 0xfe);
         assert_eq!(unknown["audio"]["stored_name"], "opaque-audio.bin");
         assert_eq!(unknown["audio"]["supported"], false);
+        assert!(unknown["renderer"].is_null());
 
         let unavailable = messages
             .iter()
@@ -9584,6 +9804,7 @@ mod audio_message_tests {
                 None,
                 Some(0x10),
                 stored_name,
+                None,
             );
         }
 
@@ -9596,7 +9817,6 @@ mod audio_message_tests {
             delete_conversation(&pool, "peer-a", "identity-a"),
             vec!["one.opus"]
         );
-        assert_eq!(clear_all_messages(&pool, "identity-a"), vec!["two.opus"]);
         assert_eq!(
             get_identity_file_refs(&pool, "identity-b"),
             vec!["three.opus"]
@@ -10268,55 +10488,52 @@ mod unread_breakdown_tests {
     }
 
     #[test]
-    fn clear_all_messages_returns_attachment_file_refs_for_identity() {
+    fn identity_rows_are_never_written_without_an_identity() {
         let pool = test_pool();
-        save_message(
-            &pool,
-            "with-file",
-            "me",
-            "peer",
-            "content",
-            "",
-            10.0,
-            "sent",
-            "outbound",
-            "me",
-            "note.txt",
-            "123_note.txt",
-            "",
-            "456_image.png",
-            "",
-            "",
-            Some("direct"),
+        save_contact(&pool, "peer", Some("Peer"), "trusted", "");
+        block_contact(&pool, "spammer", "Spammer", "");
+        assert!(!enqueue_pending_blackhole(&pool, "spammer", "", None, None));
+        hide_conversation(&pool, "peer", "");
+        assert!(
+            try_save_message(
+                &pool, "orphan", "local", "peer", "hi", "", 1.0, "sent", "outbound", "", "", "",
+                "", "", "", "", None,
+            )
+            .is_err()
         );
-        save_message(
-            &pool,
-            "other-identity",
-            "me",
-            "peer",
-            "content",
-            "",
-            10.0,
-            "sent",
-            "outbound",
-            "other",
-            "other.txt",
-            "789_other.txt",
-            "",
-            "",
-            "",
-            "",
-            Some("direct"),
-        );
+        let conn = pool.get().unwrap();
+        for table in [
+            "contacts",
+            "blocked_contacts",
+            "pending_blackholes",
+            "hidden_conversations",
+            "messages",
+        ] {
+            let rows: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE identity_id = ''"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+    }
 
-        let refs = clear_all_messages(&pool, "me");
+    #[test]
+    fn clearing_without_an_identity_keeps_every_identity() {
+        let pool = test_pool();
+        for identity in ["me", "other"] {
+            save_contact(&pool, "peer", Some("Peer"), "unknown", identity);
+            block_contact(&pool, "spammer", "Spammer", identity);
+        }
 
-        assert_eq!(
-            refs,
-            vec!["123_note.txt".to_string(), "456_image.png".to_string()]
-        );
-        assert_eq!(get_conversation(&pool, "peer", "me", 10).len(), 0);
-        assert_eq!(get_conversation(&pool, "peer", "other", 10).len(), 1);
+        clear_all_contacts(&pool, "");
+
+        for identity in ["me", "other"] {
+            assert_eq!(get_all_contacts(&pool, identity).len(), 1);
+            assert!(is_blocked(&pool, "spammer", identity));
+        }
     }
 
     #[test]
@@ -11030,9 +11247,12 @@ mod migration_tests {
             Some("audio_stored_name")
         );
         assert_eq!(
-            message_cols.len(),
-            MESSAGE_AUDIO_STORED_NAME_COLUMN_INDEX + 1
+            message_cols
+                .get(MESSAGE_RENDERER_COLUMN_INDEX)
+                .map(String::as_str),
+            Some("renderer")
         );
+        assert_eq!(message_cols.len(), MESSAGE_RENDERER_COLUMN_INDEX + 1);
     }
 
     #[test]
@@ -11057,6 +11277,238 @@ mod migration_tests {
             .query_row("SELECT COUNT(*) FROM identities", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1, "data survives repeat init_schema calls");
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused_before_anything_is_written() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratspeak-newer-schema-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let newer = SCHEMA_VERSION + 1;
+        {
+            let pool = init_pool(&dir).unwrap();
+            init_schema(&pool).unwrap();
+            // What a newer build leaves behind: its version, a table and usage
+            // accounting this build does not know, and an index it dropped.
+            pool.get()
+                .unwrap()
+                .execute_batch(&format!(
+                    "UPDATE schema_version SET version = {newer};
+                     CREATE TABLE lxmf_outbox (id TEXT PRIMARY KEY);
+                     INSERT INTO identities (hash, created_at) VALUES ('{id}', 0.0);
+                     INSERT INTO channel_history_room_usage
+                         VALUES ('{id}', '{hub}', 'room', 1, 4096);
+                     DROP INDEX idx_messages_identity_state;",
+                    id = "aa".repeat(16),
+                    hub = "bb".repeat(16),
+                ))
+                .unwrap();
+        }
+        let observer = Connection::open(dir.join(".ratspeak/ratspeak.db")).unwrap();
+        let rows = |sql: &str| -> Vec<String> {
+            let mut statement = observer.prepare(sql).unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        // Changes as soon as any other connection commits.
+        let data_version = || -> i64 {
+            observer
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        let schema = || rows("SELECT type || ' ' || name FROM sqlite_master ORDER BY name");
+        let usage =
+            || rows("SELECT room_name || ' ' || payload_bytes FROM channel_history_room_usage");
+        let (version_before, schema_before, usage_before) = (data_version(), schema(), usage());
+
+        let pool = init_pool(&dir).unwrap();
+        let result = init_schema(&pool);
+
+        assert_eq!(data_version(), version_before, "a write was committed");
+        assert_eq!(schema(), schema_before);
+        assert_eq!(usage(), usage_before);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("database schema {newer} is newer than this build ({SCHEMA_VERSION})")
+        );
+        drop(pool);
+        drop(observer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_schema_version_is_refused_before_anything_is_written() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratspeak-unreadable-schema-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        {
+            let pool = init_pool(&dir).unwrap();
+            init_schema(&pool).unwrap();
+            pool.get()
+                .unwrap()
+                .execute_batch("UPDATE schema_version SET version = 'unreadable';")
+                .unwrap();
+        }
+        let observer = Connection::open(dir.join(".ratspeak/ratspeak.db")).unwrap();
+        let data_version = || -> i64 {
+            observer
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = data_version();
+
+        let pool = init_pool(&dir).unwrap();
+        let result = init_schema(&pool);
+
+        assert_eq!(data_version(), before, "a write was committed");
+        assert!(result.is_err(), "an unreadable version was read as fresh");
+        drop(pool);
+        drop(observer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_newer_database_is_refused_without_opening_it_for_writing() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratspeak-newer-database-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        assert!(refuse_newer_database(&dir).is_ok(), "no database yet");
+        {
+            let pool = init_pool(&dir).unwrap();
+            init_schema(&pool).unwrap();
+        }
+        assert!(refuse_newer_database(&dir).is_ok(), "this build's database");
+        let path = dir.join(".ratspeak/ratspeak.db");
+        {
+            // A newer build that left WAL mode: opening it for writing would
+            // convert the header back before any version check.
+            let conn = Connection::open(&path).unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete");
+            conn.execute(
+                "UPDATE schema_version SET version = ?1",
+                params![SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+
+        let error = refuse_newer_database(&dir).unwrap_err();
+
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(!dir.join(".ratspeak/ratspeak.db-wal").exists());
+        let newer = error.downcast_ref::<NewerSchema>().expect("typed refusal");
+        assert_eq!(
+            (newer.found, newer.supported),
+            (SCHEMA_VERSION + 1, SCHEMA_VERSION)
+        );
+
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE schema_version SET version = 'unreadable'", [])
+            .unwrap();
+        assert!(
+            refuse_newer_database(&dir)
+                .unwrap_err()
+                .downcast_ref::<NewerSchema>()
+                .is_none(),
+            "an unreadable version is refused, not reported as newer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_version_check_leaves_no_side_files_beside_a_wal_database() {
+        // Characters a URI must escape, in a path the check opens as one.
+        let name = if cfg!(windows) {
+            "ratspeak side #files% 1"
+        } else {
+            "ratspeak side #files% ?1"
+        };
+        let dir =
+            std::env::temp_dir().join(format!("{name}-{}-{}", std::process::id(), now_unix_ms()));
+        init_schema(&init_pool(&dir).unwrap()).unwrap();
+        let ratspeak = dir.join(".ratspeak");
+        let path = ratspeak.join("ratspeak.db");
+        let side_files = || {
+            ["ratspeak.db-wal", "ratspeak.db-shm", "ratspeak.db-journal"]
+                .into_iter()
+                .filter(|name| ratspeak.join(name).exists())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(side_files(), Vec::<&str>::new(), "a closed database");
+        let bytes = std::fs::read(&path).unwrap();
+
+        refuse_newer_database(&dir).unwrap();
+
+        assert_eq!(side_files(), Vec::<&str>::new());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        // While a newer writer still holds its change in the WAL, the check
+        // reads through it rather than the file alone.
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(&format!(
+                "PRAGMA wal_autocheckpoint=0;
+                 UPDATE schema_version SET version = {};",
+                SCHEMA_VERSION + 1
+            ))
+            .unwrap();
+        assert!(ratspeak.join("ratspeak.db-wal").exists());
+        let error = refuse_newer_database(&dir).unwrap_err();
+        assert!(error.downcast_ref::<NewerSchema>().is_some(), "{error}");
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interrupted_schema_creation_leaves_no_versionless_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "ratspeak-interrupted-schema-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let pool = init_pool(&dir).unwrap();
+        // Something the creation cannot get past, after the version table.
+        pool.get()
+            .unwrap()
+            .execute_batch("CREATE VIEW channel_history AS SELECT 1 AS sequence;")
+            .unwrap();
+
+        assert!(init_schema(&pool).is_err());
+
+        let conn = pool.get().unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let versioned: i64 = if tables > 0 {
+            conn.query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+                .unwrap()
+        } else {
+            1
+        };
+        assert!(
+            tables == 0 || versioned > 0,
+            "a schema without its version was left behind"
+        );
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// T1-8: every user-data table must be wiped by factory reset, and every
@@ -11121,7 +11573,8 @@ mod migration_tests {
         {
             let conn = pool.get().unwrap();
             conn.execute_batch(
-                "ALTER TABLE messages DROP COLUMN audio_stored_name;
+                "ALTER TABLE messages DROP COLUMN renderer;
+                 ALTER TABLE messages DROP COLUMN audio_stored_name;
                  ALTER TABLE messages DROP COLUMN audio_mode;
                  UPDATE schema_version SET version = 42;",
             )
@@ -11144,7 +11597,7 @@ mod migration_tests {
                 .map(String::as_str),
             Some("audio_stored_name")
         );
-        assert_eq!(columns.len(), MESSAGE_AUDIO_STORED_NAME_COLUMN_INDEX + 1);
+        assert_eq!(columns.len(), MESSAGE_RENDERER_COLUMN_INDEX + 1);
         conn.execute(
             "INSERT INTO messages (
                 id, source, destination, timestamp, identity_id
@@ -11160,6 +11613,52 @@ mod migration_tests {
             )
             .unwrap();
         assert_eq!(defaults, (None, String::new()));
+    }
+
+    #[test]
+    fn migration_46_adds_nullable_renderer_and_keeps_rows() {
+        let pool = empty_pool();
+        init_schema(&pool).unwrap();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages DROP COLUMN renderer;
+                 INSERT INTO messages (id, source, destination, content, timestamp, identity_id)
+                 VALUES ('pre-renderer', 'source', 'destination', '**kept**', 1.0, 'identity');
+                 UPDATE schema_version SET version = 45;",
+            )
+            .unwrap();
+        }
+
+        init_schema(&pool).unwrap();
+        assert_eq!(read_schema_version(&pool), SCHEMA_VERSION);
+        let conn = pool.get().unwrap();
+        let columns = get_column_names(&conn, "messages").unwrap();
+        assert_eq!(
+            columns
+                .get(MESSAGE_RENDERER_COLUMN_INDEX)
+                .map(String::as_str),
+            Some("renderer")
+        );
+        assert_eq!(columns.len(), MESSAGE_RENDERER_COLUMN_INDEX + 1);
+        let kept: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT content, renderer FROM messages WHERE id = 'pre-renderer'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, ("**kept**".to_string(), None));
+        assert!(
+            conn.execute(
+                "UPDATE messages SET renderer = 256 WHERE id = 'pre-renderer'",
+                []
+            )
+            .is_err()
+        );
+        drop(conn);
+        let messages = get_conversation(&pool, "source", "identity", 10);
+        assert!(messages[0]["renderer"].is_null());
     }
 
     /// T1-8: blackhole requests queued for an identity do not survive its
@@ -11866,7 +12365,7 @@ mod identity_tests {
         let err = set_active_identity(&pool, "missing").unwrap_err();
         assert!(err.contains("identity not found"));
 
-        let active = get_active_identity(&pool).unwrap();
+        let active = get_active_identity(&pool).unwrap().unwrap();
         assert_eq!(
             active.get("hash").and_then(|v| v.as_str()),
             Some("identity-a")
@@ -12571,7 +13070,9 @@ mod pending_blackhole_tests {
         assert_eq!(version, SCHEMA_VERSION);
         drop(conn);
 
-        let active = get_active_identity(&pool).expect("active identity remains readable");
+        let active = get_active_identity(&pool)
+            .unwrap()
+            .expect("active identity remains readable");
         assert_eq!(
             active.get("hash").and_then(|v| v.as_str()),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")

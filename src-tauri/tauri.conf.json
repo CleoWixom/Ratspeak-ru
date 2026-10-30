@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicholasgasior/tauri-apps/tauri-v2/crates/tauri-cli/schema.json",
   "productName": "Ratspeak",
-  "version": "1.0.34",
+  "version": "1.0.36",
   "identifier": "org.ratspeak.desktop",
   "build": {
     "frontendDist": "../dashboard"
@@ -33,10 +33,10 @@
       "icons/icon.ico"
     ],
     "android": {
-      "versionCode": 1000064
+      "versionCode": 1000066
     },
     "iOS": {
-      "bundleVersion": "1000064"
+      "bundleVersion": "1000066"
     },
     "linux": {
       "appimage": {
@@ -53,15 +53,17 @@
         "desktopTemplate": "resources/linux/Ratspeak.desktop",
         "files": {
           "/usr/share/metainfo/org.ratspeak.desktop.metainfo.xml": "resources/linux/org.ratspeak.desktop.metainfo.xml",
-          "/usr/lib/udev/rules.d/99-ratspeak.rules": "resources/linux/99-ratspeak.rules"
-        }
+          "/usr/lib/udev/rules.d/70-ratspeak.rules": "resources/linux/70-ratspeak.rules"
+        },
+        "postInstallScript": "resources/linux/udev-postinst.sh"
       },
       "rpm": {
         "desktopTemplate": "resources/linux/Ratspeak.desktop",
         "files": {
           "/usr/share/metainfo/org.ratspeak.desktop.metainfo.xml": "resources/linux/org.ratspeak.desktop.metainfo.xml",
-          "/usr/lib/udev/rules.d/99-ratspeak.rules": "resources/linux/99-ratspeak.rules"
-        }
+          "/usr/lib/udev/rules.d/70-ratspeak.rules": "resources/linux/70-ratspeak.rules"
+        },
+        "postInstallScript": "resources/linux/udev-postinst.sh"
       }
     },
     "macOS": {

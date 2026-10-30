@@ -217,6 +217,12 @@ class MainActivity : TauriActivity() {
         if (appBackCallback != null) return
         val callback = object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                // Android 12+ only backgrounds a task on Back; a failed start
+                // closes, so opening Ratspeak again starts a fresh process.
+                if (RatspeakNativeBridge.coreStartupFailed) {
+                    finishAndRemoveTask()
+                    return
+                }
                 dispatchBackToWebView()
             }
         }
@@ -315,9 +321,11 @@ class MainActivity : TauriActivity() {
             insets
         }
 
-        // Start foreground service
-        val serviceIntent = Intent(this, RatspeakService::class.java)
-        ContextCompat.startForegroundService(this, serviceIntent)
+        // Start foreground service, unless the core already failed to start.
+        if (!RatspeakNativeBridge.coreStartupFailed) {
+            val serviceIntent = Intent(this, RatspeakService::class.java)
+            ContextCompat.startForegroundService(this, serviceIntent)
+        }
         // Wry/Tao registration and this Activity's native UI hooks are ready.
         // If a previous task was removed, reconnect its retained Rust session
         // to this new view without opening another identity or network stack.
@@ -353,27 +361,18 @@ class MainActivity : TauriActivity() {
         // A user returning to the app is the moment a waiting radio is most
         // likely back (powered on, released by another host); retry now.
         RatspeakBleRnodeSupervisor.wake()
-        // ACTION_REFRESH clears per-sender notifications in RatspeakService
-        // and kicks the poll loop so lastKnownUnread is current before the
-        // user reads messages to zero.
-        refreshServicePoll()
     }
 
     override fun onPause() {
         RatspeakNativeBridge.activityResumed(activityGeneration, false)
         super.onPause()
-        refreshServicePoll()
     }
 
-    private fun refreshServicePoll() {
-        try {
-            val intent = Intent(this, RatspeakService::class.java).apply {
-                action = RatspeakService.ACTION_REFRESH
-            }
-            startService(intent)
-        } catch (_: Exception) {
-            // Service not running yet (first onCreate hasn't finished) — safe
-            // to skip; the service will do its first poll as soon as it's up.
+    override fun onStop() {
+        super.onStop()
+        // Home or another app only backgrounds a task; a failed start closes.
+        if (RatspeakNativeBridge.coreStartupFailed && !isChangingConfigurations) {
+            finishAndRemoveTask()
         }
     }
 

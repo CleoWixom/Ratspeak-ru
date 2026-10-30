@@ -102,6 +102,44 @@ function identityPinError(err, fallback) {
         .replace(/Passcode/g, 'PIN');
 }
 
+// A key, phrase or access file is released with its identity's PIN, or after
+// an explicit confirmation when it has none; the backend requires the same.
+// `send(auth)` makes the request with `{ passcode }` or `{ confirmed: true }`
+// and resolves its result. Resolves null when declined. In the PIN sheet every
+// failure stays inline until the user cancels, which never resolves.
+function authorizeIdentityKey(target, opts, send) {
+    if (!(target && target.passcode_protected)) {
+        return rsConfirm({
+            title: opts.title,
+            message: opts.message,
+            confirmText: opts.confirmText,
+            danger: !!opts.danger
+        }).then(function(ok) { return ok ? send({ confirmed: true }) : null; });
+    }
+    return new Promise(function(resolve) {
+        showIdentityModal(opts.title,
+            '<p class="recovery-warn">' + escapeHtml(opts.message) + '</p>' +
+            '<div class="modal-field"><label>PIN</label>' +
+                '<input type="password" id="identity-key-pin" class="modal-input" maxlength="128" autocomplete="off"></div>' +
+            '<div class="modal-error" id="identity-key-error" style="display:none"></div>',
+            function() {
+                var pin = document.getElementById('identity-key-pin').value;
+                var errEl = document.getElementById('identity-key-error');
+                function fail(text) { if (errEl) { errEl.textContent = text; errEl.style.display = ''; } }
+                if (!pin) { fail('Enter your PIN.'); return; }
+                return send({ passcode: pin }).then(function(result) {
+                    closeIdentityModal();
+                    resolve(result);
+                }, function(err) {
+                    fail(identityPinError(err, 'PIN failed.'));
+                });
+            }, opts.danger ? 'danger' : '');
+        var btn = document.getElementById('identity-modal-confirm');
+        if (btn) { btn.textContent = opts.confirmText; btn.dataset.baseLabel = opts.confirmText; }
+    });
+}
+window.authorizeIdentityKey = authorizeIdentityKey;
+
 function identityPasscodeOptionHtml(prefix, opts) {
     opts = opts || {};
     var label = opts.label || 'Encrypt this identity on this device';
@@ -276,14 +314,16 @@ function chooseIdentityExportFormat() {
     });
 }
 
-function backupPinFieldsHtml(prefix, confirm) {
+// `noun` names the PIN in its labels: 'PIN' (default) or 'backup PIN'.
+function backupPinFieldsHtml(prefix, confirm, noun) {
+    noun = noun || 'PIN';
     return '' +
         '<div class="modal-field">' +
-            '<label>PIN</label>' +
+            '<label>' + noun.charAt(0).toUpperCase() + noun.slice(1) + '</label>' +
             '<input type="password" id="' + prefix + '-pin" class="modal-input" maxlength="128" autocomplete="off" placeholder="At least 6 characters">' +
         '</div>' +
         (confirm ? '<div class="modal-field">' +
-            '<label>Confirm PIN</label>' +
+            '<label>Confirm ' + noun + '</label>' +
             '<input type="password" id="' + prefix + '-pin-confirm" class="modal-input" maxlength="128" autocomplete="off">' +
         '</div>' : '') +
         '<div class="modal-error" id="' + prefix + '-pin-error" style="display:none;"></div>';
@@ -399,6 +439,34 @@ function saveIdentityBackupWithAndroid(fileName, backupBase64) {
     });
 }
 
+// How the desktop download of `url` that `start` begins ended, as the save
+// dialog and the WebView report it: `saved`, `cancelled` or `failed`. Null
+// elsewhere, or when no report comes within the dialog's ten minutes.
+function desktopDownloadResult(url, start) {
+    if (typeof isTauriDesktop !== 'function' || !isTauriDesktop() ||
+            !window.RS || typeof RS.listen !== 'function') {
+        start();
+        return Promise.resolve(null);
+    }
+    var report = null;
+    var ended = new Promise(function(resolve) { report = resolve; });
+    return Promise.resolve(RS.listen('download_result', function(data) {
+        if (data && data.url === url) report(data.status || null);
+    })).catch(function() { return null; }).then(function(unlisten) {
+        if (typeof unlisten !== 'function') {
+            start();
+            return null;
+        }
+        var timer = setTimeout(function() { report(null); }, 600000);
+        start();
+        return ended.then(function(status) {
+            clearTimeout(timer);
+            unlisten();
+            return status;
+        });
+    });
+}
+
 function saveBytesToUserFile(bytes, fileName, mimeType, backupBase64) {
     if (hasAndroidIdentityDocumentBridge()) {
         return saveIdentityDocumentWithAndroid(fileName, backupBase64 || bytesToBase64(bytes), mimeType);
@@ -409,15 +477,19 @@ function saveBytesToUserFile(bytes, fileName, mimeType, backupBase64) {
 
     var blob = new Blob([bytes], { type: mimeType || 'application/octet-stream' });
     var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(function() { try { URL.revokeObjectURL(url); } catch (_) {} }, 60000);
-    return Promise.resolve({ method: 'download', fileName: fileName });
+    return desktopDownloadResult(url, function() {
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    }).then(function(status) {
+        var revoke = function() { try { URL.revokeObjectURL(url); } catch (_) {} };
+        if (status) revoke(); else setTimeout(revoke, 60000);
+        return { method: 'download', fileName: fileName, status: status };
+    });
 }
 
 function renderNetworkIdentityCard() {
@@ -714,7 +786,7 @@ function renderActiveIdentityCard() {
             var newName = nameInput.value.trim();
             saveBtn.disabled = true;
             saveBtn.textContent = 'Saving...';
-            RS.invoke('api_set_display_name', { args: { display_name: newName } }).then(function() {
+            RS.invoke('api_set_display_name', { args: { display_name: newName, identity_id: activeIdentityHash } }).then(function() {
                 // Refresh the cached name so no consumer keeps offering the
                 // superseded one (channel nicknames, header, modals).
                 try { localStorage.setItem('ratspeak_identity_name', newName); } catch (_) {}
@@ -836,6 +908,9 @@ function updateRemoveButtonState() {
     }
 }
 
+// Switches this window asked for; their own replies say why one failed.
+var _switchRequestsPending = 0;
+
 function switchToIdentity(hash) {
     var card = document.getElementById('identity-active-card');
     if (card) {
@@ -843,7 +918,14 @@ function switchToIdentity(hash) {
     }
     // Backend reloads LXMF manager + emits identity_switched, which drives
     // full state cleanup + re-emits initial state for the new identity.
-    RS.invoke('switch_identity', { hash: hash }).catch(function() {});
+    _switchRequestsPending += 1;
+    RS.invoke('switch_identity', { hash: hash }).then(function() {
+        _switchRequestsPending -= 1;
+    }, function(err) {
+        _switchRequestsPending -= 1;
+        showToast((err && err.message) ? err.message : 'Could not switch identity', 'toast-error', 4000);
+        loadIdentities();
+    });
 }
 
 function openIdentitySwitcher() {
@@ -993,8 +1075,8 @@ function showRecoveryPhraseBackup(mnemonic, onDone, opts) {
         var copyBtn = document.getElementById('recovery-backup-copy');
         if (copyBtn) {
             copyBtn.addEventListener('click', function() {
-                RS.copyText(mnemonic).then(function(ok) {
-                    if (ok) showCopyConfirmationToast('Recovery phrase');
+                RS.copySecret(mnemonic).then(function(ok) {
+                    if (ok) showSecretCopiedToast('Recovery phrase');
                     else showToast('Could not copy the recovery phrase', 'toast-error', 2000);
                 });
             });
@@ -1017,9 +1099,8 @@ function showRecoveryPhraseBackup(mnemonic, onDone, opts) {
 }
 window.showRecoveryPhraseBackup = showRecoveryPhraseBackup;
 
-// Re-display a software identity's recovery phrase. Passcode-protected identities
-// prompt for the passcode (decrypts from the vault); otherwise the plaintext
-// sidecar is read directly. Hardware identities never reach here (no stored phrase).
+// Re-display the active software identity's recovery phrase, with its PIN or
+// after a confirmation. Hardware identities never reach here (no stored phrase).
 function viewRecoveryPhrase(target) {
     if (!target || target.is_hardware) return;
     var viewOpts = {
@@ -1029,33 +1110,18 @@ function viewRecoveryPhrase(target) {
         button: 'Done',
         requireConfirm: false
     };
-    if (target.passcode_protected) {
-        showIdentityModal('View Recovery Phrase',
-            '<div class="modal-field"><label>PIN</label>' +
-                '<input type="password" id="reveal-passcode-input" class="modal-input" maxlength="128" autocomplete="off"></div>' +
-            '<p class="recovery-warn">Enter your PIN to reveal the ' + RECOVERY_PHRASE_WORDS + '-word recovery phrase for this identity.</p>' +
-            '<div class="modal-error" id="reveal-error" style="display:none"></div>',
-            function() {
-                var pw = document.getElementById('reveal-passcode-input').value;
-                var errEl = document.getElementById('reveal-error');
-                if (!pw) { if (errEl) { errEl.textContent = 'Enter your PIN.'; errEl.style.display = ''; } return; }
-                return RS.invoke('reveal_identity_mnemonic', { args: { hash: target.hash, passcode: pw } }).then(function(data) {
-                    closeIdentityModal();
-                    showRecoveryPhraseBackup(data && data.mnemonic, null, viewOpts);
-                }).catch(function(err) {
-                    if (errEl) { errEl.textContent = identityPinError(err, 'Could not reveal phrase'); errEl.style.display = ''; }
-                });
-            }
-        );
-        var btn = document.getElementById('identity-modal-confirm');
-        if (btn) { btn.textContent = 'Reveal'; btn.dataset.baseLabel = 'Reveal'; }
-    } else {
-        RS.invoke('reveal_identity_mnemonic', { args: { hash: target.hash } }).then(function(data) {
-            showRecoveryPhraseBackup(data && data.mnemonic, null, viewOpts);
-        }).catch(function(err) {
-            showToast((err && err.message) || 'Could not reveal phrase', 'toast-error', 3000);
-        });
-    }
+    authorizeIdentityKey(target, {
+        title: 'View Recovery Phrase',
+        message: 'Anyone who sees these ' + RECOVERY_PHRASE_WORDS + ' words controls this identity. ' +
+            'Make sure no one can see your screen.',
+        confirmText: 'Reveal'
+    }, function(auth) {
+        return RS.invoke('reveal_identity_mnemonic', { args: Object.assign({ hash: target.hash }, auth) });
+    }).then(function(data) {
+        if (data) showRecoveryPhraseBackup(data.mnemonic, null, viewOpts);
+    }).catch(function(err) {
+        showToast((err && err.message) || 'Could not reveal phrase', 'toast-error', 3000);
+    });
 }
 window.viewRecoveryPhrase = viewRecoveryPhrase;
 
@@ -1322,9 +1388,12 @@ function exportActiveIdentity() {
     exportIdentityBackup((active && active.hash) || activeIdentityHash);
 }
 
-function exportIdentityPayload(hash, format, passcode) {
+// `auth` carries the identity's own authorization, and for a backup also the
+// backup's `passcode`.
+function exportIdentityPayload(hash, format, auth) {
+    var args = Object.assign({ hashHex: hash }, auth);
     if (format === 'reticulum') {
-        return RS.invoke('api_export_identity_reticulum_base64', { hashHex: hash }).then(function(data) {
+        return RS.invoke('api_export_identity_reticulum_base64', args).then(function(data) {
             return {
                 bytes: base64ToBytes(data.data_base64),
                 base64: data.data_base64,
@@ -1335,7 +1404,7 @@ function exportIdentityPayload(hash, format, passcode) {
         });
     }
     if (format === 'reticulum-base32') {
-        return RS.invoke('api_export_identity_reticulum_base32', { hashHex: hash }).then(function(data) {
+        return RS.invoke('api_export_identity_reticulum_base32', args).then(function(data) {
             return {
                 bytes: base64ToBytes(data.data_base64),
                 base64: data.data_base64,
@@ -1345,7 +1414,7 @@ function exportIdentityPayload(hash, format, passcode) {
             };
         });
     }
-    return RS.invoke('api_export_identity_backup_base64', { hashHex: hash, passcode: passcode || '' }).then(function(data) {
+    return RS.invoke('api_export_identity_backup_base64', args).then(function(data) {
         return {
             bytes: base64ToBytes(data.backup_base64),
             base64: data.backup_base64,
@@ -1373,9 +1442,11 @@ function saveIdentityExportPayload(payload) {
             return result;
         }).then(function(result) {
             if (!result) return;
-            if (result.method === 'android-document') {
+            if (result.method === 'android-document' || result.status === 'saved') {
                 showToast((result.label || 'Identity export') + ' saved', 'toast-success', 3000);
-            } else {
+            } else if (result.status === 'failed') {
+                showToast('Could not save ' + result.fileName, 'toast-error', 5000);
+            } else if (result.status !== 'cancelled') {
                 showToast('Save prompt opened for ' + result.fileName, 'toast-info', 4000);
             }
         });
@@ -1387,16 +1458,33 @@ function handleIdentityExportError(err) {
     }
 }
 
-function openEncryptedIdentityExportModal(hash, targetName) {
-    var body = backupPinFieldsHtml('identity-export-backup', true) +
-        '<p class="recovery-warn">This PIN encrypts the .rsi backup file. You will need it to import this identity on another device.</p>';
+function openEncryptedIdentityExportModal(hash, target) {
+    var protectedIdentity = !!(target && target.passcode_protected);
+    var body = (protectedIdentity
+            ? '<div class="modal-field"><label>Identity PIN</label>' +
+                  '<input type="password" id="identity-export-identity-pin" class="modal-input" maxlength="128" autocomplete="off"></div>'
+            : '') +
+        backupPinFieldsHtml('identity-export-backup', true, 'backup PIN') +
+        '<p class="recovery-warn">The backup PIN encrypts the .rsi file. You will need it to import this identity on another device.</p>';
     showIdentityModal('Export Identity Backup', body, function() {
+        var errEl = document.getElementById('identity-export-backup-pin-error');
+        function fail(text) { if (errEl) { errEl.textContent = text; errEl.style.display = ''; } }
+        // Opening this sheet and choosing Export is the confirmation.
+        var auth = { confirmed: true };
+        if (protectedIdentity) {
+            var identityPin = document.getElementById('identity-export-identity-pin').value;
+            if (!identityPin) { fail("Enter this identity's PIN."); return; }
+            auth = { identityPasscode: identityPin };
+        }
         var pin = readBackupPin('identity-export-backup', true);
         if (!pin) return;
-        closeIdentityModal();
-        return exportIdentityPayload(hash, 'ratspeak', pin)
-            .then(saveIdentityExportPayload)
-            .catch(handleIdentityExportError);
+        auth.passcode = pin;
+        return exportIdentityPayload(hash, 'ratspeak', auth).then(function(payload) {
+            closeIdentityModal();
+            return saveIdentityExportPayload(payload).catch(handleIdentityExportError);
+        }, function(err) {
+            fail(identityPinError(err, 'Could not export the identity'));
+        });
     });
 }
 
@@ -1411,23 +1499,18 @@ function exportIdentityBackup(hash) {
         return;
     }
     var targetName = target ? identityDisplayName(target) : 'Identity';
-    var chosenFormat = null;
     chooseIdentityExportFormat().then(function(format) {
         if (!format) return null;
         if (format === 'ratspeak') {
-            openEncryptedIdentityExportModal(hash, targetName);
+            openEncryptedIdentityExportModal(hash, target);
             return null;
         }
-        chosenFormat = format;
-        return rsConfirm({
+        return authorizeIdentityKey(target, {
             title: 'Export Private Identity',
             message: exportWarningForFormat(format, targetName),
             confirmText: 'Export',
             danger: true
-        });
-    }).then(function(ok) {
-        if (!ok) return;
-        return exportIdentityPayload(hash, chosenFormat || 'ratspeak');
+        }, function(auth) { return exportIdentityPayload(hash, format, auth); });
     }).then(function(payload) {
         if (!payload) return;
         return saveIdentityExportPayload(payload);
@@ -1819,11 +1902,53 @@ document.addEventListener('DOMContentLoaded', function() {
 
 RS.listen('identity_switching', function() {
     window._identitySwitchInProgress = true;
+    // The previous identity's contacts leave with it; the next start re-sends its own.
+    if (typeof lxmfContacts !== 'undefined') {
+        lxmfContacts = [];
+        if (typeof renderStandaloneContactList === 'function') renderStandaloneContactList();
+    }
     if (typeof clearNetworkInterfaceCaches === 'function') {
         clearNetworkInterfaceCaches({ render: true });
     }
     if (typeof _clearConnectTimeout === 'function') _clearConnectTimeout();
     if (typeof clearConnectPublicPending === 'function') clearConnectPublicPending();
+});
+
+// A switch that did not finish: the previous identity is back, or none is.
+RS.listen('identity_switch_failed', function(data) {
+    window._identitySwitchInProgress = false;
+    if (!_switchRequestsPending && data && data.error) showToast(data.error, 'toast-error', 4000);
+    loadIdentities();
+    if (typeof loadConversations === 'function') loadConversations();
+});
+
+// Drop every cached conversation: after an identity switch or a bulk delete,
+// nothing cached may be merged back into a fresh fetch.
+function resetConversationCaches() {
+    if (typeof lxmfConversation !== 'undefined') lxmfConversation = [];
+    if (typeof _conversationCache !== 'undefined') {
+        for (var k in _conversationCache) delete _conversationCache[k];
+    }
+    if (typeof _conversationCacheSizes !== 'undefined') _conversationCacheSizes = {};
+    if (typeof _conversationCacheBytes !== 'undefined') _conversationCacheBytes = 0;
+    if (typeof _cacheLru !== 'undefined') _cacheLru = [];
+}
+
+// A bulk delete announces what it removed before it re-sends the lists.
+// Events arrive in order, so this drops only what the window held before it.
+RS.listen('identity_data_cleared', function(data) {
+    if (data && data.messages) {
+        if (typeof _messagesClearedCount !== 'undefined') _messagesClearedCount += 1;
+        resetConversationCaches();
+        if (typeof clearReplyTarget === 'function') clearReplyTarget();
+        if (typeof _resetConversationList === 'function') _resetConversationList();
+    }
+    if (data && data.contacts && typeof lxmfContacts !== 'undefined') {
+        lxmfContacts = [];
+        if (typeof renderStandaloneContactList === 'function') renderStandaloneContactList();
+    }
+    if (typeof renderConversation === 'function') renderConversation();
+    if (typeof _reloadPeersAfterCacheClear === 'function') _reloadPeersAfterCacheClear(true);
 });
 
 RS.listen('identity_switched', function(data) {
@@ -1846,15 +1971,9 @@ RS.listen('identity_switched', function(data) {
 
     // Clear identity-scoped frontend state so the old identity's data
     // doesn't leak. PeersCache rehydrates from the new snapshot on activation.
-    if (typeof lxmfContacts !== 'undefined') lxmfContacts = [];
-
-    if (typeof lxmfConversation !== 'undefined') lxmfConversation = [];
-    if (typeof _conversationCache !== 'undefined') {
-        for (var k in _conversationCache) delete _conversationCache[k];
-    }
-    if (typeof _conversationCacheSizes !== 'undefined') _conversationCacheSizes = {};
-    if (typeof _conversationCacheBytes !== 'undefined') _conversationCacheBytes = 0;
-    if (typeof _cacheLru !== 'undefined') _cacheLru = [];
+    // Contacts left when the switch began, and the new identity's start has
+    // already sent its own.
+    resetConversationCaches();
 
     if (typeof _resetConversationSession === 'function') _resetConversationSession('identity_replaced');
     else if (typeof lxmfActiveContact !== 'undefined') lxmfActiveContact = null;
@@ -2453,21 +2572,12 @@ function _hwFinish(result) {
             completeSetupAfterHardwareIdentity(result, pinForSetup);
             return;
         }
-        var finishSetup = function() {
-            if (typeof completeSetupAfterIdentityImport === 'function') {
-                completeSetupAfterIdentityImport(result);
-            } else {
-                reloadToAppLanding();
-            }
-        };
-        if (pinForSetup) {
-            RS.invoke('hw_stage_unlock', { pin: pinForSetup })
-                .catch(function(err) {
-                    window.RS.diag('warn', '[hardware] could not stage first-run unlock PIN:', err && err.message ? err.message : String(err));
-                })
-                .finally(finishSetup);
+        // Without the new identity's hash its PIN can't be staged; it opens
+        // to the unlock prompt instead.
+        if (typeof completeSetupAfterIdentityImport === 'function') {
+            completeSetupAfterIdentityImport(result);
         } else {
-            finishSetup();
+            reloadToAppLanding();
         }
         return;
     }
@@ -2479,8 +2589,9 @@ function _hwFinish(result) {
 function _hwCopyMnemonic() {
     var phrase = _hwCtx && _hwCtx.mnemonic;
     if (!phrase) return;
-    RS.copyText(phrase).then(function(ok) {
-        if (ok) showCopyConfirmationToast('Recovery phrase');
+    RS.copySecret(phrase).then(function(ok) {
+        if (ok) showSecretCopiedToast('Recovery phrase');
+        else showToast('Could not copy the recovery phrase', 'toast-error', 2000);
     });
 }
 
@@ -2850,5 +2961,13 @@ function _hwForgetLockedIdentity() {
 }
 
 if (typeof RS !== 'undefined' && RS.listen) {
-    RS.listen('hardware_locked', function(data) { showHwUnlock(data && data.hash, data && data.kind); });
+    RS.listen('hardware_locked', function(data) {
+        // An auto-lock starts the page over, so none of the identity's data
+        // stays behind the PIN sheet.
+        if (data && data.reason === 'timeout') {
+            window.location.reload();
+            return;
+        }
+        showHwUnlock(data && data.hash, data && data.kind);
+    });
 }

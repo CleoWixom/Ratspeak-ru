@@ -2,7 +2,7 @@
 <html lang="en" data-channel-hosting="off">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-visual">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-visual">
     <meta name="theme-color" content="#FAF7F3">
     <script src="/static/js/theme.js?v=ui-20260924-4"></script>
     <script src="/static/js/text_scale.js?v=ui-20260924-4"></script>
@@ -510,6 +510,11 @@
                                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="5" r="1" fill="currentColor"/><circle cx="12" cy="12" r="1" fill="currentColor"/><circle cx="12" cy="19" r="1" fill="currentColor"/></svg>
                                 </button>
                             </div>
+                        </div>
+                        <div class="lxmf-select-bar" id="lxmf-select-bar" role="toolbar" aria-label="Selected messages" hidden>
+                            <button class="lxmf-select-bar-btn" id="lxmf-select-cancel-btn" type="button">Cancel</button>
+                            <span class="sr-only" id="lxmf-select-status" aria-live="polite"></span>
+                            <button class="lxmf-select-bar-btn lxmf-select-delete-btn" id="lxmf-select-delete-btn" type="button">Delete</button>
                         </div>
                         <div class="lxst-call-strip" id="lxst-call-strip" hidden aria-live="polite">
                             <div class="lxst-call-strip-indicator" aria-hidden="true">
@@ -1279,6 +1284,13 @@
                                     <span class="settings-row-desc" id="settings-text-scale-desc">Choose a comfortable reading size without enlarging controls or touch targets.</span>
                                 </div>
                                 <fieldset class="settings-type-presets" aria-labelledby="settings-text-scale-label" aria-describedby="settings-text-scale-desc">
+                                    <label class="settings-type-preset" data-scale="90">
+                                        <input type="radio" name="settings-text-scale" value="90">
+                                        <span class="settings-type-preset-card">
+                                            <span class="settings-type-preset-sample" aria-hidden="true">Aa</span>
+                                            <span class="settings-type-preset-value">90%</span>
+                                        </span>
+                                    </label>
                                     <label class="settings-type-preset" data-scale="100">
                                         <input type="radio" name="settings-text-scale" value="100" checked>
                                         <span class="settings-type-preset-card">
@@ -1314,6 +1326,13 @@
                                             <span class="settings-type-preset-value">140%</span>
                                         </span>
                                     </label>
+                                    <label class="settings-type-preset" data-scale="150">
+                                        <input type="radio" name="settings-text-scale" value="150">
+                                        <span class="settings-type-preset-card">
+                                            <span class="settings-type-preset-sample" aria-hidden="true">Aa</span>
+                                            <span class="settings-type-preset-value">150%</span>
+                                        </span>
+                                    </label>
                                 </fieldset>
                             </div>
                             <div class="settings-row">
@@ -1336,6 +1355,13 @@
                                     <input type="checkbox" id="desktop-notifications-toggle" checked>
                                     <span class="prop-slider"></span>
                                 </label>
+                            </div>
+                            <div class="settings-row" id="settings-row-notification-preview" style="display:none;">
+                                <div class="settings-row-info">
+                                    <span class="settings-row-label">Previews</span>
+                                    <span class="settings-row-desc">What message alerts show</span>
+                                </div>
+                                <button class="selector-badge" id="notification-preview-select" type="button">Name and message</button>
                             </div>
                             <div class="settings-row" id="settings-row-keep-connected" style="display:none;">
                                 <div class="settings-row-info">
@@ -1433,8 +1459,8 @@
                             </div>
                             <div class="settings-row" id="hw-lock-row" style="display:none;border-bottom:none;">
                                 <div class="settings-row-info">
-                                    <span class="settings-row-label">Hardware Key Auto-Lock</span>
-                                    <span class="settings-row-desc">Lock a YubiKey identity after inactivity; PIN required to resume. When disabled, it locks only when you quit. Applies on next unlock.</span>
+                                    <span class="settings-row-label">Auto-Lock</span>
+                                    <span class="settings-row-desc">Lock an identity with a PIN once this long has passed since you unlocked it; its PIN is required to resume. Even with Auto-Lock off, switching identities or restarting Ratspeak locks it. Applies on next unlock.</span>
                                 </div>
                                 <button class="selector-badge settings-state-value" id="hw-lock-timeout-select">OFF</button>
                             </div>
@@ -1469,7 +1495,7 @@
                                     <span class="prop-slider"></span>
                                 </label>
                             </div>
-                            <div class="settings-row" style="border-bottom:none;">
+                            <div class="settings-row">
                                 <div class="settings-row-info">
                                     <span class="settings-row-label">Announce Ratspeak usage</span>
                                     <span class="settings-row-desc">Let others know you support games, calls, and extra features.</span>
@@ -1478,6 +1504,13 @@
                                     <input type="checkbox" id="announce-ratspeak-usage-toggle" checked>
                                     <span class="prop-slider"></span>
                                 </label>
+                            </div>
+                            <div class="settings-row" style="border-bottom:none;">
+                                <div class="settings-row-info">
+                                    <span class="settings-row-label">Trusted websites</span>
+                                    <span class="settings-row-desc">Links to these websites open without asking.</span>
+                                </div>
+                                <button type="button" class="selector-badge selector-badge-no-caret" id="settings-trusted-links-btn">None</button>
                             </div>
                         </div>
                     </div>
@@ -2104,6 +2137,7 @@
 <script src="/static/js/voice_ringtones.js?v=ui-20260924-4"></script>
 <script src="/static/js/vendor/jsQR.js"></script>
 <script src="/static/js/contact_card.js?v=ui-20260924-4"></script>
+<script src="/static/js/markdown.js?v=ui-20260924-4"></script>
 <script src="/static/js/lxmf.js?v=ui-20260924-4"></script>
 <script src="/static/js/message_search.js?v=ui-20260924-4"></script>
 <script src="/static/js/voice_memos.js?v=ui-20260924-4"></script>

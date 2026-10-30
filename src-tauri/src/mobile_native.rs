@@ -351,6 +351,43 @@ pub(crate) fn save_stored_file(
     .unwrap_or(false)
 }
 
+/// Copies a key or phrase, marked sensitive so clipboard previews hide it.
+#[cfg(target_os = "android")]
+pub(crate) fn copy_secret(text: &str) -> bool {
+    with_android_bridge(|env, class| {
+        use jni::objects::{JObject, JValue};
+        let text = env.new_string(text)?;
+        env.call_static_method(
+            class,
+            "copySecret",
+            "(Ljava/lang/String;)Z",
+            &[JValue::Object(JObject::from(text))],
+        )?
+        .z()
+    })
+    .unwrap_or(false)
+}
+
+/// Clears the copied key or phrase unless the app sees something else copied
+/// since.
+#[cfg(target_os = "android")]
+pub(crate) fn clear_secret() {
+    let _ = with_android_bridge(|env, class| {
+        env.call_static_method(class, "clearSecret", "()V", &[])?;
+        Ok(())
+    });
+}
+
+/// No session will run in this process: stop the foreground service and keep
+/// it from starting again.
+#[cfg(target_os = "android")]
+pub(crate) fn report_startup_failure() {
+    let _ = with_android_bridge(|env, class| {
+        env.call_static_method(class, "reportStartupFailure", "()V", &[])?;
+        Ok(())
+    });
+}
+
 #[cfg(target_os = "android")]
 fn android_request_usb_permission(
     vendor_id: u16,

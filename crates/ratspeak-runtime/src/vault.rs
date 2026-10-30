@@ -5,6 +5,7 @@
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use zeroize::Zeroizing;
@@ -25,7 +26,7 @@ pub const MAX_HEX_IMPORT_BYTES: usize = 2 * MAX_IDENTITY_IMPORT_BYTES;
 pub const MAX_OUTER_WHITESPACE_BYTES: usize = 4096;
 pub const MAX_PASSCODE_BYTES: usize = 1024;
 pub const MAX_SEED_BYTES: usize = 4096;
-const SEED_FILE: &str = "identity.seed";
+pub(crate) const SEED_FILE: &str = "identity.seed";
 static JOB_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 thread_local! {
@@ -411,6 +412,28 @@ impl VaultJob {
         ValidatedVault::new(&v)?;
         Ok(v)
     }
+    /// The identity in `id_dir` with its stored recovery phrase: from its vault
+    /// with `passcode`, or without one from its plaintext files.
+    pub fn open_identity(
+        &self,
+        id_dir: &Path,
+        passcode: Option<&str>,
+    ) -> Result<UnlockedVault, VaultError> {
+        if id_dir.join("identity.hwid").exists() {
+            return Err(VaultError::InvalidFormat(
+                "hardware identity keeps its key on the token".into(),
+            ));
+        }
+        let enc = id_dir.join("identity.enc");
+        match passcode {
+            Some(passcode) => self.decrypt_identity(passcode, &read_vault(&enc)?),
+            None if enc.exists() => Err(VaultError::InvalidFormat("passcode required".into())),
+            None => Ok(UnlockedVault {
+                key: read_plain_identity_key(&id_dir.join("identity"))?,
+                mnemonic: read_seed(&id_dir.join(SEED_FILE))?,
+            }),
+        }
+    }
     pub fn reveal_mnemonic(
         &self,
         id_dir: &Path,
@@ -433,6 +456,19 @@ impl VaultJob {
         }
         read_seed(&id_dir.join(SEED_FILE))?
             .ok_or_else(|| VaultError::InvalidFormat("no recovery phrase stored".into()))
+    }
+    /// Stores `mnemonic` as `id_dir`'s plaintext recovery phrase and reads it
+    /// back; a passcode identity keeps its phrase in its vault instead.
+    pub fn store_plaintext_seed(&self, id_dir: &Path, mnemonic: &str) -> Result<(), VaultError> {
+        if id_dir.join("identity.hwid").exists() {
+            return Err(VaultError::InvalidFormat(
+                "hardware identity has no stored phrase".into(),
+            ));
+        }
+        if id_dir.join("identity.enc").exists() {
+            return Ok(());
+        }
+        write_seed_file(&id_dir.join(SEED_FILE), mnemonic.trim())
     }
     pub fn prepare_protection(
         &self,
@@ -681,28 +717,55 @@ pub fn read_vault(path: &Path) -> Result<EncryptedVault, VaultError> {
     ValidatedVault::new(&v)?;
     Ok(v)
 }
+/// Reads a secret file of at most `max_len` bytes into one buffer allocated
+/// up front and wiped on drop, so neither growth nor a refused file leaves a
+/// copy behind. `None` when the file does not exist.
+fn read_secret_file(path: &Path, max_len: usize) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut data = Zeroizing::new(vec![0u8; max_len + 1]);
+    let mut filled = 0;
+    while filled < data.len() {
+        match file.read(&mut data[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if filled > max_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {max_len}-byte limit"),
+        ));
+    }
+    data.truncate(filled);
+    Ok(Some(data))
+}
+/// A plain identity file holds the raw 64-byte key; larger files are refused
+/// after reading at most this much.
+const PLAIN_IDENTITY_MAX_BYTES: usize = 1024;
 pub fn read_plain_identity_key(path: &Path) -> Result<Zeroizing<[u8; 64]>, VaultError> {
-    let bytes = Zeroizing::new(
-        read_file_bounded(path, 64)
-            .map_err(io_error)?
-            .ok_or_else(|| VaultError::Io("identity not found".into()))?,
-    );
-    let key: [u8; 64] = bytes.as_slice().try_into().map_err(|_| {
+    let bytes = read_secret_file(path, PLAIN_IDENTITY_MAX_BYTES)
+        .map_err(io_error)?
+        .ok_or_else(|| VaultError::Io("identity not found".into()))?;
+    let key = Zeroizing::new(<[u8; 64]>::try_from(bytes.as_slice()).map_err(|_| {
         VaultError::InvalidFormat("private identity must be exactly 64 bytes".into())
-    })?;
-    Identity::from_private_key(&key)
+    })?);
+    Identity::from_private_key(&key[..])
         .map_err(|_| VaultError::InvalidFormat("private identity".into()))?;
-    Ok(Zeroizing::new(key))
+    Ok(key)
 }
 fn read_seed(path: &Path) -> Result<Option<Zeroizing<String>>, VaultError> {
-    read_file_bounded(path, MAX_SEED_BYTES)
+    read_secret_file(path, MAX_SEED_BYTES)
         .map_err(io_error)?
         .map(|bytes| {
-            let value = Zeroizing::new(
-                String::from_utf8(bytes)
-                    .map_err(|_| VaultError::InvalidFormat("seed utf8".into()))?,
-            );
-            Ok(Zeroizing::new(value.trim().to_string()))
+            let phrase = std::str::from_utf8(&bytes)
+                .map_err(|_| VaultError::InvalidFormat("seed utf8".into()))?;
+            Ok(Zeroizing::new(phrase.trim().to_string()))
         })
         .transpose()
 }
@@ -719,16 +782,7 @@ fn write_seed_file(path: &Path, phrase: &str) -> Result<(), VaultError> {
     Ok(())
 }
 pub fn store_plaintext_seed(id_dir: &Path, mnemonic: &str) -> Result<(), VaultError> {
-    let _job = try_acquire_job()?;
-    if id_dir.join("identity.hwid").exists() {
-        return Err(VaultError::InvalidFormat(
-            "hardware identity has no stored phrase".into(),
-        ));
-    }
-    if id_dir.join("identity.enc").exists() {
-        return Ok(());
-    }
-    write_seed_file(&id_dir.join(SEED_FILE), mnemonic.trim())
+    try_acquire_job()?.store_plaintext_seed(id_dir, mnemonic)
 }
 pub fn has_stored_mnemonic(id_dir: &Path) -> bool {
     let enc = id_dir.join("identity.enc");

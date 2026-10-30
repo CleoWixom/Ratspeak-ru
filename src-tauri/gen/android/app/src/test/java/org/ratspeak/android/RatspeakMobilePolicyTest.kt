@@ -473,6 +473,16 @@ class RatspeakMobilePolicyTest {
     }
 
     @Test
+    fun onlyAnUnpairedRadioAndroidHasNoTypeForIsScannedBeforeBonding() {
+        // A forgotten pairing: Android would otherwise bond over classic Bluetooth.
+        assertTrue(RatspeakMobilePolicy.bleBondNeedsScan(bonded = false, deviceTypeKnown = false))
+        // Just seen by the add flow's scan.
+        assertFalse(RatspeakMobilePolicy.bleBondNeedsScan(bonded = false, deviceTypeKnown = true))
+        assertFalse(RatspeakMobilePolicy.bleBondNeedsScan(bonded = true, deviceTypeKnown = false))
+        assertFalse(RatspeakMobilePolicy.bleBondNeedsScan(bonded = true, deviceTypeKnown = true))
+    }
+
+    @Test
     fun bleSetupFailureIsClassifiedFromEvidence() {
         fun classify(
             bonded: Boolean = true,

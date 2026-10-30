@@ -2,20 +2,22 @@ use std::path::PathBuf;
 
 /// Platform data dir from `app_data_dir`, falling back to `$HOME/ratspeak-data`.
 /// `RATSPEAK_DATA_DIR` overrides it (dev/test — e.g. a throwaway profile that
-/// leaves the real config untouched).
-pub fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
+/// leaves the real config untouched). The flag says the folder is Ratspeak's
+/// own, not one the user named.
+pub fn resolve_data_dir(app: &tauri::AppHandle) -> (PathBuf, bool) {
     use tauri::Manager;
 
     if let Ok(dir) = std::env::var("RATSPEAK_DATA_DIR") {
         if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
+            return (PathBuf::from(dir), false);
         }
     }
 
-    app.path().app_data_dir().unwrap_or_else(|_| {
+    let dir = app.path().app_data_dir().unwrap_or_else(|_| {
         let home = dirs_fallback();
         home.join("ratspeak-data")
-    })
+    });
+    (dir, true)
 }
 
 fn dirs_fallback() -> PathBuf {

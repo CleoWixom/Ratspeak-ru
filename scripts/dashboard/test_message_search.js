@@ -44,8 +44,10 @@ const context = {
 };
 vm.runInNewContext(source, context);
 const lxmfSource = fs.readFileSync(path.join(root, 'static/js/lxmf.js'), 'utf8');
-const displayStart = lxmfSource.indexOf('function _messageDisplayContent(');
-vm.runInNewContext(lxmfSource.slice(displayStart, lxmfSource.indexOf('\nfunction ', displayStart + 1)), context);
+for (const name of ['_messageBodyContent', '_messageDisplayContent', '_messagePlainContent', '_messageIsMarkdown']) {
+    const start = lxmfSource.indexOf('function ' + name + '(');
+    vm.runInNewContext(lxmfSource.slice(start, lxmfSource.indexOf('\nfunction ', start + 1)), context);
+}
 function type(value) { input.value = value; input.handlers.input(); }
 function fire() { const batch = [...timers.values()]; timers.clear(); batch.forEach(fn => fn()); }
 async function settle() { for (let i = 0; i < 4; i++) await Promise.resolve(); }

@@ -44,6 +44,13 @@ pub ratspeak_core::notification::NativeNotificationKind::Call
 pub ratspeak_core::notification::NativeNotificationKind::Channel
 pub ratspeak_core::notification::NativeNotificationKind::Game
 pub ratspeak_core::notification::NativeNotificationKind::Message
+pub enum ratspeak_core::notification::NotificationPreview
+pub ratspeak_core::notification::NotificationPreview::NameAndMessage
+pub ratspeak_core::notification::NotificationPreview::NameOnly
+pub ratspeak_core::notification::NotificationPreview::Neither
+impl ratspeak_core::notification::NotificationPreview
+pub fn ratspeak_core::notification::NotificationPreview::as_str(self) -> &'static str
+pub fn ratspeak_core::notification::NotificationPreview::parse(&str) -> core::option::Option<Self>
 pub struct ratspeak_core::notification::NativeNotification
 pub ratspeak_core::notification::NativeNotification::body: alloc::string::String
 pub ratspeak_core::notification::NativeNotification::kind: ratspeak_core::notification::NativeNotificationKind
@@ -58,10 +65,14 @@ pub fn ratspeak_core::notification::NativeNotification::message(impl core::conve
 pub struct ratspeak_core::notification::NoopNotifier
 impl ratspeak_core::notification::NativeNotifier for ratspeak_core::notification::NoopNotifier
 pub fn ratspeak_core::notification::NoopNotifier::notify(&self, ratspeak_core::notification::NativeNotification)
+pub fn ratspeak_core::notification::NoopNotifier::withdraw_all(&self)
 pub trait ratspeak_core::notification::NativeNotifier: core::marker::Send + core::marker::Sync
 pub fn ratspeak_core::notification::NativeNotifier::notify(&self, ratspeak_core::notification::NativeNotification)
+pub fn ratspeak_core::notification::NativeNotifier::withdraw_all(&self)
 impl ratspeak_core::notification::NativeNotifier for ratspeak_core::notification::NoopNotifier
 pub fn ratspeak_core::notification::NoopNotifier::notify(&self, ratspeak_core::notification::NativeNotification)
+pub fn ratspeak_core::notification::NoopNotifier::withdraw_all(&self)
+pub fn ratspeak_core::notification::with_preview(ratspeak_core::notification::NativeNotification, ratspeak_core::notification::NotificationPreview) -> ratspeak_core::notification::NativeNotification
 pub mod ratspeak_core::radio
 pub struct ratspeak_core::radio::RnodeCatalog
 pub ratspeak_core::radio::RnodeCatalog::bandwidth_max: u64
@@ -153,6 +164,13 @@ pub ratspeak_core::NativeNotificationKind::Call
 pub ratspeak_core::NativeNotificationKind::Channel
 pub ratspeak_core::NativeNotificationKind::Game
 pub ratspeak_core::NativeNotificationKind::Message
+pub enum ratspeak_core::NotificationPreview
+pub ratspeak_core::NotificationPreview::NameAndMessage
+pub ratspeak_core::NotificationPreview::NameOnly
+pub ratspeak_core::NotificationPreview::Neither
+impl ratspeak_core::notification::NotificationPreview
+pub fn ratspeak_core::notification::NotificationPreview::as_str(self) -> &'static str
+pub fn ratspeak_core::notification::NotificationPreview::parse(&str) -> core::option::Option<Self>
 pub struct ratspeak_core::NativeNotification
 pub ratspeak_core::NativeNotification::body: alloc::string::String
 pub ratspeak_core::NativeNotification::kind: ratspeak_core::notification::NativeNotificationKind
@@ -171,6 +189,7 @@ pub fn ratspeak_core::emitter::NoopEmitter::try_emit(&self, &str, serde_json::va
 pub struct ratspeak_core::NoopNotifier
 impl ratspeak_core::notification::NativeNotifier for ratspeak_core::notification::NoopNotifier
 pub fn ratspeak_core::notification::NoopNotifier::notify(&self, ratspeak_core::notification::NativeNotification)
+pub fn ratspeak_core::notification::NoopNotifier::withdraw_all(&self)
 pub const ratspeak_core::LXMF_DELIVERY_APP_NAME: &str
 pub const ratspeak_core::LXMF_PROPAGATION_APP_NAME: &str
 pub trait ratspeak_core::Emitter: core::marker::Send + core::marker::Sync
@@ -181,6 +200,8 @@ pub fn ratspeak_core::emitter::NoopEmitter::emit(&self, &str, serde_json::value:
 pub fn ratspeak_core::emitter::NoopEmitter::try_emit(&self, &str, serde_json::value::Value) -> core::result::Result<(), ratspeak_core::emitter::EmitError>
 pub trait ratspeak_core::NativeNotifier: core::marker::Send + core::marker::Sync
 pub fn ratspeak_core::NativeNotifier::notify(&self, ratspeak_core::notification::NativeNotification)
+pub fn ratspeak_core::NativeNotifier::withdraw_all(&self)
 impl ratspeak_core::notification::NativeNotifier for ratspeak_core::notification::NoopNotifier
 pub fn ratspeak_core::notification::NoopNotifier::notify(&self, ratspeak_core::notification::NativeNotification)
+pub fn ratspeak_core::notification::NoopNotifier::withdraw_all(&self)
 pub fn ratspeak_core::hex_to_array16(&str) -> core::option::Option<[u8; 16]>

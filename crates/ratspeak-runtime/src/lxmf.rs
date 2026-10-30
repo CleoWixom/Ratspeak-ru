@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 use lxmf_core::admission::{AdmissionEpochs, DownloadedPropagationMessage, SuppressionLedger};
 use lxmf_core::constants::{
-    DELIVERY_RETRY_WAIT, MAX_DELIVERY_ATTEMPTS, MAX_PATHLESS_TRIES, PATH_REQUEST_WAIT,
-    STRUCT_OVERHEAD, TIMESTAMP_SIZE,
+    DELIVERY_RETRY_WAIT, ENCRYPTED_PACKET_MAX_CONTENT, MAX_DELIVERY_ATTEMPTS, MAX_PATHLESS_TRIES,
+    PATH_REQUEST_WAIT, STRUCT_OVERHEAD, TIMESTAMP_SIZE,
 };
 use lxmf_core::delivery_ratchet::{
     DeliveryAnnounceKind, DeliveryRatchetError, DeliveryRatchetState,
@@ -52,11 +52,6 @@ const MAX_LXMF_RESOURCE_BYTES: usize = rns_protocol::resource::MAX_RESOURCE_SIZE
 pub const MAX_AUDIO_FIELD_BYTES: usize = 1_000_000;
 pub const AUDIO_MESSAGE_FILE_NAME: &str = "Voice message.opus";
 pub const COMPACT_AUDIO_FILE_NAME: &str = "Voice message.c2raw";
-// A deferred PoW stamp can still be attached after semantic submission. Its
-// MessagePack bin8 representation is marker + u8 length + 32 stamp bytes; the
-// surrounding fixarray marker remains one byte when the payload grows 4 -> 5.
-const MAX_DEFERRED_STAMP_WIRE_BYTES: usize = 2 + lxmf_core::constants::STAMP_SIZE;
-const OPPORTUNISTIC_MAX_CONTENT_BYTES: usize = 295;
 const AUTO_PROPAGATION_CHECK_INTERVAL_SECS: f64 = 5.0 * 60.0;
 const BACKCHANNEL_COMMAND_BUFFER: usize = 64;
 mod packet_delivery;
@@ -119,6 +114,34 @@ fn encode_msgpack_value(value: &rmpv::Value) -> Vec<u8> {
     let mut buf = Vec::new();
     rmpv::encode::write_value(&mut buf, value).expect("writing msgpack to Vec cannot fail");
     buf
+}
+
+/// FIELD_RENDERER is a native MessagePack integer on the wire, never bin.
+fn renderer_custom_field(renderer: u8) -> (u8, Vec<u8>) {
+    (
+        lxmf_core::constants::FIELD_RENDERER,
+        encode_msgpack_value(&rmpv::Value::from(renderer)),
+    )
+}
+
+/// Inbound FIELD_RENDERER; only an unsigned MessagePack integer in 0..=255 counts.
+pub(crate) fn message_renderer(msg: &LxMessage) -> Option<u8> {
+    renderer_from_encoded(
+        msg.get_field(lxmf_core::constants::FIELD_RENDERER)?
+            .encoded(),
+    )
+}
+
+fn renderer_from_encoded(mut encoded: &[u8]) -> Option<u8> {
+    // Integer markers only, so no other value shape is ever decoded.
+    if !matches!(encoded.first()?, 0x00..=0x7f | 0xcc..=0xcf | 0xd0..=0xd3) {
+        return None;
+    }
+    let value = rmpv::decode::read_value(&mut encoded).ok()?;
+    if !encoded.is_empty() {
+        return None;
+    }
+    u8::try_from(value.as_u64()?).ok()
 }
 
 pub fn get_ratspeak_announce_app_data(
@@ -793,11 +816,25 @@ impl OutboundMessageView for SignedLxMessage {
         self.message_id()
     }
     fn packed_len(&self) -> Result<usize, MessageError> {
-        self.packed_len().and_then(|n| {
-            n.checked_add(MAX_DEFERRED_STAMP_WIRE_BYTES)
-                .ok_or_else(|| MessageError::PackFailed("wire size overflow".into()))
-        })
+        finalized_packed_len(self)
     }
+}
+
+/// The wire length `msg` has once finalized with its recipient stamp, which
+/// `finalize` derives from the same signed inputs. As in Python's `pack()`, the
+/// stamp is one more bin8 element: marker, length, and a ticket's 16-byte hash
+/// or a 32-byte proof of work. The payload's fixarray marker stays one byte.
+fn finalized_packed_len(msg: &SignedLxMessage) -> Result<usize, MessageError> {
+    let stamp = if msg.outbound_ticket().is_some() {
+        2 + lxmf_core::constants::TICKET_LENGTH
+    } else if msg.stamp_cost().is_some() {
+        2 + lxmf_core::constants::STAMP_SIZE
+    } else {
+        0
+    };
+    msg.packed_len()?
+        .checked_add(stamp)
+        .ok_or_else(|| MessageError::PackFailed("wire size overflow".into()))
 }
 
 fn message_within_resource_limit(msg: &impl OutboundMessageView) -> bool {
@@ -872,7 +909,7 @@ fn normalize_protocol_delivery_method(msg: &mut impl OutboundMessageView) {
         && let Ok(packed_len) = msg.packed_len()
     {
         let content_size = packed_len.saturating_sub(96 + TIMESTAMP_SIZE + STRUCT_OVERHEAD);
-        if content_size > OPPORTUNISTIC_MAX_CONTENT_BYTES {
+        if content_size > ENCRYPTED_PACKET_MAX_CONTENT {
             msg.method = DeliveryMethod::Direct;
         }
     }
@@ -904,6 +941,7 @@ pub struct AttachmentMessageRequest<'a> {
     pub db_pool: &'a DbPool,
     pub identity_id: &'a str,
     pub preference: DeliveryPreference,
+    pub renderer: Option<u8>,
 }
 
 /// Fully-specified first-class LXMF audio send request with an explicit wire mode.
@@ -1049,6 +1087,7 @@ pub struct MessageSendRequest<'a> {
     pub identity_id: &'a str,
     pub preference: DeliveryPreference,
     pub profile: DeliveryProfile,
+    pub renderer: Option<u8>,
 }
 
 pub struct ReplyMessageSendRequest<'a> {
@@ -1061,6 +1100,7 @@ pub struct ReplyMessageSendRequest<'a> {
     pub identity_id: &'a str,
     pub preference: DeliveryPreference,
     pub profile: DeliveryProfile,
+    pub renderer: Option<u8>,
 }
 
 struct MessageWithMethodRequest<'a> {
@@ -1074,6 +1114,7 @@ struct MessageWithMethodRequest<'a> {
     profile: DeliveryProfile,
     reply_to_id: Option<&'a str>,
     reply_to_preview: Option<&'a str>,
+    renderer: Option<u8>,
 }
 
 pub struct ReactionSendRequest<'a> {
@@ -1444,7 +1485,7 @@ fn load_hwid_identity(
     )
 }
 
-fn bounded_plain_identity_from_file(
+pub(crate) fn bounded_plain_identity_from_file(
     path: &Path,
 ) -> Result<Identity, Box<dyn std::error::Error + Send + Sync>> {
     let key = crate::vault::read_plain_identity_key(path)?;
@@ -1490,12 +1531,10 @@ pub fn contact_card_public_key_from_profile(data_dir: &Path, hash_hex: &str) -> 
     }
 
     let id_file = data_dir.join("identities").join(hash_hex).join("identity");
-    std::fs::read(id_file).ok().and_then(|key_bytes| {
-        Identity::from_private_key(&key_bytes)
-            .ok()
-            .filter(|identity| hex::encode(identity.hash) == hash_hex)
-            .map(|identity| identity.get_public_key())
-    })
+    bounded_plain_identity_from_file(&id_file)
+        .ok()
+        .filter(|identity| hex::encode(identity.hash) == hash_hex)
+        .map(|identity| identity.get_public_key())
 }
 
 #[cfg(feature = "seed")]
@@ -1871,22 +1910,9 @@ fn prepare_identity_namespace(
 /// Establish/reconcile the app's private directory tree before configuration,
 /// database pools, identity files or network workers are opened. Call once at
 /// process startup; live identity rebuilds only validate its committed marker.
+/// Takes the profile owner lock, and refuses a newer build's database, before
+/// reconciling anything.
 pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
-    if data_root.join(STORAGE_NAMESPACE_READY).try_exists()? {
-        // Completed roots cannot become fresh merely because directories have
-        // disappeared. Only an explicit recorded deletion may retire identity
-        // descendants; the app/database roots remain established.
-        let ready = data_root.join(STORAGE_NAMESPACE_READY);
-        if read_file_bounded(&ready, 64)?.as_deref() == Some(STORAGE_NAMESPACE_RESET_BYTES) {
-            let witness = storage_namespace_witness(data_root)?;
-            let reset = durable_reconcile(&ready, STORAGE_NAMESPACE_RESET_BYTES)
-                .map_err(std::io::Error::other)?;
-            finish_identity_storage_reset(&data_root.join(".ratspeak"), &witness, &reset)?;
-            durable_write(&ready, STORAGE_NAMESPACE_BYTES).map_err(std::io::Error::other)?;
-        } else {
-            established_storage_namespace(data_root)?;
-        }
-    }
     // Platform-provided roots already exist. A fresh explicit/test root may
     // need multiple ancestors, all established from an existing outside anchor.
     if !data_root.try_exists()? {
@@ -1911,14 +1937,41 @@ pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
         durable_create_dir_all(data_root, &witness).map_err(std::io::Error::other)?;
     }
     require_real_directory(data_root)?;
+    // Reconciliation may retire identities; never run it beside another owner,
+    // or on a newer build's profile, whose recorded intents may differ.
+    crate::owner_lock::acquire_owner_lock(data_root)?;
+    let ratspeak_dir = data_root.join(".ratspeak");
+    // The version check must not follow a linked `.ratspeak` either.
+    match std::fs::symlink_metadata(&ratspeak_dir) {
+        Ok(_) => require_real_directory(&ratspeak_dir)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    db::refuse_newer_database(data_root).map_err(std::io::Error::other)?;
+    if data_root.join(STORAGE_NAMESPACE_READY).try_exists()? {
+        // Completed roots cannot become fresh merely because directories have
+        // disappeared. Only an explicit recorded deletion may retire identity
+        // descendants; the app/database roots remain established.
+        let ready = data_root.join(STORAGE_NAMESPACE_READY);
+        if read_file_bounded(&ready, 64)?.as_deref() == Some(STORAGE_NAMESPACE_RESET_BYTES) {
+            let witness = storage_namespace_witness(data_root)?;
+            let reset = durable_reconcile(&ready, STORAGE_NAMESPACE_RESET_BYTES)
+                .map_err(std::io::Error::other)?;
+            finish_identity_storage_reset(&ratspeak_dir, &witness, &reset)?;
+            durable_write(&ready, STORAGE_NAMESPACE_BYTES).map_err(std::io::Error::other)?;
+        } else {
+            established_storage_namespace(data_root)?;
+        }
+    }
     let witness = durable_write(
         &data_root.join(STORAGE_NAMESPACE_WITNESS),
         STORAGE_NAMESPACE_BYTES,
     )
     .map_err(std::io::Error::other)?;
-    let ratspeak_dir = data_root.join(".ratspeak");
     let identities = ratspeak_dir.join("identities");
     durable_create_dir_all(&ratspeak_dir, &witness).map_err(std::io::Error::other)?;
+    // Builds before private folders left it readable by every local user.
+    make_private(&ratspeak_dir)?;
     durable_create_dir_all(&identities, &witness).map_err(std::io::Error::other)?;
     for entry in std::fs::read_dir(&identities)? {
         let entry = entry?;
@@ -1962,6 +2015,79 @@ pub fn initialize_storage_namespace(data_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Why an identity was not imported. Nothing it wrote is left behind.
+#[derive(Debug, thiserror::Error)]
+pub enum IdentityImportError {
+    #[error("Identity already exists")]
+    Exists,
+    #[error("{0}")]
+    InvalidKey(String),
+    /// Its recovery phrase could not be stored.
+    #[error("recovery phrase not stored: {0}")]
+    Phrase(crate::vault::VaultError),
+    #[error("{0}")]
+    Storage(String),
+}
+
+/// Takes back what a failed import wrote. A namespace it created goes whole,
+/// through its recorded deletion, which a restart finishes; in one that was
+/// there before, only the files it created go.
+fn discard_failed_import(ratspeak_dir: &Path, hash: &str, new_namespace: bool, created: &[&Path]) {
+    if new_namespace {
+        let retired = data_root_for_identity_namespace(ratspeak_dir)
+            .and_then(|root| established_storage_namespace(&root))
+            .and_then(|witness| retire_identity_namespace(ratspeak_dir, hash, true, &witness));
+        match retired {
+            Ok(()) => return,
+            Err(error) => tracing::warn!(%error, "could not retire a failed import's namespace"),
+        }
+    }
+    for path in created {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(%error, "could not remove a failed import's file"),
+        }
+    }
+}
+
+/// Leaves `dir` to its owner alone, as a fresh profile's folders are. Unix
+/// only; elsewhere the platform's own folders already are.
+pub fn make_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(dir)?.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Stores an attachment in an identity's `files` directory, under a fresh name.
+pub(crate) fn save_attachment_in(
+    files_dir: &Path,
+    file_name: &str,
+    data: &[u8],
+) -> std::io::Result<String> {
+    use std::io::Write;
+
+    let stored_name = attachment_storage_name(file_name);
+    let path = files_dir.join(&stored_name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    if let Err(error) = file.write_all(data).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(stored_name)
+}
+
 impl LxmfManager {
     /// Load/create a manager after [`initialize_storage_namespace`] has completed
     /// before database or configuration users are opened.
@@ -1970,13 +2096,18 @@ impl LxmfManager {
         preferred_identity_hash: Option<&str>,
         hw_pin: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::load_or_create_with_vault_job(data_dir, preferred_identity_hash, hw_pin, None)
+        Self::load_or_create_with_vault_job(
+            data_dir,
+            preferred_identity_hash,
+            hw_pin.as_deref(),
+            None,
+        )
     }
 
     pub(crate) fn load_or_create_with_vault_job(
         data_dir: &Path,
         preferred_identity_hash: Option<&str>,
-        hw_pin: Option<String>,
+        hw_pin: Option<&str>,
         job: Option<&crate::vault::VaultJob>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if preferred_identity_hash
@@ -1998,10 +2129,10 @@ impl LxmfManager {
             let enc_file = identities_dir.join(hash).join("identity.enc");
             if hwid_file.exists() {
                 is_hardware = true;
-                load_hwid_identity(&hwid_file, hash, hw_pin.as_deref())?
+                load_hwid_identity(&hwid_file, hash, hw_pin)?
             } else if enc_file.exists() {
                 // Passcode-protected software identity; `hw_pin` carries the passcode.
-                load_encrypted_identity(&enc_file, hash, hw_pin.as_deref(), job)?
+                load_encrypted_identity(&enc_file, hash, hw_pin, job)?
             } else if id_file.exists() {
                 tracing::info!(identity = %crate::short_id(hash), "Loading active identity from profile");
                 bounded_plain_identity_from_file(&id_file)?
@@ -2373,32 +2504,85 @@ impl LxmfManager {
         nickname: &str,
         db_pool: &DbPool,
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self::import_identity_with_phrase(
+            ratspeak_dir,
+            key_bytes,
+            None,
+            nickname,
+            db_pool,
+        )?)
+    }
+
+    /// Imports a private identity, with the recovery phrase it derives from
+    /// when it has one. The phrase is stored and read back before the key,
+    /// and the row comes last: an identity that fails leaves none of them.
+    pub fn import_identity_with_phrase(
+        ratspeak_dir: &Path,
+        key_bytes: &[u8],
+        phrase: Option<(&str, &crate::vault::VaultJob)>,
+        nickname: &str,
+        db_pool: &DbPool,
+    ) -> Result<(String, String), IdentityImportError> {
         if key_bytes.len() != 64 {
-            return Err("Identity key must be exactly 64 bytes".into());
+            return Err(IdentityImportError::InvalidKey(
+                "Identity key must be exactly 64 bytes".into(),
+            ));
         }
 
         let identity = Identity::from_private_key(key_bytes)
-            .map_err(|e| format!("Invalid identity key: {e}"))?;
+            .map_err(|e| IdentityImportError::InvalidKey(format!("Invalid identity key: {e}")))?;
         let hash_hex = hex::encode(identity.hash);
 
         let id_dir = ratspeak_dir.join("identities").join(&hash_hex);
-        if id_dir.join("identity").exists() {
-            return Err("Identity already exists".into());
+        let key_path = id_dir.join("identity");
+        if key_path.exists() {
+            return Err(IdentityImportError::Exists);
         }
 
         let lxmf_dest =
             Destination::hash_from_name_and_identity(LXMF_APP_NAME, Some(&identity.hash));
         let lxmf_hex = hex::encode(lxmf_dest);
 
-        initialize_identity_storage_namespace(ratspeak_dir, &hash_hex)?;
-        identity.to_file(&id_dir.join("identity"))?;
+        let storage =
+            |error: &dyn std::fmt::Display| IdentityImportError::Storage(error.to_string());
+        let new_namespace = !id_dir.try_exists().map_err(|e| storage(&e))?;
+        initialize_identity_storage_namespace(ratspeak_dir, &hash_hex).map_err(|e| storage(&e))?;
+        let discard = |created: &[&Path]| {
+            discard_failed_import(ratspeak_dir, &hash_hex, new_namespace, created);
+        };
+        let seed_path = id_dir.join(crate::vault::SEED_FILE);
+        let mut created = Vec::new();
+        if let Some((phrase, job)) = phrase {
+            let seed_existed = seed_path.try_exists().map_err(|e| storage(&e))?;
+            if !seed_existed {
+                created.push(seed_path.as_path());
+            }
+            if let Err(error) = job.store_plaintext_seed(&id_dir, phrase) {
+                // An uncertain or unverified write may have left this phrase.
+                if seed_existed && matches!(error, crate::vault::VaultError::RecoveryRequired(_)) {
+                    created.push(seed_path.as_path());
+                }
+                discard(&created);
+                return Err(IdentityImportError::Phrase(error));
+            }
+        }
+        created.push(key_path.as_path());
+        if let Err(error) = identity.to_file(&key_path) {
+            discard(&created);
+            return Err(storage(&error));
+        }
 
         let display_name = if nickname.is_empty() {
             format!("!Ratspeak.org-{}", &lxmf_hex[..6])
         } else {
             nickname.to_string()
         };
-        db::save_identity(db_pool, &hash_hex, &lxmf_hex, nickname, &display_name);
+        if let Err(error) =
+            db::try_save_identity(db_pool, &hash_hex, &lxmf_hex, nickname, &display_name)
+        {
+            discard(&created);
+            return Err(storage(&error));
+        }
 
         tracing::info!(identity = %crate::short_id(&hash_hex), "Imported identity");
         Ok((hash_hex, lxmf_hex))
@@ -2428,22 +2612,6 @@ impl LxmfManager {
         let witness = established_storage_namespace(data_root)?;
         retire_identity_namespace(&data_root.join(".ratspeak"), hash_hex, cascade, &witness)?;
         Ok(())
-    }
-
-    pub fn export_identity(&self, hash_hex: &str) -> Option<Vec<u8>> {
-        if self.identity_hash == hash_hex
-            && !self.is_hardware
-            && let Some(private_key) = self.identity.get_private_key()
-        {
-            return Some(private_key.to_vec());
-        }
-
-        let id_file = self
-            .data_dir
-            .join("identities")
-            .join(hash_hex)
-            .join("identity");
-        std::fs::read(&id_file).ok()
     }
 
     pub fn contact_card_public_key(&self, hash_hex: &str) -> Option<[u8; 64]> {
@@ -2562,9 +2730,12 @@ impl LxmfManager {
         msg.include_ticket = true;
 
         for (field_id, bytes) in custom_fields {
-            // FIELD_REACTION is a native msgpack dict on the wire; everything
-            // else we emit packs as bin.
-            if *field_id == lxmf_core::constants::FIELD_REACTION {
+            // FIELD_REACTION (dict) and FIELD_RENDERER (int) are native msgpack
+            // on the wire; everything else we emit packs as bin.
+            if matches!(
+                *field_id,
+                lxmf_core::constants::FIELD_REACTION | lxmf_core::constants::FIELD_RENDERER
+            ) {
                 msg.set_msgpack_field(*field_id, bytes.clone()).ok()?;
             } else {
                 msg.set_field(*field_id, bytes.clone()).ok()?;
@@ -2594,6 +2765,7 @@ impl LxmfManager {
             identity_id,
             preference: DeliveryPreference::Auto,
             profile: DeliveryProfile::Message,
+            renderer: None,
         })
     }
 
@@ -2628,6 +2800,7 @@ impl LxmfManager {
             profile: request.profile,
             reply_to_id: None,
             reply_to_preview: None,
+            renderer: request.renderer,
         })
         .ok_or(LxmfSubmissionFailure::PreparationFailed)
     }
@@ -2654,6 +2827,7 @@ impl LxmfManager {
             profile: request.profile,
             reply_to_id: Some(request.reply_to_id),
             reply_to_preview: Some(request.reply_to_preview),
+            renderer: request.renderer,
         })
         .map(|queued| queued.message_id)
     }
@@ -2684,6 +2858,7 @@ impl LxmfManager {
             profile: DeliveryProfile::Message,
             reply_to_id: None,
             reply_to_preview: None,
+            renderer: None,
         })
         .map(|queued| queued.message_id)
     }
@@ -2703,10 +2878,11 @@ impl LxmfManager {
             profile,
             reply_to_id,
             reply_to_preview,
+            renderer,
         } = request;
         let reply_to_id = reply_to_id.unwrap_or("");
         let reply_to_preview = reply_to_preview.unwrap_or("");
-        let custom_fields = if reply_to_id.is_empty() {
+        let mut custom_fields = if reply_to_id.is_empty() {
             Vec::new()
         } else {
             ratspeak_chat_custom_fields(&RatspeakChatExtension::Reply {
@@ -2716,6 +2892,7 @@ impl LxmfManager {
             })
             .unwrap_or_default()
         };
+        custom_fields.extend(renderer.map(renderer_custom_field));
         let mut msg = self.create_message_with_custom_fields(
             dest_hash_hex,
             content,
@@ -2748,7 +2925,7 @@ impl LxmfManager {
 
         // The manager lock is still held here, so the router cannot advance
         // this freshly accepted message before its local history row exists.
-        db::save_message(
+        db::save_message_with_audio(
             db_pool,
             &msg_id,
             &self.lxmf_hash,
@@ -2766,6 +2943,9 @@ impl LxmfManager {
             reply_to_id,
             reply_to_preview,
             Some(delivery_method_name(method)),
+            None,
+            "",
+            renderer,
         );
 
         Some(LxmfQueuedMessage {
@@ -2838,6 +3018,7 @@ impl LxmfManager {
             db_pool,
             identity_id,
             preference,
+            renderer,
         } = request;
 
         let dest_bytes =
@@ -2870,6 +3051,10 @@ impl LxmfManager {
             msg.set_file_attachment_field(file_name, file_bytes)
                 .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         }
+        if let Some((field_id, bytes)) = renderer.map(renderer_custom_field) {
+            msg.set_msgpack_field(field_id, bytes)
+                .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
+        }
 
         msg.include_ticket = true;
         let intent = self
@@ -2884,12 +3069,8 @@ impl LxmfManager {
             .sign_with(|bytes| identity.sign(bytes).ok_or("identity signing unavailable"))
             .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         normalize_protocol_delivery_method(&mut msg);
-        let packed_len = msg
-            .packed_len()
-            .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
-        let packed_len = packed_len
-            .checked_add(MAX_DEFERRED_STAMP_WIRE_BYTES)
-            .ok_or(LxmfSubmissionFailure::PreparationFailed)?;
+        let packed_len =
+            finalized_packed_len(&msg).map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         if let Err(error) = validate_attachment_envelope_size(packed_len) {
             tracing::warn!(
                 packed_len,
@@ -2925,7 +3106,7 @@ impl LxmfManager {
                 (file_name, stored_name.as_str(), "", "")
             };
 
-        if db::try_save_message(
+        if db::try_save_message_with_audio(
             db_pool,
             &msg_id,
             &self.lxmf_hash,
@@ -2943,6 +3124,9 @@ impl LxmfManager {
             "",
             "",
             Some(delivery_method_name(method)),
+            None,
+            "",
+            renderer,
         )
         .is_err()
         {
@@ -3033,12 +3217,8 @@ impl LxmfManager {
             .sign_with(|bytes| identity.sign(bytes).ok_or("identity signing unavailable"))
             .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         normalize_protocol_delivery_method(&mut msg);
-        let packed_len = msg
-            .packed_len()
-            .map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
-        let packed_admission_len = packed_len
-            .checked_add(MAX_DEFERRED_STAMP_WIRE_BYTES)
-            .ok_or(LxmfSubmissionFailure::PreparationFailed)?;
+        let packed_admission_len =
+            finalized_packed_len(&msg).map_err(|_| LxmfSubmissionFailure::PreparationFailed)?;
         validate_audio_message_size(packed_admission_len)?;
         if audio_mode == lxmf_core::constants::AM_CODEC2_700C && packed_admission_len > 3_659 {
             return Err(LxmfSubmissionFailure::ResourceLimitExceeded {
@@ -3089,6 +3269,7 @@ impl LxmfManager {
             Some(delivery_method_name(method)),
             Some(audio_mode),
             &stored_name,
+            None,
         )
         .is_err()
         {
@@ -3377,20 +3558,7 @@ impl LxmfManager {
     }
 
     pub fn save_attachment(&self, file_name: &str, data: &[u8]) -> std::io::Result<String> {
-        use std::io::Write;
-
-        let stored_name = attachment_storage_name(file_name);
-        let path = self.files_dir().join(&stored_name);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        if let Err(error) = file.write_all(data).and_then(|_| file.sync_all()) {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
-        }
-        Ok(stored_name)
+        save_attachment_in(&self.files_dir(), file_name, data)
     }
 
     fn adopt_staged_attachment(
@@ -8187,6 +8355,7 @@ mod tests {
                 identity_id: "identity-a",
                 preference: DeliveryPreference::Direct,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .expect("reply send");
 
@@ -8567,6 +8736,168 @@ mod tests {
     }
 
     #[test]
+    fn storage_namespace_touches_nothing_while_another_owner_holds_the_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let other = std::fs::File::create(temp.path().join(".ratspeak-host.lock")).unwrap();
+        rns_identity::persistence::try_lock_exclusive(&other).unwrap();
+
+        let error = initialize_storage_namespace(temp.path()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
+        assert!(!temp.path().join(".ratspeak").exists());
+        assert!(!temp.path().join(STORAGE_NAMESPACE_WITNESS).exists());
+    }
+
+    /// Set only in the second process: the profile root it tries to open.
+    const SECOND_OWNER_ROOT: &str = "RATSPEAK_TEST_SECOND_OWNER_ROOT";
+
+    #[test]
+    fn storage_namespace_second_process_leaves_recorded_deletions_untouched() {
+        if let Some(root) = std::env::var_os(SECOND_OWNER_ROOT) {
+            let error = initialize_storage_namespace(Path::new(&root)).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let manager = LxmfManager::load_or_create(temp.path(), None, None).unwrap();
+        let hash = manager.identity_hash.clone();
+        let identities = manager.data_dir.join("identities");
+        drop(manager);
+        let intent = identities.join(format!("{hash}.namespace-delete"));
+        durable_write(&intent, DELETE_IDENTITY_ALL).unwrap();
+        let ready = temp.path().join(STORAGE_NAMESPACE_READY);
+        durable_write(&ready, STORAGE_NAMESPACE_RESET_BYTES).unwrap();
+
+        // The same test, run as another process against this profile.
+        let name = concat!(
+            module_path!(),
+            "::storage_namespace_second_process_leaves_recorded_deletions_untouched"
+        );
+        let name = name.split_once("::").unwrap().1;
+        let second = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(SECOND_OWNER_ROOT, temp.path())
+            .output()
+            .unwrap();
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&second.stdout),
+            String::from_utf8_lossy(&second.stderr)
+        );
+
+        assert!(
+            std::fs::read(&ready).unwrap() == STORAGE_NAMESPACE_RESET_BYTES,
+            "the second process finished the pending reset"
+        );
+        assert!(
+            intent.is_file() && identities.join(&hash).join("identity").is_file(),
+            "the second process retired the identity"
+        );
+        assert!(second.status.success(), "{output}");
+        assert!(output.contains("test result: ok. 1 passed"), "{output}");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn storage_namespace_refuses_a_linked_profile_before_reading_its_database() {
+        let temp = tempfile::tempdir().unwrap();
+        // A newer database somewhere else, and a profile whose `.ratspeak`
+        // only links to it.
+        let elsewhere = temp.path().join("elsewhere");
+        let pool = crate::db::init_pool(&elsewhere).unwrap();
+        crate::db::init_schema(&pool).unwrap();
+        let current: i64 = pool
+            .get()
+            .unwrap()
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute("UPDATE schema_version SET version = ?1", [current + 1])
+            .unwrap();
+        drop(pool);
+        let root = temp.path().join("profile");
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere.join(".ratspeak"), root.join(".ratspeak")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(elsewhere.join(".ratspeak"), root.join(".ratspeak"))
+            .unwrap();
+
+        let error = initialize_storage_namespace(&root).unwrap_err();
+
+        assert!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<crate::db::NewerSchema>())
+                .is_none(),
+            "the linked database was read"
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // A profile made before private folders is readable by every local user.
+    #[cfg(unix)]
+    #[test]
+    fn storage_namespace_makes_an_older_readable_profile_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let ratspeak = temp.path().join(".ratspeak");
+        std::fs::create_dir(&ratspeak).unwrap();
+        std::fs::set_permissions(&ratspeak, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        initialize_storage_namespace(temp.path()).unwrap();
+
+        let mode = std::fs::metadata(&ratspeak).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn storage_namespace_refuses_a_newer_database_before_reconciling() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let manager = LxmfManager::load_or_create(temp.path(), None, None).unwrap();
+        let hash = manager.identity_hash.clone();
+        let identities = manager.data_dir.join("identities");
+        drop(manager);
+        let pool = crate::db::init_pool(temp.path()).unwrap();
+        crate::db::init_schema(&pool).unwrap();
+        let current: i64 = pool
+            .get()
+            .unwrap()
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute("UPDATE schema_version SET version = ?1", [current + 1])
+            .unwrap();
+        drop(pool);
+        // A newer build recorded a deletion and a reset in a format this
+        // build may read differently; neither may be replayed here.
+        let intent = identities.join(format!("{hash}.namespace-delete"));
+        durable_write(&intent, DELETE_IDENTITY_ALL).unwrap();
+        let ready = temp.path().join(STORAGE_NAMESPACE_READY);
+        durable_write(&ready, STORAGE_NAMESPACE_RESET_BYTES).unwrap();
+
+        let result = initialize_storage_namespace(temp.path());
+
+        assert!(
+            std::fs::read(&ready).unwrap() == STORAGE_NAMESPACE_RESET_BYTES,
+            "the pending reset was finished"
+        );
+        assert!(
+            intent.is_file() && identities.join(&hash).join("identity").is_file(),
+            "the recorded deletion was replayed"
+        );
+        let error = result.unwrap_err();
+        let newer = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<crate::db::NewerSchema>())
+            .expect("a newer database is reported as such");
+        assert_eq!((newer.found, newer.supported), (current + 1, current));
+    }
+
+    #[test]
     fn ratchet_files_are_identity_scoped_and_restart_verified() {
         let unique = TEMP_LXMF_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!(
@@ -8663,7 +8994,7 @@ mod tests {
     }
 
     #[test]
-    fn export_identity_uses_unlocked_active_identity_without_plaintext_file() {
+    fn contact_card_public_key_uses_the_loaded_identity_without_its_key_file() {
         let unique = TEMP_LXMF_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!(
             "ratspeak-lxmf-export-active-test-{}-{}-{unique}",
@@ -8676,7 +9007,6 @@ mod tests {
         initialize_storage_namespace(&tmp).unwrap();
         let mgr = LxmfManager::load_or_create(&tmp, None, None).unwrap();
         let hash = mgr.identity_hash.clone();
-        let private_key = mgr.identity.get_private_key().unwrap().to_vec();
         let public_key = mgr.identity.get_public_key();
         let id_file = tmp
             .join(".ratspeak")
@@ -8685,7 +9015,6 @@ mod tests {
             .join("identity");
         std::fs::remove_file(id_file).unwrap();
 
-        assert_eq!(mgr.export_identity(&hash).unwrap(), private_key);
         assert_eq!(mgr.contact_card_public_key(&hash).unwrap(), public_key);
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -8764,7 +9093,6 @@ mod tests {
         )
         .unwrap();
 
-        assert!(mgr.export_identity(&hash).is_none());
         assert_eq!(mgr.contact_card_public_key(&hash).unwrap(), public_key);
         assert_eq!(
             contact_card_public_key_from_profile(&tmp.join(".ratspeak"), &hash),
@@ -10792,6 +11120,32 @@ mod tests {
         assert!(!id_dir.exists());
     }
 
+    // An identity is created with its row or not at all: a row that cannot
+    // be written takes the key written before it along.
+    #[test]
+    fn an_imported_identity_whose_row_cannot_be_written_leaves_no_key() {
+        let root = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(root.path()).unwrap();
+        let pool = db::init_pool(root.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        pool.get()
+            .unwrap()
+            .execute_batch("DROP TABLE identities")
+            .unwrap();
+        let identity = Identity::new();
+        let key = identity.get_private_key().unwrap();
+        let ratspeak_dir = root.path().join(".ratspeak");
+
+        let result = LxmfManager::import_identity_to_data_dir(&ratspeak_dir, &key[..], "A", &pool);
+
+        assert!(result.is_err());
+        let profile = ratspeak_dir
+            .join("identities")
+            .join(hex::encode(identity.hash));
+        assert!(!profile.join("identity").exists());
+        assert!(!profile.exists(), "the namespace it created stays");
+    }
+
     #[test]
     fn auto_delivery_defaults_to_direct_for_user_messages() {
         let pool = test_pool();
@@ -11122,7 +11476,7 @@ mod tests {
     fn oversized_opportunistic_payload_normalizes_to_direct() {
         let mut mgr = test_manager();
         let dest = "cccccccccccccccccccccccccccccccc";
-        let content = "x".repeat(OPPORTUNISTIC_MAX_CONTENT_BYTES + 512);
+        let content = "x".repeat(ENCRYPTED_PACKET_MAX_CONTENT + 512);
         let mut msg = mgr
             .create_final_message(dest, &content, "", DeliveryMethod::Opportunistic)
             .unwrap();
@@ -11138,7 +11492,7 @@ mod tests {
         let mut mgr = test_manager();
         let identity_id = mgr.identity_hash.clone();
         let dest = "cd".repeat(16);
-        let content = "x".repeat(OPPORTUNISTIC_MAX_CONTENT_BYTES + 512);
+        let content = "x".repeat(ENCRYPTED_PACKET_MAX_CONTENT + 512);
 
         let queued = mgr
             .send_message_with_preference_report(MessageSendRequest {
@@ -11149,6 +11503,7 @@ mod tests {
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Opportunistic,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .expect("oversized opportunistic message should queue as Direct");
 
@@ -11157,6 +11512,167 @@ mod tests {
             db::get_message_delivery_method(&pool, &queued.message_id, &identity_id).as_deref(),
             Some("direct")
         );
+    }
+
+    /// Python LXMF's own `pack()` decisions on either side of the fallback to
+    /// direct delivery, with no stamp, a ticket stamp and a proof of work
+    /// (`tools/generate-lxmf-opportunistic-golden.py`).
+    fn opportunistic_golden() -> Value {
+        let golden: Value =
+            serde_json::from_str(include_str!("../testdata/lxmf-opportunistic-golden.json"))
+                .unwrap();
+        assert_eq!(
+            golden["encrypted_packet_max_content"],
+            ENCRYPTED_PACKET_MAX_CONTENT
+        );
+        golden
+    }
+
+    /// The recipient stamp inputs of a golden case on a message being drafted.
+    fn golden_stamp(golden: &Value, case: &Value) -> (Option<[u8; 16]>, Option<u8>) {
+        match case["stamp"].as_str().unwrap() {
+            "none" => (None, None),
+            "ticket" => (Some([0x5A; 16]), None),
+            "proof_of_work" => (None, Some(golden["stamp_cost"].as_u64().unwrap() as u8)),
+            other => panic!("unknown stamp {other}"),
+        }
+    }
+
+    #[test]
+    fn the_stamp_room_is_what_finalization_attaches() {
+        let ticket = Some([0x5A; 16]);
+        for (outbound_ticket, stamp_cost) in [
+            (None, None),
+            (ticket, None),
+            (None, Some(0)),
+            (ticket, Some(8)),
+        ] {
+            let mut draft = LxMessageDraft::new(
+                [0x11; 16],
+                [0x22; 16],
+                "",
+                "hello",
+                DeliveryMethod::Opportunistic,
+            )
+            .unwrap();
+            draft.outbound_ticket = outbound_ticket;
+            draft.stamp_cost = stamp_cost;
+            let msg = draft
+                .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                    &[7; 32],
+                ))
+                .unwrap();
+            let predicted = OutboundMessageView::packed_len(&msg).unwrap();
+            let stamp = msg.generate_recipient_stamp().unwrap();
+            assert_eq!(
+                msg.finalize(stamp).unwrap().packed_len().unwrap(),
+                predicted,
+                "ticket {outbound_ticket:?}, stamp cost {stamp_cost:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_opportunistic_fallback_matches_python_for_each_stamp() {
+        let golden = opportunistic_golden();
+        for case in golden["cases"].as_array().unwrap() {
+            let length = case["content_length"].as_u64().unwrap() as usize;
+            let mut draft = LxMessageDraft::new(
+                [0x11; 16],
+                [0x22; 16],
+                golden["title"].as_str().unwrap(),
+                &"x".repeat(length),
+                DeliveryMethod::Opportunistic,
+            )
+            .unwrap();
+            (draft.outbound_ticket, draft.stamp_cost) = golden_stamp(&golden, case);
+            let mut msg = draft
+                .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                    &[7; 32],
+                ))
+                .unwrap();
+            assert_eq!(
+                msg.packed_len().unwrap() as u64,
+                case["unstamped_packed_size"].as_u64().unwrap(),
+                "{case}"
+            );
+
+            normalize_protocol_delivery_method(&mut msg);
+
+            assert_eq!(
+                delivery_method_name(msg.method),
+                case["method"].as_str().unwrap(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn opportunistic_sends_are_recorded_as_python_sends_them() {
+        // A title and content that make this manager's message, before its
+        // stamp, `size` bytes on the wire.
+        fn sized(mgr: &mut LxmfManager, dest: &str, size: usize) -> (String, String) {
+            let mut wire = |title: usize, content: usize| {
+                mgr.create_message(
+                    dest,
+                    &"x".repeat(content),
+                    &"t".repeat(title),
+                    DeliveryMethod::Opportunistic,
+                )
+                .unwrap()
+                .packed_len()
+                .unwrap()
+            };
+            let estimate = (200 + size).saturating_sub(wire(0, 200));
+            (0..3)
+                .flat_map(|title| {
+                    (estimate.saturating_sub(3)..=estimate + 1).map(move |c| (title, c))
+                })
+                .find(|&(title, content)| wire(title, content) == size)
+                .map(|(title, content)| ("t".repeat(title), "x".repeat(content)))
+                .expect("a message of the golden size")
+        }
+        let golden = opportunistic_golden();
+        let pool = test_pool();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        for case in golden["cases"].as_array().unwrap() {
+            let mut mgr = test_manager();
+            let identity_id = mgr.identity_hash.clone();
+            let dest = [0xCE; 16];
+            let dest_hex = hex::encode(dest);
+            match golden_stamp(&golden, case) {
+                (Some(token), _) => mgr
+                    .router
+                    .ticket_store
+                    .remember_outbound(lxmf_core::ticket::Ticket::new(token, dest, now + 3600.0)),
+                (None, Some(cost)) => mgr.router.set_stamp_cost(dest, cost),
+                (None, None) => {}
+            }
+            let size = case["unstamped_packed_size"].as_u64().unwrap() as usize;
+            let (title, content) = sized(&mut mgr, &dest_hex, size);
+
+            let queued = mgr
+                .send_message_with_preference_report(MessageSendRequest {
+                    dest_hash_hex: &dest_hex,
+                    content: &content,
+                    title: &title,
+                    db_pool: &pool,
+                    identity_id: &identity_id,
+                    preference: DeliveryPreference::Opportunistic,
+                    profile: DeliveryProfile::Message,
+                    renderer: None,
+                })
+                .unwrap();
+
+            assert_eq!(
+                db::get_message_delivery_method(&pool, &queued.message_id, &identity_id).as_deref(),
+                case["method"].as_str(),
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -11214,6 +11730,7 @@ mod tests {
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Auto,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .expect("normal Auto send");
         assert_eq!(normal.method, DeliveryMethod::Direct);
@@ -11230,6 +11747,7 @@ mod tests {
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Auto,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .expect("reply Auto send");
         let reply_hash: [u8; 32] = hex::decode(reply).unwrap().try_into().expect("reply hash");
@@ -11249,6 +11767,7 @@ mod tests {
                 db_pool: &pool,
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Auto,
+                renderer: None,
             })
             .expect("attachment Auto send");
         assert_eq!(attachment.method, DeliveryMethod::Direct);
@@ -11292,6 +11811,7 @@ mod tests {
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Direct,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .is_ok()
         );
@@ -11313,6 +11833,7 @@ mod tests {
                 identity_id: &identity_id,
                 preference: DeliveryPreference::Auto,
                 profile: DeliveryProfile::Message,
+                renderer: None,
             })
             .expect("no-compression Auto send");
         assert_eq!(no_compression.method, DeliveryMethod::Direct);
@@ -11333,6 +11854,7 @@ mod tests {
             identity_id: &identity_id,
             preference: DeliveryPreference::Direct,
             profile: DeliveryProfile::Message,
+            renderer: None,
         });
 
         assert_eq!(result, Err(LxmfSubmissionFailure::PreparationFailed));
@@ -11367,7 +11889,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_stamp_reserve_matches_actual_packed_lxm_at_efficient_boundary() {
+    fn the_stamp_room_matches_the_stamped_message_at_the_efficient_boundary() {
         fn message_with_audio_len(audio_len: usize) -> SignedLxMessage {
             let mut message = lxmf_core::message::LxMessageDraft::new(
                 [0x11; 16],
@@ -11380,6 +11902,8 @@ mod tests {
             message
                 .set_audio_field(lxmf_core::constants::AM_OPUS_OGG, &vec![0; audio_len])
                 .unwrap();
+            // A recipient that asks for a proof-of-work stamp.
+            message.stamp_cost = Some(8);
             message
                 .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
                     &[7; 32],
@@ -11389,45 +11913,40 @@ mod tests {
 
         let limit = rns_protocol::resource::MAX_EFFICIENT_SIZE;
         let mut audio_len = limit - 512;
-        let unstamped = loop {
+        let at_limit = loop {
             let message = message_with_audio_len(audio_len);
-            let packed_len = message.packed_len().unwrap();
-            let predicted = packed_len + MAX_DEFERRED_STAMP_WIRE_BYTES;
+            let predicted = finalized_packed_len(&message).unwrap();
             match predicted.cmp(&limit) {
                 std::cmp::Ordering::Equal => break message,
                 std::cmp::Ordering::Less => audio_len += limit - predicted,
                 std::cmp::Ordering::Greater => audio_len -= predicted - limit,
             }
         };
-        let unstamped_len = unstamped.packed_len().unwrap();
-        assert_eq!(unstamped_len + MAX_DEFERRED_STAMP_WIRE_BYTES, limit);
-
-        let stamped = unstamped
-            .finalize(Some(lxmf_core::message::RecipientStamp::ProofOfWork(
-                [0x44; 32],
-            )))
-            .unwrap();
-        assert_eq!(stamped.packed_len().unwrap(), limit);
         assert_eq!(
-            validate_audio_message_size(unstamped_len + MAX_DEFERRED_STAMP_WIRE_BYTES),
+            validate_audio_message_size(finalized_packed_len(&at_limit).unwrap()),
             Err(LxmfSubmissionFailure::ResourceLimitExceeded {
                 actual_bytes: limit,
                 limit_bytes: limit,
             })
         );
+        let stamped = at_limit
+            .finalize(Some(lxmf_core::message::RecipientStamp::ProofOfWork(
+                [0x44; 32],
+            )))
+            .unwrap();
+        assert_eq!(stamped.packed_len().unwrap(), limit);
 
         let below = message_with_audio_len(audio_len - 1);
-        let below_unstamped_len = below.packed_len().unwrap();
+        assert_eq!(
+            validate_audio_message_size(finalized_packed_len(&below).unwrap()),
+            Ok(())
+        );
         let below = below
             .finalize(Some(lxmf_core::message::RecipientStamp::ProofOfWork(
                 [0x55; 32],
             )))
             .unwrap();
         assert_eq!(below.packed_len().unwrap(), limit - 1);
-        assert_eq!(
-            validate_audio_message_size(below_unstamped_len + MAX_DEFERRED_STAMP_WIRE_BYTES),
-            Ok(())
-        );
     }
 
     #[test]
@@ -11922,6 +12441,207 @@ mod tests {
         assert!(!mgr.auto_live_fallback.contains(&message_id));
     }
 
+    fn renderer_test_message(field: Option<lxmf_core::message::FieldValue>) -> LxMessage {
+        let mut draft =
+            LxMessageDraft::new([3; 16], [4; 16], "", "**hi**", DeliveryMethod::Direct).unwrap();
+        if let Some(value) = field {
+            draft
+                .set_field_value(lxmf_core::constants::FIELD_RENDERER, value)
+                .unwrap();
+        }
+        draft
+            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                &[7; 32],
+            ))
+            .unwrap()
+            .finalize(None)
+            .unwrap()
+    }
+
+    #[test]
+    fn inbound_renderer_accepts_only_unsigned_msgpack_integers() {
+        for (encoded, expected) in [
+            (&[0x02][..], Some(2)),
+            (&[0x00][..], Some(0)),
+            (&[0xcc, 0xff][..], Some(255)),
+            (&[0xcd, 0x00, 0x02][..], Some(2)),
+            (&[0xd0, 0x02][..], Some(2)),
+            (&[0xcd, 0x01, 0x00][..], None),
+            (&[0xff][..], None),
+            (&[0xd0, 0xfe][..], None),
+            (&[0xc4, 0x01, 0x02][..], None),
+            (&[0xa1, b'2'][..], None),
+            (&[0xca, 0x40, 0x00, 0x00, 0x00][..], None),
+            (&[0xc0][..], None),
+            (&[0x02, 0x02][..], None),
+            (&[][..], None),
+        ] {
+            assert_eq!(renderer_from_encoded(encoded), expected, "{encoded:02x?}");
+        }
+
+        let native = lxmf_core::message::FieldValue::MessagePack(
+            lxmf_core::message::EncodedFieldValue::new(Bytes::from_static(&[0x02])).unwrap(),
+        );
+        assert_eq!(
+            message_renderer(&renderer_test_message(Some(native))),
+            Some(2)
+        );
+        let bin = lxmf_core::message::FieldValue::Binary(Bytes::from_static(&[0x02]));
+        assert_eq!(message_renderer(&renderer_test_message(Some(bin))), None);
+        let text = lxmf_core::message::FieldValue::MessagePack(
+            lxmf_core::message::EncodedFieldValue::new(Bytes::from_static(&[0xa1, b'2'])).unwrap(),
+        );
+        assert_eq!(message_renderer(&renderer_test_message(Some(text))), None);
+        assert_eq!(message_renderer(&renderer_test_message(None)), None);
+    }
+
+    /// Python LXMF `pack()` of a Markdown message
+    /// (`tools/generate-lxmf-renderer-golden.py`).
+    #[test]
+    fn renderer_field_matches_python_lxmf_both_ways() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../testdata/lxmf-renderer-golden.json")).unwrap();
+        let packed = hex::decode(golden["packed"].as_str().unwrap()).unwrap();
+        let public_key = hex::decode(golden["source_public_key"].as_str().unwrap()).unwrap();
+        let signer = rns_crypto::ed25519::Ed25519PublicKey::from_bytes(
+            &public_key[32..].try_into().unwrap(),
+        )
+        .unwrap();
+
+        let message = LxMessage::unpack_owned(
+            Bytes::from(packed.clone()),
+            lxmf_core::message_api::MessageDecodeLimits::default(),
+        )
+        .unwrap();
+        assert!(message.verify_signature(&signer));
+        assert_eq!(message_renderer(&message), Some(2));
+
+        let content = golden["content"].as_str().unwrap();
+        let mut draft = LxMessageDraft::new(
+            packed[..16].try_into().unwrap(),
+            packed[16..32].try_into().unwrap(),
+            "",
+            content,
+            DeliveryMethod::Direct,
+        )
+        .unwrap();
+        draft
+            .set_timestamp(golden["timestamp"].as_f64().unwrap())
+            .unwrap();
+        let (field_id, bytes) = renderer_custom_field(lxmf_core::constants::RENDERER_MARKDOWN);
+        draft.set_msgpack_field(field_id, bytes).unwrap();
+        assert_eq!(draft.pack_payload().unwrap(), packed[96..]);
+    }
+
+    #[test]
+    fn markdown_sends_pack_renderer_as_native_int_and_persist_it() {
+        let pool = test_pool();
+        let mut mgr = test_manager();
+        let dest = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let reply_target = "01".repeat(32);
+
+        let text = mgr
+            .send_message_with_preference_report(MessageSendRequest {
+                dest_hash_hex: dest,
+                content: "**bold**",
+                title: "",
+                db_pool: &pool,
+                identity_id: "me",
+                preference: DeliveryPreference::Direct,
+                profile: DeliveryProfile::Message,
+                renderer: Some(lxmf_core::constants::RENDERER_MARKDOWN),
+            })
+            .expect("text queued")
+            .message_id;
+        let reply = mgr
+            .send_reply_with_preference(ReplyMessageSendRequest {
+                dest_hash_hex: dest,
+                content: "_re_",
+                title: "",
+                reply_to_id: &reply_target,
+                reply_to_preview: "original",
+                db_pool: &pool,
+                identity_id: "me",
+                preference: DeliveryPreference::Direct,
+                profile: DeliveryProfile::Message,
+                renderer: Some(lxmf_core::constants::RENDERER_MARKDOWN),
+            })
+            .expect("reply queued");
+        let attachment = mgr
+            .send_message_with_attachment_fields_preference_report(AttachmentMessageRequest {
+                dest_hash_hex: dest,
+                content: "`file`\n[File: note.txt]",
+                title: "",
+                file_name: "note.txt",
+                file_bytes: b"hello",
+                staged_path: None,
+                is_image: false,
+                image_mime: "",
+                db_pool: &pool,
+                identity_id: "me",
+                preference: DeliveryPreference::Direct,
+                renderer: Some(lxmf_core::constants::RENDERER_MARKDOWN),
+            })
+            .expect("attachment queued")
+            .message_id;
+        let plain = mgr
+            .send_message_with_preference_report(MessageSendRequest {
+                dest_hash_hex: dest,
+                content: "plain",
+                title: "",
+                db_pool: &pool,
+                identity_id: "me",
+                preference: DeliveryPreference::Direct,
+                profile: DeliveryProfile::Message,
+                renderer: None,
+            })
+            .expect("plain queued")
+            .message_id;
+
+        for id in [&text, &reply, &attachment] {
+            let message = mgr
+                .router
+                .pending_outbound
+                .iter()
+                .find(|message| hex::encode(message.message_id()) == *id)
+                .expect("pending outbound");
+            let field = message
+                .get_field(lxmf_core::constants::FIELD_RENDERER)
+                .expect("renderer field");
+            assert_eq!(field.encoded(), &[0x02]);
+            assert!(
+                message
+                    .wire_bytes()
+                    .windows(2)
+                    .any(|pair| pair == [0x0f, 0x02])
+            );
+            assert_eq!(message_renderer(message), Some(2));
+        }
+        let message = mgr
+            .router
+            .pending_outbound
+            .iter()
+            .find(|message| hex::encode(message.message_id()) == plain)
+            .expect("plain pending outbound");
+        assert!(
+            message
+                .get_field(lxmf_core::constants::FIELD_RENDERER)
+                .is_none()
+        );
+
+        let rows = db::get_conversation(&pool, dest, "me", 10);
+        let renderer = |id: &str| {
+            rows.iter()
+                .find(|row| row["id"] == id)
+                .map(|row| row["renderer"].clone())
+                .expect("stored row")
+        };
+        for id in [&text, &reply, &attachment] {
+            assert_eq!(renderer(id), 2);
+        }
+        assert!(renderer(&plain).is_null());
+    }
+
     #[test]
     fn attachment_field_uses_lxmf_string_filename_and_binary_bytes() {
         let pool = test_pool();
@@ -11941,6 +12661,7 @@ mod tests {
                 db_pool: &pool,
                 identity_id: "me",
                 preference: DeliveryPreference::Direct,
+                renderer: None,
             })
             .expect("message queued");
         assert_eq!(queued.method, DeliveryMethod::Direct);
@@ -12095,7 +12816,7 @@ mod tests {
         let field = message.audio_field().unwrap().unwrap();
         assert_eq!(field.mode, 3);
         assert_eq!(field.bytes, audio);
-        assert!(message.packed_len().unwrap() + MAX_DEFERRED_STAMP_WIRE_BYTES <= 3659);
+        assert!(message.packed_len().unwrap() <= 3659);
         let rows = db::get_conversation(&pool, &dest, "me", 10);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["id"], queued.message_id);
@@ -12188,6 +12909,7 @@ mod tests {
                 db_pool: &pool,
                 identity_id: "me",
                 preference: DeliveryPreference::Direct,
+                renderer: None,
             })
             .expect("staged message queued");
 
@@ -12227,6 +12949,7 @@ mod tests {
                 db_pool: &pool,
                 identity_id: "me",
                 preference: DeliveryPreference::Propagated,
+                renderer: None,
             });
 
         assert_eq!(result, Err(LxmfSubmissionFailure::PreparationFailed));

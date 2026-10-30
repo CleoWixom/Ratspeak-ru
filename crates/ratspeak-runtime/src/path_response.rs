@@ -9,6 +9,7 @@ use rns_runtime::lifecycle::ShutdownSignal;
 use rns_transport::messages::TransportMessage;
 use tokio::sync::mpsc::{Sender, error::TrySendError};
 
+use crate::announce::AnnounceSemanticRevision;
 use crate::state::AppState;
 
 pub(crate) const RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -32,7 +33,9 @@ struct PendingResponse {
     expires: Instant,
     next_attempt: Instant,
     // Once built, these bytes remain immutable through transport pressure.
-    message: Option<TransportMessage>,
+    // Rebuilding returns them again (Reticulum answers a tag from its cache),
+    // so a change to what the identity announces drops them instead.
+    message: Option<(TransportMessage, AnnounceSemanticRevision)>,
 }
 
 impl PendingResponse {
@@ -140,12 +143,13 @@ impl PendingPathResponses {
                 continue;
             }
             if request.message.is_none() {
+                let revision = state.announce_semantic_revision();
                 match crate::build_lxmf_path_response_message(
                     state,
                     request.attached_interface,
                     request.tag.as_deref(),
                 ) {
-                    Ok(message) => request.message = Some(message),
+                    Ok(message) => request.message = Some((message, revision)),
                     Err(BuildError::Coalesced) => {
                         request.next_attempt = now + COALESCED_RETRY;
                         self.requests.push_back(request);
@@ -179,13 +183,22 @@ impl PendingPathResponses {
                 self.requests.push_back(request);
                 continue;
             }
-            match request.transport.try_send(request.message.take().unwrap()) {
+            let (message, revision) = request.message.take().unwrap();
+            // Checked last, so a rename during the build drops it too.
+            if revision != state.announce_semantic_revision() {
+                tracing::debug!(
+                    reason = "announce_changed",
+                    "LXMF path-response dropped: what it announced changed"
+                );
+                continue;
+            }
+            match request.transport.try_send(message) {
                 Ok(()) => tracing::debug!(
                     attached = request.attached_interface.is_some(),
                     "queued LXMF path-response announce"
                 ),
                 Err(TrySendError::Full(message)) => {
-                    request.message = Some(message);
+                    request.message = Some((message, revision));
                     request.next_attempt = now + RETRY_INTERVAL;
                     self.requests.push_back(request);
                 }
@@ -284,7 +297,7 @@ mod tests {
         let mut owner = PendingPathResponses::default();
         owner.admit(&f.state, Some(7), Some(vec![1; 16]), now);
         owner.service(&f.state, &f.shutdown, now);
-        let bytes = raw(owner.requests[0].message.as_ref().unwrap()).clone();
+        let bytes = raw(&owner.requests[0].message.as_ref().unwrap().0).clone();
         let expires = owner.requests[0].expires;
         owner.admit(&f.state, Some(7), Some(vec![1; 16]), now + RETRY_INTERVAL);
         assert_eq!(owner.requests.len(), 1);
@@ -294,11 +307,34 @@ mod tests {
         drop(f.state.identity_switch_lock.lock().await);
         f.state.lxmf.lock().unwrap().as_mut().unwrap().display_name = "changed".into();
         owner.service(&f.state, &f.shutdown, now + RETRY_INTERVAL);
-        assert_eq!(raw(owner.requests[0].message.as_ref().unwrap()), &bytes);
+        assert_eq!(raw(&owner.requests[0].message.as_ref().unwrap().0), &bytes);
         f.outbound.try_recv().unwrap();
         owner.service(&f.state, &f.shutdown, now + RETRY_INTERVAL * 2);
         assert!(owner.is_empty());
         assert_eq!(raw(&f.outbound.try_recv().unwrap()), &bytes);
+    }
+
+    // A response built before a rename would announce the old name, and
+    // rebuilding gives the same bytes back (Reticulum answers a tag from its
+    // cache), so the rename drops it.
+    #[tokio::test]
+    async fn a_rename_drops_a_queued_path_response() {
+        let mut f = Fixture::new(1).await;
+        f.fill_transport();
+        let now = Instant::now();
+        let mut owner = PendingPathResponses::default();
+        owner.admit(&f.state, Some(7), Some(vec![4; 16]), now);
+        owner.service(&f.state, &f.shutdown, now);
+        assert!(owner.requests[0].message.is_some());
+        f.state.lxmf.lock().unwrap().as_mut().unwrap().display_name = "renamed".into();
+        f.state.bump_announce_content_revision();
+        f.outbound.try_recv().unwrap();
+        owner.service(&f.state, &f.shutdown, now + RETRY_INTERVAL);
+        assert!(owner.is_empty());
+        assert!(
+            f.outbound.try_recv().is_err(),
+            "the old name was sent after the rename"
+        );
     }
 
     #[tokio::test]
@@ -490,7 +526,9 @@ mod tests {
             rx,
             f.shutdown.clone(),
         ));
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // The credit stays held, so an ingress that awaited it would never
+        // finish; the bounds only absorb a loaded parallel suite.
+        tokio::time::timeout(Duration::from_secs(30), async {
             // Observe the post-commit event instead of continuously reading the
             // shared-memory SQLite table while the blocking worker writes it.
             // The observer must not introduce table-lock contention itself.
@@ -502,7 +540,7 @@ mod tests {
         .expect("inbound processing cannot await path-response transport credit");
         assert_eq!(message_rows(&f.state), 1);
         assert!(raw(&f.outbound.try_recv().unwrap()).is_empty());
-        let response = tokio::time::timeout(Duration::from_secs(3), f.outbound.recv())
+        let response = tokio::time::timeout(Duration::from_secs(30), f.outbound.recv())
             .await
             .unwrap()
             .unwrap();

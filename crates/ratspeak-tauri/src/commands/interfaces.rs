@@ -4,7 +4,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ratspeak_runtime::PendingRNodeActivityMonitor;
 #[cfg(any(
     feature = "ble",
     feature = "serial",
@@ -22,6 +21,7 @@ use ratspeak_runtime::mobile_platform::NativeBleRnodeDisconnect;
 use ratspeak_runtime::mobile_platform::NativeBleRnodeRequest;
 #[cfg(all(feature = "ble", not(target_os = "android")))]
 use ratspeak_runtime::rns::ble_rnode_startup_options;
+use ratspeak_runtime::{PendingRNodeActivityMonitor, Zeroizing};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tauri::State;
@@ -1164,10 +1164,7 @@ pub async fn api_app_settings(state: State<'_, Arc<AppState>>) -> AppResult<Valu
             .is_none_or(|value| value != "false");
         let hide_known_spam_peers =
             db::get_setting(&p, "hide_known_spam_peers").is_none_or(|value| value != "false");
-        let text_scale_percent = db::get_setting(&p, "text_scale_percent")
-            .and_then(|value| value.parse::<u16>().ok())
-            .map(|value| (value.clamp(100, 140) + 5) / 10 * 10)
-            .unwrap_or(100);
+        let text_scale_percent = stored_text_scale(&p);
         let theme_family = db::get_setting(&p, "theme_family")
             .and_then(|value| normalize_theme_family(&value).map(str::to_string))
             .unwrap_or_else(|| DEFAULT_THEME_FAMILY.to_string());
@@ -1401,11 +1398,84 @@ mod native_theme_tests {
     }
 }
 
+const TEXT_SCALE_BASIS: &str = "2";
+
+/// Percent of the standard type scale (100 = platform default size).
+fn normalize_text_scale(percent: u16) -> u16 {
+    (percent.clamp(90, 150) + 5) / 10 * 10
+}
+
+/// Presets saved before the standard scale were one step larger for the same
+/// size; move them down once so nobody ends up smaller than they chose.
+fn stored_text_scale(pool: &db::DbPool) -> u16 {
+    let stored = db::get_setting(pool, "text_scale_percent").and_then(|v| v.parse::<u16>().ok());
+    if db::get_setting(pool, "text_scale_basis").as_deref() == Some(TEXT_SCALE_BASIS) {
+        return stored.map_or(100, normalize_text_scale);
+    }
+    let migrated = stored.map_or(100, |v| normalize_text_scale(v.saturating_sub(10)).max(100));
+    if text_scale_settings_save(pool, migrated).is_err() {
+        tracing::warn!(reason = "persist_failed", "text size migration not saved");
+    }
+    migrated
+}
+
+fn text_scale_settings_save(pool: &db::DbPool, percent: u16) -> Result<(), String> {
+    db::try_set_settings(
+        pool,
+        &[
+            ("text_scale_percent".to_string(), percent.to_string()),
+            ("text_scale_basis".to_string(), TEXT_SCALE_BASIS.to_string()),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod text_scale_tests {
+    use super::*;
+
+    fn memory_pool() -> db::DbPool {
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        db::init_schema(&pool).unwrap();
+        pool
+    }
+
+    #[test]
+    fn presets_clamp_to_standard_scale_steps() {
+        assert_eq!(normalize_text_scale(0), 90);
+        assert_eq!(normalize_text_scale(104), 100);
+        assert_eq!(normalize_text_scale(105), 110);
+        assert_eq!(normalize_text_scale(500), 150);
+    }
+
+    #[test]
+    fn legacy_presets_move_down_one_step_once() {
+        for (legacy, migrated) in [(100, 100), (110, 100), (120, 110), (130, 120), (140, 130)] {
+            let pool = memory_pool();
+            db::try_set_setting(&pool, "text_scale_percent", &legacy.to_string()).unwrap();
+            assert_eq!(stored_text_scale(&pool), migrated);
+            assert_eq!(
+                stored_text_scale(&pool),
+                migrated,
+                "migration must not repeat"
+            );
+        }
+        let fresh = memory_pool();
+        assert_eq!(stored_text_scale(&fresh), 100);
+        text_scale_settings_save(&fresh, 90).unwrap();
+        assert_eq!(
+            stored_text_scale(&fresh),
+            90,
+            "new-scale choices are never migrated"
+        );
+    }
+}
+
 #[tauri::command]
 pub async fn set_text_scale(state: State<'_, Arc<AppState>>, percent: u16) -> AppResult<Value> {
-    let percent = (percent.clamp(100, 140) + 5) / 10 * 10;
+    let percent = normalize_text_scale(percent);
     db::spawn_db(state.db.clone(), move |p| {
-        db::try_set_setting(&p, "text_scale_percent", &percent.to_string())
+        text_scale_settings_save(&p, percent)
     })
     .await
     .map_err(|_| AppError::internal("set_text_scale db task panicked"))?
@@ -1417,6 +1487,234 @@ pub async fn set_text_scale(state: State<'_, Arc<AppState>>, percent: u16) -> Ap
         json!({ "text_scale_percent": percent }),
     );
     Ok(json!({ "percent": percent }))
+}
+
+const TRUSTED_LINK_HOSTS_SETTING: &str = "trusted_link_hosts";
+const MAX_TRUSTED_LINK_HOSTS: usize = 200;
+
+// Serializes the read-modify-write of the stored host list.
+static TRUSTED_LINK_HOSTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// ASCII-lowercase DNS name (A-labels, so `xn--` IDNs pass), trailing dot
+/// dropped; a leading `www.` folds into the bare host.
+fn normalize_link_host(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let lower = trimmed
+        .strip_suffix('.')
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
+    let host = match lower.strip_prefix("www.") {
+        Some(rest) if rest.contains('.') => rest.to_string(),
+        _ => lower,
+    };
+    let valid = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        });
+    valid.then_some(host)
+}
+
+fn decode_trusted_link_hosts(stored: Option<&str>) -> Vec<String> {
+    let raw: Vec<Value> = stored
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default();
+    let mut hosts = Vec::with_capacity(raw.len().min(MAX_TRUSTED_LINK_HOSTS));
+    for host in raw
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(normalize_link_host)
+    {
+        push_trusted_link_host(&mut hosts, host);
+    }
+    hosts
+}
+
+/// Adds or refreshes `host` as the newest entry, evicting the oldest past the cap.
+fn push_trusted_link_host(hosts: &mut Vec<String>, host: String) {
+    hosts.retain(|existing| *existing != host);
+    hosts.push(host);
+    if hosts.len() > MAX_TRUSTED_LINK_HOSTS {
+        hosts.drain(..hosts.len() - MAX_TRUSTED_LINK_HOSTS);
+    }
+}
+
+fn stored_trusted_link_hosts(pool: &db::DbPool) -> Result<Vec<String>, String> {
+    let stored = db::get_settings(pool, &[TRUSTED_LINK_HOSTS_SETTING])?;
+    Ok(decode_trusted_link_hosts(
+        stored.get(TRUSTED_LINK_HOSTS_SETTING).map(String::as_str),
+    ))
+}
+
+fn update_trusted_link_hosts(
+    pool: &db::DbPool,
+    update: impl FnOnce(&mut Vec<String>),
+) -> Result<Vec<String>, String> {
+    let _guard = TRUSTED_LINK_HOSTS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut hosts = stored_trusted_link_hosts(pool)?;
+    update(&mut hosts);
+    let encoded = serde_json::to_string(&hosts).map_err(|error| error.to_string())?;
+    db::try_set_settings(pool, &[(TRUSTED_LINK_HOSTS_SETTING.to_string(), encoded)])?;
+    Ok(hosts)
+}
+
+async fn save_trusted_link_hosts(
+    state: &AppState,
+    update: impl FnOnce(&mut Vec<String>) + Send + 'static,
+) -> AppResult<Value> {
+    let hosts = db::spawn_db(state.db.clone(), move |p| {
+        update_trusted_link_hosts(&p, update)
+    })
+    .await
+    .map_err(|_| AppError::internal("trusted link hosts db task panicked"))?
+    .map_err(|error| {
+        AppError::database_unavailable(format!("Failed to save trusted links: {error}"))
+    })?;
+    state.emit_to_all(
+        "app_settings_updated",
+        json!({ "trusted_link_hosts": hosts }),
+    );
+    Ok(json!({ "hosts": hosts }))
+}
+
+#[tauri::command]
+pub async fn api_trusted_link_hosts(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    let hosts = db::spawn_db(state.db.clone(), |p| stored_trusted_link_hosts(&p))
+        .await
+        .map_err(|_| AppError::internal("trusted link hosts db task panicked"))?
+        .map_err(|error| {
+            AppError::database_unavailable(format!("Failed to read trusted links: {error}"))
+        })?;
+    Ok(json!({ "hosts": hosts }))
+}
+
+#[tauri::command]
+pub async fn trust_link_host(state: State<'_, Arc<AppState>>, host: String) -> AppResult<Value> {
+    let host = normalize_link_host(&host).ok_or_else(|| AppError::bad_request("Invalid host"))?;
+    save_trusted_link_hosts(&state, move |hosts| push_trusted_link_host(hosts, host)).await
+}
+
+#[tauri::command]
+pub async fn untrust_link_host(state: State<'_, Arc<AppState>>, host: String) -> AppResult<Value> {
+    let host = normalize_link_host(&host).ok_or_else(|| AppError::bad_request("Invalid host"))?;
+    save_trusted_link_hosts(&state, move |hosts| {
+        hosts.retain(|existing| *existing != host)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn clear_trusted_link_hosts(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    save_trusted_link_hosts(&state, Vec::clear).await
+}
+
+#[cfg(test)]
+mod trusted_link_host_tests {
+    use super::*;
+
+    fn memory_pool() -> db::DbPool {
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        db::init_schema(&pool).unwrap();
+        pool
+    }
+
+    #[test]
+    fn hosts_normalize_to_lowercase_dns_names() {
+        for (raw, expected) in [
+            ("Example.COM", "example.com"),
+            ("example.com.", "example.com"),
+            (" docs.ratspeak.org ", "docs.ratspeak.org"),
+            ("xn--bcher-kva.example", "xn--bcher-kva.example"),
+            ("localhost", "localhost"),
+            ("10.0.0.1", "10.0.0.1"),
+            ("WWW.Example.org", "example.org"),
+            ("www.com", "www.com"),
+        ] {
+            assert_eq!(normalize_link_host(raw).as_deref(), Some(expected), "{raw}");
+        }
+        let too_long = format!("{}.com", vec!["a".repeat(63); 4].join("."));
+        let long_label = format!("{}.com", "a".repeat(64));
+        for raw in [
+            "",
+            ".",
+            "a..b",
+            ".example.com",
+            "-bad.com",
+            "bad-.com",
+            "exa mple.com",
+            "bücher.de",
+            "user@example.com",
+            "example.com:443",
+            "https://example.com",
+            "[::1]",
+            too_long.as_str(),
+            long_label.as_str(),
+        ] {
+            assert_eq!(normalize_link_host(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn adding_dedupes_to_newest_and_evicts_oldest_past_cap() {
+        let mut hosts = Vec::new();
+        for index in 0..MAX_TRUSTED_LINK_HOSTS {
+            push_trusted_link_host(&mut hosts, format!("h{index}.example"));
+        }
+        push_trusted_link_host(&mut hosts, "h0.example".into());
+        assert_eq!(hosts.len(), MAX_TRUSTED_LINK_HOSTS);
+        assert_eq!(hosts.first().map(String::as_str), Some("h1.example"));
+        assert_eq!(hosts.last().map(String::as_str), Some("h0.example"));
+
+        push_trusted_link_host(&mut hosts, "new.example".into());
+        assert_eq!(hosts.len(), MAX_TRUSTED_LINK_HOSTS);
+        assert_eq!(hosts.first().map(String::as_str), Some("h2.example"));
+        assert_eq!(hosts.last().map(String::as_str), Some("new.example"));
+    }
+
+    #[test]
+    fn stored_hosts_round_trip_and_tolerate_bad_rows() {
+        let pool = memory_pool();
+        assert!(stored_trusted_link_hosts(&pool).unwrap().is_empty());
+        update_trusted_link_hosts(&pool, |hosts| {
+            push_trusted_link_host(hosts, "a.example".into());
+            push_trusted_link_host(hosts, "b.example".into());
+        })
+        .unwrap();
+        assert_eq!(
+            stored_trusted_link_hosts(&pool).unwrap(),
+            ["a.example", "b.example"]
+        );
+        let removed =
+            update_trusted_link_hosts(&pool, |hosts| hosts.retain(|h| h != "a.example")).unwrap();
+        assert_eq!(removed, ["b.example"]);
+        assert!(
+            update_trusted_link_hosts(&pool, Vec::clear)
+                .unwrap()
+                .is_empty()
+        );
+
+        db::try_set_setting(
+            &pool,
+            TRUSTED_LINK_HOSTS_SETTING,
+            r#"["B.example.", "bad host", 7, "b.example", "c.example"]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stored_trusted_link_hosts(&pool).unwrap(),
+            ["b.example", "c.example"]
+        );
+        db::try_set_setting(&pool, TRUSTED_LINK_HOSTS_SETTING, "not json").unwrap();
+        assert!(stored_trusted_link_hosts(&pool).unwrap().is_empty());
+    }
 }
 
 #[tauri::command]
@@ -1512,8 +1810,8 @@ pub async fn set_developer_mode(
     Ok(json!({ "developer_mode": enabled }))
 }
 
-/// Auto-lock timeout for hardware identities (seconds; 0 = off). Applies on the
-/// next unlock/boot — the running session keeps its current timer.
+/// Auto-lock timeout for identities with a PIN, hardware or passcode (seconds;
+/// 0 = off), counted from the unlock. Applies on the next unlock.
 #[tauri::command]
 pub async fn set_hardware_lock_timeout(
     state: State<'_, Arc<AppState>>,
@@ -1535,7 +1833,7 @@ pub async fn set_hardware_lock_timeout(
         "app_settings_updated",
         json!({ "hardware_session_timeout": seconds }),
     );
-    tracing::info!("Hardware auto-lock timeout set to {seconds}s");
+    tracing::info!("Auto-lock timeout set to {seconds}s");
     Ok(json!({ "hardware_session_timeout": seconds }))
 }
 
@@ -1652,6 +1950,30 @@ pub async fn api_notification_settings(state: State<'_, Arc<AppState>>) -> AppRe
     Ok(json!({
         "enabled": state.native_notifications_enabled(),
         "ios_stubbed": false,
+        "preview": state.notification_preview().as_str(),
+    }))
+}
+
+/// What alerts show: `name_and_message`, `name_only` or `neither`. A call
+/// always names the caller.
+#[tauri::command]
+pub async fn set_notification_preview(
+    state: State<'_, Arc<AppState>>,
+    preview: String,
+) -> AppResult<Value> {
+    let preview = ratspeak_core::NotificationPreview::parse(&preview)
+        .ok_or_else(|| AppError::bad_request("Unknown notification preview"))?;
+    db::spawn_db(state.db.clone(), move |p| {
+        db::try_set_setting(&p, "notification_preview", preview.as_str())
+    })
+    .await
+    .map_err(|_| AppError::internal("set_notification_preview db task panicked"))?
+    .map_err(|e| AppError::database_unavailable(format!("Failed to save previews: {e}")))?;
+    state.set_notification_preview(preview);
+    Ok(json!({
+        "enabled": state.native_notifications_enabled(),
+        "ios_stubbed": false,
+        "preview": preview.as_str(),
     }))
 }
 
@@ -2204,12 +2526,71 @@ fn cfg_bool(entry: &Value, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct InterfaceIfacSettings {
     network_name: Option<String>,
-    passphrase: Option<String>,
+    passphrase: Option<Zeroizing<String>>,
     ifac_size: Option<usize>,
     unresolved: bool,
+}
+
+impl std::fmt::Debug for InterfaceIfacSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterfaceIfacSettings")
+            .field("network_name", &self.network_name)
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("ifac_size", &self.ifac_size)
+            .field("unresolved", &self.unresolved)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod ifac_secret_tests {
+    use super::*;
+
+    #[test]
+    fn ifac_settings_debug_redacts_passphrase() {
+        let phrase = "a private overlay passphrase that must never appear in debug output";
+        let settings = ifac_settings_from_entry(&json!({
+            "network_name": "overlay",
+            "passphrase": phrase,
+            "ifac_size": "16",
+        }));
+        assert_eq!(settings.config_args().passphrase, Some(phrase));
+        let debug = format!("{settings:?}");
+        assert!(debug.contains("overlay"));
+        assert!(!debug.contains(phrase));
+    }
+
+    #[test]
+    fn ifac_passphrase_keeps_its_optional_json_string_shape() {
+        for value in [json!({}), json!({ "ifac_passphrase": null })] {
+            let fields: InterfaceIfacCommandFields = serde_json::from_value(value).unwrap();
+            assert!(fields.ifac_passphrase.is_none());
+        }
+        let phrase = "a private overlay passphrase";
+        let fields: InterfaceIfacCommandFields = serde_json::from_value(json!({
+            "ifac_enabled": true,
+            "ifac_passphrase": phrase,
+        }))
+        .unwrap();
+        let settings = ifac_settings_from_args(&fields, None).unwrap();
+        assert_eq!(settings.config_args().passphrase, Some(phrase));
+        assert_eq!(
+            settings.runtime_config().unwrap().passphrase.as_deref(),
+            Some(phrase)
+        );
+        assert!(
+            serde_json::from_value::<InterfaceIfacCommandFields>(json!({
+                "ifac_passphrase": 123,
+            }))
+            .is_err()
+        );
+    }
 }
 
 impl InterfaceIfacSettings {
@@ -2221,7 +2602,7 @@ impl InterfaceIfacSettings {
     fn config_args(&self) -> crate::rns_config::InterfaceIfacArgs<'_> {
         crate::rns_config::InterfaceIfacArgs {
             network_name: self.network_name.as_deref(),
-            passphrase: self.passphrase.as_deref(),
+            passphrase: self.passphrase.as_deref().map(String::as_str),
             ifac_size: self.ifac_size,
         }
     }
@@ -2230,7 +2611,7 @@ impl InterfaceIfacSettings {
         self.is_enabled()
             .then(|| rns_runtime::reticulum::RuntimeInterfaceIfacConfig {
                 network_name: self.network_name.clone(),
-                passphrase: self.passphrase.clone(),
+                passphrase: self.passphrase.as_deref().cloned(),
                 ifac_size: self.ifac_size,
             })
     }
@@ -2242,10 +2623,16 @@ struct InterfaceIfacCommandFields {
     ifac_enabled: Option<bool>,
     #[serde(default)]
     ifac_network_name: Option<String>,
-    #[serde(default)]
-    ifac_passphrase: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_ifac_passphrase")]
+    ifac_passphrase: Option<Zeroizing<String>>,
     #[serde(default)]
     ifac_size: Option<usize>,
+}
+
+fn deserialize_ifac_passphrase<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Zeroizing<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(|value| value.map(Zeroizing::new))
 }
 
 fn ifac_settings_from_entry(entry: &Value) -> InterfaceIfacSettings {
@@ -2253,7 +2640,8 @@ fn ifac_settings_from_entry(entry: &Value) -> InterfaceIfacSettings {
         network_name: cfg_non_empty_str(entry, "network_name")
             .or_else(|| cfg_non_empty_str(entry, "networkname")),
         passphrase: cfg_non_empty_str(entry, "passphrase")
-            .or_else(|| cfg_non_empty_str(entry, "pass_phrase")),
+            .or_else(|| cfg_non_empty_str(entry, "pass_phrase"))
+            .map(Zeroizing::new),
         ifac_size: cfg_usize(entry, "ifac_size"),
         unresolved: entry.get("ifac_error").is_some(),
     }
@@ -2286,7 +2674,7 @@ fn ifac_settings_from_args(
             passphrase: fields
                 .ifac_passphrase
                 .as_deref()
-                .map(|s| sanitize_text(s, 256))
+                .map(|s| Zeroizing::new(sanitize_text(s, 256)))
                 .filter(|s| !s.is_empty()),
             ifac_size: fields
                 .ifac_size
@@ -3595,7 +3983,9 @@ mod android_ble_owner_policy_tests {
             .expect_err("ambiguous name must fail closed");
         assert!(error.to_string().contains("More than one interface"));
         assert_eq!(
-            crate::rns_config::read_config(temp.path()).as_deref(),
+            crate::rns_config::read_config(temp.path())
+                .as_deref()
+                .map(String::as_str),
             Some(config)
         );
     }
@@ -4036,7 +4426,7 @@ async fn finish_interface_replace(
     activity_fence: ActivityRequestFence,
     config_dir: PathBuf,
     operation: &'static str,
-    old_config_content: String,
+    old_config_content: Zeroizing<String>,
     old_runtime: EditableInterfaceConfig,
     new_runtime: EditableInterfaceConfig,
 ) {
@@ -5981,7 +6371,9 @@ async fn resolve_rnode_public_map_update(
 async fn active_identity_display_name_for_public_map(state: &Arc<AppState>) -> AppResult<String> {
     let active = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
         .await
-        .map_err(|_| AppError::internal("active identity db task panicked"))?;
+        .map_err(|_| AppError::internal("active identity db task panicked"))?
+        .ok()
+        .flatten();
     let display_name = active
         .as_ref()
         .and_then(|identity| identity.get("display_name"))

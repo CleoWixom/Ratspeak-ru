@@ -46,7 +46,8 @@ assert.strictEqual(breakpointContext.isMobile(), true);
 breakpointContext.window.innerWidth = 1025;
 assert.strictEqual(breakpointContext.isMobile(), false);
 
-var storage = {};
+// A 130% choice from before the standard scale migrates down one step.
+var storage = { 'rs-text-scale-percent': '130' };
 var root = { style: {}, dataset: {} };
 function CustomEvent(name, options) { this.type = name; this.detail = options.detail; }
 var scaleContext = {
@@ -66,15 +67,19 @@ scaleContext.window.document = scaleContext.document;
 scaleContext.window.localStorage = scaleContext.localStorage;
 vm.createContext(scaleContext);
 vm.runInContext(read('static/js/text_scale.js'), scaleContext);
-assert.strictEqual(scaleContext.window.RS.textScale.get(), 100);
-assert.strictEqual(scaleContext.window.RS.textScale.commit(127), 130);
-assert.strictEqual(root.style.fontSize, '130%');
-assert.strictEqual(root.dataset.textScaleTier, 'large');
-assert.strictEqual(storage['rs-text-scale-percent'], '130');
-assert.strictEqual(scaleContext.window.RS.textScale.commit(200), 140);
-assert.strictEqual(root.dataset.textScaleTier, 'xlarge');
-assert.strictEqual(scaleContext.window.RS.textScale.reset(), 100);
+assert.strictEqual(scaleContext.window.RS.textScale.get(), 120);
 assert.strictEqual(storage['rs-text-scale-percent'], undefined);
+assert.strictEqual(storage['rs-text-scale'], '120');
+assert.strictEqual(scaleContext.window.RS.textScale.commit(117), 120);
+assert.strictEqual(root.style.fontSize, '120%');
+assert.strictEqual(root.dataset.textScaleTier, 'large');
+assert.strictEqual(scaleContext.window.RS.textScale.commit(200), 150);
+assert.strictEqual(root.dataset.textScaleTier, 'xlarge');
+assert.strictEqual(scaleContext.window.RS.textScale.commit(10), 90);
+assert.strictEqual(root.dataset.textScaleTier, 'normal');
+assert.strictEqual(storage['rs-text-scale'], '90');
+assert.strictEqual(scaleContext.window.RS.textScale.reset(), 100);
+assert.strictEqual(storage['rs-text-scale'], undefined);
 
 var html = read('index.html');
 var ids = Array.from(html.matchAll(/\sid="([^"]+)"/g), function(match) { return match[1]; });
@@ -95,8 +100,8 @@ var labelTargets = Array.from(html.matchAll(/<label\b[^>]*\sfor="([^"]+)"/g), fu
 assert.deepStrictEqual(Array.from(new Set(labelTargets.filter(function(id) {
     return ids.indexOf(id) === -1;
 }))), [], 'label for attributes must resolve to dashboard controls');
-assert.strictEqual((html.match(/name="settings-text-scale"/g) || []).length, 5);
-['100', '110', '120', '130', '140'].forEach(function(value) {
+assert.strictEqual((html.match(/name="settings-text-scale"/g) || []).length, 7);
+['90', '100', '110', '120', '130', '140', '150'].forEach(function(value) {
     assert(html.includes('name="settings-text-scale" value="' + value + '"'));
 });
 assert(html.includes('class="settings-type-presets"'));

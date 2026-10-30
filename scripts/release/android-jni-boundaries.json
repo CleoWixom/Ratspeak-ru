@@ -26,7 +26,8 @@
       "name": "org.ratspeak.android.RatspeakNotifications",
       "methods": [
         ["nativeInitialize", "(Landroid/content/Context;)V"],
-        ["show", "(Landroid/content/Context;Ljava/lang/String;)I"]
+        ["show", "(Landroid/content/Context;Ljava/lang/String;)I"],
+        ["withdrawAll", "(Landroid/content/Context;)I"]
       ]
     },
     {
@@ -44,11 +45,14 @@
         ["startOrReplaceBleRnode", "(Ljava/lang/String;ILjava/lang/String;J)Z"],
         ["disconnectBleRnode", "(Ljava/lang/String;J)Z"],
         ["saveStoredFile", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZLjava/lang/String;)Z"],
+        ["copySecret", "(Ljava/lang/String;)Z"],
+        ["clearSecret", "()V"],
         ["nativeSetNetworkType", "(Ljava/lang/String;J)V"],
         ["nativeUsbDeviceEvent", "(ILjava/lang/String;IILjava/lang/String;ZJ)V"],
         ["nativeBleRnodeState", "(Ljava/lang/String;JIILjava/lang/String;)V"],
         ["nativeMemoryPressure", "(Z)V"],
         ["showActivityRestoreFailure", "(J)V"],
+        ["reportStartupFailure", "()V"],
         ["nativeActivityAttached", "(JIZ)V"],
         ["nativeActivityDetached", "(J)V"],
         ["nativeActivityResumed", "(JZ)V"],

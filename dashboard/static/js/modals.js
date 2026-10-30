@@ -1299,7 +1299,7 @@ function refreshRnodeSerialPorts() {
                 }).join('');
             if (ports.some(function(p) { return p.permission_denied; })) {
                 showToast(
-                    'USB-Serial radio found, but permission was denied. Install the Ratspeak udev rules, then reconnect it.',
+                    'USB-Serial radio found, but permission was denied. Install Ratspeak\'s udev rule (with the AppImage, as /etc/udev/rules.d/70-ratspeak.rules, and delete an older 99-ratspeak.rules there) or join the dialout or uucp group, then reconnect it.',
                     'toast-warning',
                     8000
                 );

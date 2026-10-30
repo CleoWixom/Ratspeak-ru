@@ -777,36 +777,60 @@ fn spawn_enable_ble_peer_task(
                 .ok()
                 .and_then(|g| g.as_ref().map(|mgr| mgr.identity_hash.clone()));
 
-            let (identity_hash, seed_addresses, provisional_identities) =
-                db::spawn_db(state_arc.db.clone(), move |p| {
-                    let hash_hex = from_lxmf
-                        .filter(|h| !h.is_empty())
-                        .or_else(|| {
-                            db::get_active_identity(&p).and_then(|v| {
-                                v.get("hash")
-                                    .and_then(|s| s.as_str())
-                                    .map(|s| s.to_string())
-                            })
+            let resolved = db::spawn_db(state_arc.db.clone(), move |p| {
+                let hash_hex = match from_lxmf.filter(|h| !h.is_empty()) {
+                    Some(hash) => hash,
+                    None => db::get_active_identity(&p)
+                        .ok()?
+                        .and_then(|v| {
+                            v.get("hash")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string())
                         })
-                        .unwrap_or_default();
-                    let id = hex::decode(&hash_hex).unwrap_or_default();
-                    let recent_v2 = db::get_setting(&p, BLE_RECENT_DISCONNECTS_V2_SETTING);
-                    let recent_legacy = db::get_setting(&p, BLE_RECENT_DISCONNECTS_SETTING);
-                    let seed = ble_recent_disconnect_seed_addresses(
-                        recent_v2.as_deref(),
-                        recent_legacy.as_deref(),
-                    );
-                    let provisional = ble_recent_disconnect_identity_seeds(recent_v2.as_deref());
-                    tracing::info!(
-                        hash_hex_len = hash_hex.len(),
-                        decoded_len = id.len(),
-                        seed_address_count = seed.len(),
-                        "Bluetooth Peer enable: resolved active identity"
-                    );
-                    (id, seed, provisional)
-                })
-                .await
-                .expect("db task panicked");
+                        .unwrap_or_default(),
+                };
+                let id = hex::decode(&hash_hex).unwrap_or_default();
+                let recent_v2 = db::get_setting(&p, BLE_RECENT_DISCONNECTS_V2_SETTING);
+                let recent_legacy = db::get_setting(&p, BLE_RECENT_DISCONNECTS_SETTING);
+                let seed = ble_recent_disconnect_seed_addresses(
+                    recent_v2.as_deref(),
+                    recent_legacy.as_deref(),
+                );
+                let provisional = ble_recent_disconnect_identity_seeds(recent_v2.as_deref());
+                tracing::info!(
+                    hash_hex_len = hash_hex.len(),
+                    decoded_len = id.len(),
+                    seed_address_count = seed.len(),
+                    "Bluetooth Peer enable: resolved active identity"
+                );
+                Some((id, seed, provisional))
+            })
+            .await
+            .expect("db task panicked");
+            // A failed read is not a missing identity: keep the saved choice.
+            let Some((identity_hash, seed_addresses, provisional_identities)) = resolved else {
+                tracing::error!(
+                    reason = "query_failed",
+                    "Bluetooth Peer enable: active identity unreadable"
+                );
+                state_arc.emit_to_all("ble_peer_status_update", json!({ "enabled": false }));
+                emit_op_status_broadcast(
+                    &state_arc,
+                    "enable_ble_peer",
+                    "hub",
+                    "Bluetooth Peer could not start",
+                    true,
+                    Some("Ratspeak couldn't read the active identity. Try again."),
+                );
+                record_interface_activity(
+                    &state_arc,
+                    activity_fence,
+                    InterfaceClass::BluetoothPeer,
+                    ble_peer_activity_transition(BlePeerActivityOutcome::RuntimeFailed),
+                    None,
+                );
+                return;
+            };
 
             // Zero/missing identity → Android startAdvertising SecurityException.
             if !rns_interface::ble_peer::is_valid_identity_hash(&identity_hash) {
@@ -1686,10 +1710,10 @@ pub async fn apply_ble_rnode_bridge_ready(
     {
         tokio::spawn(async move {
             // The opaque operation token gates product work independently of
-            // Activity capture. Hold the identity transition lock only across
+            // Activity capture. Hold the identity lifecycle lock only across
             // the runtime spawn so a consumed token cannot race a teardown.
             let spawn_result = {
-                let _identity_guard = state_arc.identity_switch_lock.lock().await;
+                let _identity_guard = state_arc.identity_switch_lock.lock_routine().await;
                 if state_arc.current_identity_session_generation()
                     != activity_fence.identity_session_generation()
                 {

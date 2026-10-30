@@ -5,23 +5,48 @@ changes that materially affect how an artifact is reproduced.
 
 ## [Unreleased]
 
+## [1.0.36] - 2026-10-30
+
+### Added
+
+- Added Markdown support to messages: bold, italic, strikethrough, code, links, headings, lists, quotes and code blocks.
+- Added spoilers: put text between two bars on each side, like `||this||`. Or use `>!` and/or `!<`
+- Added deleting messages: select one or multiple messages to delete.
+- Added outbound URL security warning.
+- Added markdown hotkey shortcuts on desktop: Cmd or Ctrl with B, I or E formats the selected text.
+- Added changelog viewing to the in-app "Check For Updates" feature.
+
 ### Fixed and improved
 
-- Bluetooth radios that are off, out of range or need pairing again now say why, with Connection Help, instead of always showing "Waiting for radio".
-- A radio that rejects its settings, such as TX power below an amplifier's minimum, stops with the setting named and an Edit action, on Bluetooth, USB, serial and TCP.
-- Resuming or editing a radio that is away keeps it enabled and connects when it returns, instead of pausing or reverting it after two minutes.
-- Desktop serial and TCP radios that are unplugged or busy keep retrying and show why: radio not found, port access denied or port in use.
-- Android reconnects to a returning Bluetooth radio within seconds using background auto-connect, instead of retrying as rarely as every 10 minutes.
-- Fixed Android Bluetooth radio sessions dropping when the app reconnected slowly.
-- Fixed propagation pickup and purge when many messages are stored on a relay.
-- Preserved unknown interface locations and restored discovery announcements.
-- Bounded background announcements at flow-controlled radio writers.
-- Ratspeak warns at startup when its data is on a network drive or in temporary memory, where messages and keys may not survive a crash or restart.
+- Text across the app is larger and easier to read. Again.
+- The message reaction menu now opens beside the message and got a design uplift.
+- Links in messages are easier to read.
+- Locked zoom in the app outside of enlarged photos.
+
+## [1.0.35] - 2026-10-26
+
+### Added
+
+- Added Auto-Lock for passcode-protected identities.
+- Added a setting for how much notifications show.
+
+### Fixed and improved
+
+- Improved Bluetooth on Android: radios reconnect faster and show why they can't connect.
+- Fixed pairing a radio again after removing it from Android's Bluetooth settings.
+- Radios that reject a setting now say which one.
+- Improved identity switching, so messages and contacts always stay with the right identity.
+- Showing your recovery phrase or exporting a key now asks for your PIN, and copied phrases clear after a minute.
+- Fixed a file name bug when exporting on desktop.
+- Fixed recovery phrases not being saved in rare cases.
+- Improved compatibility with the latest Python Reticulum and LXMF.
+- Fixed downloading messages from propagation nodes that hold many messages.
+- Fixed game boards being cut off on phones; games now open full screen.
+- Made captured chess pieces and game results easier to see.
 
 ### Build and compatibility
 
-- Updated the coordinated source graph to rsReticulum 1.3.0 (`~1.3.0`), including
-  the nullable discovery coordinate API migration.
+- Linux: USB radios are now available only to the signed-in user. The rule is now `70-ratspeak.rules`; delete any old `99-ratspeak.rules` you copied by hand.
 
 ## [1.0.34] - 2026-10-10
 

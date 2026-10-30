@@ -370,6 +370,9 @@ pub struct SendLxmfArgs {
     /// Echoed back in `lxmf_step` so the optimistic UI row reconciles.
     #[serde(default)]
     pub client_msg_id: Option<String>,
+    /// LXMF FIELD_RENDERER; see [`parse_message_renderer`].
+    #[serde(default)]
+    pub renderer: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -379,6 +382,17 @@ pub struct CancelLxmfMessageArgs {
 
 pub(crate) fn parse_delivery_preference(value: Option<&str>) -> DeliveryPreference {
     DeliveryPreference::parse(value)
+}
+
+/// Markdown is the only renderer Ratspeak sends; plain (0) sends no field.
+pub(crate) fn parse_message_renderer(value: Option<u8>) -> AppResult<Option<u8>> {
+    match value {
+        None | Some(lxmf_core::constants::RENDERER_PLAIN) => Ok(None),
+        Some(lxmf_core::constants::RENDERER_MARKDOWN) => {
+            Ok(Some(lxmf_core::constants::RENDERER_MARKDOWN))
+        }
+        Some(_) => Err(AppError::bad_request("Unsupported message renderer")),
+    }
 }
 
 pub(crate) fn propagation_node_configured(state: &AppState) -> bool {
@@ -531,6 +545,7 @@ pub async fn send_lxmf_message(
     let title = sanitize_text(args.title.as_deref().unwrap_or(""), 256);
     let delivery_pref = parse_delivery_preference(args.delivery_method.as_deref());
     let client_msg_id = normalize_lxmf_client_msg_id(args.client_msg_id.as_deref())?;
+    let renderer = parse_message_renderer(args.renderer)?;
 
     if !validate_hex(&dest_hash, 16, 64) {
         emit_lxmf_send_error(
@@ -573,6 +588,9 @@ pub async fn send_lxmf_message(
     }
     propagation_readiness?;
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let st: Arc<AppState> = Arc::clone(&state);
     let dh = dest_hash.clone();
     let ct = content.clone();
@@ -592,6 +610,7 @@ pub async fn send_lxmf_message(
                     identity_id: &id_c,
                     preference: delivery_pref,
                     profile: DeliveryProfile::Message,
+                    renderer,
                 })
                 .ok()
         })
@@ -714,6 +733,9 @@ pub async fn send_reaction(
     }
 
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let st: Arc<AppState> = Arc::clone(&state);
     let dh = dest_hash.clone();
     let mid = message_id.clone();
@@ -784,6 +806,8 @@ pub struct SendReplyArgs {
     pub delivery_method: Option<String>,
     #[serde(default)]
     pub client_msg_id: Option<String>,
+    #[serde(default)]
+    pub renderer: Option<u8>,
 }
 
 #[tauri::command]
@@ -807,6 +831,7 @@ pub async fn send_lxmf_reply(
         .unwrap_or_else(|| reply_to_id.clone());
     let delivery_pref = parse_delivery_preference(args.delivery_method.as_deref());
     let client_msg_id = normalize_lxmf_client_msg_id(args.client_msg_id.as_deref())?;
+    let renderer = parse_message_renderer(args.renderer)?;
 
     if !validate_hex(&dest_hash, 16, 64) || content.is_empty() {
         state.emit_to_all(
@@ -837,6 +862,9 @@ pub async fn send_lxmf_reply(
     }
     propagation_readiness?;
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let st: Arc<AppState> = Arc::clone(&state);
     let dh = dest_hash.clone();
     let ct = content.clone();
@@ -857,6 +885,7 @@ pub async fn send_lxmf_reply(
                 identity_id: &id_c,
                 preference: delivery_pref,
                 profile: DeliveryProfile::Message,
+                renderer,
             })
         })
     })
@@ -965,6 +994,9 @@ pub async fn send_lxmf_propagated(
     }
     propagation_readiness?;
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let st: Arc<AppState> = Arc::clone(&state);
     let dh = dest_hash.clone();
     let ct = content.clone();
@@ -1053,6 +1085,8 @@ pub struct SendWithAttachmentArgs {
     pub file_name: Option<String>,
     #[serde(default)]
     pub client_msg_id: Option<String>,
+    #[serde(default)]
+    pub renderer: Option<u8>,
 }
 
 enum AttachmentLeaseOwner {
@@ -1082,6 +1116,7 @@ async fn queue_prepared_attachment(
     dest_hash: String,
     content: String,
     delivery_pref: DeliveryPreference,
+    renderer: Option<u8>,
     client_msg_id: Option<String>,
     file_name: String,
     file_bytes: Vec<u8>,
@@ -1108,6 +1143,9 @@ async fn queue_prepared_attachment(
     }
     propagation_readiness?;
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let st = Arc::clone(&state);
     let dh = dest_hash.clone();
     let ct = content.clone();
@@ -1140,6 +1178,7 @@ async fn queue_prepared_attachment(
                         db_pool: &st.db,
                         identity_id: &identity_id,
                         preference: delivery_pref,
+                        renderer,
                     },
                 ),
             )
@@ -1353,7 +1392,7 @@ pub(crate) async fn queue_prepared_audio(
     let mut clip = staged.take();
     let (response, returned_clip) = tokio::task::spawn_blocking(move || {
         let state = st;
-        let _identity = runtime.block_on(state.identity_switch_lock.lock());
+        let _identity = runtime.block_on(state.identity_switch_lock.lock_routine());
         if state.current_identity_session_generation()
             != activity_fence.identity_session_generation()
             || active_identity_id(&state) != identity_id
@@ -1571,6 +1610,7 @@ pub async fn send_lxmf_with_attachment(
     let content = sanitize_message_content(args.content.as_deref().unwrap_or(""))?;
     let delivery_pref = parse_delivery_preference(args.delivery_method.as_deref());
     let client_msg_id = normalize_lxmf_client_msg_id(args.client_msg_id.as_deref())?;
+    let renderer = parse_message_renderer(args.renderer)?;
 
     let is_image = args.image_data.as_deref().is_some_and(|s| !s.is_empty());
     let image_mime = if is_image {
@@ -1687,6 +1727,7 @@ pub async fn send_lxmf_with_attachment(
         dest_hash,
         content,
         delivery_pref,
+        renderer,
         client_msg_id,
         file_name,
         file_bytes,
@@ -2054,6 +2095,8 @@ pub struct SendStagedAttachmentArgs {
     pub staging_token: String,
     #[serde(default)]
     pub client_msg_id: Option<String>,
+    #[serde(default)]
+    pub renderer: Option<u8>,
 }
 
 #[tauri::command]
@@ -2065,6 +2108,7 @@ pub async fn send_lxmf_with_staged_attachment(
     let content = sanitize_message_content(args.content.as_deref().unwrap_or(""))?;
     let delivery_pref = parse_delivery_preference(args.delivery_method.as_deref());
     let client_msg_id = normalize_lxmf_client_msg_id(args.client_msg_id.as_deref())?;
+    let renderer = parse_message_renderer(args.renderer)?;
     if !validate_hex(&dest_hash, 16, 64) {
         return Err(AppError::new(
             "invalid_destination",
@@ -2115,6 +2159,7 @@ pub async fn send_lxmf_with_staged_attachment(
         dest_hash,
         content,
         delivery_pref,
+        renderer,
         client_msg_id,
         file_name,
         file_bytes,
@@ -2396,6 +2441,9 @@ pub async fn hide_conversation(state: State<'_, Arc<AppState>>, hash: String) ->
         return Err(AppError::bad_request("Invalid identity hash"));
     }
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let dh = dest_hash.clone();
     let id_c = identity_id.clone();
     let total = db::spawn_db(state.db.clone(), move |p| {
@@ -2433,27 +2481,35 @@ pub async fn delete_conversation(
     if !validate_hex(&dest_hash, 16, 64) {
         return Err(AppError::bad_request("Invalid identity hash"));
     }
+    // Bound to the identity the user saw, not to one that took over meanwhile.
+    let generation = state.current_identity_session_generation();
     let deletion =
         ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await;
-    let generation = state.current_identity_session_generation();
+    if state.current_identity_session_generation() != generation {
+        return Err(AppError::conflict("Identity changed"));
+    }
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
 
     // One blocking task so the lxmf MutexGuard never crosses an .await.
     let st: Arc<AppState> = Arc::clone(&state);
     let dh = dest_hash.clone();
     let id_c = identity_id.clone();
-    let total =
-        tokio::task::spawn_blocking(move || -> Result<i64, db::admission::AdmissionDbError> {
-            let _deletion = deletion;
+    let (total, files) = tokio::task::spawn_blocking(move || {
+        let _deletion = deletion;
+        let deleted =
             ratspeak_runtime::propagation_recovery::delete_messages(&st, &id_c, Some(&dh))?;
-            let counts = db::get_all_unread_counts(&st.db, &id_c);
-            Ok(counts.values().sum())
-        })
-        .await
-        .map_err(|_| AppError::internal("message deletion worker failed"))?
-        .map_err(|error| AppError::database_unavailable(error.to_string()))?;
+        let files = deleted.remove_files();
+        let total: i64 = db::get_all_unread_counts(&st.db, &id_c).values().sum();
+        Ok::<_, db::admission::AdmissionDbError>((total, files))
+    })
+    .await
+    .map_err(|_| AppError::internal("message deletion worker failed"))?
+    .map_err(|error| AppError::database_unavailable(error.to_string()))?;
 
-    let _lifecycle = state.identity_switch_lock.lock().await;
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
     if generation != state.current_identity_session_generation() {
         return Ok(json!({"hash":dest_hash}));
     }
@@ -2463,7 +2519,83 @@ pub async fn delete_conversation(
     );
     state.emit_to_all("unread_total", json!({ "count": total }));
     broadcast_conversations(Arc::clone(&state));
+    files.map_err(super::shared::files_not_removed)?;
     Ok(json!({ "hash": dest_hash, "unread_total": total }))
+}
+
+/// Deletes the given messages of one conversation on this device only.
+#[tauri::command]
+pub async fn delete_messages(
+    state: State<'_, Arc<AppState>>,
+    hash: String,
+    ids: Vec<String>,
+) -> AppResult<Value> {
+    let dest_hash = sanitize_text(&hash, 128).to_ascii_lowercase();
+    if !validate_hex(&dest_hash, 16, 64) {
+        return Err(AppError::bad_request("Invalid identity hash"));
+    }
+    if ids.is_empty() || ids.len() > db::admission::MAX_SELECTED_DELETION {
+        return Err(AppError::bad_request("Invalid message selection"));
+    }
+    // Inbound rows carry the LXMF hash, outbound rows their client id.
+    let mut ids = ids
+        .iter()
+        .map(|id| {
+            if validate_hex(id, 64, 64) {
+                Ok(id.to_ascii_lowercase())
+            } else {
+                normalize_lxmf_client_msg_id(Some(id))
+                    .map(Option::unwrap_or_default)
+                    .map_err(|_| AppError::bad_request("Invalid message id"))
+            }
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    ids.sort_unstable();
+    ids.dedup();
+    let generation = state.current_identity_session_generation();
+    let deletion =
+        ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await;
+    if state.current_identity_session_generation() != generation {
+        return Err(AppError::conflict("Identity changed"));
+    }
+    let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
+
+    let st: Arc<AppState> = Arc::clone(&state);
+    let dh = dest_hash.clone();
+    let id_c = identity_id.clone();
+    let (deleted, total, files) = tokio::task::spawn_blocking(move || {
+        let _deletion = deletion;
+        let (removed, deleted) = ratspeak_runtime::propagation_recovery::delete_selected_messages(
+            &st, &id_c, &dh, &ids,
+        )?;
+        let files = removed.remove_files();
+        let total: i64 = db::get_all_unread_counts(&st.db, &id_c).values().sum();
+        Ok::<_, db::admission::AdmissionDbError>((deleted, total, files))
+    })
+    .await
+    .map_err(|_| AppError::internal("message deletion worker failed"))?
+    .map_err(|error| match error {
+        db::admission::AdmissionDbError::StillSending => {
+            AppError::conflict("Cancel sending before deleting this message")
+        }
+        error => AppError::database_unavailable(error.to_string()),
+    })?;
+
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
+    if generation != state.current_identity_session_generation() {
+        return Ok(json!({ "hash": dest_hash, "deleted": deleted.len() }));
+    }
+    state.emit_to_all(
+        "messages_deleted",
+        json!({ "hash": dest_hash, "ids": deleted }),
+    );
+    state.emit_to_all("unread_total", json!({ "count": total }));
+    broadcast_conversations(Arc::clone(&state));
+    files.map_err(super::shared::files_not_removed)?;
+    Ok(json!({ "hash": dest_hash, "deleted": deleted.len(), "unread_total": total }))
 }
 
 #[tauri::command]

@@ -252,6 +252,7 @@ function _rsShowDialog(cfg, callback) {
     message.className = 'rs-dialog-message';
     message.textContent = cfg.message;
     built.body.appendChild(message);
+    if (cfg.detail) built.body.appendChild(cfg.detail);
 
     if (cfg.hasInput) {
         input = document.createElement('input');
@@ -306,9 +307,14 @@ function _rsShowDialog(cfg, callback) {
             e.stopPropagation();
             built.dismiss(resolveValue(false));
         }
-        if (e.key === 'Enter' && (!cfg.hasInput || document.activeElement === input)) {
-            e.preventDefault();
-            built.dismiss(resolveValue(true));
+        if (e.key === 'Enter') {
+            var active = document.activeElement;
+            // A focused button activates natively; Enter must not override Cancel.
+            if (active && active.tagName === 'BUTTON' && built.sheet.contains(active)) return;
+            if (cfg.hasInput ? active === input : cfg.initialFocus !== 'cancel') {
+                e.preventDefault();
+                built.dismiss(resolveValue(true));
+            }
         }
         if (e.key === 'Tab') {
             var focusable = built.sheet.querySelectorAll('input, button');
@@ -340,9 +346,127 @@ function _rsShowDialog(cfg, callback) {
 
     if (input) {
         if (!isMobile()) { input.focus(); input.select(); }
+    } else if (cfg.initialFocus === 'cancel') {
+        if (!(RS.ui && typeof RS.ui.prefersKeyboardFocus === 'function') || RS.ui.prefersKeyboardFocus()) {
+            cancelBtn.focus();
+        }
     } else {
         confirmBtn.focus();
     }
+}
+
+var RS_LINK_PATH_CHARS = 24;
+var RS_WARNING_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 20h20L12 3z"/><path d="M12 10v4"/><path d="M12 17h.01"/></svg>';
+var RS_COPY_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/>' +
+    '<path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>';
+
+function _rsHostOfText(text) {
+    var m = /^\s*(?:https?:\/\/)?((?:[a-z0-9-]+\.)+[a-z]{2,})\.?(?:[\/:?#]|\s*$)/i.exec(text || '');
+    return m ? m[1].toLowerCase().replace(/^www\./, '') : null;
+}
+
+// Display parts and warnings for an outbound link. The host is never
+// truncated; punycode stays punycode so look-alike hosts stay visible.
+function rsLinkTarget(href, linkText) {
+    var url;
+    try { url = new URL(href); } catch (_) { return null; }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+    var host = url.hostname.toLowerCase().replace(/\.$/, '');
+    var www = /^www\.[^.]+\./.test(host) ? 'www.' : '';
+    var rest = (url.pathname === '/' ? '' : url.pathname) + url.search + url.hash;
+    var warnings = [];
+    var textHost = _rsHostOfText(linkText);
+    var mismatch = linkText != null && textHost && textHost !== host.replace(/^www\./, '');
+    if (mismatch) warnings.push('The link text shows ' + textHost + ', but it opens ' + host + '.');
+    if (url.username || url.password) {
+        warnings.push('This link hides its real address.' + (mismatch ? '' : ' It opens ' + host + '.'));
+    }
+    if (host.split('.').some(function(label) { return label.indexOf('xn--') === 0; })) {
+        warnings.push('This address uses international characters, which can imitate other websites.');
+    }
+    return {
+        href: url.href,
+        host: host,
+        // www.example.org and example.org share one trust entry.
+        trustKey: host.slice(www.length),
+        parts: {
+            scheme: url.protocol === 'http:' ? 'http://' : '',
+            www: www,
+            host: host.slice(www.length),
+            port: url.port ? ':' + url.port : '',
+            rest: rest.length > RS_LINK_PATH_CHARS ? rest.slice(0, RS_LINK_PATH_CHARS) + '\u2026' : rest,
+        },
+        warnings: warnings,
+    };
+}
+
+function _rsLinkDetail(target) {
+    var wrap = document.createElement('div');
+    wrap.className = 'rs-link-detail';
+    var box = document.createElement('div');
+    box.className = 'rs-link-target';
+    var text = document.createElement('span');
+    text.className = 'rs-link-target-text';
+    [['scheme', 'quiet'], ['www', 'quiet'], ['host', 'host'], ['port', 'quiet'], ['rest', 'quiet']].forEach(function(part) {
+        if (!target.parts[part[0]]) return;
+        var span = document.createElement('span');
+        span.className = 'rs-link-' + part[1];
+        span.textContent = target.parts[part[0]];
+        text.appendChild(span);
+    });
+    var copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'rs-link-copy';
+    copy.setAttribute('aria-label', 'Copy link');
+    copy.innerHTML = RS_COPY_ICON;
+    copy.addEventListener('click', function() {
+        Promise.resolve(RS.copyText(target.href)).then(function() {
+            showToast('Link copied', 'toast-success', 1800);
+        }).catch(function() {
+            showToast('Could not copy', 'toast-error', 1800);
+        });
+    });
+    box.appendChild(text);
+    box.appendChild(copy);
+    wrap.appendChild(box);
+    target.warnings.forEach(function(warning) {
+        var row = document.createElement('div');
+        row.className = 'rs-link-warning';
+        row.innerHTML = RS_WARNING_ICON;
+        var copyText = document.createElement('span');
+        copyText.textContent = warning;
+        row.appendChild(copyText);
+        wrap.appendChild(row);
+    });
+    return wrap;
+}
+
+// Resolves { confirmed, trust }. Deceptive links never offer the trust opt-out.
+function rsLinkConfirm(href, opts) {
+    opts = opts || {};
+    var target = rsLinkTarget(href, opts.linkText);
+    if (!target) return Promise.resolve({ confirmed: false, trust: false });
+    var warned = target.warnings.length > 0;
+    return new Promise(function(resolve) {
+        _rsShowDialog({
+            title: 'Leaving Ratspeak',
+            message: 'This link opens in your browser:',
+            detail: _rsLinkDetail(target),
+            confirmText: warned ? 'Open Anyway' : 'Open Link',
+            cancelText: 'Cancel',
+            initialFocus: warned ? 'cancel' : 'confirm',
+            hasInput: false,
+            checkbox: warned || opts.allowTrust === false ? null : {
+                label: "Don't ask again for " + target.trustKey,
+            },
+        }, function(result) {
+            if (result && typeof result === 'object') {
+                resolve({ confirmed: !!result.confirmed, trust: !!result.checked, host: target.trustKey });
+            } else {
+                resolve({ confirmed: !!result, trust: false, host: target.trustKey });
+            }
+        });
+    });
 }
 
 // Resolves the chosen value or null on cancel.

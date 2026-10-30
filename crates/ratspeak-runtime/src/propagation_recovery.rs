@@ -78,7 +78,7 @@ pub fn invalidate_downloads(state: &AppState) {
 /// inside one lifecycle span, even when its awaiting command is cancelled.
 pub struct DownloadDeletionGuard {
     state: Arc<AppState>,
-    _lifecycle: crate::state::OwnedIdentitySwitchGuard,
+    _lifecycle: crate::state::OwnedRoutineGuard,
 }
 impl Drop for DownloadDeletionGuard {
     fn drop(&mut self) {
@@ -86,26 +86,39 @@ impl Drop for DownloadDeletionGuard {
     }
 }
 pub async fn begin_download_deletion(state: Arc<AppState>) -> DownloadDeletionGuard {
-    let lifecycle = state.identity_switch_lock.lock_owned().await;
+    let lifecycle = state.identity_switch_lock.lock_routine_owned().await;
     invalidate_downloads(&state);
     DownloadDeletionGuard {
         state,
         _lifecycle: lifecycle,
     }
 }
-/// Invoke inside the blocking worker while retaining its deletion lifecycle guard.
+pub use crate::inbound_admission::DeletedMessages;
+
+/// Invoke inside the blocking worker while retaining its deletion lifecycle
+/// guard. The rows are gone when this returns; remove their files after.
 pub fn delete_messages(
     state: &AppState,
     identity: &str,
     peer: Option<&str>,
-) -> Result<(), crate::db::admission::AdmissionDbError> {
+) -> Result<DeletedMessages, crate::db::admission::AdmissionDbError> {
     crate::inbound_admission::delete_messages(state, identity, peer)
+}
+
+/// `delete_messages` for chosen `ids` with `peer`; also returns the ids deleted.
+pub fn delete_selected_messages(
+    state: &AppState,
+    identity: &str,
+    peer: &str,
+    ids: &[String],
+) -> Result<(DeletedMessages, Vec<String>), crate::db::admission::AdmissionDbError> {
+    crate::inbound_admission::delete_selected_messages(state, identity, peer, ids)
 }
 
 pub async fn retry_deferred_downloads(state: Arc<AppState>) -> Result<(), String> {
     let generation = state.current_identity_session_generation();
     tokio::spawn(async move {
-        let _lifecycle = state.identity_switch_lock.lock_owned().await;
+        let _lifecycle = state.identity_switch_lock.lock_routine_owned().await;
         if state.current_identity_session_generation() != generation {
             return Err("Selected identity changed".into());
         }

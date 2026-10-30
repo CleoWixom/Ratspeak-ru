@@ -135,7 +135,8 @@
         var landingRows = [];
         for (var column = 0; column < COLUMNS; column++) landingRows[column] = _landingRow(board, column);
 
-        var html = '<div class="four-board-wrap' + (isMyTurn ? ' your-turn' : '') + '">';
+        var html = '<div class="four-board-wrap' + (isMyTurn ? ' your-turn' : '') +
+            (session.status === 'completed' ? ' has-result' : '') + '">';
         html += _playerKey(opponentName, theirMarker, theirTurnActive);
         html += '<div class="four-board-stage">';
         html += '<div class="four-board my-marker-' + myMarker.toLowerCase() +

@@ -7025,6 +7025,7 @@ mod tests {
         fn notify(&self, notification: NativeNotification) {
             self.seen.lock().unwrap().push(notification);
         }
+        fn withdraw_all(&self) {}
     }
 
     #[test]
