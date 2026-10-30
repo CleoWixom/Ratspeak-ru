@@ -2645,6 +2645,108 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 });
 
+function updateTrustedLinksButton(hosts) {
+    var btn = document.getElementById('settings-trusted-links-btn');
+    if (!btn) return;
+    var n = hosts.length;
+    btn.textContent = n ? n + (n === 1 ? ' website' : ' websites') : 'None';
+    btn.setAttribute('aria-label', 'Trusted websites: ' + btn.textContent);
+}
+
+function openTrustedLinksSheet() {
+    var built = _rsBuildSheet({ title: 'Trusted websites' }, function() {});
+    built.sheet.classList.add('trusted-links-sheet');
+    built.overlay.addEventListener('click', function(e) {
+        if (e.target === built.overlay) built.dismiss();
+    });
+    var list = document.createElement('div');
+    list.className = 'trusted-links-list';
+    built.body.appendChild(list);
+    var clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.className = 'rs-dialog-cancel trusted-links-clear';
+    clearBtn.textContent = 'Remove All';
+    built.footer.appendChild(clearBtn);
+    var doneBtn = document.createElement('button');
+    doneBtn.type = 'button';
+    doneBtn.className = 'rs-dialog-confirm';
+    doneBtn.textContent = 'Done';
+    doneBtn.addEventListener('click', function() { built.dismiss(); });
+    built.footer.appendChild(doneBtn);
+    built.sheet.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') { e.stopPropagation(); built.dismiss(); }
+        if (e.key === 'Tab') {
+            var focusable = Array.prototype.filter.call(built.sheet.querySelectorAll('button'), function(b) { return !b.hidden; });
+            if (!focusable.length) return;
+            var first = focusable[0], last = focusable[focusable.length - 1];
+            if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+            else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        }
+    });
+
+    function render(hosts) {
+        updateTrustedLinksButton(hosts);
+        list.textContent = '';
+        clearBtn.hidden = hosts.length === 0;
+        if (!hosts.length) {
+            var empty = document.createElement('p');
+            empty.className = 'trusted-links-empty';
+            empty.textContent = 'No trusted websites. When you open a link, you can choose not to be asked again for that website.';
+            list.appendChild(empty);
+            return;
+        }
+        hosts.forEach(function(host) {
+            var row = document.createElement('div');
+            row.className = 'trusted-links-row';
+            var name = document.createElement('span');
+            name.className = 'trusted-links-host';
+            name.textContent = host;
+            var remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'selector-badge selector-badge-no-caret';
+            remove.textContent = 'Remove';
+            remove.setAttribute('aria-label', 'Remove ' + host);
+            remove.addEventListener('click', function() {
+                RS.linkTrust.remove(host).then(function(next) {
+                    render(next);
+                    showToast('Removed ' + host, 'toast-success', 1800);
+                }).catch(function() {
+                    showToast('Could not remove ' + host, 'toast-error', 2500);
+                });
+            });
+            row.appendChild(name);
+            row.appendChild(remove);
+            list.appendChild(row);
+        });
+    }
+
+    clearBtn.addEventListener('click', function() {
+        rsConfirm({
+            title: 'Remove all trusted websites?',
+            message: 'Links to these websites will ask again before opening.',
+            confirmText: 'Remove All',
+            danger: true,
+        }).then(function(ok) {
+            if (!ok) return;
+            RS.linkTrust.clear().then(render).catch(function() {
+                showToast('Could not remove websites', 'toast-error', 2500);
+            });
+        });
+    });
+
+    render(RS.linkTrust.list());
+    built.present();
+    doneBtn.focus();
+    RS.linkTrust.load().then(render);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    var btn = document.getElementById('settings-trusted-links-btn');
+    if (!btn || !(RS.linkTrust)) return;
+    btn.addEventListener('click', openTrustedLinksSheet);
+    RS.linkTrust.load().then(updateTrustedLinksButton);
+});
+
 RS.listen('contact_blocked', function() { updateBlockedCount(); });
 RS.listen('contact_unblocked', function() { updateBlockedCount(); });
 // Block-list modal listens for `blackhole_update` itself (line 822) so the

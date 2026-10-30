@@ -305,6 +305,7 @@ function targetWithClasses(classes) {
 (function testCanonicalCopyText() {
     var context = {};
     vm.runInNewContext(
+        namedFunctionSource(lxmfSource, '_messageBodyContent') + '\n' +
         namedFunctionSource(lxmfSource, '_messageDisplayContent') + '\n' +
         'this.displayContent = _messageDisplayContent;',
         context,

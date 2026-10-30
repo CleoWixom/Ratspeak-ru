@@ -8,11 +8,14 @@ changes that materially affect how an artifact is reproduced.
 ### Added
 
 - Added deleting messages: choose Select in a message's menu, pick more messages, then Delete.
+- Added Markdown in messages: bold, italic, strikethrough, code, links, headings, lists, quotes, code blocks and `||spoilers||`. Formatted messages are marked as Markdown, so other apps such as Sideband and Columba can show them cleanly.
+- Links in messages now show where they go before opening in your browser; trusted websites are managed in Settings, Privacy.
 
 ### Fixed and improved
 
 - Text across the app now uses standard sizes and is easier to read; Text size now runs from 90% to 150%.
 - The message menu now opens beside the message and never covers the header or the message box.
+- Links in messages are easier to read, and pressing Enter in a dialog now does what the selected button does.
 
 ## [1.0.35] - 2026-10-26
 

@@ -1668,26 +1668,60 @@ function _splitTrailingUrlPunctuation(raw) {
     return { url: url, trailing: trailing };
 }
 
+function _messageLinkRanges(text) {
+    var value = String(text || '');
+    var ranges = [];
+    value.replace(RS_LINK_RE, function(match, schemeUrl, bareUrl, offset) {
+        var prev = offset > 0 ? value.charAt(offset - 1) : '';
+        if (prev === '@') return match;
+        var label = _splitTrailingUrlPunctuation(match).url;
+        if (!label) return match;
+        ranges.push({
+            start: offset,
+            end: offset + label.length,
+            href: /^https?:\/\//i.test(label) ? label : 'https://' + label,
+        });
+        return match;
+    });
+    return ranges;
+}
+
 function linkifyMessageText(text) {
     var value = String(text || '');
     if (!value) return '';
     var out = '';
     var last = 0;
-    value.replace(RS_LINK_RE, function(match, schemeUrl, bareUrl, offset) {
-        var prev = offset > 0 ? value.charAt(offset - 1) : '';
-        if (prev === '@') return match;
-        out += escapeHtml(value.slice(last, offset));
-        var split = _splitTrailingUrlPunctuation(match);
-        var label = split.url;
-        var href = /^https?:\/\//i.test(label) ? label : 'https://' + label;
-        out += '<a class="rs-message-link" href="' + escapeHtml(href) +
-            '" data-url="' + escapeHtml(href) + '" rel="noopener noreferrer">' +
-            escapeHtml(label) + '</a>' + escapeHtml(split.trailing);
-        last = offset + match.length;
-        return match;
+    _messageLinkRanges(value).forEach(function(range) {
+        var label = value.slice(range.start, range.end);
+        out += escapeHtml(value.slice(last, range.start));
+        out += '<a class="rs-message-link" href="' + escapeHtml(range.href) +
+            '" data-url="' + escapeHtml(range.href) + '" rel="noopener noreferrer">' +
+            escapeHtml(label) + '</a>';
+        last = range.end;
     });
     out += escapeHtml(value.slice(last));
     return out.replace(/\n/g, '<br>');
+}
+
+function _messageIsMarkdown(msg) {
+    return !!(msg && Number(msg.renderer) === 2 && window.RS && RS.markdown);
+}
+
+function _stripMessageMarkdown(text) {
+    return window.RS && RS.markdown ? RS.markdown.strip(text) : String(text || '');
+}
+
+function _messageBodyHtml(msg, hasRenderedAudio) {
+    var body = _messageBodyContent(msg, hasRenderedAudio);
+    var title = ((msg && msg.title) || '').trim();
+    if (_messageIsMarkdown(msg) && body.trim()) {
+        var rendered = RS.markdown.render(body, { links: _messageLinkRanges });
+        if (rendered != null) {
+            return { html: (title ? '<p class="md-p">' + escapeHtml(title) + '</p>' : '') + rendered, markdown: true };
+        }
+    }
+    var text = _messageDisplayContent(msg, hasRenderedAudio);
+    return { html: text ? linkifyMessageText(text) : '', markdown: false };
 }
 
 // Check color reflects the observable delivery state, independent of transport
@@ -2518,16 +2552,21 @@ function _updateConversationPreview(hash, previewText, timestamp) {
 function _conversationPreviewForMessage(message) {
     if (!message) return '';
     var title = (message.title || '').trim();
-    if (title) return _messageDisplayContent(message, !!message.audio).trim();
+    if (title) return _messagePlainContent(message, !!message.audio).trim();
     if (message.audio && (Number(message.audio.mode) === 0x10 || Number(message.audio.mode) === 0x03)) return 'Voice message';
     if (message.audio) return 'Unsupported audio';
-    var content = (message.content || '').trim();
+    var content = (_messageIsMarkdown(message) ? _stripMessageMarkdown(message.content) : (message.content || '')).trim();
     if (content) return content;
     if (message.image) return 'Photo';
     if (Array.isArray(message.attachments) && message.attachments.length > 0) {
         return message.attachments[0].filename || 'Attachment';
     }
     return '';
+}
+
+function _conversationListPreview(c) {
+    var text = c.last_message || '';
+    return Number(c.preview_renderer) === 2 ? _stripMessageMarkdown(text) : text;
 }
 
 function _lastVisibleConversationMessage() {
@@ -2589,7 +2628,7 @@ function renderDashboardRecentMessages() {
 
     container.innerHTML = convos.slice(0, 5).map(function(c) {
         var nameInfo = _conversationNameInfo(c.hash, c.display_name, c.is_contact);
-        var rawPreview = c.last_message || '';
+        var rawPreview = _conversationListPreview(c);
         var dirPrefix = c.last_direction === 'outbound' ? 'You: ' : '';
         var preview = dirPrefix + rawPreview;
         var time = c.timestamp ? formatConvTime(c.timestamp) : '';
@@ -2763,7 +2802,7 @@ function _renderConversationsFromCache(convos) {
     var html = '';
     convos.forEach(function(c) {
             var nameInfo = _conversationNameInfo(c.hash, c.display_name, c.is_contact);
-            var rawPreview = c.last_message || '';
+            var rawPreview = _conversationListPreview(c);
             var dirPrefix = c.last_direction === 'outbound' ? 'You: ' : '';
             var preview = dirPrefix + rawPreview;
             var time = c.timestamp ? formatConvTime(c.timestamp) : '';
@@ -3284,15 +3323,29 @@ document.addEventListener('DOMContentLoaded', function() {
 
 window.renderConversation = renderConversation;
 
-function _messageDisplayContent(msg, hasRenderedAudio) {
+function _messageBodyContent(msg, hasRenderedAudio) {
     var displayContent = (msg && msg.content) || '';
     if (msg && (msg.image || (msg.attachments && msg.attachments.length > 0)) && displayContent) {
         displayContent = displayContent.replace(/\n?\[File:[^\]]*\]\s*$/, '');
     }
     if (hasRenderedAudio && displayContent.trim() === 'Voice message') displayContent = '';
+    return displayContent;
+}
+
+function _messageDisplayContent(msg, hasRenderedAudio) {
+    var displayContent = _messageBodyContent(msg, hasRenderedAudio);
     var title = ((msg && msg.title) || '').trim();
     if (title) return title + (displayContent.trim() ? '\n\n' + displayContent : '');
     return displayContent;
+}
+
+// Previews, reply quotes and search show Markdown messages without syntax.
+function _messagePlainContent(msg, hasRenderedAudio) {
+    if (!_messageIsMarkdown(msg)) return _messageDisplayContent(msg, hasRenderedAudio);
+    var body = _stripMessageMarkdown(_messageBodyContent(msg, hasRenderedAudio));
+    var title = ((msg && msg.title) || '').trim();
+    if (title) return title + (body.trim() ? '\n\n' + body : '');
+    return body;
 }
 
 function _mobileMessageActionsUseLongPress() {
@@ -3663,6 +3716,7 @@ function renderConversation(options) {
 
         // Strip the `[File: ...]` fallback suffix when we have structured payload.
         var displayContent = _messageDisplayContent(msg, !!audioHtml);
+        var body = _messageBodyHtml(msg, !!audioHtml);
 
         var hasReactions = reactionHtml ? ' has-reactions' : '';
         var hasImage = !!imageHtml;
@@ -3684,7 +3738,7 @@ function renderConversation(options) {
             '<div class="' + bubbleClass + '" data-msg-id="' + escapeHtml(msg.id || '') + '">' +
                 replyHtml +
                 imageHtml +
-                (displayContent ? '<div class="lxmf-msg-content">' + linkifyMessageText(displayContent) + '</div>' : '') +
+                (body.html ? '<div class="lxmf-msg-content' + (body.markdown ? ' md' : '') + '">' + body.html + '</div>' : '') +
                 audioHtml +
                 attachHtml +
                 '<div class="lxmf-msg-meta">' + metaHtml + '</div>' +
@@ -3756,18 +3810,43 @@ function renderConversation(options) {
         });
     });
 
+    _bindMessageSpoilers(container);
+    _bindMessageCodeBlocks(container);
+    var pointer = document.documentElement.dataset.inputModality !== 'touch';
+    container.querySelectorAll('.rs-message-link.md-link[data-url]').forEach(function(link) {
+        if (!pointer) return;
+        var target = rsLinkTarget(link.getAttribute('data-url'));
+        if (target) {
+            var p = target.parts;
+            link.title = p.scheme + p.www + p.host + p.port + p.rest;
+        }
+    });
+
     container.querySelectorAll('.rs-message-link[data-url]').forEach(function(link) {
+        // Middle-click must not bypass the warning or autoscroll.
+        link.addEventListener('mousedown', function(e) {
+            if (e.button === 1) e.preventDefault();
+        });
+        link.addEventListener('auxclick', function(e) {
+            if (e.button !== 1) return;
+            e.preventDefault();
+            e.stopPropagation();
+            if (_messageLinkActivationAllowed(this) && !this.closest('.md-spoiler:not(.is-revealed)')) {
+                _confirmExternalLink(this.getAttribute('data-url'), this);
+            }
+        });
         link.addEventListener('click', function(e) {
             e.preventDefault();
             e.stopPropagation();
             if (_consumePendingMessageHoldActivation(e, this)) return;
             if (!_messageLinkActivationAllowed(this)) return;
-            var url = this.getAttribute('data-url');
-            if (url && window.RS && typeof RS.openExternalUrl === 'function') {
-                RS.openExternalUrl(url).catch(function(err) {
-                    showToast('Could not open link: ' + ((err && err.message) || 'error'), 'toast-error', 3500);
-                });
+            var covered = this.closest('.md-spoiler:not(.is-revealed)');
+            if (covered) {
+                _revealMessageSpoiler(covered);
+                return;
             }
+            var url = this.getAttribute('data-url');
+            if (url) _confirmExternalLink(url, this);
         });
     });
 
@@ -4005,6 +4084,29 @@ function _cancelStagedAttachmentToken(stageToken) {
     });
 }
 
+var COMPOSER_FORMAT_KEYS = { b: '**', i: '*', e: '`' };
+
+function _composerFormatMarker(e) {
+    if (!(window.RS && RS.markdown) || e.altKey || e.isComposing) return null;
+    var mod = /Mac|iPhone|iPad/.test(navigator.platform || '') ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+    if (!mod) return null;
+    var key = (e.key || '').toLowerCase();
+    if (e.shiftKey) return key === 'x' ? '~~' : null;
+    return COMPOSER_FORMAT_KEYS[key] || null;
+}
+
+// Formatting sets LXMF FIELD_RENDERER = Markdown; plain text goes out untouched.
+function _prepareComposedMessage(text) {
+    if (!text || !(window.RS && RS.markdown)) return { content: text, renderer: null, preview: text };
+    var prepared = RS.markdown.prepare(text, { links: _messageLinkRanges });
+    if (!prepared.markdown) return { content: text, renderer: null, preview: text };
+    return {
+        content: prepared.content,
+        renderer: RS.markdown.RENDERER,
+        preview: RS.markdown.strip(prepared.content),
+    };
+}
+
 function sendLxmfMessage(deliveryMethod, shareContext) {
     if (!lxmfActiveContact) return;
     if (!shareContext && RS.textShares && RS.textShares.interceptSend(deliveryMethod)) return;
@@ -4013,7 +4115,9 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
     var input = document.getElementById('lxmf-input');
     if (!input) return;
     var shouldRestoreComposerFocus = _consumeLxmfSendFocusState(input);
-    var text = input.value.trim();
+    var composed = _prepareComposedMessage(input.value.trim());
+    var text = composed.content;
+    var renderer = composed.renderer;
     var chosenDelivery = _deliveryPrefOrAuto(deliveryMethod);
     var maxMessageBytes = lxmfLimits.max_message_bytes || 134217727;
     if (text && _utf8ByteLength(text) > maxMessageBytes) {
@@ -4050,6 +4154,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
                     delivery_method: chosenDelivery,
                     client_msg_id: attachMsgId,
                     staging_token: stageToken,
+                    renderer: renderer,
                 }
             });
         }).then(function(resp) {
@@ -4075,6 +4180,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
             id: attachMsgId,
             direction: 'outbound',
             content: text,
+            renderer: renderer,
             timestamp: Date.now() / 1000,
             state: 'sending',
             delivery_method: _optimisticDeliveryMethod(chosenDelivery),
@@ -4088,7 +4194,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
         });
 
         // Capture before clearPendingFile() wipes pending state.
-        var attachPreview = text || (isImage ? 'Photo' : pendingAttachment.name);
+        var attachPreview = composed.preview || (isImage ? 'Photo' : pendingAttachment.name);
         pendingAttachment.preview_url = null;
         pendingAttachment.detached_for_send = true;
         clearPendingFile();
@@ -4113,6 +4219,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
                 reply_to_id: _replyTarget.id,
                 reply_to_preview: _replyTarget.content,
                 client_msg_id: msgId,
+                renderer: renderer,
             }
         }).then(function(resp) {
             _handleLxmfSendAccepted(resp, msgId, targetHash, sendOwner);
@@ -4121,6 +4228,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
             id: msgId,
             direction: 'outbound',
             content: text,
+            renderer: renderer,
             timestamp: Date.now() / 1000,
             state: 'sending',
             delivery_method: _optimisticDeliveryMethod(chosenDelivery),
@@ -4129,7 +4237,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
         });
         clearReplyTarget();
         if (replyWasActive) renderConversation({ forceScrollBottom: true });
-        _updateConversationPreview(targetHash, text, Date.now() / 1000);
+        _updateConversationPreview(targetHash, composed.preview, Date.now() / 1000);
         loadConversations();
         _finishLxmfComposerSend(input, shouldRestoreComposerFocus, targetHash);
         return;
@@ -4141,6 +4249,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
             content: text,
             delivery_method: chosenDelivery,
             client_msg_id: msgId,
+            renderer: renderer,
         }
     }).then(function(resp) {
         _handleLxmfSendAccepted(resp, msgId, targetHash, sendOwner);
@@ -4157,12 +4266,13 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
         id: msgId,
         direction: 'outbound',
         content: text,
+        renderer: renderer,
         timestamp: Date.now() / 1000,
         state: 'sending',
         delivery_method: _optimisticDeliveryMethod(chosenDelivery),
     });
     if (messageWasActive) renderConversation({ forceScrollBottom: true });
-    _updateConversationPreview(targetHash, text, Date.now() / 1000);
+    _updateConversationPreview(targetHash, composed.preview, Date.now() / 1000);
     loadConversations();
     _finishLxmfComposerSend(input, shouldRestoreComposerFocus, targetHash);
 }
@@ -4698,7 +4808,7 @@ function clearPendingFile() {
 }
 
 function setReplyTarget(msgData) {
-    var replyContent = _messageDisplayContent(msgData, !!msgData.audio).substring(0, 100);
+    var replyContent = _messagePlainContent(msgData, !!msgData.audio).substring(0, 100);
     if (msgData.audio && !replyContent.trim()) {
         replyContent = (Number(msgData.audio.mode) === 0x10 || Number(msgData.audio.mode) === 0x03) ? 'Voice message' : 'Unsupported audio';
     }
@@ -4752,7 +4862,8 @@ var _messagePointerContextSelection = null;
 
 function _messageHoldActivationSurface(target, bubble) {
     if (!target || !target.closest || !bubble || !bubble.contains(target)) return null;
-    return target.closest('.lxmf-clickable-img, .rs-message-link, .rs-file-download, .msg-reply-quote');
+    return target.closest('.lxmf-clickable-img, .rs-message-link, .rs-file-download, .msg-reply-quote, ' +
+        '.md-spoiler:not(.is-revealed), .md-code-copy');
 }
 
 function _clearPendingMessageHoldActivation(expectedSequence) {
@@ -4990,7 +5101,7 @@ function _clearMessageSelection() {
 
 function _messageSelectLabel(msg) {
     var when = msg.timestamp ? new Date(msg.timestamp * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
-    var text = String(_messageDisplayContent(msg, !!msg.audio) || '').trim().slice(0, 60) ||
+    var text = String(_messagePlainContent(msg, !!msg.audio) || '').trim().slice(0, 60) ||
         (msg.image ? 'Photo' : msg.audio ? 'Voice message' : 'File');
     return (msg.direction === 'outbound' ? 'You' : 'Them') + (when ? ', ' + when : '') + ': ' + text;
 }
@@ -5230,13 +5341,172 @@ function _messageTouchStartsDirectControl(touch, bubble) {
     if (!target || !target.closest || !bubble || !bubble.contains(target)) return false;
     return !!target.closest(
         '.msg-actions-trigger, .lxmf-send-cancel, .msg-send-cancel-inline, .msg-retry-btn, ' +
-        '.voice-memo-player-play, .voice-memo-player-waveform, .voice-memo-player-download'
+        '.voice-memo-player-play, .voice-memo-player-waveform, .voice-memo-player-download, .md-code-copy'
     );
 }
 
 function _messageLinkUsesNativeContext(target) {
     var isMessageLink = target && target.closest && target.closest('.rs-message-link');
     return !!isMessageLink && document.documentElement.dataset.inputModality !== 'touch';
+}
+
+function _openExternalMessageLink(url) {
+    if (!(window.RS && typeof RS.openExternalUrl === 'function')) return;
+    RS.openExternalUrl(url).catch(function(err) {
+        showToast('Could not open link: ' + ((err && err.message) || 'error'), 'toast-error', 3500);
+    });
+}
+
+// Hosts the user chose not to be asked about again (device-wide setting).
+RS.linkTrust = (function() {
+    var hosts = [];
+    var loading = null;
+    function apply(resp) {
+        hosts = resp && Array.isArray(resp.hosts) ? resp.hosts.slice() : hosts;
+        if (typeof updateTrustedLinksButton === 'function') updateTrustedLinksButton(hosts.slice());
+        return hosts.slice();
+    }
+    return {
+        load: function() {
+            if (!loading) {
+                loading = RS.invoke('api_trusted_link_hosts').then(apply).catch(function() {
+                    loading = null;
+                    return hosts.slice();
+                });
+            }
+            return loading;
+        },
+        list: function() { return hosts.slice(); },
+        has: function(host) { return hosts.indexOf(host) >= 0; },
+        add: function(host) { return RS.invoke('trust_link_host', { host: host }).then(apply); },
+        remove: function(host) { return RS.invoke('untrust_link_host', { host: host }).then(apply); },
+        clear: function() { return RS.invoke('clear_trusted_link_hosts').then(apply); },
+    };
+})();
+
+function _confirmExternalLink(url, link) {
+    var masked = link && link.hasAttribute('data-masked');
+    var linkText = masked ? link.textContent : null;
+    var target = rsLinkTarget(url, linkText);
+    if (!target) return;
+    RS.linkTrust.load().then(function() {
+        if (!target.warnings.length && RS.linkTrust.has(target.trustKey)) {
+            _openExternalMessageLink(target.href);
+            return;
+        }
+        rsLinkConfirm(url, { linkText: linkText }).then(function(result) {
+            if (!result.confirmed) return;
+            if (result.trust) {
+                RS.linkTrust.add(result.host).catch(function() {
+                    showToast('Could not save website', 'toast-error', 2500);
+                });
+            }
+            _openExternalMessageLink(target.href);
+        });
+    });
+}
+
+// Only code blocks that actually overflow become keyboard-scrollable stops.
+function _syncCodeBlockFocus(pre) {
+    if (pre.scrollWidth > pre.clientWidth) {
+        var lang = pre.getAttribute('data-lang');
+        pre.setAttribute('tabindex', '0');
+        pre.setAttribute('aria-label', lang ? 'Code, ' + lang : 'Code');
+    } else {
+        pre.removeAttribute('tabindex');
+        pre.removeAttribute('aria-label');
+    }
+}
+
+var _codeBlockObserver = typeof ResizeObserver === 'function'
+    ? new ResizeObserver(function(entries) {
+        entries.forEach(function(entry) { _syncCodeBlockFocus(entry.target); });
+    })
+    : null;
+
+function _bindMessageCodeBlocks(container) {
+    if (_codeBlockObserver) _codeBlockObserver.disconnect();
+    container.querySelectorAll('.md-codeblock').forEach(function(block) {
+        var pre = block.querySelector('.md-pre');
+        if (pre) {
+            _syncCodeBlockFocus(pre);
+            if (_codeBlockObserver) _codeBlockObserver.observe(pre);
+        }
+        var copy = block.querySelector('.md-code-copy');
+        if (!copy) return;
+        copy.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (_consumePendingMessageHoldActivation(e, copy) || _messageSelectionActive()) return;
+            if (copy.closest('.md-spoiler:not(.is-revealed)')) return;
+            var code = pre ? pre.textContent : '';
+            Promise.resolve(RS.copyText(code)).then(function() {
+                showToast('Code copied', 'toast-success', 1800);
+                if (typeof haptic === 'function') haptic('light');
+                copy.classList.add('is-copied');
+                clearTimeout(copy._copiedTimer);
+                copy._copiedTimer = setTimeout(function() { copy.classList.remove('is-copied'); }, 1200);
+            }).catch(function() {
+                showToast('Could not copy', 'toast-error', 1800);
+            });
+        });
+    });
+}
+
+// Revealed spoilers stay revealed across re-renders until the chat changes.
+var _revealedSpoilers = { hash: null, keys: {} };
+
+function _spoilerKey(spoiler) {
+    var bubble = spoiler.closest('.lxmf-msg[data-msg-id]');
+    if (!bubble) return null;
+    var all = bubble.querySelectorAll('.md-spoiler');
+    return bubble.getAttribute('data-msg-id') + ':' + Array.prototype.indexOf.call(all, spoiler);
+}
+
+function _revealMessageSpoiler(spoiler, restoring) {
+    var hadFocus = !restoring && document.activeElement === spoiler;
+    spoiler.classList.add('is-revealed');
+    spoiler.removeAttribute('role');
+    spoiler.removeAttribute('aria-label');
+    spoiler.removeAttribute('aria-expanded');
+    var content = spoiler.querySelector('.md-spoiler-content');
+    if (content) {
+        content.removeAttribute('aria-hidden');
+        content.removeAttribute('inert');
+    }
+    if (hadFocus) {
+        spoiler.setAttribute('tabindex', '-1');
+        spoiler.focus({ preventScroll: true });
+    } else {
+        spoiler.removeAttribute('tabindex');
+    }
+    if (restoring) return;
+    var key = _spoilerKey(spoiler);
+    if (key) _revealedSpoilers.keys[key] = true;
+}
+
+function _bindMessageSpoilers(container) {
+    var hash = _canonicalConversationHash(lxmfActiveContact);
+    if (_revealedSpoilers.hash !== hash) _revealedSpoilers = { hash: hash, keys: {} };
+    container.querySelectorAll('.md-spoiler').forEach(function(spoiler) {
+        if (_revealedSpoilers.keys[_spoilerKey(spoiler)]) {
+            _revealMessageSpoiler(spoiler, true);
+            return;
+        }
+        spoiler.addEventListener('click', function(e) {
+            if (spoiler.classList.contains('is-revealed') || _messageSelectionActive()) return;
+            e.preventDefault();
+            e.stopPropagation();
+            if (_consumePendingMessageHoldActivation(e, spoiler)) return;
+            _revealMessageSpoiler(spoiler);
+        });
+        spoiler.addEventListener('keydown', function(e) {
+            if (spoiler.classList.contains('is-revealed') || (e.key !== 'Enter' && e.key !== ' ')) return;
+            e.preventDefault();
+            e.stopPropagation();
+            _revealMessageSpoiler(spoiler);
+        });
+    });
 }
 
 function _messageLinkActivationAllowed(link) {
@@ -6056,7 +6326,7 @@ RS.listen('lxmf_message', function(msg) {
     // for a background browser, where the last selected chat is not visible.
     if (!window.__TAURI_INTERNALS__ && !appForeground && typeof rsNotify !== 'undefined') {
         var notifFrom = _messageSourceName(msg);
-        var notifBody = _messageDisplayContent(msg, !!msg.audio).substring(0, 120) || 'New message';
+        var notifBody = _messagePlainContent(msg, !!msg.audio).substring(0, 120) || 'New message';
         rsNotify.send({
             title: 'Message from ' + notifFrom,
             body: notifBody,
@@ -6971,6 +7241,12 @@ document.addEventListener('DOMContentLoaded', function() {
         RS.composer.bindTypingPolicy(textarea);
         textarea.removeAttribute('maxlength');
         textarea.addEventListener('keydown', function(e) {
+            var wrap = _composerFormatMarker(e);
+            if (wrap) {
+                e.preventDefault();
+                RS.markdown.toggleWrap(this, wrap);
+                return;
+            }
             if (RS.composer.shouldSendOnEnter(e)) {
                 e.preventDefault();
                 sendLxmfMessage('auto');
