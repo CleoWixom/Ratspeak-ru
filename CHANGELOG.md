@@ -5,6 +5,15 @@ changes that materially affect how an artifact is reproduced.
 
 ## [Unreleased]
 
+### Added
+
+- Added deleting messages: choose Select in a message's menu, pick more messages, then Delete.
+
+### Fixed and improved
+
+- Text across the app now uses standard sizes and is easier to read; Text size now runs from 90% to 150%.
+- The message menu now opens beside the message and never covers the header or the message box.
+
 ## [1.0.35] - 2026-10-26
 
 ### Added
