@@ -248,6 +248,7 @@ impl PreparedGame {
         }
         drop(connection);
         let working = lrgp::router::LrgpRouter::with_builtin_apps();
+        crate::battleship::register(&working);
         if let Some((session, _)) = &prior {
             working
                 .restore_session(session.clone())

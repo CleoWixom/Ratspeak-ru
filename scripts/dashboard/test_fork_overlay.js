@@ -161,7 +161,7 @@ async function runLoader(anchors) {
         '/static/js/connection_link_presenters.js?v=ui-test-1', '/static/js/native_connection_link.js?v=ui-test-1',
         '/static/js/connection_qr.js?v=ui-test-1', '/static/js/contacts_backup.js?v=ui-test-1',
         '/static/js/announce_radar.js?v=ui-test-1', '/static/js/route_lookup.js?v=ui-test-1',
-        '/static/js/ru_text_scale.js?v=ui-test-1', '/static/js/ru_peer_views.js?v=ui-test-1', '/static/js/ru_lxma.js?v=ui-test-1', '/static/js/ru_geo.js?v=ui-test-1', '/static/js/ru_extensions.js?v=ui-test-1']);
+        '/static/js/ru_text_scale.js?v=ui-test-1', '/static/js/ru_peer_views.js?v=ui-test-1', '/static/js/ru_lxma.js?v=ui-test-1', '/static/js/ru_geo.js?v=ui-test-1', '/static/js/ru_battleship.js?v=ui-test-1', '/static/js/ru_extensions.js?v=ui-test-1']);
     assert.strictEqual(full.html.scale[0], 'beforebegin');
     ['50', '70', '90'].forEach(function(v) { assert(full.html.scale[1].indexOf('value="' + v + '"') !== -1); });
     assert(full.appended.some(function(n) { return n.tag === 'input' && n.id === 'contacts-backup-file-input'; }));
@@ -170,7 +170,7 @@ async function runLoader(anchors) {
     // Missing anchors cost one feature each, never the loader.
     var bare = await runLoader({});
     assert.strictEqual(bare.warnings.length, 3);
-    assert.strictEqual(bare.appended.filter(function(n) { return n.tag === 'script'; }).length, 11);
+    assert.strictEqual(bare.appended.filter(function(n) { return n.tag === 'script'; }).length, 12);
     console.log('fork overlay passed');
 })().catch(function(error) { console.error(error); process.exit(1); });
 
