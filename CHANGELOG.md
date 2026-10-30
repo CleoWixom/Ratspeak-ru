@@ -5,18 +5,23 @@ changes that materially affect how an artifact is reproduced.
 
 ## [Unreleased]
 
+## [1.0.36] - 2026-10-29
+
 ### Added
 
-- Added deleting messages: choose Select in a message's menu, pick more messages, then Delete.
-- Added Markdown in messages: bold, italic, strikethrough, code, links, headings, lists, quotes, code blocks and `||spoilers||`. Formatted messages are marked as Markdown, so other apps such as Sideband and Columba can show them cleanly.
-- Links in messages now show where they go before opening in your browser; trusted websites are managed in Settings, Privacy.
+- Added Markdown support to messages: bold, italic, strikethrough, code, links, headings, lists, quotes and code blocks.
+- Added spoilers: put text between two bars on each side, like `||this||`. Or use `>!` and/or `!<`
+- Added deleting messages: select one or multiple messages to delete.
+- Added outbound URL security warning.
+- Added markdown hotkey shortcuts on desktop: Cmd or Ctrl with B, I or E formats the selected text.
+- Added changelog viewing to the in-app "Check For Updates" feature.
 
 ### Fixed and improved
 
-- Text across the app now uses standard sizes and is easier to read; Text size now runs from 90% to 150%.
-- The message menu now opens beside the message and never covers the header or the message box.
-- Links in messages are easier to read, and pressing Enter in a dialog now does what the selected button does.
-- The app no longer zooms when pinched or double-tapped on mobile; expanded images can still be zoomed.
+- Text across the app is larger and easier to read. Again.
+- The message reaction menu now opens beside the message and got a design uplift.
+- Links in messages are easier to read.
+- Locked zoom in the app outside of enlarged photos.
 
 ## [1.0.35] - 2026-10-26
 

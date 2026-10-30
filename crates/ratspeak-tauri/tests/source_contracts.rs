@@ -6305,15 +6305,19 @@ fn settings_version_display_uses_package_version_api() {
     assert!(settings_js.contains("https://api.github.com/repos/ratspeak/Ratspeak/releases/latest"));
     assert!(settings_js.contains("function promptRatspeakUpdateCheck"));
     assert!(settings_js.contains("title: 'Check for updates?'"));
-    assert!(settings_js.contains("confirmText: 'Yes'"));
-    assert!(settings_js.contains("cancelText: 'No'"));
+    assert!(settings_js.contains("confirmText: 'Continue'"));
+    assert!(settings_js.contains("cancelText: 'Cancel'"));
+    assert!(!settings_js.contains("Are you sure?"));
     assert!(settings_js.contains("function checkRatspeakUpdate"));
     assert!(settings_js.contains("function _settingsVersionSuffixRank"));
     assert!(settings_js.contains("replace(/(\\d)-([a-z]+)$/i, '$1$2')"));
     assert!(settings_js.contains("fetch(RATSPEAK_RELEASE_LATEST_URL"));
-    assert!(settings_js.contains("Update available!"));
-    assert!(settings_js.contains("Up to date!"));
-    assert!(settings_js.contains("For privacy reasons, we do not currently auto-update"));
+    assert!(settings_js.contains("function _settingsShowUpdateAvailable(release, currentVersion)"));
+    assert!(settings_js.contains("title: 'Update available'"));
+    assert!(settings_js.contains("\"You're up to date\""));
+    assert!(settings_js.contains("For privacy, Ratspeak doesn't update itself."));
+    assert!(settings_js.contains("RS.markdown.render(body"));
+    assert!(!settings_js.contains("data.html_url"));
 
     let nav_js = read_source(root.join("dashboard/static/js/nav.js")).expect("nav");
     assert!(nav_js.contains("id=\"about-modal-version\""));

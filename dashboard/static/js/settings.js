@@ -35,6 +35,8 @@ var _settingsHideKnownSpamPeersBusy = false;
 var _settingsHideKnownSpamPeersEnabled = true;
 var RATSPEAK_RELEASE_LATEST_URL = 'https://api.github.com/repos/ratspeak/Ratspeak/releases/latest';
 var RATSPEAK_RELEASES_URL = 'https://github.com/ratspeak/Ratspeak/releases';
+var RATSPEAK_TESTFLIGHT_URL = 'https://testflight.apple.com/join/AzzW4Jg6';
+var RATSPEAK_RELEASE_TAG_RE = /^v?\d+(\.\d+){1,3}[0-9A-Za-z.-]*$/;
 
 window.ratspeakChannelHostingEnabled = function() {
     return !!_settingsChannelHostingEnabled;
@@ -495,19 +497,33 @@ function _settingsSetUpdateButtonsBusy(busy) {
     _settingsUpdateCheckInFlight = !!busy;
     document.querySelectorAll('.settings-update-check-btn').forEach(function(btn) {
         btn.disabled = _settingsUpdateCheckInFlight;
-        btn.textContent = _settingsUpdateCheckInFlight ? 'Checking...' : 'Check for updates';
+        btn.textContent = _settingsUpdateCheckInFlight ? 'Checking…' : 'Check for updates';
     });
+}
+
+// The busy state disables (and so blurs) the button, so dialogs can't restore focus to it themselves.
+function _settingsFocusUpdateButton() {
+    if (RS.ui && typeof RS.ui.prefersKeyboardFocus === 'function' && !RS.ui.prefersKeyboardFocus()) return;
+    var btn = document.querySelector('.settings-update-check-btn');
+    if (btn && !btn.disabled) btn.focus();
 }
 
 function _settingsShowUpdateResult(title, message) {
     if (typeof rsAlert === 'function') {
         return rsAlert({ title: title, message: message, closeText: 'Close' });
     }
-    showToast(title + ' ' + message, title === 'Update available!' ? 'toast-warning' : 'toast-info', 6000);
+    showToast(title + ' ' + message, 'toast-info', 6000);
     return Promise.resolve();
 }
 
-function _settingsLatestReleaseVersion(signal) {
+function _settingsUpdateError(kind, status) {
+    var error = new Error(kind === 'http' ? 'GitHub returned ' + status : 'Unexpected release response');
+    error.kind = kind;
+    error.status = status;
+    return error;
+}
+
+function _settingsLatestRelease(signal) {
     return fetch(RATSPEAK_RELEASE_LATEST_URL, {
         method: 'GET',
         cache: 'no-store',
@@ -516,13 +532,245 @@ function _settingsLatestReleaseVersion(signal) {
             'Accept': 'application/vnd.github+json'
         }
     }).then(function(resp) {
-        if (!resp.ok) throw new Error('GitHub returned ' + resp.status);
-        return resp.json();
+        if (!resp.ok) throw _settingsUpdateError('http', resp.status);
+        return resp.json().catch(function() { throw _settingsUpdateError('bad-response'); });
     }).then(function(data) {
-        var latest = data && (data.tag_name || data.name);
-        latest = _settingsNormalizeVersion(latest);
-        if (!latest) throw new Error('No release version returned');
-        return latest;
+        var latest = _settingsNormalizeVersion(data && (data.tag_name || data.name));
+        if (!latest) throw _settingsUpdateError('bad-response');
+        return {
+            version: latest,
+            tag: data && typeof data.tag_name === 'string' ? data.tag_name : '',
+            publishedAt: data && typeof data.published_at === 'string' ? data.published_at : '',
+            body: data && typeof data.body === 'string' ? data.body : '',
+        };
+    });
+}
+
+// Release notes arrive as Markdown; drop a leading heading that only repeats the version.
+function _settingsReleaseNotesBody(body, latestVersion) {
+    var text = String(body || '').replace(/\r\n?/g, '\n');
+    var lines = text.split('\n');
+    var i = 0;
+    while (i < lines.length && !lines[i].trim()) i++;
+    var heading = i < lines.length ? /^#{1,6}[ \t]+(.+?)[ \t#]*$/.exec(lines[i]) : null;
+    if (heading && _settingsNormalizeVersion(heading[1]) === latestVersion) {
+        i++;
+        while (i < lines.length && !lines[i].trim()) i++;
+        text = lines.slice(i).join('\n');
+    }
+    return text.trim();
+}
+
+function _settingsReleaseUrl(tag) {
+    return RATSPEAK_RELEASE_TAG_RE.test(tag || '')
+        ? RATSPEAK_RELEASES_URL + '/tag/' + encodeURIComponent(tag)
+        : RATSPEAK_RELEASES_URL;
+}
+
+function _settingsElement(tag, className, text) {
+    var el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text != null) el.textContent = text;
+    return el;
+}
+
+// The notes are untrusted remote text: they reach the page only through the
+// escaping Markdown renderer, and their links get the leaving-app warning.
+function _settingsRenderReleaseNotes(notes, body, ios) {
+    if (!body) {
+        notes.appendChild(_settingsElement('p', 'rs-update-notes-empty', 'No release notes for this version.'));
+        return;
+    }
+    if (!(window.RS && RS.markdown)) {
+        notes.classList.add('rs-release-notes-plain');
+        notes.textContent = body;
+        return;
+    }
+    var html = RS.markdown.render(body, { links: typeof _messageLinkRanges === 'function' ? _messageLinkRanges : null });
+    if (html == null) {
+        notes.appendChild(_settingsElement('p', 'rs-update-notes-empty', ios
+            ? 'These notes are too long to show here.'
+            : 'These notes are too long to show here. Get Update opens them on GitHub.'));
+        return;
+    }
+    notes.innerHTML = html;
+    notes.querySelectorAll('.md-spoiler').forEach(function(spoiler) {
+        if (typeof _revealMessageSpoiler === 'function') _revealMessageSpoiler(spoiler, true);
+    });
+    notes.addEventListener('click', function(e) {
+        var link = e.target.closest('.rs-message-link[data-url]');
+        if (link) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (typeof _confirmExternalLink === 'function') _confirmExternalLink(link.getAttribute('data-url'), link);
+            return;
+        }
+        var copy = e.target.closest('.md-code-copy');
+        if (!copy) return;
+        e.preventDefault();
+        var pre = copy.closest('.md-codeblock') && copy.closest('.md-codeblock').querySelector('.md-pre');
+        Promise.resolve(RS.copyText(pre ? pre.textContent : '')).then(function() {
+            showToast('Code copied', 'toast-success', 1800);
+        }).catch(function() {
+            showToast('Could not copy', 'toast-error', 1800);
+        });
+    });
+    notes.addEventListener('mousedown', function(e) {
+        if (e.button === 1 && e.target.closest('.rs-message-link')) e.preventDefault();
+    });
+    notes.addEventListener('auxclick', function(e) {
+        var link = e.button === 1 && e.target.closest('.rs-message-link[data-url]');
+        if (!link) return;
+        e.preventDefault();
+        if (typeof _confirmExternalLink === 'function') _confirmExternalLink(link.getAttribute('data-url'), link);
+    });
+}
+
+function _settingsShowUpdateAvailable(release, currentVersion) {
+    return new Promise(function(resolve) {
+        var ios = typeof isIOS === 'function' && isIOS();
+        var observer = null;
+        var built = _rsBuildSheet({
+            title: 'Update available',
+            ariaLabel: 'Update available',
+            sheetClass: 'rs-update-sheet',
+            nativeBackValue: null,
+        }, function() {
+            if (observer) observer.disconnect();
+            _settingsFocusUpdateButton();
+            resolve();
+        });
+        built.sheet.tabIndex = -1;
+        built.overlay.addEventListener('click', function(e) {
+            if (e.target === built.overlay) built.dismiss(null);
+        });
+        built.sheet.setAttribute('aria-describedby', 'rs-update-summary');
+
+        var summary = _settingsElement('div', 'rs-update-summary');
+        summary.id = 'rs-update-summary';
+        summary.tabIndex = -1;
+        summary.appendChild(_settingsElement('div', 'rs-update-version', 'Ratspeak ' + release.version));
+        var meta = _settingsElement('div', 'rs-update-meta');
+        var published = release.publishedAt ? new Date(release.publishedAt) : null;
+        if (published && !isNaN(published.getTime())) {
+            var time = _settingsElement('time', null,
+                'Released ' + published.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }));
+            time.setAttribute('datetime', release.publishedAt);
+            meta.appendChild(time);
+            meta.appendChild(document.createTextNode(' · '));
+        }
+        meta.appendChild(document.createTextNode("You're on " + currentVersion));
+        summary.appendChild(meta);
+        built.body.appendChild(summary);
+
+        var section = _settingsElement('section', 'rs-update-notes');
+        section.setAttribute('aria-labelledby', 'rs-update-notes-label');
+        var label = _settingsElement('h2', 'rs-update-notes-label', "What's new");
+        label.id = 'rs-update-notes-label';
+        var notes = _settingsElement('div', 'rs-release-notes md');
+        section.appendChild(label);
+        section.appendChild(notes);
+        built.body.appendChild(section);
+        _settingsRenderReleaseNotes(notes, _settingsReleaseNotesBody(release.body, release.version), ios);
+
+        built.footer.appendChild(_settingsElement('p', 'rs-update-footnote', ios
+            ? "For privacy, Ratspeak doesn't update itself. On iPhone and iPad, updates come through TestFlight."
+            : "For privacy, Ratspeak doesn't update itself. Get Update opens the release on GitHub."));
+        var closeBtn = _settingsElement('button', 'rs-dialog-cancel', 'Close');
+        closeBtn.type = 'button';
+        closeBtn.addEventListener('click', function() { built.dismiss(null); });
+        var getBtn = _settingsElement('button', 'rs-dialog-confirm', ios ? 'Open TestFlight' : 'Get Update');
+        getBtn.type = 'button';
+        getBtn.addEventListener('click', function() {
+            var failure = ios ? 'Could not open TestFlight' : 'Could not open GitHub';
+            RS.openExternalUrl(ios ? RATSPEAK_TESTFLIGHT_URL : _settingsReleaseUrl(release.tag)).then(function(opened) {
+                if (opened) built.dismiss(null);
+                else showToast(failure, 'toast-error', 3500);
+            }).catch(function() {
+                showToast(failure, 'toast-error', 3500);
+            });
+        });
+        built.footer.appendChild(closeBtn);
+        built.footer.appendChild(getBtn);
+
+        // The body is the only scroller; it becomes a labelled tab stop only when it scrolls.
+        function syncScroller() {
+            var body = built.body;
+            if (body.scrollHeight > body.clientHeight + 1) {
+                body.setAttribute('tabindex', '0');
+                body.setAttribute('role', 'region');
+                body.setAttribute('aria-label', "What's new in " + release.version);
+            } else {
+                body.removeAttribute('tabindex');
+                body.removeAttribute('role');
+                body.removeAttribute('aria-label');
+            }
+            notes.querySelectorAll('.md-pre').forEach(function(pre) {
+                if (typeof _syncCodeBlockFocus === 'function') _syncCodeBlockFocus(pre);
+            });
+        }
+
+        built.sheet.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                e.stopPropagation();
+                built.dismiss(null);
+                return;
+            }
+            if (e.key !== 'Tab') return;
+            var focusable = Array.prototype.filter.call(
+                built.sheet.querySelectorAll('a[href], button:not(:disabled), [tabindex="0"]'),
+                function(el) { return el.offsetParent !== null || el === built.body; }
+            );
+            if (!focusable.length) return;
+            var first = focusable[0];
+            var last = focusable[focusable.length - 1];
+            if (e.shiftKey && (document.activeElement === first || document.activeElement === summary)) {
+                e.preventDefault();
+                last.focus();
+            } else if (!e.shiftKey && document.activeElement === last) {
+                e.preventDefault();
+                first.focus();
+            }
+        });
+
+        RS.gestures.attachDragDismiss(built.sheet, {
+            axis: 'y',
+            blockIfScrolled: true,
+            skipIf: function(e) {
+                return !!(e.target.closest('button') || e.target.closest('a') || e.target.closest('.md-pre'));
+            },
+            parallaxOverlay: built.overlay,
+            onCommit: function() { built.dismiss(null); }
+        });
+
+        built.present();
+        syncScroller();
+        if (typeof ResizeObserver === 'function') {
+            observer = new ResizeObserver(syncScroller);
+            observer.observe(built.body);
+            observer.observe(notes);
+        }
+        summary.focus({ preventScroll: true });
+    });
+}
+
+function _settingsShowUpdateFailure(err, currentVersion) {
+    var title = "Couldn't check for updates";
+    if (err && err.kind === 'bad-response') {
+        return _settingsShowUpdateResult(title, 'GitHub sent an unexpected response. Try again later.')
+            .then(_settingsFocusUpdateButton);
+    }
+    var limited = err && err.kind === 'http' && (err.status === 403 || err.status === 429);
+    return rsConfirm({
+        title: title,
+        message: limited
+            ? 'GitHub is limiting requests right now. Try again in a few minutes.'
+            : 'Check your internet connection and try again.',
+        confirmText: 'Try Again',
+        cancelText: 'Close'
+    }).then(function(retry) {
+        if (retry) return checkRatspeakUpdate(currentVersion);
+        _settingsFocusUpdateButton();
     });
 }
 
@@ -530,42 +778,37 @@ function checkRatspeakUpdate(currentVersion) {
     currentVersion = _settingsNormalizeVersion(currentVersion || _settingsVersionValue);
     if (!currentVersion) {
         return _settingsShowUpdateResult(
-            'Update check failed',
-            'Could not determine the current Ratspeak version.'
+            "Couldn't check for updates",
+            "Ratspeak couldn't read its own version. Restart the app and try again."
         );
     }
 
     _settingsSetUpdateButtonsBusy(true);
     var progress = typeof rsProgress === 'function'
-        ? rsProgress({ title: 'Checking for updates', message: 'Contacting GitHub...' })
+        ? rsProgress({ title: 'Checking for updates', message: 'Contacting GitHub…' })
         : null;
     var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     var timeoutId = setTimeout(function() {
         if (controller) controller.abort();
     }, 12000);
 
-    return _settingsLatestReleaseVersion(controller ? controller.signal : undefined).then(function(latestVersion) {
+    return _settingsLatestRelease(controller ? controller.signal : undefined).then(function(release) {
         if (progress) progress.close();
-        if (_settingsCompareVersions(latestVersion, currentVersion) > 0) {
-            return _settingsShowUpdateResult(
-                'Update available!',
-                "You're on version " + currentVersion + ', the latest version is ' + latestVersion + '. For privacy reasons, we do not currently auto-update. Please install the latest version for your device manually.'
-            );
-        }
-        return _settingsShowUpdateResult(
-            'Up to date!',
-            "You're on the latest version of Ratspeak, no update available."
-        );
-    }).catch(function(err) {
-        if (progress) progress.close();
-        window.RS.diag('warn', '[settings] update check failed:', err);
-        return _settingsShowUpdateResult(
-            'Update check failed',
-            'Could not check for updates. Confirm your internet connection and try again, or visit ' + RATSPEAK_RELEASES_URL + ' manually.'
-        );
-    }).finally(function() {
         clearTimeout(timeoutId);
         _settingsSetUpdateButtonsBusy(false);
+        if (_settingsCompareVersions(release.version, currentVersion) > 0) {
+            return _settingsShowUpdateAvailable(release, currentVersion);
+        }
+        return _settingsShowUpdateResult(
+            "You're up to date",
+            'Ratspeak ' + currentVersion + ' is the latest version.'
+        ).then(_settingsFocusUpdateButton);
+    }, function(err) {
+        if (progress) progress.close();
+        clearTimeout(timeoutId);
+        _settingsSetUpdateButtonsBusy(false);
+        window.RS.diag('warn', '[settings] update check failed:', err);
+        return _settingsShowUpdateFailure(err, currentVersion);
     });
 }
 
@@ -573,9 +816,9 @@ function promptRatspeakUpdateCheck(currentVersion) {
     if (_settingsUpdateCheckInFlight) return;
     rsConfirm({
         title: 'Check for updates?',
-        message: 'Checking for the latest version requires an internet connection and will compare your version with the current available version. Are you sure?',
-        confirmText: 'Yes',
-        cancelText: 'No'
+        message: 'Checking for the latest version requires an internet connection and will compare your version with the current available version.',
+        confirmText: 'Continue',
+        cancelText: 'Cancel'
     }).then(function(ok) {
         if (!ok) return;
         return checkRatspeakUpdate(currentVersion);
