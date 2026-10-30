@@ -1,23 +1,17 @@
-## v1.0.34
+## v1.0.36
 
 ### Added
 
-- Added voice messages for compatible handhelds, with the recording format selected automatically.
-- Added Codec2 support for compatible low-bandwidth voice calls.
+- Added Markdown support to messages: bold, italic, strikethrough, code, links, headings, lists, quotes and code blocks.
+- Added spoilers: put text between two bars on each side, like `||this||`. Or use `>!` and/or `!<`
+- Added deleting messages: select one or multiple messages to delete.
+- Added outbound URL security warning.
+- Added markdown hotkey shortcuts on desktop: Cmd or Ctrl with B, I or E formats the selected text.
+- Added changelog viewing to the in-app "Check For Updates" feature.
 
 ### Fixed and improved
 
-- Improved Windows Bluetooth discovery and reconnection, including saved devices missing from scan results.
-- Fixed Android Bluetooth cleanup when permissions are revoked.
-- Kept recorded clips available for retry and prevented duplicate voice messages after an uncertain send result.
-- Improved recording limits, voice controls, and handling when leaving a chat or changing identities.
-- Removed legacy text fallbacks for message reactions.
-
-### Build and compatibility
-
-- Source builds require Rust 1.89 or later.
-- Compact recordings are limited to 15 seconds. Receive the handheld's announce before recording so the app can select its compatible format.
-
-### Known issue
-
-- Some attachments sent to NomadNet may appear delivered without being saved by the receiver due to an upstream Python Reticulum issue.
+- Text across the app is larger and easier to read. Again.
+- The message reaction menu now opens beside the message and got a design uplift.
+- Links in messages are easier to read.
+- Locked zoom in the app outside of enlarged photos.

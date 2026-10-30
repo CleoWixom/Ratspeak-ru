@@ -581,12 +581,11 @@
 
         var html = '';
 
-        html += '<button class="mobile-back-btn games-back-btn" aria-label="Back to games list">' +
-            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>' +
-        '</button>';
-
         html += '<div class="games-detail-header ' + themeClass + '">' +
             '<div class="games-detail-heading">' +
+                '<button class="mobile-back-btn games-back-btn" aria-label="Back to games list">' +
+                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>' +
+                '</button>' +
                 '<span class="games-detail-icon">' + _gameIconMarkup(appId) + '</span>' +
                 '<span class="games-detail-copy">' +
                     '<span class="games-detail-title">' + escapeHtml(_gameName(appId)) + '</span>' +
@@ -715,13 +714,12 @@
             var canPlayCell = isMyTurn && cell === '_';
             html += '<button type="button" role="gridcell" class="' + classes + '" data-cell-index="' + i + '" aria-label="' + cellLabel + '" aria-disabled="' + (canPlayCell ? 'false' : 'true') + '"' + (canPlayCell ? '' : ' tabindex="-1"') + '>' + display + '</button>';
         }
-        html += '</div>';
-
-        html += '<div class="ttt-player-label' + (oTurnActive ? ' active-turn' : '') + '">' + oPlayer + '</div>';
-
         if (winCells && status === 'completed') {
             html += _renderWinLine(winCells);
         }
+        html += '</div>';
+
+        html += '<div class="ttt-player-label' + (oTurnActive ? ' active-turn' : '') + '">' + oPlayer + '</div>';
 
         if (status === 'pending') {
             var isPendingReceived = !_isMe(session, session.challenger);
@@ -756,7 +754,7 @@
         var coords = cells.map(function(c) {
             return { x: (c % 3) * 33.33 + 16.67, y: Math.floor(c / 3) * 33.33 + 16.67 };
         });
-        return '<svg class="ttt-win-line" viewBox="0 0 100 100" preserveAspectRatio="none">' +
+        return '<svg class="ttt-win-line" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">' +
             '<line x1="' + coords[0].x + '%" y1="' + coords[0].y + '%" ' +
             'x2="' + coords[2].x + '%" y2="' + coords[2].y + '%" ' +
             'stroke="var(--accent)" stroke-width="3" stroke-linecap="round" opacity="0.7">' +
@@ -1001,23 +999,27 @@
              + (captured.q || 0) * 9;
     }
 
+    // One icon per kind plus a ×N count; side 'w' shows the black pieces White captured.
     function _renderCapturedTray(captured, side) {
-        // side 'w' shows the black pieces White has captured.
         var otherColor = (side === 'w') ? 'b' : 'w';
-        var order = ['q','r','b','n','p']; // high-value first
-        var html = '<div class="chess-captured-tray" data-side="' + side + '">';
-        var any = false;
+        var order = ['q', 'r', 'b', 'n', 'p']; // high-value first
+        var names = { q: 'queen', r: 'rook', b: 'bishop', n: 'knight', p: 'pawn' };
+        var groups = '';
+        var spoken = [];
         for (var i = 0; i < order.length; i++) {
             var kind = order[i];
             var count = captured[kind] || 0;
-            for (var j = 0; j < count; j++) {
-                html += '<svg class="chess-captured-piece" viewBox="0 0 45 45" aria-hidden="true">' +
-                    '<use href="/static/assets/chess-pieces.svg#' + otherColor + kind + '"/></svg>';
-                any = true;
-            }
+            if (!count) continue;
+            groups += '<span class="chess-captured-group">' +
+                '<svg class="chess-captured-piece" viewBox="0 0 45 45" aria-hidden="true">' +
+                '<use href="/static/assets/chess-pieces.svg#' + otherColor + kind + '"/></svg>' +
+                (count > 1 ? '<span class="chess-captured-count" aria-hidden="true">×' + count + '</span>' : '') +
+                '</span>';
+            spoken.push(count + ' ' + names[kind] + (count > 1 ? 's' : ''));
         }
-        html += '</div>';
-        return any ? html : '<div class="chess-captured-tray" data-side="' + side + '"></div>';
+        if (!groups) return '<div class="chess-captured-tray" data-side="' + side + '"></div>';
+        return '<div class="chess-captured-tray" data-side="' + side + '" role="img" aria-label="' +
+            (side === 'w' ? 'White' : 'Black') + ' captured: ' + spoken.join(', ') + '">' + groups + '</div>';
     }
 
     function _renderChessBoard(session) {

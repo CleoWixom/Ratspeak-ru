@@ -55,6 +55,18 @@ object RatspeakNativeBridge {
 
     internal fun hasActivitySession(): Boolean = activitySessionStarted
 
+    // Set when the Rust core reports that it could not start. Nothing may then
+    // keep this process running; a new process always starts false.
+    @Volatile
+    internal var coreStartupFailed = false
+        private set
+
+    @JvmStatic
+    fun reportStartupFailure() {
+        coreStartupFailed = true
+        mainHandler.post { RatspeakService.stopForStartupFailure() }
+    }
+
     internal fun attachActivity(activity: MainActivity, webviewReady: Boolean): Long {
         check(Looper.myLooper() == Looper.getMainLooper())
         val generation = activitySequence.incrementAndGet()
@@ -123,6 +135,7 @@ object RatspeakNativeBridge {
             contextRef = WeakReference(context.applicationContext)
         }
         RatspeakNotifications.initialize(context.applicationContext)
+        RatspeakClipboard.initialize(context.applicationContext)
     }
 
     @JvmStatic
@@ -158,6 +171,20 @@ object RatspeakNativeBridge {
     fun setBleRnodeAutoResume(enabled: Boolean): Boolean {
         RatspeakBleRnodeSupervisor.setAutoResume(enabled)
         return true
+    }
+
+    /** Copies a key or phrase, marked sensitive so clipboard previews hide it. */
+    @JvmStatic
+    fun copySecret(text: String): Boolean {
+        val context = context() ?: return false
+        return RatspeakClipboard.copy(context, text)
+    }
+
+    /** Clears the copied key or phrase; see [RatspeakClipboard.clear]. */
+    @JvmStatic
+    fun clearSecret() {
+        val context = context() ?: return
+        RatspeakClipboard.clear(context)
     }
 
     @JvmStatic

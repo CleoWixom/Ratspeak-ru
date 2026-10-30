@@ -324,7 +324,7 @@ pub async fn set_propagation_mode(
         }
         PropagationMode::Manual => {
             // Re-apply DB-stored hash; (re)creates the propagation client.
-            let identity = crate::db::get_active_identity(&st.db);
+            let identity = crate::db::get_active_identity(&st.db).ok().flatten();
             let stored_hash = identity
                 .as_ref()
                 .and_then(|id| id.get("propagation_node").and_then(|h| h.as_str()))
@@ -574,9 +574,9 @@ pub(crate) async fn emit_ingress_diagnostics_snapshot(
     // The transport query may complete after an identity switch. Serialize the
     // Activity records with the switch boundary and reject the stale snapshot
     // rather than publishing old-identity interface data afterward.
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let _identity_lifecycle = state.identity_switch_lock.lock_routine().await;
     let _activity_control = state.activity_control_lock.lock().await;
-    if !state.is_current_activity_request_fence_after_identity_lock(expected_fence) {
+    if !state.is_current_activity_origin_fence(expected_fence) {
         return;
     }
     for entry in entries {
@@ -584,7 +584,7 @@ pub(crate) async fn emit_ingress_diagnostics_snapshot(
         let held_announces = entry.held_announces;
         if burst_active {
             state.activity.record_event_fenced(
-                || state.is_current_activity_request_fence_after_identity_lock(expected_fence),
+                || state.is_current_activity_origin_fence(expected_fence),
                 || {
                     Ok(producer::rns_announce_activity(
                         producer::RnsAnnounceActivity {
@@ -597,7 +597,7 @@ pub(crate) async fn emit_ingress_diagnostics_snapshot(
         }
         if held_announces > 0 {
             state.activity.record_event_fenced(
-                || state.is_current_activity_request_fence_after_identity_lock(expected_fence),
+                || state.is_current_activity_origin_fence(expected_fence),
                 || {
                     Ok(producer::rns_announce_activity(
                         producer::RnsAnnounceActivity {

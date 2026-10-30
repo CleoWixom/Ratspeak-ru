@@ -289,7 +289,7 @@ fn channels_keep_hubs_live_only_and_wire_bounded_local_history_across_the_produc
         ".channel-room-row-title,\n    .channel-hub-row-title {\n        font-size: var(--mobile-list-title-size);"
     ));
     assert!(responsive_css.contains(
-        ".channel-event-text {\n        color: var(--text-primary);\n        font-size: 1rem;"
+        ".channel-event-text {\n        color: var(--text-primary);\n        font-size: var(--text-base);"
     ));
     assert!(responsive_css.contains(".channel-system-event {\n        margin: var(--space-6) 0;"));
     assert!(channels_css.contains(".channel-members-scrim"));
@@ -1225,11 +1225,7 @@ fn privacy_announce_usage_setting_is_wired() {
 
     let system_rs =
         read_source(root.join("crates/ratspeak-tauri/src/commands/system.rs")).expect("system");
-    let reset_body = system_rs
-        .split("pub async fn api_reset_database")
-        .nth(1)
-        .and_then(|tail| tail.split("pub async fn api_identity_reset").next())
-        .expect("reset database body");
+    let reset_body = rust_function_block(&system_rs, "api_reset_database");
     assert!(!reset_body.contains("\"settings\""));
 }
 
@@ -1547,10 +1543,10 @@ fn text_scale_presets_are_durable_and_backend_validated() {
 
     assert!(settings.contains("RS.invoke('set_text_scale'"));
     assert!(settings.contains("data.text_scale_percent"));
-    assert!(scale.contains("var MAX = 140"));
+    assert!(scale.contains("var MAX = 150"));
     assert!(interfaces.contains("pub async fn set_text_scale"));
     assert!(interfaces.contains("\"text_scale_percent\""));
-    assert!(interfaces.contains("(percent.clamp(100, 140) + 5) / 10 * 10"));
+    assert!(interfaces.contains("(percent.clamp(90, 150) + 5) / 10 * 10"));
     assert!(tauri_lib.contains("set_text_scale"));
     assert!(index.contains("/static/style.css?v=ui-20260924-4"));
     assert!(views_css.contains(".settings-theme-family-row > .settings-row-info"));
@@ -2317,7 +2313,10 @@ fn profile_status_frontend_contract_is_wired() {
     assert!(settings_js.contains("profile_status"));
     assert!(settings_js.contains("function trimProfileStatusToByteLimit"));
     assert!(settings_js.contains("function openIdentityStatusEditor"));
-    assert!(settings_js.contains("RS.invoke('set_identity_status', { status: nextStatus })"));
+    // The status names the identity the window shows.
+    assert!(settings_js.contains(
+        "RS.invoke('set_identity_status', { status: nextStatus, identityId: identityId })"
+    ));
     assert!(settings_js.contains("counter.textContent = bytes + '/' + PROFILE_STATUS_MAX_BYTES;"));
 
     let lxmf_js = read_source(root.join("dashboard/static/js/lxmf.js")).expect("lxmf js");
@@ -2560,7 +2559,9 @@ fn android_service_is_not_sticky_without_runtime_ownership() {
         .next()
         .unwrap();
     let admission = create
-        .find("if (!RatspeakNativeBridge.hasActivitySession())")
+        .find(
+            "if (!RatspeakNativeBridge.hasActivitySession() || RatspeakNativeBridge.coreStartupFailed)",
+        )
         .unwrap();
     let rejected = create[admission..]
         .split("sessionAdmitted = true")
@@ -2880,7 +2881,8 @@ fn games_ui_uses_runtime_manifests_and_accessible_atomic_actions() {
     assert!(games_css.contains(".ttt-cell:focus-visible"));
     assert!(games_css.contains(".chess-square:focus-visible"));
     assert!(games_css.contains(".four-lane-action:focus-visible"));
-    assert!(games_css.contains("background: var(--surface-scrim);"));
+    assert!(games_css.contains("background: rgba(var(--theme-page-rgb), 0.85);"));
+    assert!(!games_css.contains("var(--surface-overlay)"));
     assert!(
         !games_css.contains(".game-modal"),
         "Games must use the shared bottom sheet instead of a parallel legacy modal"
@@ -3792,6 +3794,181 @@ fn mobile_window_inspection_is_explicit_on_cold_start_and_reattachment() {
     assert!(shell.contains(".devtools(diagnostics_enabled() || developer_mode)"));
 }
 
+/// A core that cannot start manages no AppState, so no command can run. The
+/// window still opens, cold or reattached, and shows the failure.
+#[test]
+fn a_failed_start_shows_its_screen_without_command_state() {
+    let root = repo_root();
+    let shell = read_source(root.join("src-tauri/src/lib.rs")).expect("app shell");
+
+    assert!(!shell.contains("Failed to start Ratspeak core"));
+    let setup = shell.split(".setup(|app| {").nth(1).expect("setup closure");
+    let failure = setup
+        .find("Err(failure) => {")
+        .expect("startup failure branch");
+    let managed = setup
+        .find("app.manage(failure.error);")
+        .expect("startup failure is managed for the window");
+    let window = setup
+        .find("let window = main_window_builder(&handle);")
+        .expect("main window");
+    assert!(failure < managed && managed < window);
+
+    let builder = shell
+        .split("fn main_window_builder(")
+        .nth(1)
+        .expect("common window builder")
+        .split("#[cfg(target_os = \"linux\")]")
+        .next()
+        .unwrap();
+    assert!(builder.contains("try_state::<ratspeak_tauri::StartupError>()"));
+    assert!(builder.contains("window.__RATSPEAK_STARTUP_ERROR__ = "));
+
+    // Closing the screen quits instead of hiding a process that holds nothing.
+    let close = shell
+        .split("event: tauri::WindowEvent::CloseRequested { api, .. },")
+        .nth(1)
+        .and_then(|tail| tail.split("api.prevent_close();").next())
+        .expect("desktop close handler");
+    assert!(close.contains("try_state::<ratspeak_tauri::StartupError>()"));
+    assert!(close.contains(".is_none()"));
+}
+
+/// Tauri runs `setup` inside `run`, so diagnostics start before the profile
+/// opens. A failed start is logged where setup handles it, under fields the
+/// diagnostics filter keeps, and nothing before `run` looks for one.
+#[test]
+fn a_failed_start_is_logged_with_its_step_and_io_kind() {
+    let root = repo_root();
+    let shell = read_source(root.join("src-tauri/src/lib.rs")).expect("app shell");
+
+    let setup = shell.split(".setup(|app| {").nth(1).expect("setup closure");
+    assert!(setup.contains("ratspeak_tauri::init_core("));
+    assert_eq!(shell.matches("ratspeak_tauri::init_core(").count(), 1);
+    let failure = setup
+        .split("Err(failure) => {")
+        .nth(1)
+        .and_then(|tail| tail.split("None").next())
+        .expect("startup failure branch");
+    let logged = failure.find("tracing::error!(").expect("failure is logged");
+    assert!(failure.contains("reason = failure.step"));
+    assert!(failure.contains("kind = ?failure.kind"));
+    assert!(logged < failure.find("app.manage(failure.error);").unwrap());
+
+    let build = shell.find(".build(context)").unwrap();
+    let tracing = shell
+        .find("let mut tracing_guard = init_tracing();")
+        .unwrap();
+    let run = shell.find("app.run(|app_handle, event| {").unwrap();
+    assert!(build < tracing && tracing < run);
+    assert!(!shell[tracing..run].contains("StartupError"));
+}
+
+/// A core that failed to start keeps nothing running on Android: the session
+/// is not retained when its task closes, and the foreground service stops and
+/// stays stopped, so closing the app ends the process.
+#[test]
+fn a_failed_start_leaves_no_android_session_or_service() {
+    let root = repo_root();
+    let read = |path: &str| read_source(root.join(path)).expect(path);
+    let kotlin = "src-tauri/gen/android/app/src/main/java/org/ratspeak/android/";
+    let lifecycle = read("src-tauri/src/android_lifecycle.rs");
+    let shell = read("src-tauri/src/lib.rs");
+    let native = read("src-tauri/src/mobile_native.rs");
+    let bridge = read(&format!("{kotlin}RatspeakNativeBridge.kt"));
+    let service = read(&format!("{kotlin}RatspeakService.kt"));
+    let activity = read(&format!("{kotlin}MainActivity.kt"));
+    let boundaries = read("scripts/release/android-jni-boundaries.json");
+
+    let ready = lifecycle
+        .split("tauri::RunEvent::Ready => {")
+        .nth(1)
+        .and_then(|tail| tail.split("tauri::RunEvent::ExitRequested").next())
+        .expect("Ready handling");
+    let guard = ready
+        .find("try_state::<ratspeak_tauri::StartupError>()")
+        .expect("a failed start is not retained");
+    assert!(guard < ready.find("NativeLifecycleEvent::Ready").unwrap());
+
+    let failure = shell
+        .split("Err(failure) => {")
+        .nth(1)
+        .and_then(|tail| tail.split("None").next())
+        .expect("startup failure branch");
+    assert!(failure.contains("mobile_native::report_startup_failure();"));
+    assert!(native.contains("\"reportStartupFailure\""));
+    assert!(boundaries.contains("[\"reportStartupFailure\", \"()V\"]"));
+    assert!(bridge.contains("fun reportStartupFailure()"));
+    assert!(service.contains("fun stopForStartupFailure()"));
+
+    let create = service
+        .split("override fun onCreate()")
+        .nth(1)
+        .and_then(|tail| tail.split("sessionAdmitted = true").next())
+        .expect("service admission");
+    assert!(create.contains(
+        "if (!RatspeakNativeBridge.hasActivitySession() || RatspeakNativeBridge.coreStartupFailed)"
+    ));
+    let start = activity
+        .find("ContextCompat.startForegroundService(this, serviceIntent)")
+        .unwrap();
+    assert!(activity[..start].contains("if (!RatspeakNativeBridge.coreStartupFailed)"));
+    // That guarded start is the Activity's only way to start the service.
+    assert_eq!(activity.matches("startForegroundService(").count(), 1);
+    assert!(!activity.contains("startService("));
+}
+
+/// On Android 12+ Back and Home only move a task to the background. A failed
+/// start closes instead whenever it is left, so opening Ratspeak again starts
+/// a fresh process.
+#[test]
+fn a_failed_start_closes_when_left_on_android() {
+    let activity = read_source(
+        repo_root()
+            .join("src-tauri/gen/android/app/src/main/java/org/ratspeak/android/MainActivity.kt"),
+    )
+    .expect("Android MainActivity");
+
+    let back = activity
+        .split("override fun handleOnBackPressed()")
+        .nth(1)
+        .and_then(|tail| tail.split("dispatchBackToWebView()").next())
+        .expect("app back handling");
+    assert!(back.contains("if (RatspeakNativeBridge.coreStartupFailed)"));
+    assert!(back.contains("finishAndRemoveTask()"));
+
+    let stop = activity
+        .split("override fun onStop()")
+        .nth(1)
+        .and_then(|tail| tail.split("\n    }\n").next())
+        .expect("Activity stop handling");
+    assert!(
+        stop.contains("if (RatspeakNativeBridge.coreStartupFailed && !isChangingConfigurations)")
+    );
+    assert!(stop.contains("finishAndRemoveTask()"));
+}
+
+/// A profile on a filesystem that cannot lock opens with a warning beside the
+/// storage warning; the lock itself is covered by the runtime's tests.
+#[test]
+fn an_unenforced_profile_lock_is_shown_beside_the_storage_warning() {
+    let root = repo_root();
+    let system = read_source(root.join("crates/ratspeak-tauri/src/commands/system.rs"))
+        .expect("system commands");
+    let events =
+        read_source(root.join("dashboard/static/js/tauri_events.js")).expect("frontend events");
+
+    let progress = system
+        .split("pub async fn api_startup_progress(")
+        .nth(1)
+        .and_then(|tail| tail.split("#[tauri::command]").next())
+        .expect("startup progress command");
+    assert!(progress.contains("\"storage_warning\": storage_warning("));
+    assert!(progress.contains("\"profile_lock_warning\": profile_lock_warning("));
+    assert!(system.contains("ratspeak_runtime::owner_lock::unenforced("));
+    assert!(events.contains("showToast(data.profile_lock_warning, 'toast-warning', 5000);"));
+}
+
 #[test]
 fn modal_action_footers_use_shared_dialog_buttons() {
     let root = repo_root();
@@ -3880,6 +4057,234 @@ fn app_sources_do_not_write_direct_stdout_or_stderr_logs() {
             "{rel} must not print to stderr"
         );
     }
+}
+
+/// The function a line belongs to, and whether that function is a test.
+fn enclosing_fn(lines: &[&str], index: usize) -> Option<(String, bool)> {
+    let signature = |line: &str| {
+        let mut rest = line.trim_start();
+        for prefix in ["pub(crate) ", "pub(super) ", "pub ", "async "] {
+            rest = rest.strip_prefix(prefix).unwrap_or(rest);
+        }
+        rest = rest.strip_prefix("async ").unwrap_or(rest);
+        rest.strip_prefix("fn ").map(|tail| {
+            tail.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+    };
+    let (at, name) = lines[..=index]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(at, line)| signature(line).map(|name| (at, name)))?;
+    let is_test = lines[..at]
+        .iter()
+        .rev()
+        .take_while(|line| {
+            let line = line.trim_start();
+            line.starts_with("#[") || line.starts_with("//")
+        })
+        .any(|line| {
+            let line = line.trim_start();
+            line.starts_with("#[test]") || line.starts_with("#[tokio::test")
+        });
+    Some((name, is_test))
+}
+
+/// A fenced request is refused when a transition ran since it began, so only
+/// a real transition (identity, runtime or Activity capture) takes the
+/// lifecycle lock as one. Everything else takes `lock_routine`.
+#[test]
+fn only_real_transitions_take_the_lifecycle_lock_as_a_transition() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    for dir in [
+        "crates/ratspeak-runtime/src",
+        "crates/ratspeak-tauri/src",
+        "src-tauri/src",
+    ] {
+        collect_files(&root.join(dir), &mut files);
+    }
+    let mut transitions = Vec::new();
+    for path in files {
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = read_source(&path).expect("source file");
+        let lines: Vec<&str> = source.lines().collect();
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains("identity_switch_lock.lock()")
+                && !line.contains("identity_switch_lock.lock_owned()")
+            {
+                continue;
+            }
+            let (name, is_test) = enclosing_fn(&lines, index)
+                .unwrap_or_else(|| panic!("{rel}:{} is outside a function", index + 1));
+            if !is_test {
+                transitions.push(format!("{rel} {name}"));
+            }
+        }
+    }
+    transitions.sort();
+    assert_eq!(
+        transitions,
+        [
+            "crates/ratspeak-runtime/src/lib.rs lock_protected_session",
+            "crates/ratspeak-runtime/src/lib.rs restart_rns_lxmf",
+            "crates/ratspeak-runtime/src/network_ownership.rs apply",
+            "crates/ratspeak-runtime/src/propagation_recovery.rs recover_host",
+            "crates/ratspeak-tauri/src/commands/activity.rs activity_clear",
+            "crates/ratspeak-tauri/src/commands/activity.rs activity_resume",
+            "crates/ratspeak-tauri/src/commands/activity.rs activity_set_profile",
+            "crates/ratspeak-tauri/src/commands/activity.rs activity_start",
+            "crates/ratspeak-tauri/src/commands/activity.rs activity_stop",
+            "crates/ratspeak-tauri/src/commands/identity.rs acquire_identity_mutation",
+            "crates/ratspeak-tauri/src/commands/identity.rs api_delete_identity",
+            "crates/ratspeak-tauri/src/commands/identity.rs remove_identity_passcode",
+            "crates/ratspeak-tauri/src/commands/identity.rs set_identity_passcode",
+            "crates/ratspeak-tauri/src/commands/identity.rs switch_identity_session",
+            "crates/ratspeak-tauri/src/commands/identity.rs unlock_protected_identity",
+            "crates/ratspeak-tauri/src/commands/network.rs enable_network_log",
+            "crates/ratspeak-tauri/src/commands/network.rs set_network_log_level",
+            "crates/ratspeak-tauri/src/commands/system.rs api_factory_reset",
+            "crates/ratspeak-tauri/src/commands/system.rs api_setup_complete",
+            "crates/ratspeak-tauri/src/commands/system.rs api_system_shutdown",
+            "crates/ratspeak-tauri/src/commands/system.rs apply_foreground_transition",
+            "crates/ratspeak-tauri/src/lib.rs init_core",
+            "src-tauri/src/lib.rs set_desktop_foreground",
+            "src-tauri/src/lib.rs shutdown_desktop_core_for_exit",
+        ],
+        "a new transition must be deliberate; routine work takes lock_routine"
+    );
+}
+
+/// An unblock whose runtime stopped before its network lift lifts it through
+/// the next runtime of its identity, once that runtime is up.
+#[test]
+fn a_runtime_lifts_its_identitys_pending_network_unblocks_once_up() {
+    let runtime =
+        read_source(repo_root().join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime lib");
+    let start = rust_function_block(&runtime, "init_rns_lxmf_inner");
+    let ready = start
+        .find("tracing::info!(\"Startup complete\");")
+        .expect("startup completes");
+    let lifts = start
+        .find("blackhole::apply_pending_network_lifts(")
+        .expect("pending network lifts are applied at startup");
+    assert!(
+        ready < lifts,
+        "pending lifts are applied before the runtime is up"
+    );
+}
+
+/// A poll reads announced names and presence under one identity session and
+/// publishes them only while that session is current, under the lifecycle
+/// lock: a switch that lands in between, even to an identity that comes up
+/// locked, never leaves the previous identity's lists in its window.
+#[test]
+fn announced_names_and_presence_reach_only_their_session() {
+    let runtime =
+        read_source(repo_root().join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime lib");
+    let poll = rust_function_block(&runtime, "poll_stats_loop");
+    for emit in [
+        "emit_peers_batch(&state, &rows)",
+        "state.emit_to_all(\"contacts_update\"",
+    ] {
+        let at = poll.find(emit).unwrap_or_else(|| panic!("missing {emit}"));
+        let gate = poll[..at]
+            .rfind("publish_in_session(&state, poll_generation")
+            .unwrap_or_else(|| panic!("{emit} is published outside its session"));
+        assert!(
+            !poll[gate..at].contains(".await;"),
+            "{emit} is published outside its session"
+        );
+    }
+}
+
+/// Every activation starts a new identity session before its shutdown, so
+/// nothing begun under the previous one lands in the next; unlock reopens
+/// the same session. The Activity reset, the one step that can refuse, comes
+/// first, so a refusal starts no session and leaves no runtime running in
+/// one it did not begin. The hardware paths need a card to run, so this
+/// pins them.
+#[test]
+fn every_activation_starts_a_new_identity_session() {
+    let root = repo_root();
+    let read = |path: &str| read_source(root.join(path)).expect(path);
+    let identity = read("crates/ratspeak-tauri/src/commands/identity.rs");
+    let hardware = read("crates/ratspeak-tauri/src/commands/hardware.rs");
+    let system = read("crates/ratspeak-tauri/src/commands/system.rs");
+    let runtime = read("crates/ratspeak-runtime/src/lib.rs");
+    // A marker, not a name: the import's signature is generic.
+    for (source, function, reset) in [
+        (
+            &hardware,
+            "fn hw_activate_and_unlock(",
+            "reset_for_hardware_change(",
+        ),
+        (&hardware, "fn hw_remove(", "reset_for_hardware_change("),
+        (
+            &system,
+            "fn api_setup_complete(",
+            "crate::reset_activity_for_shutdown(",
+        ),
+        (
+            &system,
+            "fn api_factory_reset(",
+            "crate::reset_activity_for_shutdown(",
+        ),
+        (
+            &identity,
+            "fn import_identity_after_parse<",
+            "crate::reset_activity_for_shutdown(",
+        ),
+        (
+            &identity,
+            "fn switch_identity_session_held(",
+            "crate::reset_activity_for_shutdown(",
+        ),
+        (
+            &runtime,
+            "fn lock_protected_session(",
+            "reset_activity_for_shutdown(",
+        ),
+    ] {
+        let body = rust_struct_literal_blocks(source, function)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing {function}"));
+        let reset = body
+            .find(reset)
+            .unwrap_or_else(|| panic!("{function} resets nothing"));
+        let bump = body
+            .find("bump_identity_session_generation()")
+            .unwrap_or_else(|| panic!("{function} starts no session"));
+        let finish = body.find("finish_shutdown(").expect("shutdown");
+        assert!(
+            reset < bump,
+            "{function} starts its session before the reset that can refuse"
+        );
+        assert!(
+            bump < finish,
+            "{function} shuts down before its session starts"
+        );
+        assert!(
+            !body.contains("shutdown_rns_lxmf("),
+            "{function} has a shutdown that can refuse after its session started"
+        );
+    }
+    assert!(
+        !rust_function_block(&identity, "unlock_protected_identity")
+            .contains("bump_identity_session_generation")
+    );
 }
 
 #[test]
@@ -4240,10 +4645,18 @@ fn frontend_ipc_waits_and_connect_errors_are_visible() {
         .expect("post-build current transport capture");
     assert!(packet_build < transport_capture);
     assert!(burst.contains("state.is_current_activity_origin_fence(activity_origin)"));
-    assert!(burst.contains("state.identity_switch_lock.lock().await"));
-    assert!(
-        burst.contains("is_current_activity_request_fence_after_identity_lock(activity_origin)")
-    );
+    // Sending is routine work: it excludes transitions and invalidates
+    // nothing. Only the admission span holds the lock; dispatch waits outside.
+    let admission = rust_struct_literal_blocks(&runtime_rs, "async fn admit_in_lifecycle<")
+        .into_iter()
+        .next()
+        .expect("lifecycle admission span");
+    assert!(admission.contains("state.identity_switch_lock.lock_routine().await"));
+    assert!(admission.contains("state.is_current_activity_origin_fence(activity_origin)"));
+    assert_eq!(admission.matches(".await").count(), 2);
+    assert!(burst.contains("admit_in_lifecycle(state, activity_origin, ||"));
+    assert!(!burst.contains("identity_switch_lock"));
+    assert!(!burst.contains("is_current_activity_request_fence_after_identity_lock"));
     assert!(burst.contains("any_interface_online_cached(state)"));
     assert!(!burst.contains("report.disposition = AnnounceSendDisposition::AlreadyQueued"));
     assert!(!runtime_rs.contains("announce waited on lxmf manager lock"));
@@ -4487,10 +4900,23 @@ fn ifac_is_available_ungated_on_client_and_server_sheets() {
     let rns_config =
         read_source(root.join("crates/ratspeak-runtime/src/rns_config.rs")).expect("rns config");
     assert!(rns_config.contains("pub struct InterfaceIfacArgs"));
-    assert!(rns_config.contains("network_name = {network_name}"));
-    assert!(rns_config.contains("passphrase = {passphrase}"));
-    assert!(rns_config.contains("ifac_size = {}\\n    ifac_size_unit = bits\\n"));
-    assert!(rns_config.contains("ifac_size * 8"));
+    let config_dir = tempfile::tempdir().expect("config directory");
+    fs::write(config_dir.path().join("config"), "[interfaces]\n").expect("base config");
+    assert!(ratspeak_runtime::rns_config::add_tcp_client_with_ifac(
+        config_dir.path(),
+        "Private TCP",
+        "private.example",
+        4242,
+        ratspeak_runtime::rns_config::InterfaceIfacArgs {
+            network_name: Some("private network"),
+            passphrase: Some("test passphrase"),
+            ifac_size: Some(8),
+        },
+    ));
+    let config = ratspeak_runtime::rns_config::read_config(config_dir.path()).expect("IFAC config");
+    assert!(config.contains("    network_name = private network\n"));
+    assert!(config.contains("    passphrase = test passphrase\n"));
+    assert!(config.contains("    ifac_size = 64\n    ifac_size_unit = bits\n"));
     assert!(rns_config.contains("add_tcp_client_with_ifac"));
     assert!(rns_config.contains("update_tcp_client_with_ifac"));
     assert!(rns_config.contains("add_tcp_server_with_ifac"));
@@ -5879,15 +6305,19 @@ fn settings_version_display_uses_package_version_api() {
     assert!(settings_js.contains("https://api.github.com/repos/ratspeak/Ratspeak/releases/latest"));
     assert!(settings_js.contains("function promptRatspeakUpdateCheck"));
     assert!(settings_js.contains("title: 'Check for updates?'"));
-    assert!(settings_js.contains("confirmText: 'Yes'"));
-    assert!(settings_js.contains("cancelText: 'No'"));
+    assert!(settings_js.contains("confirmText: 'Continue'"));
+    assert!(settings_js.contains("cancelText: 'Cancel'"));
+    assert!(!settings_js.contains("Are you sure?"));
     assert!(settings_js.contains("function checkRatspeakUpdate"));
     assert!(settings_js.contains("function _settingsVersionSuffixRank"));
     assert!(settings_js.contains("replace(/(\\d)-([a-z]+)$/i, '$1$2')"));
     assert!(settings_js.contains("fetch(RATSPEAK_RELEASE_LATEST_URL"));
-    assert!(settings_js.contains("Update available!"));
-    assert!(settings_js.contains("Up to date!"));
-    assert!(settings_js.contains("For privacy reasons, we do not currently auto-update"));
+    assert!(settings_js.contains("function _settingsShowUpdateAvailable(release, currentVersion)"));
+    assert!(settings_js.contains("title: 'Update available'"));
+    assert!(settings_js.contains("\"You're up to date\""));
+    assert!(settings_js.contains("For privacy, Ratspeak doesn't update itself."));
+    assert!(settings_js.contains("RS.markdown.render(body"));
+    assert!(!settings_js.contains("data.html_url"));
 
     let nav_js = read_source(root.join("dashboard/static/js/nav.js")).expect("nav");
     assert!(nav_js.contains("id=\"about-modal-version\""));
@@ -5947,18 +6377,16 @@ fn release_workflows_build_once_and_publish_only_after_complete_aggregation() {
         .as_array()
         .expect("component array");
     let release_note_fragments = [
-        "voice messages for compatible handhelds",
-        "recording format selected automatically",
-        "Codec2 support for compatible low-bandwidth voice calls",
-        "Windows Bluetooth discovery and reconnection",
-        "Android Bluetooth cleanup when permissions are revoked",
-        "Kept recorded clips available for retry",
-        "prevented duplicate voice messages after an uncertain send result",
-        "leaving a chat or changing identities",
-        "Removed legacy text fallbacks for message reactions",
-        "Source builds require Rust 1.89 or later",
-        "Compact recordings are limited to 15 seconds",
-        "Some attachments sent to NomadNet may appear delivered",
+        "Added Markdown support to messages",
+        "put text between two bars on each side",
+        "select one or multiple messages to delete",
+        "Added outbound URL security warning",
+        "Cmd or Ctrl with B, I or E formats the selected text",
+        "changelog viewing to the in-app",
+        "Text across the app is larger and easier to read",
+        "message reaction menu now opens beside the message",
+        "Links in messages are easier to read",
+        "Locked zoom in the app outside of enlarged photos",
     ];
 
     for workflow_path in [
@@ -6415,10 +6843,7 @@ fn settings_information_architecture_groups_one_off_settings() {
     assert!(identity_panel.contains(
         r#"class="selector-badge selector-badge-no-caret" id="settings-view-recovery-phrase-btn">View</button>"#
     ));
-    assert!(
-        identity_panel
-            .contains(r#"<span class="settings-row-label">Hardware Key Auto-Lock</span>"#)
-    );
+    assert!(identity_panel.contains(r#"<span class="settings-row-label">Auto-Lock</span>"#));
     assert!(identity_panel.contains(r#"id="hw-lock-row""#));
 
     let network_panel = index
@@ -6428,7 +6853,7 @@ fn settings_information_architecture_groups_one_off_settings() {
         .expect("network settings panel");
     assert!(network_panel.contains(r#"<span class="settings-row-label">Transport Mode</span>"#));
     assert!(network_panel.contains(r#"<span class="settings-row-label">Auto-Announce</span>"#));
-    assert!(!network_panel.contains("Hardware Key Auto-Lock"));
+    assert!(!network_panel.contains("Auto-Lock"));
 
     assert!(
         settings_js
@@ -6507,7 +6932,7 @@ fn mobile_settings_use_section_drilldown_instead_of_stacked_panels() {
     assert!(
         responsive_css.contains(".settings-detail-mode .settings-panel.settings-panel-selected")
     );
-    assert!(responsive_css.contains(".settings-row-label {\n        font-size: 1rem;"));
+    assert!(responsive_css.contains(".settings-row-label {\n        font-size: var(--text-base);"));
 }
 
 #[test]
@@ -6614,9 +7039,9 @@ fn mobile_primary_lists_share_readable_row_scale() {
 
     assert!(responsive_css.contains("--mobile-list-avatar-size: 44px;"));
     assert!(responsive_css.contains("--mobile-list-min-height: 58px;"));
-    assert!(responsive_css.contains("--mobile-list-title-size: 1rem;"));
-    assert!(responsive_css.contains("--mobile-list-detail-size: 0.875rem;"));
-    assert!(responsive_css.contains("--mobile-list-meta-size: 0.8125rem;"));
+    assert!(responsive_css.contains("--mobile-list-title-size: var(--text-base);"));
+    assert!(responsive_css.contains("--mobile-list-detail-size: var(--text-sm);"));
+    assert!(responsive_css.contains("--mobile-list-meta-size: var(--text-xs);"));
     assert!(responsive_css.contains(
         ".conv-row,\n    .contacts-row,\n    .identity-list-item,\n    .games-session-row"
     ));
@@ -7390,7 +7815,10 @@ fn message_actions_stage_touch_selection_and_preserve_accessible_actions() {
     assert!(lxmf.contains("if (_activeContextMenu !== active) return;"));
     assert!(lxmf.contains("_clearNativeMessageSelection();"));
     assert!(lxmf.contains("function _messageTouchStartsDirectControl(touch, bubble)"));
-    assert!(lxmf.contains("function _messageLinkUsesNativeContext(target)"));
+    assert!(lxmf.contains("function _messageLinkUrlAt(target)"));
+    assert!(lxmf.contains(
+        "if (_messageLinkUrlAt(target) && document.documentElement.dataset.inputModality !== 'touch') return 'actions';"
+    ));
     assert!(lxmf.contains("function _rememberMessagePointerContextSelection(event, bubble)"));
     assert!(lxmf.contains("function _consumeMessagePointerContextSelection(bubble)"));
     assert!(lxmf.contains(
@@ -7457,7 +7885,8 @@ fn message_actions_stage_touch_selection_and_preserve_accessible_actions() {
     assert!(lxmf.contains("var mediaAction = _messageMediaContextAction(msgData);"));
     assert!(!lxmf.contains("<span>Select Text</span>"));
     assert!(!lxmf.contains("data-message-action', 'select-text"));
-    assert!(lxmf.contains("<span>Copy Message</span>"));
+    assert!(lxmf.contains("<span>Copy</span>"));
+    assert!(lxmf.contains("(isSelected ? 'Deselect' : 'Select')"));
     assert!(lxmf.contains("label: canCopyImage ? 'Copy Image' : 'Save Image'"));
     assert!(lxmf.contains("label: 'Save File'"));
     assert!(lxmf.contains("menu.setAttribute('role', 'dialog')"));
@@ -7525,9 +7954,12 @@ fn message_actions_stage_touch_selection_and_preserve_accessible_actions() {
     assert!(messaging_css.contains(".msg-actions-trigger.msg-actions-trigger-mobile-hidden"));
     assert!(messaging_css.contains("clip-path: inset(50%);"));
     assert!(!messaging_css.contains(".msg-text-selection-guide"));
-    assert!(messaging_css.contains(".msg-context-actions > :last-child:nth-child(odd)"));
-    assert!(messaging_css.contains("grid-column: 1 / -1;"));
-    assert!(messaging_css.contains("position: fixed; z-index: calc(var(--z-modal) + 3);"));
+    assert!(
+        messaging_css
+            .contains(".msg-ctx-btn + .msg-ctx-btn { border-top: 1px solid var(--divider); }")
+    );
+    assert!(messaging_css.contains("z-index: calc(var(--z-modal) + 3);"));
+    assert!(lxmf.contains("function _layoutMessageActionPanels(state, allowScroll)"));
     assert!(nav.contains("RS.closeMessageActionMenu()"));
 
     assert!(runtime.contains("RATSPEAK_CHAT_CUSTOM_TYPE"));
@@ -7648,7 +8080,8 @@ fn identity_management_is_first_class_tab() {
     assert!(identity_js.contains("function openRatspeakBackupImportPinModal"));
     assert!(identity_js.contains("function openEncryptedIdentityExportModal"));
     assert!(identity_js.contains("passcode: importPasscode"));
-    assert!(identity_js.contains("passcode: passcode || ''"));
+    // The backup PIN goes as the backup's `passcode`, beside the identity's own.
+    assert!(identity_js.contains("auth.passcode = pin;"));
     assert!(identity_js.contains("protectIdentityWithPasscode(data.hash, importPasscode)"));
     assert!(!identity_js.contains(r#"<path d="M7 16l5 5 5-5"/>"#));
     assert!(identity_js.contains("function identityImportFormatChoices()"));
@@ -9485,7 +9918,7 @@ fn android_text_sharing_is_narrow_durable_and_never_a_transport_command() {
     assert!(!native.contains("Log."));
     assert!(activity.contains("savedInstanceState?.getString(\"ratspeak.text_share_id\")"));
     assert!(activity.contains("shareIntakeId = RatspeakTextShares.receive(intent)"));
-    assert!(bridge.contains("identity_switch_lock.lock().await"));
+    assert!(bridge.contains("identity_switch_lock.lock_routine().await"));
     assert!(bridge.contains("current_identity_session_generation"));
     assert!(bridge.contains("owner(Some(&args.activity_generation))"));
     assert!(bridge.contains("readImageChunk"));
@@ -9509,7 +9942,6 @@ fn android_text_sharing_is_narrow_durable_and_never_a_transport_command() {
     let identities = read("crates/ratspeak-tauri/src/commands/identity.rs");
     let system = read("crates/ratspeak-tauri/src/commands/system.rs");
     assert!(identities.contains("forget_shared_text_drafts(&state, Some(hash_hex.clone()))"));
-    assert!(system.contains("forget_shared_text_drafts(&state, Some(identity_id.clone()))"));
     assert!(system.contains("forget_shared_text_drafts(&state, None)"));
     assert!(root.join("scripts/dashboard/test_text_shares.js").is_file());
     assert!(!root.join("dashboard/scripts/test_text_shares.js").exists());
@@ -9542,4 +9974,544 @@ fn native_codec2_distribution_notices_match_selected_rs_lxst() {
             "notice bytes differ: {name}",
         );
     }
+}
+
+#[test]
+fn factory_reset_invalidates_the_identity_cache_after_its_wipe() {
+    let system = read_source(repo_root().join("crates/ratspeak-tauri/src/commands/system.rs"))
+        .expect("system commands");
+    let reset = rust_function_block(&system, "api_factory_reset");
+    let wipe = reset
+        .find("for table in db::RESET_TABLES")
+        .expect("factory reset wipe");
+    let bump = reset
+        .find("db::note_identity_tables_changed()")
+        .expect("identity generation bump");
+    assert!(
+        wipe < bump,
+        "bumped before the wipe, a reader can cache the old identity under the new generation"
+    );
+}
+
+#[test]
+fn startup_never_reads_a_failed_active_identity_lookup_as_none() {
+    let runtime = read_source(repo_root().join("crates/ratspeak-runtime/src/lib.rs"))
+        .expect("runtime source");
+    let startup = rust_function_block(&runtime, "init_rns_lxmf_inner");
+    // The preferred-identity read and the recovery read both decide which
+    // identity starts; a failed lookup there must stop startup.
+    assert_eq!(
+        startup
+            .matches("read_active_identity_for_startup(&state).await")
+            .count(),
+        2
+    );
+    let read = rust_function_block(&runtime, "read_active_identity_for_startup");
+    assert!(read.contains("state.set_startup_stage(\"error\")"));
+}
+
+#[test]
+fn every_ipc_command_passes_the_invoke_gate() {
+    let shell = read_source(repo_root().join("src-tauri/src/lib.rs")).expect("Tauri shell");
+    let compact: String = shell.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(compact.matches("generate_handler!").count(), 1);
+    assert!(
+        compact.contains(
+            ".invoke_handler(ratspeak_tauri::invoke_gate::gated(tauri::generate_handler!["
+        )
+    );
+    let registered: Vec<&str> = shell
+        .lines()
+        .skip_while(|line| !line.contains("generate_handler!["))
+        .skip(1)
+        .map(str::trim)
+        .take_while(|line| !line.starts_with(']'))
+        .filter(|line| !line.is_empty() && !line.starts_with("//") && !line.starts_with("#["))
+        .filter_map(|line| line.trim_end_matches(',').rsplit("::").next())
+        .collect();
+    assert!(registered.len() > 200, "command registry not found");
+    let gate = read_source(repo_root().join("crates/ratspeak-tauri/src/invoke_gate.rs"))
+        .expect("invoke gate");
+    for list in ["IDENTITY_FREE", "LOCK_FREE"] {
+        let free = gate_list(&gate, list);
+        assert!(free.len() > 40, "{list} not parsed");
+        for command in free {
+            assert!(
+                registered.contains(&command),
+                "{list}: {command} is not registered"
+            );
+        }
+    }
+}
+
+/// The command names of one of the invoke gate's lists.
+fn gate_list<'a>(gate: &'a str, list: &str) -> Vec<&'a str> {
+    gate.split(&format!("const {list}: &[&str] = &["))
+        .nth(1)
+        .and_then(|tail| tail.split("];").next())
+        .unwrap_or_else(|| panic!("{list} list"))
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix('"')?.strip_suffix("\","))
+        .collect()
+}
+
+/// A locked identity's data waits for its unlock; the gate still answers
+/// app settings and identity management.
+#[test]
+fn a_locked_identity_keeps_only_settings_and_identity_management() {
+    let gate = read_source(repo_root().join("crates/ratspeak-tauri/src/invoke_gate.rs"))
+        .expect("invoke gate");
+    let lock_free = gate_list(&gate, "LOCK_FREE");
+    for scoped in [
+        "api_lxmf_conversations",
+        "get_conversation",
+        "api_contacts",
+        "api_contact_card",
+        "api_blocked_contacts",
+        "api_channels",
+        "api_announces",
+        "api_get_peers_snapshot",
+        "api_list_network_interfaces",
+        "activity_status",
+        "get_all_game_sessions",
+        "voice_status",
+        "api_lxmf_limits",
+        "send_lxmf_message",
+        "api_set_display_name",
+        "set_identity_status",
+        "api_update_identity",
+    ] {
+        assert!(
+            !lock_free.contains(&scoped),
+            "{scoped} answers while locked"
+        );
+    }
+    for unlock in [
+        "unlock_identity",
+        "hw_unlock",
+        "switch_identity",
+        "api_list_identities",
+    ] {
+        assert!(
+            lock_free.contains(&unlock),
+            "{unlock} is refused while locked"
+        );
+    }
+}
+
+#[test]
+fn startup_never_hands_identity_less_rows_to_the_active_identity() {
+    let root = repo_root();
+    let db_path = root.join("crates/ratspeak-db/src/db.rs");
+    let db = read_source(&db_path).expect("db source");
+    let runtime =
+        read_source(root.join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime source");
+    assert!(!db.contains("fn backfill_identity_id"));
+    assert!(!runtime.contains("backfill_identity_id"));
+
+    // Nothing may claim or rewrite identity-less rows.
+    let mut files = vec![db_path];
+    collect_files(&root.join("crates/ratspeak-runtime/src"), &mut files);
+    for path in files
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+    {
+        let source = read_source(path).expect("source");
+        for statement in source.split("UPDATE ").skip(1) {
+            let statement: String = statement
+                .split('"')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(
+                !statement.contains("identity_id=''"),
+                "{}: UPDATE {statement}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn active_identity_read_errors_are_not_taken_for_a_missing_identity() {
+    let root = repo_root();
+    let ble = read_source(root.join("crates/ratspeak-tauri/src/commands/ble.rs")).expect("ble");
+    let enable = rust_function_block(&ble, "spawn_enable_ble_peer_task");
+    // Saving Bluetooth Peer as off is for a missing identity, not a failed read.
+    assert!(!enable.contains("get_active_identity(&p).ok().flatten()"));
+    let unreadable = enable
+        .find("reason = \"query_failed\"")
+        .expect("read-failure branch");
+    let saved_off = enable
+        .find("db::set_setting(&p, BLE_PEER_ENABLED_SETTING, \"0\")")
+        .expect("missing-identity branch");
+    assert!(unreadable < saved_off);
+
+    let runtime =
+        read_source(root.join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime source");
+    let hub = rust_function_block(&runtime, "start_channel_hub_service");
+    assert!(hub.contains("reason = \"query_failed\""));
+}
+
+/// Auto-lock runs from the unlock, not from the last interaction, and its
+/// copy says so.
+#[test]
+fn auto_lock_copy_counts_from_the_unlock() {
+    let root = repo_root();
+    let index = read_source(root.join("dashboard/index.html")).expect("dashboard index");
+    let settings = read_source(root.join("dashboard/static/js/settings.js")).expect("settings js");
+    let row = index
+        .split(r#"id="hw-lock-row""#)
+        .nth(1)
+        .and_then(|tail| tail.split(r#"id="hw-lock-timeout-select""#).next())
+        .expect("auto-lock row");
+    let choice = settings
+        .split("function _initHwLockSetting(")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}\n").next())
+        .expect("auto-lock choice");
+    for copy in [row, choice] {
+        assert!(copy.contains("since you unlocked it"), "{copy}");
+        assert!(
+            !copy.contains("inactivity") && !copy.contains("idle"),
+            "{copy}"
+        );
+    }
+}
+
+/// Auto-lock runs on the suspend-counting clock and has a watcher of its own,
+/// which reads that clock again at least every 5 s: no timer counts down the
+/// unlock in awake time, and the lock waits for no network or LXMF tick.
+#[test]
+fn auto_lock_has_a_watcher_of_its_own() {
+    let runtime =
+        read_source(repo_root().join("crates/ratspeak-runtime/src/lib.rs")).expect("runtime lib");
+    assert!(!runtime.contains("fn arm_hw_lock_timer"));
+    let tick = runtime
+        .split("let mut interval = tokio::time::interval(Duration::from_millis(500));")
+        .nth(1)
+        .and_then(|tail| tail.split("download_coordinator.synchronize(").next())
+        .expect("LXMF tick loop");
+    assert!(!tick.contains("auto_lock"), "the lock waits for the tick");
+    assert!(runtime.contains("const AUTO_LOCK_RECHECK: Duration = Duration::from_secs(5);"));
+    let arm = rust_function_block(&runtime, "arm_auto_lock");
+    assert!(arm.contains("tokio::spawn(watch_auto_lock("));
+    let watcher = rust_function_block(&runtime, "watch_auto_lock");
+    assert!(watcher.contains("ContinuousInstant::now()"));
+    assert!(watcher.contains(".min(AUTO_LOCK_RECHECK)"));
+    assert!(watcher.contains("armed_auto_lock(generation)"));
+    let lock = rust_function_block(&runtime, "lock_protected_session");
+    assert!(!lock.contains("sleep("));
+    let refused = lock
+        .find("set_hw_locked(Some(")
+        .expect("the lock refuses the identity");
+    let teardown = lock.find("finish_shutdown(").expect("teardown");
+    assert!(
+        refused < teardown,
+        "the identity stays open through its teardown"
+    );
+}
+
+/// A hardware change that shuts down the identity its token backs keeps that
+/// identity locked, whether the change succeeds or not: lifting the lock
+/// would open its data, and setup, with no PIN. An activation keeps its
+/// identity locked until the load has checked the PIN. These paths need a
+/// card to run, so this pins them.
+#[test]
+fn a_hardware_change_keeps_the_identity_it_shut_down_locked() {
+    let hardware = read_source(repo_root().join("crates/ratspeak-tauri/src/commands/hardware.rs"))
+        .expect("hardware commands");
+    assert!(!hardware.contains("fn clear_hardware_lock_state"));
+    for function in [
+        "hw_provision_recoverable",
+        "hw_provision_hardware_only",
+        "hw_restore",
+        "hw_reset_piv",
+    ] {
+        let block = rust_function_block(&hardware, function);
+        let operation = block
+            .find("run_identity_mutation(")
+            .unwrap_or_else(|| panic!("{function} changes no token"));
+        let kept = block
+            .find("keep_hardware_identity_locked(")
+            .unwrap_or_else(|| panic!("{function} lifts the lock"));
+        let answered = block[operation..]
+            .find(".map_err(")
+            .map(|at| operation + at)
+            .unwrap_or_else(|| panic!("{function} has no result"));
+        assert!(kept < answered, "{function} keeps the lock only on success");
+        assert!(!block.contains("set_hw_locked(None)"), "{function}");
+    }
+    let activation = rust_function_block(&hardware, "hw_activate_and_unlock");
+    let activated = activation.find("set_active_identity(").expect("activation");
+    let loaded = activation[activated..]
+        .find("crate::init_rns_lxmf(")
+        .map(|at| activated + at)
+        .expect("load");
+    let before_load = &activation[activated..loaded];
+    assert!(before_load.contains("set_hw_locked(Some(hash.clone()))"));
+    assert!(!before_load.contains("set_hw_locked(None)"));
+}
+
+/// The process stays dumpable on Linux. xdg-desktop-portal opens
+/// `/proc/<pid>/root` to tell who calls it and refuses a caller it can't
+/// read, and every file dialog, identity exports and backups included, goes
+/// through a portal there.
+#[test]
+fn the_process_stays_dumpable_for_the_desktop_portals() {
+    let process = read_source(repo_root().join("crates/ratspeak-tauri/src/process.rs"))
+        .expect("process hardening");
+    assert!(!process.contains("PR_SET_DUMPABLE"));
+    assert!(process.contains("libc::RLIMIT_CORE"));
+    assert!(process.contains("std::panic::set_hook"));
+}
+
+/// The radio rule gives ports to the user at the seat through uaccess, which
+/// systemd applies in 73-seat-late.rules: it sorts before that and opens no
+/// port to every local account. Packages run udevadm so plugged-in radios
+/// follow it, and the copy tells the AppImage path and to drop the old file.
+#[test]
+fn linux_radio_rule_reaches_only_the_seat_user() {
+    let root = repo_root();
+    let linux = root.join("src-tauri/resources/linux");
+    let mut rules: Vec<String> = std::fs::read_dir(&linux)
+        .expect("Linux resources")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rules"))
+        .collect();
+    rules.sort();
+    assert_eq!(rules, ["70-ratspeak.rules"]);
+    assert!(rules[0].as_str() < "73-seat-late.rules");
+    let rule = read_source(linux.join("70-ratspeak.rules")).expect("udev rule");
+    let matches: Vec<&str> = rule
+        .lines()
+        .filter(|line| line.starts_with("SUBSYSTEM=="))
+        .collect();
+    assert_eq!(matches.len(), 8);
+    for line in matches {
+        assert!(line.ends_with(r#", TAG+="uaccess""#), "{line}");
+        assert!(
+            !line.contains("MODE=") && !line.contains("GROUP="),
+            "{line}"
+        );
+    }
+    assert!(!rule.contains("0666"));
+    assert!(rule.contains("/etc/udev/rules.d/99-ratspeak.rules"));
+
+    let config: serde_json::Value = serde_json::from_str(
+        &read_source(root.join("src-tauri/tauri.conf.json")).expect("Tauri config"),
+    )
+    .expect("valid Tauri config");
+    for package in ["deb", "rpm"] {
+        let bundle = &config["bundle"]["linux"][package];
+        assert_eq!(
+            bundle["files"]["/usr/lib/udev/rules.d/70-ratspeak.rules"],
+            "resources/linux/70-ratspeak.rules",
+            "{package}"
+        );
+        let script = bundle["postInstallScript"].as_str().expect(package);
+        let script = read_source(root.join("src-tauri").join(script)).expect(package);
+        assert!(script.contains("udevadm trigger --subsystem-match=tty --action=change"));
+        assert!(
+            script.contains("|| true"),
+            "{package}: a failed trigger fails no install"
+        );
+    }
+    assert!(
+        !read_source(root.join("src-tauri/tauri.conf.json"))
+            .unwrap()
+            .contains("99-ratspeak")
+    );
+
+    let health = read_source(root.join("dashboard/static/js/health.js")).expect("health");
+    assert!(health.contains("dialout") && health.contains("uucp"));
+    let modals = read_source(root.join("dashboard/static/js/modals.js")).expect("modals");
+    assert!(modals.contains("/etc/udev/rules.d/70-ratspeak.rules"));
+    assert!(modals.contains("99-ratspeak.rules"));
+}
+
+/// An identity's alerts go with its session: each transition that ends one
+/// withdraws them right after its generation bump, so no alert of that
+/// session, checked under the routine lock, can follow.
+#[test]
+fn ending_an_identity_session_withdraws_its_alerts() {
+    let root = repo_root();
+    let read = |path: &str| read_source(root.join(path)).expect(path);
+    let identity = read("crates/ratspeak-tauri/src/commands/identity.rs");
+    let hardware = read("crates/ratspeak-tauri/src/commands/hardware.rs");
+    let system = read("crates/ratspeak-tauri/src/commands/system.rs");
+    let runtime = read("crates/ratspeak-runtime/src/lib.rs");
+    for (source, function) in [
+        (&identity, "switch_identity_session_held"),
+        (&hardware, "hw_remove"),
+        (&hardware, "hw_activate_and_unlock"),
+        (&system, "api_factory_reset"),
+        (&runtime, "lock_protected_session"),
+    ] {
+        let block = rust_function_block(source, function);
+        let bump = block
+            .find("bump_identity_session_generation()")
+            .unwrap_or_else(|| panic!("{function} ends no session"));
+        let withdraw = block
+            .find("withdraw_native_notifications()")
+            .unwrap_or_else(|| panic!("{function} leaves its alerts"));
+        assert!(bump < withdraw, "{function} withdraws before its bump");
+    }
+
+    let notifier = read("crates/ratspeak-tauri/src/notifier.rs");
+    assert!(notifier.contains("fn withdraw_all(&self)"));
+    assert!(
+        notifier.contains("remove_all_active()"),
+        "iOS withdraws through the plugin"
+    );
+    assert!(notifier.contains("\"withdrawAll\""));
+    let android = read(
+        "src-tauri/gen/android/app/src/main/java/org/ratspeak/android/RatspeakNotifications.kt",
+    );
+    let withdraw = android
+        .split("fun withdrawAll(")
+        .nth(1)
+        .and_then(|tail| tail.split("\n    }\n").next())
+        .expect("Android withdrawal");
+    assert!(withdraw.contains("activeNotifications"));
+    assert!(withdraw.contains("alertChannels"));
+    assert!(
+        !android.contains("cancelAll"),
+        "the service's own card stays"
+    );
+    let service =
+        read("src-tauri/gen/android/app/src/main/java/org/ratspeak/android/RatspeakService.kt");
+    let activity =
+        read("src-tauri/gen/android/app/src/main/java/org/ratspeak/android/MainActivity.kt");
+    for source in [&service, &activity] {
+        assert!(!source.contains("ACTION_REFRESH"));
+        assert!(!source.contains("clearAllMessageNotifications"));
+    }
+}
+
+/// The call alert is raised beside the voice event loop, which a transition
+/// joins under the lifecycle lock: the loop never waits for that lock.
+#[test]
+fn the_call_alert_never_holds_up_the_voice_loop() {
+    let voice =
+        read_source(repo_root().join("crates/ratspeak-runtime/src/voice.rs")).expect("voice");
+    let events = rust_function_block(&voice, "drive_voice_events");
+    assert!(events.contains("raise_incoming_call_alert("));
+    assert!(!events.contains("notify_incoming_call_if_background("));
+    assert!(!events.contains("identity_switch_lock"));
+    let alert = rust_function_block(&voice, "raise_incoming_call_alert");
+    assert!(alert.contains("tokio::spawn("));
+    assert!(alert.contains("lock_routine()"));
+}
+
+/// Copied keys and phrases leave the clipboard after a minute of clock time:
+/// the deadline runs on the clock that counts suspend and its wait re-checks
+/// it at least every 5 s, never one awake-time sleep. Desktop keeps them out
+/// of clipboard history and clears them on quit; Android marks them
+/// sensitive; iOS keeps them on the device with a native expiry. Checking
+/// that needs a live clipboard, so the platform half is pinned here.
+#[test]
+fn copied_secrets_leave_the_clipboard() {
+    let root = repo_root();
+    let read = |path: &str| read_source(root.join(path)).expect(path);
+    let shell = read("src-tauri/src/lib.rs");
+    assert!(shell.contains("secret_clipboard::copy_secret,"));
+    assert!(shell.contains("tauri::RunEvent::Exit => secret_clipboard::forget_now(),"));
+    let clipboard = read("src-tauri/src/secret_clipboard.rs");
+    assert!(
+        clipboard.contains(
+            "const CLEAR_AFTER: std::time::Duration = std::time::Duration::from_secs(60);"
+        )
+    );
+    assert!(clipboard.contains("const RECHECK: Duration = Duration::from_secs(5);"));
+    assert!(clipboard.contains("ContinuousInstant::now()"));
+    assert!(clipboard.contains(".min(RECHECK)"));
+    assert!(!clipboard.contains("thread::sleep"));
+    assert!(!clipboard.contains("sleep(CLEAR_AFTER)"));
+    for exclusion in [
+        "SetExtApple::exclude_from_history",
+        "SetExtWindows::exclude_from_monitoring",
+        "SetExtLinux::exclude_from_history",
+        "UIPasteboardOptionLocalOnly",
+        "UIPasteboardOptionExpirationDate",
+    ] {
+        assert!(clipboard.contains(exclusion), "{exclusion}");
+    }
+    let android =
+        read("src-tauri/gen/android/app/src/main/java/org/ratspeak/android/RatspeakClipboard.kt");
+    assert!(android.contains("ClipDescription.EXTRA_IS_SENSITIVE"));
+    // Made on the main thread: before Android 9 it needs a looper, and Rust
+    // calls in on threads without one.
+    let bridge = read(
+        "src-tauri/gen/android/app/src/main/java/org/ratspeak/android/RatspeakNativeBridge.kt",
+    );
+    assert!(bridge.contains("RatspeakClipboard.initialize(context.applicationContext)"));
+    let gate = read("crates/ratspeak-tauri/src/invoke_gate.rs");
+    for list in ["IDENTITY_FREE", "LOCK_FREE"] {
+        assert!(gate_list(&gate, list).contains(&"copy_secret"), "{list}");
+    }
+    // Every recovery phrase and access file goes through it.
+    for path in [
+        "dashboard/static/js/identity.js",
+        "dashboard/static/js/setup.js",
+        "dashboard/static/js/network_ownership.js",
+    ] {
+        let source = read(path);
+        assert!(source.contains("RS.copySecret("), "{path}");
+        for secret in [
+            "RS.copyText(mnemonic",
+            "RS.copyText(phrase",
+            "RS.copyText(setupRecoveryMnemonic",
+            "RS.copyText(content",
+        ] {
+            assert!(!source.contains(secret), "{path}: {secret}");
+        }
+    }
+}
+
+/// The app hardens its process before anything else runs or any secret is
+/// in memory; the hardening itself is tested in a process of its own.
+#[test]
+fn the_app_hardens_its_process_first() {
+    let shell = read_source(repo_root().join("src-tauri/src/lib.rs")).expect("Tauri shell");
+    let run = rust_function_block(&shell, "run");
+    let body = run[run.find('{').unwrap() + 1..].trim_start();
+    assert!(
+        body.starts_with("ratspeak_tauri::process::harden();"),
+        "{body}"
+    );
+}
+
+/// Keys leave only through the exports that ask for the identity's PIN or a
+/// confirmation; the raw-key commands that asked for neither are gone.
+#[test]
+fn identity_keys_leave_only_through_authorized_exports() {
+    let root = repo_root();
+    let identity = read_source(root.join("crates/ratspeak-tauri/src/commands/identity.rs"))
+        .expect("identity commands");
+    let shell = read_source(root.join("src-tauri/src/lib.rs")).expect("Tauri shell");
+    for removed in ["fn api_export_identity(", "fn api_export_identity_base64("] {
+        assert!(!identity.contains(removed), "{removed}");
+    }
+    assert!(!shell.contains("identity::api_export_identity,"));
+    assert!(!shell.contains("identity::api_export_identity_base64,"));
+    for export in [
+        "api_export_identity_reticulum_base64",
+        "api_export_identity_reticulum_base32",
+        "api_export_identity_backup_base64",
+    ] {
+        assert!(
+            rust_function_block(&identity, export).contains("export_identity("),
+            "{export}"
+        );
+    }
+    let reveal = rust_function_block(&identity, "reveal_identity_mnemonic");
+    assert!(reveal.contains("active_identity_id(&state)"));
+    assert!(reveal.contains("release_passcode("));
+    let runtime = read_source(root.join("crates/ratspeak-runtime/src/lxmf.rs")).expect("lxmf");
+    assert!(!runtime.contains("pub fn export_identity("));
 }

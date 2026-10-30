@@ -386,7 +386,7 @@ pub async fn api_channel_participants(
 pub async fn api_channel_unread(
     state: State<'_, Arc<AppState>>,
 ) -> AppResult<crate::db::ChannelUnreadSummary> {
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let _identity_lifecycle = state.identity_switch_lock.lock_routine().await;
     let identity_id = require_identity(&state)?;
     let pool = state.db.clone();
     crate::db::spawn_db(pool, move |pool| {
@@ -402,7 +402,7 @@ pub async fn mark_channel_room_read(
     state: State<'_, Arc<AppState>>,
     args: MarkChannelRoomReadArgs,
 ) -> AppResult<ChannelRoomStateUpdate> {
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let _identity_lifecycle = state.identity_switch_lock.lock_routine().await;
     let identity_id = require_identity(&state)?;
     let destination_hash = clean_destination_hash(&args.hub_destination_hash)?;
     let room = ratspeak_runtime::rrc::normalize_room(
@@ -450,7 +450,7 @@ pub async fn set_channel_room_notification_level(
     state: State<'_, Arc<AppState>>,
     args: SetChannelRoomNotificationLevelArgs,
 ) -> AppResult<ChannelRoomStateUpdate> {
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    let _identity_lifecycle = state.identity_switch_lock.lock_routine().await;
     let identity_id = require_identity(&state)?;
     let destination_hash = clean_destination_hash(&args.hub_destination_hash)?;
     let room = ratspeak_runtime::rrc::normalize_room(

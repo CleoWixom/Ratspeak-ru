@@ -62,6 +62,7 @@ pub fn sanitize_announced_status(value: &str) -> Result<String, String> {
 /// Active identity's (hash, lxmf_hash) via the generation-stamped cache.
 /// Hot async paths call this every poll/announce/message; the sync DB read
 /// only happens when an identity-table write bumped `db::identity_generation`.
+/// A failed read also returns `None` but is never cached.
 pub fn active_identity_snapshot(state: &AppState) -> Option<(String, String)> {
     let generation = db::identity_generation();
     if let Ok(cache) = state.active_identity_cache.lock()
@@ -72,7 +73,10 @@ pub fn active_identity_snapshot(state: &AppState) -> Option<(String, String)> {
         return snapshot.clone();
     }
 
-    let snapshot = db::get_active_identity(&state.db).and_then(|id| {
+    let Ok(active) = db::get_active_identity(&state.db) else {
+        return None;
+    };
+    let snapshot = active.and_then(|id| {
         let hash = id.get("hash")?.as_str()?.to_string();
         let lxmf_hash = id
             .get("lxmf_hash")
@@ -85,6 +89,16 @@ pub fn active_identity_snapshot(state: &AppState) -> Option<(String, String)> {
         *cache = Some((generation, snapshot.clone()));
     }
     snapshot
+}
+
+/// The cache, current for this generation, holds no active identity. Never
+/// reads the database: an unknown state is not absent.
+pub fn active_identity_known_absent(state: &AppState) -> bool {
+    let generation = db::identity_generation();
+    state
+        .active_identity_cache
+        .lock()
+        .is_ok_and(|cache| matches!(cache.as_ref(), Some((cached, None)) if *cached == generation))
 }
 
 pub fn active_identity_id(state: &AppState) -> String {

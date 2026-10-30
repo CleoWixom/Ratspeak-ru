@@ -358,10 +358,12 @@ pub(crate) async fn run(
 }
 
 #[cfg(test)]
-mod get_tests {
+pub(crate) mod get_tests {
     use super::*;
     use std::sync::atomic::Ordering;
-    static GET_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Also held by the library's tests that tear a session down: a teardown
+    /// quiesces every host, and these tests wait that out only so long.
+    pub(crate) static GET_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     fn ready_state() -> Arc<AppState> {
         let (state, _) = crate::inbound_pipeline_tests::pipeline_state();
         state
@@ -375,11 +377,22 @@ mod get_tests {
         );
         state
     }
+    /// A runtime shutdown in another test briefly quiesces every host.
+    async fn lease(state: &Arc<AppState>, generation: u64) -> GetLease {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(lease) = GetLease::acquire(state, generation) {
+                return lease;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no host lease");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn hosted_get_quiescence_joins_cancelled_blocking_work_and_invalidates_generation() {
         let _test = GET_TEST_LOCK.lock().await;
         let state = ready_state();
-        let lease = GetLease::acquire(&state, state.current_identity_session_generation()).unwrap();
+        let lease = lease(&state, state.current_identity_session_generation()).await;
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
@@ -413,7 +426,7 @@ mod get_tests {
         let _test = GET_TEST_LOCK.lock().await;
         let state = ready_state();
         let old = state.current_identity_session_generation();
-        assert!(GetLease::acquire(&state, old).is_some());
+        drop(lease(&state, old).await);
         state
             .propagation_node_hosting_enabled
             .store(false, Ordering::Relaxed);

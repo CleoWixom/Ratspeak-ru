@@ -9,28 +9,95 @@ function showConnectionSummary() {
     connectionWatcher = null;
 }
 
+// Shown in place of the app when the core could not start. It is static: no
+// command state exists, so nothing here may invoke. On a phone, closing the
+// app ends the failed process, so opening it again starts afresh.
+var _RS_STARTUP_ERROR_COPY = {
+    profile_in_use: {
+        title: 'Ratspeak is already open',
+        message: 'Another Ratspeak app is using this data. Quit it, then open Ratspeak again.',
+        mobile: 'Another Ratspeak app is using this data. Close Ratspeak and open it again.'
+    },
+    schema_newer: {
+        title: 'Update Ratspeak',
+        message: 'This data was saved by a newer version of Ratspeak. Install the latest version to open it.'
+    },
+    storage: {
+        title: "Ratspeak can't open its data",
+        message: "Make sure the drive with Ratspeak's data is connected, has free space and lets Ratspeak write to it. Then restart Ratspeak.",
+        mobile: 'Close Ratspeak and open it again. If this keeps happening, make sure this device has free space.'
+    }
+};
+
+function _rsShowStartupError(failure) {
+    var copy = _RS_STARTUP_ERROR_COPY[failure.code] || _RS_STARTUP_ERROR_COPY.storage;
+    var mobile = window.__RATSPEAK_MOBILE__ === true;
+    var overlay = document.createElement('div');
+    overlay.id = 'startup-error-overlay';
+    overlay.className = 'hw-unlock-overlay';
+    overlay.setAttribute('role', 'alert');
+    overlay.style.display = 'flex';
+    var card = document.createElement('div');
+    card.className = 'hw-unlock-card';
+    var icon = document.createElement('div');
+    icon.className = 'hw-unlock-icon';
+    icon.innerHTML = '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" ' +
+        'stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 6.5v7m0 4v.01"/></svg>';
+    var title = document.createElement('div');
+    title.className = 'hw-unlock-title';
+    title.textContent = copy.title;
+    var message = document.createElement('div');
+    message.className = 'hw-unlock-sub';
+    message.textContent = (mobile && copy.mobile) || copy.message;
+    card.appendChild(icon);
+    card.appendChild(title);
+    card.appendChild(message);
+    if (failure.code === 'schema_newer') {
+        var detail = document.createElement('div');
+        detail.className = 'inline-hint-sm font-mono';
+        detail.textContent = 'Data version ' + failure.found + ', supported up to ' + failure.supported;
+        card.appendChild(detail);
+    }
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+}
+
 // One-shot bootstrap; subsequent updates arrive via push events.
 function _rsBootstrapOnLoad() {
+    if (window.__RATSPEAK_STARTUP_ERROR__) {
+        _rsShowStartupError(window.__RATSPEAK_STARTUP_ERROR__);
+        return;
+    }
+    if (window.RS && RS.audioPlayback && typeof RS.audioPlayback.installUnlock === 'function') {
+        RS.audioPlayback.installUnlock();
+    }
+    if (typeof loadIdentities === 'function') loadIdentities();
     // Race-free check for a locked protected identity at boot (the
-    // hardware_locked event can fire before this listener attaches).
+    // hardware_locked event can fire before this listener attaches). A
+    // locked identity's data waits for the unlock, which reloads the page.
     RS.invoke('api_startup_progress').then(function(data) {
-        if (data && data.stage === 'hw_locked' && typeof showHwUnlock === 'function') {
+        var locked = !!(data && data.stage === 'hw_locked');
+        if (locked && typeof showHwUnlock === 'function') {
             showHwUnlock(data.hw_locked, data.hw_locked_kind);
         }
         if (data && data.storage_warning && typeof showToast === 'function') {
             showToast(data.storage_warning, 'toast-warning', 5000);
         }
-    }).catch(function() {});
-    if (window.RS && RS.audioPlayback && typeof RS.audioPlayback.installUnlock === 'function') {
-        RS.audioPlayback.installUnlock();
-    }
+        if (data && data.profile_lock_warning && typeof showToast === 'function') {
+            showToast(data.profile_lock_warning, 'toast-warning', 5000);
+        }
+        if (!locked) _rsLoadIdentityViews();
+    }).catch(function() { _rsLoadIdentityViews(); });
+}
+
+// The active identity's announces, conversations, blocks and peers.
+function _rsLoadIdentityViews() {
     RS.invoke('api_announces').then(function(data) {
         if (Array.isArray(data)) {
             announceCache = data;
             if (typeof renderAnnounceList === 'function') renderAnnounceList();
         }
     }).catch(function() {});
-    if (typeof loadIdentities === 'function') loadIdentities();
     if (typeof loadConversations === 'function') loadConversations();
     if (typeof updateBlockedCount === 'function') updateBlockedCount();
 
@@ -325,10 +392,12 @@ function _renderPathCacheCleared() {
     if (typeof renderNetworkContactList === 'function') renderNetworkContactList();
 }
 
-function _reloadPeersAfterCacheClear() {
+// keepOnFailure: the peers still exist (a bulk delete changed only their
+// flags), so a failed reload must not empty the list.
+function _reloadPeersAfterCacheClear(keepOnFailure) {
     if (typeof PeersCache === 'undefined' || !PeersCache) return;
     if (typeof RS === 'undefined' || typeof RS.invoke !== 'function') {
-        if (typeof PeersCache.clear === 'function') PeersCache.clear();
+        if (!keepOnFailure && typeof PeersCache.clear === 'function') PeersCache.clear();
         return;
     }
     RS.invoke('api_get_peers_snapshot').then(function(rows) {
@@ -339,7 +408,7 @@ function _reloadPeersAfterCacheClear() {
             if (typeof PeersCache.init === 'function') PeersCache.init().catch(function() {});
         }
     }).catch(function() {
-        if (typeof PeersCache.clear === 'function') PeersCache.clear();
+        if (!keepOnFailure && typeof PeersCache.clear === 'function') PeersCache.clear();
     });
 }
 
@@ -1092,6 +1161,7 @@ RS.listen('ble_rnode_pairing_finished', function(data) {
 // Android BLE connect phases for the add/edit dialog. Retry phases are left
 // out so they never overwrite the explained waiting reason.
 var _BLE_RNODE_PHASES = {
+    finding: 'Looking for the RNode nearby...',
     bonding: 'Pairing... Enter the PIN shown on the RNode when Android asks.',
     pairing_settle: 'Paired. Reconnecting securely...',
     mtu: 'Negotiating link...',

@@ -1,0 +1,16 @@
+{
+  "source": "LXMF LXMessage.pack(), fields {FIELD_RENDERER: RENDERER_MARKDOWN}",
+  "reticulum": {
+    "version": "1.5.5",
+    "commit": "7f2b3b9b524c9386316379af1313b43a5e4f7a5d"
+  },
+  "lxmf": {
+    "version": "1.2.0",
+    "commit": "c3ff2d6dc2f256daab896dadc044dd5a913ecbb7"
+  },
+  "timestamp": 1700000000.0,
+  "content": "**bold** and ||hidden||",
+  "renderer": 2,
+  "source_public_key": "c306fb0ef2bf8b7f93bad98155fa37daec74db0c4cbeda6c6f1dba9d36558252bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5",
+  "packed": "9065c6a70344cdd39e85699d34901fb8a8ca03e60789eaab72d067062a6b5ed84c99322e2c91f3a8c4d98756bd952a2b94fc97d64e9db463f90c6465957191d6ad60f0bb6d91e346c790710516d3449b429713d4b8f459b99d82bbb8399fa30f94cb41d954fc40000000c400c4172a2a626f6c642a2a20616e64207c7c68696464656e7c7c810f02"
+}

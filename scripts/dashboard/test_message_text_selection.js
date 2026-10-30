@@ -305,6 +305,7 @@ function targetWithClasses(classes) {
 (function testCanonicalCopyText() {
     var context = {};
     vm.runInNewContext(
+        namedFunctionSource(lxmfSource, '_messageBodyContent') + '\n' +
         namedFunctionSource(lxmfSource, '_messageDisplayContent') + '\n' +
         'this.displayContent = _messageDisplayContent;',
         context,
@@ -619,7 +620,7 @@ function classListStub() {
         'function _consumePendingMessageHoldContext() { return pendingContext; }\n' +
         namedFunctionSource(lxmfSource, '_messageActionOwnsText') + '\n' +
         namedFunctionSource(lxmfSource, '_messageSelectionIntersectsBubble') + '\n' +
-        namedFunctionSource(lxmfSource, '_messageLinkUsesNativeContext') + '\n' +
+        namedFunctionSource(lxmfSource, '_messageLinkUrlAt') + '\n' +
         namedFunctionSource(lxmfSource, '_messageLinkActivationAllowed') + '\n' +
         namedFunctionSource(lxmfSource, '_rememberMessagePointerContextSelection') + '\n' +
         namedFunctionSource(lxmfSource, '_consumeMessagePointerContextSelection') + '\n' +
@@ -628,7 +629,7 @@ function classListStub() {
         'this.setPendingContext = function(value) { pendingContext = value; };\n' +
         'this.rememberPointerSelection = _rememberMessagePointerContextSelection;\n' +
         'this.consumePointerSelection = _consumeMessagePointerContextSelection;\n' +
-        'this.nativeLink = _messageLinkUsesNativeContext;\n' +
+        'this.linkUrl = _messageLinkUrlAt;\n' +
         'this.linkAllowed = _messageLinkActivationAllowed;\n' +
         'this.disposition = _messageContextMenuDisposition;',
         context,
@@ -637,14 +638,18 @@ function classListStub() {
     var bubble = { contains: function(candidate) { return candidate === link || candidate === text; } };
     var text;
     var link = {
+        getAttribute: function(name) { return name === 'data-url' ? 'https://example.org/' : null; },
         closest: function(selector) {
-            if (selector === '.rs-message-link' || selector === '.lxmf-msg-content') return link;
+            if (selector === '.rs-message-link[data-url]' || selector === '.lxmf-msg-content') return link;
             if (selector === '.lxmf-msg') return bubble;
             return null;
         }
     };
-    assert.strictEqual(context.nativeLink(link), true);
-    assert.strictEqual(context.disposition(link, bubble, 10), 'native');
+    assert.strictEqual(context.linkUrl(link), 'https://example.org/');
+    assert.strictEqual(context.disposition(link, bubble, 10), 'actions',
+        'pointer links open message actions; the platform menu would skip the link warning');
+    assert.strictEqual(context.disposition(link, bubble, 10, true), 'actions',
+        'a selection never hands a link to the platform menu');
     text = {
         closest: function(selector) {
             if (selector === '.lxmf-msg-content') return text;
@@ -667,7 +672,6 @@ function classListStub() {
         'a pre-existing left-drag selection must retain the native copy menu');
     selection = { isCollapsed: true, rangeCount: 0 };
     documentStub.documentElement.dataset.inputModality = 'touch';
-    assert.strictEqual(context.nativeLink(link), false);
     assert.strictEqual(context.linkAllowed(link), true);
     assert.strictEqual(context.disposition(link, bubble, 10), 'actions');
     context.setOwner(bubble);
@@ -791,9 +795,12 @@ var metaSource = lxmfSource.slice(
 );
 assert(metaSource.indexOf('msg-actions-trigger') < metaSource.indexOf('msg-time'),
     'the plus action must render to the left of the timestamp');
-assert(messagingCss.includes('.msg-context-actions > :last-child:nth-child(odd)') &&
-       messagingCss.includes('grid-column: 1 / -1;'),
-    'an odd final action must span the dialog instead of leaving a visual hole');
+assert(/\.msg-context-actions\s*\{[\s\S]*?flex-direction:\s*column;/.test(messagingCss) &&
+       messagingCss.includes('.msg-ctx-btn + .msg-ctx-btn { border-top: 1px solid var(--divider); }'),
+    'actions must stack as full-width rows so any count of actions leaves no visual hole');
+assert(lxmfSource.includes("reactBar.className = 'msg-action-panel msg-quick-react'") &&
+       lxmfSource.includes("actions.className = 'msg-action-panel msg-context-actions'"),
+    'reactions and actions must be separately placeable panels');
 assert(!messagingCss.includes('.msg-text-selection-guide') &&
        !lxmfSource.includes('Text selected. Adjust the selection or choose Done.') &&
        !lxmfSource.includes('<span>Select Text</span>') &&

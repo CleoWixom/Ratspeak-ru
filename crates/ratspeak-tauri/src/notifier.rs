@@ -26,6 +26,19 @@ impl NativeNotifier for TauriNotifier {
         #[cfg(not(target_os = "android"))]
         self.notify_with_plugin(notification);
     }
+
+    fn withdraw_all(&self) {
+        #[cfg(target_os = "android")]
+        android::withdraw_all();
+        #[cfg(target_os = "ios")]
+        if self.handle.notification().remove_all_active().is_err() {
+            tracing::warn!(
+                reason = "withdraw_failed",
+                "iOS notifications could not be withdrawn"
+            );
+        }
+        // The plugin posts desktop alerts and cannot withdraw them.
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -236,6 +249,38 @@ mod android {
             tracing::warn!(
                 reason = "notification_bridge_init_failed",
                 "Android notification bridge unavailable"
+            );
+        }
+    }
+
+    /// Cancels the message and call alerts still shown; the service's own
+    /// card stays.
+    pub(super) fn withdraw_all() {
+        let Some(bridge) = BRIDGE.get() else {
+            return;
+        };
+        let Ok(env) = bridge.vm.attach_current_thread() else {
+            tracing::warn!(
+                reason = "notification_thread_attach_failed",
+                "Android notifications could not be withdrawn"
+            );
+            return;
+        };
+        let result = env
+            .call_static_method(
+                JClass::from(bridge.class.as_obj()),
+                "withdrawAll",
+                "(Landroid/content/Context;)I",
+                &[JValue::Object(bridge.application.as_obj())],
+            )
+            .and_then(|value| value.i());
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        if !matches!(result, Ok(0)) {
+            tracing::warn!(
+                reason = "withdraw_failed",
+                "Android notifications could not be withdrawn"
             );
         }
     }

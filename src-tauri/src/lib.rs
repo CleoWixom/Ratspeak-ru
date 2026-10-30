@@ -9,6 +9,7 @@ mod connection_deep_link;
 )]
 mod mobile_native;
 mod paths;
+mod secret_clipboard;
 mod text_share;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -148,12 +149,20 @@ fn main_window_builder(
     } else {
         ""
     };
+    // A core that failed to start manages no command state; the page says why.
+    let startup_script = handle
+        .try_state::<ratspeak_tauri::StartupError>()
+        .and_then(|error| serde_json::to_string(error.inner()).ok())
+        .map(|error| format!("window.__RATSPEAK_STARTUP_ERROR__ = {error};"))
+        .unwrap_or_default();
     let window = tauri::WebviewWindowBuilder::new(
         handle,
         "main",
         tauri::WebviewUrl::App("index.html".into()),
     )
-    .initialization_script(format!("{platform_script}{diagnostics_script}"));
+    .initialization_script(format!(
+        "{platform_script}{diagnostics_script}{startup_script}"
+    ));
     // The devtools Cargo feature is needed for desktop field diagnostics, but
     // leaves inspection enabled by default on mobile too. Set the mobile policy
     // explicitly for every window, including Android session reattachment.
@@ -339,6 +348,80 @@ mod mailto_tests {
             encode_mailto_query_component("a+b&c\nü"),
             "a%2Bb%26c%0A%C3%BC"
         );
+    }
+}
+
+// The WebView's suggested destination keeps a link's `download` name, which a
+// `blob:` URL cannot carry. Stored files drop their "1693824532000_" prefix.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn download_dialog_name(url: &tauri::Url, destination: &std::path::Path) -> String {
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download");
+    name.split_once('_')
+        .filter(|(stamp, rest)| {
+            !stamp.is_empty() && !rest.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit())
+        })
+        .map_or(name, |(_, rest)| rest)
+        .to_string()
+}
+
+#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+mod download_dialog_name_tests {
+    use super::download_dialog_name;
+
+    fn name(url: &str, destination: &str) -> String {
+        download_dialog_name(
+            &tauri::Url::parse(url).unwrap(),
+            std::path::Path::new(destination),
+        )
+    }
+
+    #[test]
+    fn blob_downloads_keep_the_links_file_name() {
+        assert_eq!(
+            name(
+                "blob:tauri://localhost/5f0c2a",
+                "/Users/me/Downloads/0123456789abcdef-reticulum-identity.identity"
+            ),
+            "0123456789abcdef-reticulum-identity.identity"
+        );
+        assert_eq!(
+            name(
+                "blob:http://tauri.localhost/5f0c2a",
+                "/home/me/Downloads/0123456789abcdef-ratspeak-identity.rsi"
+            ),
+            "0123456789abcdef-ratspeak-identity.rsi"
+        );
+    }
+
+    #[test]
+    fn only_a_numeric_stored_file_prefix_is_dropped() {
+        assert_eq!(
+            name(
+                "asset://localhost/files/1693824532000_doc.pdf",
+                "/d/1693824532000_doc.pdf"
+            ),
+            "doc.pdf"
+        );
+        assert_eq!(
+            name("blob:tauri://localhost/1", "/d/my_notes.txt"),
+            "my_notes.txt"
+        );
+        assert_eq!(name("blob:tauri://localhost/1", "/d/2026_"), "2026_");
+    }
+
+    #[test]
+    fn without_a_suggestion_the_url_then_download_names_the_file() {
+        assert_eq!(name("asset://localhost/files/report.pdf", ""), "report.pdf");
+        assert_eq!(name("blob:tauri://localhost/1", ""), "download");
     }
 }
 
@@ -977,6 +1060,7 @@ fn init_tracing() -> TracingGuard {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    ratspeak_tauri::process::harden();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if std::env::args().any(|arg| arg == "--webview-diag") {
         print_webview_diagnostics();
@@ -1018,330 +1102,355 @@ pub fn run() {
     };
 
     let app = builder
-        .invoke_handler(tauri::generate_handler![
-            open_external_url,
-            open_support_email,
-            set_window_decorations,
-            save_image_to_photos,
-            save_stored_attachment_native,
-            request_microphone_permission,
-            channel_deep_link::peek_native_channel_share,
-            channel_deep_link::ack_native_channel_share,
+        .invoke_handler(ratspeak_tauri::invoke_gate::gated(
+            tauri::generate_handler![
+                open_external_url,
+                open_support_email,
+                set_window_decorations,
+                save_image_to_photos,
+                save_stored_attachment_native,
+                request_microphone_permission,
+                secret_clipboard::copy_secret,
+                channel_deep_link::peek_native_channel_share,
+                channel_deep_link::ack_native_channel_share,
             connection_deep_link::peek_native_connection_link,
             connection_deep_link::ack_native_connection_link,
             connection_deep_link::validate_connection_link,
-            text_share::list_text_shares,
-            text_share::edit_text_share,
-            ratspeak_tauri::commands::system::api_version,
-            ratspeak_tauri::commands::system::api_startup_progress,
-            ratspeak_tauri::commands::system::api_setup_status,
-            ratspeak_tauri::commands::identity::api_identity,
-            ratspeak_tauri::commands::network::api_announces,
-            ratspeak_tauri::commands::network::api_alerts,
-            ratspeak_tauri::commands::network::api_propagation,
-            ratspeak_tauri::commands::network::api_propagation_nodes,
-            ratspeak_tauri::commands::interfaces::migrate_interface_ifac_units,
-            ratspeak_tauri::commands::network::api_hub_interfaces,
-            ratspeak_tauri::commands::activity::activity_status,
-            ratspeak_tauri::commands::activity::activity_start,
-            ratspeak_tauri::commands::activity::activity_stop,
-            ratspeak_tauri::commands::activity::activity_resume,
-            ratspeak_tauri::commands::activity::activity_set_profile,
-            ratspeak_tauri::commands::activity::activity_replay,
-            ratspeak_tauri::commands::activity::activity_clear,
-            ratspeak_tauri::commands::activity::activity_detail,
-            ratspeak_tauri::commands::activity::activity_reveal,
-            ratspeak_tauri::commands::activity::activity_safe_copy,
-            ratspeak_tauri::commands::channels::api_channels,
-            ratspeak_tauri::commands::channels::api_channel_history,
-            ratspeak_tauri::commands::channels::api_channel_participants,
-            ratspeak_tauri::commands::channels::api_channel_unread,
-            ratspeak_tauri::commands::channels::mark_channel_room_read,
-            ratspeak_tauri::commands::channels::set_channel_room_notification_level,
-            ratspeak_tauri::commands::channels::discover_channel_hubs,
-            ratspeak_tauri::commands::channels::refresh_channel_directory,
-            ratspeak_tauri::commands::channels::api_channel_share,
-            ratspeak_tauri::commands::channels::api_preview_channel_share,
-            ratspeak_tauri::commands::channels::connect_channel_hub,
-            ratspeak_tauri::commands::channels::disconnect_channel_hub,
-            ratspeak_tauri::commands::channels::join_channel,
-            ratspeak_tauri::commands::channels::part_channel,
-            ratspeak_tauri::commands::channels::send_channel_message,
-            ratspeak_tauri::commands::channels::api_saved_channel_hubs,
-            ratspeak_tauri::commands::channels::save_channel_hub,
-            ratspeak_tauri::commands::channels::remove_saved_channel_hub,
-            ratspeak_tauri::commands::channels::api_saved_channel_rooms,
-            ratspeak_tauri::commands::channels::api_channel_room_index,
-            ratspeak_tauri::commands::channels::save_channel_room,
-            ratspeak_tauri::commands::channels::remove_saved_channel_room,
-            ratspeak_tauri::commands::channel_hub::api_channel_hub,
-            ratspeak_tauri::commands::channel_hub::api_channel_hub_admin,
-            ratspeak_tauri::commands::channel_hub::channel_hub_admin_mutate,
-            ratspeak_tauri::commands::channel_hub::channel_hub_start,
-            ratspeak_tauri::commands::channel_hub::channel_hub_stop,
-            ratspeak_tauri::commands::channel_hub::set_channel_hosting_enabled,
-            ratspeak_tauri::commands::channel_hub::channel_hub_set_config,
-            ratspeak_tauri::commands::messaging::api_conversation,
-            ratspeak_tauri::commands::messaging::api_lxmf_conversations,
-            ratspeak_tauri::commands::messaging::api_search_messages,
-            ratspeak_tauri::commands::messaging::api_files,
-            ratspeak_tauri::commands::messaging::api_lxmf_limits,
-            ratspeak_tauri::commands::messaging::api_file_metadata,
-            ratspeak_tauri::commands::messaging::api_file_read_chunk,
-            ratspeak_tauri::commands::messaging::send_lxmf_message,
-            ratspeak_tauri::commands::messaging::send_reaction,
-            ratspeak_tauri::commands::messaging::send_lxmf_reply,
-            ratspeak_tauri::commands::messaging::send_lxmf_propagated,
-            ratspeak_tauri::commands::messaging::send_lxmf_with_attachment,
-            ratspeak_tauri::commands::messaging::begin_attachment_stage,
-            ratspeak_tauri::commands::messaging::append_attachment_stage,
-            ratspeak_tauri::commands::messaging::cancel_attachment_stage,
-            ratspeak_tauri::commands::messaging::inspect_image_attachment_stage,
-            ratspeak_tauri::commands::messaging::prepare_image_attachment_stage,
-            ratspeak_tauri::commands::messaging::mark_image_attachment_stage_as_file,
-            ratspeak_tauri::commands::messaging::send_lxmf_with_staged_attachment,
-            ratspeak_tauri::commands::messaging::cancel_lxmf_message,
-            ratspeak_tauri::commands::messaging::get_conversation,
-            ratspeak_tauri::commands::messaging::mark_read,
-            ratspeak_tauri::commands::messaging::hide_conversation,
-            ratspeak_tauri::commands::messaging::delete_conversation,
-            ratspeak_tauri::commands::contacts::api_contacts,
-            ratspeak_tauri::commands::contacts::api_blocked_contacts,
-            ratspeak_tauri::commands::peers::api_get_peers_snapshot,
-            ratspeak_tauri::commands::contact_card::api_contact_card,
-            ratspeak_tauri::commands::contact_card::api_preview_contact_card,
-            ratspeak_tauri::commands::contact_card::import_contact_card,
-            ratspeak_tauri::commands::contacts::add_contact,
-            ratspeak_tauri::commands::contacts::remove_contact,
-            ratspeak_tauri::commands::contacts::block_contact,
-            ratspeak_tauri::commands::contacts::unblock_contact,
-            ratspeak_tauri::commands::contacts::get_blackhole,
-            ratspeak_tauri::commands::contacts::clear_system_blackholes,
-            ratspeak_tauri::commands::contacts::purge_unverified_blackholes,
-            ratspeak_tauri::commands::contacts::check_contact_status,
-            ratspeak_tauri::commands::system::dismiss_alert,
-            ratspeak_tauri::commands::network::set_propagation_node,
-            ratspeak_tauri::commands::network::set_propagation_mode,
-            ratspeak_tauri::commands::network::set_propagation_hosting,
-            ratspeak_tauri::commands::network::recover_propagation_host,
-            ratspeak_tauri::commands::network::retry_deferred_propagation,
-            ratspeak_tauri::commands::network::set_stamp_settings,
-            ratspeak_tauri::commands::network::refresh_propagation_nodes,
-            ratspeak_tauri::commands::network::enable_propagation,
-            ratspeak_tauri::commands::network::sync_propagation,
-            ratspeak_tauri::commands::network::get_propagation_status,
-            ratspeak_tauri::commands::network::trigger_announce,
-            ratspeak_tauri::commands::network::request_path,
-            ratspeak_tauri::commands::network::request_all_paths,
-            ratspeak_tauri::commands::identity::switch_identity,
-            ratspeak_tauri::commands::interfaces::set_transport_mode,
-            ratspeak_tauri::commands::interfaces::network_type_changed,
-            ratspeak_tauri::commands::interfaces::set_auto_announce,
-            ratspeak_tauri::commands::interfaces::api_app_settings,
-            ratspeak_tauri::commands::interfaces::set_peers_sort,
-            ratspeak_tauri::commands::interfaces::set_hardware_lock_timeout,
-            ratspeak_tauri::commands::interfaces::set_developer_mode,
-            ratspeak_tauri::commands::network_ownership::api_network_ownership,
-            ratspeak_tauri::commands::network_ownership::test_shared_instance,
-            ratspeak_tauri::commands::network_ownership::set_network_ownership,
-            ratspeak_tauri::commands::network_ownership::export_shared_access,
-            ratspeak_tauri::commands::network_ownership::import_shared_access,
-            ratspeak_tauri::commands::interfaces::set_announce_ratspeak_usage,
-            ratspeak_tauri::commands::interfaces::set_android_ble_rnode_auto_resume,
-            ratspeak_tauri::commands::interfaces::set_activity_identity_protection,
-            ratspeak_tauri::commands::interfaces::set_hide_known_spam_peers,
-            ratspeak_tauri::commands::interfaces::set_lxmf_limit_1mb,
-            ratspeak_tauri::commands::interfaces::accept_public_channel_consent,
-            ratspeak_tauri::commands::interfaces::set_appearance,
-            ratspeak_tauri::commands::interfaces::set_native_theme,
-            ratspeak_tauri::commands::interfaces::set_text_scale,
-            ratspeak_tauri::commands::interfaces::api_notification_settings,
-            ratspeak_tauri::commands::interfaces::set_desktop_notifications,
-            open_mobile_app_settings,
-            ratspeak_tauri::commands::interfaces::add_lora_interface,
-            ratspeak_tauri::commands::interfaces::update_lora_interface,
-            ratspeak_tauri::commands::interfaces::remove_lora_interface,
-            ratspeak_tauri::commands::interfaces::pause_interface,
-            ratspeak_tauri::commands::interfaces::resume_interface,
-            ratspeak_tauri::commands::interfaces::request_android_usb_permission,
-            ratspeak_tauri::commands::interfaces::enable_auto_interface,
-            ratspeak_tauri::commands::interfaces::disable_auto_interface,
-            ratspeak_tauri::commands::interfaces::api_list_network_interfaces,
-            ratspeak_tauri::commands::interfaces::add_tcp_connection,
-            ratspeak_tauri::commands::interfaces::update_tcp_connection,
-            ratspeak_tauri::commands::interfaces::remove_tcp_connection,
-            ratspeak_tauri::commands::interfaces::add_tcp_server,
-            ratspeak_tauri::commands::interfaces::update_tcp_server,
-            ratspeak_tauri::commands::interfaces::remove_tcp_server,
-            ratspeak_tauri::commands::interfaces::add_backbone_connection,
-            ratspeak_tauri::commands::interfaces::update_backbone_connection,
-            ratspeak_tauri::commands::interfaces::remove_backbone_connection,
-            ratspeak_tauri::commands::interfaces::add_backbone_server,
-            ratspeak_tauri::commands::interfaces::update_backbone_server,
-            ratspeak_tauri::commands::interfaces::remove_backbone_server,
-            ratspeak_tauri::commands::interfaces::api_rnode_presets,
-            ratspeak_tauri::commands::interfaces::api_serial_ports,
-            ratspeak_tauri::commands::interfaces::api_ble_available,
-            ratspeak_tauri::commands::interfaces::api_ble_scan,
-            ratspeak_tauri::commands::interfaces::api_ble_peer_available,
-            ratspeak_tauri::commands::interfaces::api_ble_peer_status,
-            ratspeak_tauri::commands::interfaces::api_connection_history,
-            ratspeak_tauri::commands::interfaces::api_delete_connection_history,
-            ratspeak_tauri::commands::network::api_network_blackhole,
-            ratspeak_tauri::commands::network::api_path_query,
-            ratspeak_tauri::commands::identity::api_list_identities,
-            ratspeak_tauri::commands::identity::api_create_identity,
-            ratspeak_tauri::commands::identity::api_import_identity,
-            ratspeak_tauri::commands::identity::api_import_identity_base64,
-            // `seed` is enabled on every target (desktop via `hardware`, mobile explicitly).
-            ratspeak_tauri::commands::identity::restore_seed_identity,
-            ratspeak_tauri::commands::identity::set_identity_passcode,
-            ratspeak_tauri::commands::identity::remove_identity_passcode,
-            ratspeak_tauri::commands::identity::reveal_identity_mnemonic,
-            ratspeak_tauri::commands::identity::unlock_identity,
-            ratspeak_tauri::commands::identity::api_preview_identity_import_base64,
-            ratspeak_tauri::commands::identity::api_activate_identity,
-            ratspeak_tauri::commands::identity::api_export_identity,
-            ratspeak_tauri::commands::identity::api_export_identity_base64,
-            ratspeak_tauri::commands::identity::api_export_identity_backup_base64,
-            ratspeak_tauri::commands::identity::api_export_identity_reticulum_base64,
-            ratspeak_tauri::commands::identity::api_export_identity_reticulum_base32,
-            ratspeak_tauri::commands::identity::api_update_identity,
-            ratspeak_tauri::commands::identity::api_delete_identity,
-            ratspeak_tauri::commands::identity::api_set_display_name,
-            ratspeak_tauri::commands::identity::set_identity_status,
-            ratspeak_tauri::commands::system::api_setup_complete,
-            ratspeak_tauri::commands::system::api_setup_restart,
-            ratspeak_tauri::commands::system::api_set_foreground,
-            ratspeak_tauri::commands::system::api_unread_count,
-            ratspeak_tauri::commands::system::api_system_restart,
-            ratspeak_tauri::commands::system::api_system_shutdown,
-            ratspeak_tauri::commands::system::api_database_stats,
-            ratspeak_tauri::commands::system::api_clear_paths,
-            ratspeak_tauri::commands::system::api_clear_announces,
-            ratspeak_tauri::commands::system::api_clear_messages,
-            ratspeak_tauri::commands::system::api_clear_contacts,
-            ratspeak_tauri::commands::system::api_reset_database,
-            ratspeak_tauri::commands::system::api_identity_reset,
-            ratspeak_tauri::commands::system::api_factory_reset,
-            ratspeak_tauri::commands::games::send_game_action,
-            ratspeak_tauri::commands::games::resend_last_game_action,
-            ratspeak_tauri::commands::games::get_active_games,
-            ratspeak_tauri::commands::games::get_all_game_sessions,
-            ratspeak_tauri::commands::games::mark_game_read,
-            ratspeak_tauri::commands::games::delete_game_session,
-            ratspeak_tauri::commands::games::get_game_session_detail,
-            ratspeak_tauri::commands::games::get_available_games,
-            ratspeak_tauri::commands::ble::enable_ble_peer_interface,
-            ratspeak_tauri::commands::ble::disable_ble_peer_interface,
-            ratspeak_tauri::commands::ble::disconnect_ble_peer,
-            ratspeak_tauri::commands::ble::scan_ble_mesh_peers,
-            ratspeak_tauri::commands::ble::scan_ble_devices,
-            ratspeak_tauri::commands::ble::ble_rnode_bridge_ready,
-            ratspeak_tauri::commands::ble::ble_rnode_bridge_failed,
-            ratspeak_tauri::commands::ble::cancel_ble_connect,
-            ratspeak_tauri::commands::ble::disconnect_ble_rnode,
-            ratspeak_tauri::commands::ble::submit_ble_rnode_passkey,
-            ratspeak_tauri::commands::ble::cancel_ble_rnode_pairing,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_start_service,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_stop_service,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_status,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_call,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_answer,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_reject,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_hangup,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_set_microphone_muted,
-            ratspeak_tauri::commands::voice::voice_set_talk,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_restart_speaker,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_memo_start,
-            ratspeak_tauri::commands::voice::voice_memo_format,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_memo_status,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_memo_pause,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_memo_stop,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_memo_cancel,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::send_lxmf_voice_message,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_memo_playback_start,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_memo_playback_session_stop,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_memo_decode_data,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_memo_decode_stored,
-            #[cfg(feature = "lxst-voice")]
-            ratspeak_tauri::commands::voice::voice_memo_inspect_stored,
-            // Hardware (PIV) identity commands — desktop only (pcsc).
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            ratspeak_tauri::commands::hardware::hw_detect,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            ratspeak_tauri::commands::hardware::hw_provision_recoverable,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            ratspeak_tauri::commands::hardware::hw_provision_hardware_only,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            ratspeak_tauri::commands::hardware::hw_import_existing,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            ratspeak_tauri::commands::hardware::hw_restore,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            ratspeak_tauri::commands::hardware::hw_stage_unlock,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            ratspeak_tauri::commands::hardware::hw_reset_piv,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            ratspeak_tauri::commands::hardware::hw_change_pin,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            ratspeak_tauri::commands::hardware::hw_remove,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            ratspeak_tauri::commands::hardware::hw_unlock,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            ratspeak_tauri::commands::hardware::hw_activate_and_unlock,
-        ])
+                text_share::list_text_shares,
+                text_share::edit_text_share,
+                ratspeak_tauri::commands::system::api_version,
+                ratspeak_tauri::commands::system::api_startup_progress,
+                ratspeak_tauri::commands::system::api_setup_status,
+                ratspeak_tauri::commands::identity::api_identity,
+                ratspeak_tauri::commands::network::api_announces,
+                ratspeak_tauri::commands::network::api_alerts,
+                ratspeak_tauri::commands::network::api_propagation,
+                ratspeak_tauri::commands::network::api_propagation_nodes,
+                ratspeak_tauri::commands::interfaces::migrate_interface_ifac_units,
+                ratspeak_tauri::commands::network::api_hub_interfaces,
+                ratspeak_tauri::commands::activity::activity_status,
+                ratspeak_tauri::commands::activity::activity_start,
+                ratspeak_tauri::commands::activity::activity_stop,
+                ratspeak_tauri::commands::activity::activity_resume,
+                ratspeak_tauri::commands::activity::activity_set_profile,
+                ratspeak_tauri::commands::activity::activity_replay,
+                ratspeak_tauri::commands::activity::activity_clear,
+                ratspeak_tauri::commands::activity::activity_detail,
+                ratspeak_tauri::commands::activity::activity_reveal,
+                ratspeak_tauri::commands::activity::activity_safe_copy,
+                ratspeak_tauri::commands::channels::api_channels,
+                ratspeak_tauri::commands::channels::api_channel_history,
+                ratspeak_tauri::commands::channels::api_channel_participants,
+                ratspeak_tauri::commands::channels::api_channel_unread,
+                ratspeak_tauri::commands::channels::mark_channel_room_read,
+                ratspeak_tauri::commands::channels::set_channel_room_notification_level,
+                ratspeak_tauri::commands::channels::discover_channel_hubs,
+                ratspeak_tauri::commands::channels::refresh_channel_directory,
+                ratspeak_tauri::commands::channels::api_channel_share,
+                ratspeak_tauri::commands::channels::api_preview_channel_share,
+                ratspeak_tauri::commands::channels::connect_channel_hub,
+                ratspeak_tauri::commands::channels::disconnect_channel_hub,
+                ratspeak_tauri::commands::channels::join_channel,
+                ratspeak_tauri::commands::channels::part_channel,
+                ratspeak_tauri::commands::channels::send_channel_message,
+                ratspeak_tauri::commands::channels::api_saved_channel_hubs,
+                ratspeak_tauri::commands::channels::save_channel_hub,
+                ratspeak_tauri::commands::channels::remove_saved_channel_hub,
+                ratspeak_tauri::commands::channels::api_saved_channel_rooms,
+                ratspeak_tauri::commands::channels::api_channel_room_index,
+                ratspeak_tauri::commands::channels::save_channel_room,
+                ratspeak_tauri::commands::channels::remove_saved_channel_room,
+                ratspeak_tauri::commands::channel_hub::api_channel_hub,
+                ratspeak_tauri::commands::channel_hub::api_channel_hub_admin,
+                ratspeak_tauri::commands::channel_hub::channel_hub_admin_mutate,
+                ratspeak_tauri::commands::channel_hub::channel_hub_start,
+                ratspeak_tauri::commands::channel_hub::channel_hub_stop,
+                ratspeak_tauri::commands::channel_hub::set_channel_hosting_enabled,
+                ratspeak_tauri::commands::channel_hub::channel_hub_set_config,
+                ratspeak_tauri::commands::messaging::api_conversation,
+                ratspeak_tauri::commands::messaging::api_lxmf_conversations,
+                ratspeak_tauri::commands::messaging::api_search_messages,
+                ratspeak_tauri::commands::messaging::api_files,
+                ratspeak_tauri::commands::messaging::api_lxmf_limits,
+                ratspeak_tauri::commands::messaging::api_file_metadata,
+                ratspeak_tauri::commands::messaging::api_file_read_chunk,
+                ratspeak_tauri::commands::messaging::send_lxmf_message,
+                ratspeak_tauri::commands::messaging::send_reaction,
+                ratspeak_tauri::commands::messaging::send_lxmf_reply,
+                ratspeak_tauri::commands::messaging::send_lxmf_propagated,
+                ratspeak_tauri::commands::messaging::send_lxmf_with_attachment,
+                ratspeak_tauri::commands::messaging::begin_attachment_stage,
+                ratspeak_tauri::commands::messaging::append_attachment_stage,
+                ratspeak_tauri::commands::messaging::cancel_attachment_stage,
+                ratspeak_tauri::commands::messaging::inspect_image_attachment_stage,
+                ratspeak_tauri::commands::messaging::prepare_image_attachment_stage,
+                ratspeak_tauri::commands::messaging::mark_image_attachment_stage_as_file,
+                ratspeak_tauri::commands::messaging::send_lxmf_with_staged_attachment,
+                ratspeak_tauri::commands::messaging::cancel_lxmf_message,
+                ratspeak_tauri::commands::messaging::get_conversation,
+                ratspeak_tauri::commands::messaging::mark_read,
+                ratspeak_tauri::commands::messaging::hide_conversation,
+                ratspeak_tauri::commands::messaging::delete_conversation,
+                ratspeak_tauri::commands::messaging::delete_messages,
+                ratspeak_tauri::commands::contacts::api_contacts,
+                ratspeak_tauri::commands::contacts::api_blocked_contacts,
+                ratspeak_tauri::commands::peers::api_get_peers_snapshot,
+                ratspeak_tauri::commands::contact_card::api_contact_card,
+                ratspeak_tauri::commands::contact_card::api_preview_contact_card,
+                ratspeak_tauri::commands::contact_card::import_contact_card,
+                ratspeak_tauri::commands::contacts::add_contact,
+                ratspeak_tauri::commands::contacts::remove_contact,
+                ratspeak_tauri::commands::contacts::block_contact,
+                ratspeak_tauri::commands::contacts::unblock_contact,
+                ratspeak_tauri::commands::contacts::get_blackhole,
+                ratspeak_tauri::commands::contacts::clear_system_blackholes,
+                ratspeak_tauri::commands::contacts::purge_unverified_blackholes,
+                ratspeak_tauri::commands::contacts::check_contact_status,
+                ratspeak_tauri::commands::system::dismiss_alert,
+                ratspeak_tauri::commands::network::set_propagation_node,
+                ratspeak_tauri::commands::network::set_propagation_mode,
+                ratspeak_tauri::commands::network::set_propagation_hosting,
+                ratspeak_tauri::commands::network::recover_propagation_host,
+                ratspeak_tauri::commands::network::retry_deferred_propagation,
+                ratspeak_tauri::commands::network::set_stamp_settings,
+                ratspeak_tauri::commands::network::refresh_propagation_nodes,
+                ratspeak_tauri::commands::network::enable_propagation,
+                ratspeak_tauri::commands::network::sync_propagation,
+                ratspeak_tauri::commands::network::get_propagation_status,
+                ratspeak_tauri::commands::network::trigger_announce,
+                ratspeak_tauri::commands::network::request_path,
+                ratspeak_tauri::commands::network::request_all_paths,
+                ratspeak_tauri::commands::identity::switch_identity,
+                ratspeak_tauri::commands::interfaces::set_transport_mode,
+                ratspeak_tauri::commands::interfaces::network_type_changed,
+                ratspeak_tauri::commands::interfaces::set_auto_announce,
+                ratspeak_tauri::commands::interfaces::api_app_settings,
+                ratspeak_tauri::commands::interfaces::set_peers_sort,
+                ratspeak_tauri::commands::interfaces::set_hardware_lock_timeout,
+                ratspeak_tauri::commands::interfaces::set_developer_mode,
+                ratspeak_tauri::commands::network_ownership::api_network_ownership,
+                ratspeak_tauri::commands::network_ownership::test_shared_instance,
+                ratspeak_tauri::commands::network_ownership::set_network_ownership,
+                ratspeak_tauri::commands::network_ownership::export_shared_access,
+                ratspeak_tauri::commands::network_ownership::import_shared_access,
+                ratspeak_tauri::commands::interfaces::set_announce_ratspeak_usage,
+                ratspeak_tauri::commands::interfaces::set_android_ble_rnode_auto_resume,
+                ratspeak_tauri::commands::interfaces::set_activity_identity_protection,
+                ratspeak_tauri::commands::interfaces::set_hide_known_spam_peers,
+                ratspeak_tauri::commands::interfaces::set_lxmf_limit_1mb,
+                ratspeak_tauri::commands::interfaces::accept_public_channel_consent,
+                ratspeak_tauri::commands::interfaces::set_appearance,
+                ratspeak_tauri::commands::interfaces::set_native_theme,
+                ratspeak_tauri::commands::interfaces::set_text_scale,
+                ratspeak_tauri::commands::interfaces::api_trusted_link_hosts,
+                ratspeak_tauri::commands::interfaces::trust_link_host,
+                ratspeak_tauri::commands::interfaces::untrust_link_host,
+                ratspeak_tauri::commands::interfaces::clear_trusted_link_hosts,
+                ratspeak_tauri::commands::interfaces::api_notification_settings,
+                ratspeak_tauri::commands::interfaces::set_desktop_notifications,
+                ratspeak_tauri::commands::interfaces::set_notification_preview,
+                open_mobile_app_settings,
+                ratspeak_tauri::commands::interfaces::add_lora_interface,
+                ratspeak_tauri::commands::interfaces::update_lora_interface,
+                ratspeak_tauri::commands::interfaces::remove_lora_interface,
+                ratspeak_tauri::commands::interfaces::pause_interface,
+                ratspeak_tauri::commands::interfaces::resume_interface,
+                ratspeak_tauri::commands::interfaces::request_android_usb_permission,
+                ratspeak_tauri::commands::interfaces::enable_auto_interface,
+                ratspeak_tauri::commands::interfaces::disable_auto_interface,
+                ratspeak_tauri::commands::interfaces::api_list_network_interfaces,
+                ratspeak_tauri::commands::interfaces::add_tcp_connection,
+                ratspeak_tauri::commands::interfaces::update_tcp_connection,
+                ratspeak_tauri::commands::interfaces::remove_tcp_connection,
+                ratspeak_tauri::commands::interfaces::add_tcp_server,
+                ratspeak_tauri::commands::interfaces::update_tcp_server,
+                ratspeak_tauri::commands::interfaces::remove_tcp_server,
+                ratspeak_tauri::commands::interfaces::add_backbone_connection,
+                ratspeak_tauri::commands::interfaces::update_backbone_connection,
+                ratspeak_tauri::commands::interfaces::remove_backbone_connection,
+                ratspeak_tauri::commands::interfaces::add_backbone_server,
+                ratspeak_tauri::commands::interfaces::update_backbone_server,
+                ratspeak_tauri::commands::interfaces::remove_backbone_server,
+                ratspeak_tauri::commands::interfaces::api_rnode_presets,
+                ratspeak_tauri::commands::interfaces::api_serial_ports,
+                ratspeak_tauri::commands::interfaces::api_ble_available,
+                ratspeak_tauri::commands::interfaces::api_ble_scan,
+                ratspeak_tauri::commands::interfaces::api_ble_peer_available,
+                ratspeak_tauri::commands::interfaces::api_ble_peer_status,
+                ratspeak_tauri::commands::interfaces::api_connection_history,
+                ratspeak_tauri::commands::interfaces::api_delete_connection_history,
+                ratspeak_tauri::commands::network::api_network_blackhole,
+                ratspeak_tauri::commands::network::api_path_query,
+                ratspeak_tauri::commands::identity::api_list_identities,
+                ratspeak_tauri::commands::identity::api_create_identity,
+                ratspeak_tauri::commands::identity::api_import_identity,
+                ratspeak_tauri::commands::identity::api_import_identity_base64,
+                // `seed` is enabled on every target (desktop via `hardware`, mobile explicitly).
+                ratspeak_tauri::commands::identity::restore_seed_identity,
+                ratspeak_tauri::commands::identity::set_identity_passcode,
+                ratspeak_tauri::commands::identity::remove_identity_passcode,
+                ratspeak_tauri::commands::identity::reveal_identity_mnemonic,
+                ratspeak_tauri::commands::identity::unlock_identity,
+                ratspeak_tauri::commands::identity::api_preview_identity_import_base64,
+                ratspeak_tauri::commands::identity::api_activate_identity,
+                ratspeak_tauri::commands::identity::api_export_identity_backup_base64,
+                ratspeak_tauri::commands::identity::api_export_identity_reticulum_base64,
+                ratspeak_tauri::commands::identity::api_export_identity_reticulum_base32,
+                ratspeak_tauri::commands::identity::api_update_identity,
+                ratspeak_tauri::commands::identity::api_delete_identity,
+                ratspeak_tauri::commands::identity::api_set_display_name,
+                ratspeak_tauri::commands::identity::set_identity_status,
+                ratspeak_tauri::commands::system::api_setup_complete,
+                ratspeak_tauri::commands::system::api_setup_restart,
+                ratspeak_tauri::commands::system::api_set_foreground,
+                ratspeak_tauri::commands::system::api_unread_count,
+                ratspeak_tauri::commands::system::api_system_restart,
+                ratspeak_tauri::commands::system::api_system_shutdown,
+                ratspeak_tauri::commands::system::api_database_stats,
+                ratspeak_tauri::commands::system::api_clear_paths,
+                ratspeak_tauri::commands::system::api_clear_announces,
+                ratspeak_tauri::commands::system::api_clear_messages,
+                ratspeak_tauri::commands::system::api_clear_contacts,
+                ratspeak_tauri::commands::system::api_reset_database,
+                ratspeak_tauri::commands::system::api_factory_reset,
+                ratspeak_tauri::commands::games::send_game_action,
+                ratspeak_tauri::commands::games::resend_last_game_action,
+                ratspeak_tauri::commands::games::get_active_games,
+                ratspeak_tauri::commands::games::get_all_game_sessions,
+                ratspeak_tauri::commands::games::mark_game_read,
+                ratspeak_tauri::commands::games::delete_game_session,
+                ratspeak_tauri::commands::games::get_game_session_detail,
+                ratspeak_tauri::commands::games::get_available_games,
+                ratspeak_tauri::commands::ble::enable_ble_peer_interface,
+                ratspeak_tauri::commands::ble::disable_ble_peer_interface,
+                ratspeak_tauri::commands::ble::disconnect_ble_peer,
+                ratspeak_tauri::commands::ble::scan_ble_mesh_peers,
+                ratspeak_tauri::commands::ble::scan_ble_devices,
+                ratspeak_tauri::commands::ble::ble_rnode_bridge_ready,
+                ratspeak_tauri::commands::ble::ble_rnode_bridge_failed,
+                ratspeak_tauri::commands::ble::cancel_ble_connect,
+                ratspeak_tauri::commands::ble::disconnect_ble_rnode,
+                ratspeak_tauri::commands::ble::submit_ble_rnode_passkey,
+                ratspeak_tauri::commands::ble::cancel_ble_rnode_pairing,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_start_service,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_stop_service,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_status,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_call,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_answer,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_reject,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_hangup,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_set_microphone_muted,
+                ratspeak_tauri::commands::voice::voice_set_talk,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_restart_speaker,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_memo_start,
+                ratspeak_tauri::commands::voice::voice_memo_format,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_memo_status,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_memo_pause,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_memo_stop,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_memo_cancel,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::send_lxmf_voice_message,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_memo_playback_start,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_memo_playback_session_stop,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_memo_decode_data,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_memo_decode_stored,
+                #[cfg(feature = "lxst-voice")]
+                ratspeak_tauri::commands::voice::voice_memo_inspect_stored,
+                // Hardware (PIV) identity commands — desktop only (pcsc).
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                ratspeak_tauri::commands::hardware::hw_detect,
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                ratspeak_tauri::commands::hardware::hw_provision_recoverable,
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                ratspeak_tauri::commands::hardware::hw_provision_hardware_only,
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                ratspeak_tauri::commands::hardware::hw_import_existing,
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                ratspeak_tauri::commands::hardware::hw_restore,
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                ratspeak_tauri::commands::hardware::hw_reset_piv,
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                ratspeak_tauri::commands::hardware::hw_change_pin,
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                ratspeak_tauri::commands::hardware::hw_remove,
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                ratspeak_tauri::commands::hardware::hw_unlock,
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                ratspeak_tauri::commands::hardware::hw_activate_and_unlock,
+            ],
+        ))
         .setup(|app| {
             let handle = app.handle().clone();
 
-            let data_dir = paths::resolve_data_dir(&handle);
+            let (data_dir, default_data_dir) = paths::resolve_data_dir(&handle);
             tracing::debug!("resolved Ratspeak data directory");
 
             // setup() has no Tokio runtime; leak one for process-lifetime tasks.
             let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
             let tauri_handle = handle.clone();
-            let state = rt.block_on(async move {
-                ratspeak_tauri::init_core(data_dir, tauri_handle)
-                    .await
-                    .expect("Failed to start Ratspeak core")
-            });
+            // Without AppState no command runs; the window shows the failure.
+            let state = match rt.block_on(ratspeak_tauri::init_core(
+                data_dir,
+                default_data_dir,
+                tauri_handle,
+            )) {
+                Ok(state) => Some(state),
+                Err(failure) => {
+                    tracing::error!(
+                        reason = failure.step,
+                        kind = ?failure.kind,
+                        screen = ?failure.error,
+                        "Ratspeak could not start"
+                    );
+                    #[cfg(target_os = "android")]
+                    mobile_native::report_startup_failure();
+                    app.manage(failure.error);
+                    None
+                }
+            };
 
             // Window prefs must be read before the window is built.
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-            let (decorations_setting, developer_mode) = rt
-                .block_on(ratspeak_tauri::db::spawn_db(state.db.clone(), |p| {
-                    (
-                        ratspeak_tauri::db::get_setting(&p, "window_decorations"),
-                        ratspeak_tauri::db::get_setting(&p, "developer_mode_enabled")
-                            .is_some_and(|v| v == "true"),
-                    )
-                }))
+            let (decorations_setting, developer_mode) = state
+                .as_ref()
+                .and_then(|state| {
+                    rt.block_on(ratspeak_tauri::db::spawn_db(state.db.clone(), |p| {
+                        (
+                            ratspeak_tauri::db::get_setting(&p, "window_decorations"),
+                            ratspeak_tauri::db::get_setting(&p, "developer_mode_enabled")
+                                .is_some_and(|v| v == "true"),
+                        )
+                    }))
+                    .ok()
+                })
                 .unwrap_or((None, false));
 
             std::mem::forget(rt);
 
-            app.manage(std::sync::Arc::clone(&state));
-            #[cfg(any(target_os = "android", target_os = "ios"))]
-            mobile_native::install(&state);
+            if let Some(state) = &state {
+                app.manage(std::sync::Arc::clone(state));
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                mobile_native::install(state);
+            }
 
             // Programmatic window construction so we can attach on_download.
             let window = main_window_builder(&handle);
@@ -1372,34 +1481,31 @@ pub fn run() {
             };
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            let window = window.on_download(|_webview, event| {
+            let window = window.on_download(|webview, event| {
+                // The page learns how its download ended, not that it began.
+                let report = |url: &tauri::Url, status: &str| {
+                    let _ = tauri::Emitter::emit(
+                        &webview,
+                        "download_result",
+                        serde_json::json!({ "url": url.as_str(), "status": status }),
+                    );
+                };
                 match event {
                     DownloadEvent::Requested { url, destination } => {
-                        let filename = url
-                            .path_segments()
-                            .and_then(|mut s| s.next_back())
-                            .unwrap_or("download")
-                            .to_string();
-
-                        // Strip "1693824532000_doc.pdf" → "doc.pdf".
-                        let clean_name = filename
-                            .find('_')
-                            .map(|pos| &filename[pos + 1..])
-                            .unwrap_or(&filename);
-
-                        if let Some(path) =
-                            rfd::FileDialog::new().set_file_name(clean_name).save_file()
-                        {
+                        let name = download_dialog_name(&url, destination);
+                        if let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() {
                             *destination = path;
                             true
                         } else {
+                            report(&url, "cancelled");
                             false
                         }
                     }
-                    DownloadEvent::Finished { success, .. } => {
+                    DownloadEvent::Finished { url, success, .. } => {
                         if !success {
                             tracing::debug!(reason = "download_failed", "download failed");
                         }
+                        report(&url, if success { "saved" } else { "failed" });
                         true
                     }
                     _ => true,
@@ -1486,6 +1592,7 @@ pub fn run() {
     // Initialize file diagnostics only after Builder::build has completed.
     // The desktop single-instance plugin may exit a secondary process during
     // build; that process must never touch or rotate the primary's logs.
+    // Tauri runs `setup`, which opens the profile, inside `run` below.
     let mut tracing_guard = init_tracing();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if let Some(dropped) = tracing_guard.dropped_counter() {
@@ -1520,11 +1627,16 @@ pub fn run() {
 
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         match event {
+            // A core that failed to start holds nothing; closing its window quits.
             tauri::RunEvent::WindowEvent {
                 label,
                 event: tauri::WindowEvent::CloseRequested { api, .. },
                 ..
-            } if label == "main" => {
+            } if label == "main"
+                && app_handle
+                    .try_state::<ratspeak_tauri::StartupError>()
+                    .is_none() =>
+            {
                 api.prevent_close();
                 set_desktop_foreground(app_handle, false);
                 if let Some(window) = app_handle.get_webview_window("main") {
@@ -1534,6 +1646,7 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { .. } => {
                 shutdown_desktop_core_for_exit(app_handle);
             }
+            tauri::RunEvent::Exit => secret_clipboard::forget_now(),
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen {
                 has_visible_windows,
@@ -1714,10 +1827,13 @@ fn set_desktop_foreground(app: &tauri::AppHandle, foreground: bool) {
         state.set_notification_foreground(foreground);
         if foreground {
             tauri::async_runtime::spawn(async move {
-                let expiry = {
+                // Ending a Trace is a profile change; most foreground edges have none.
+                let expiry = if state.activity.trace_expiry_due() {
                     let _identity_lifecycle = state.identity_switch_lock.lock().await;
                     let _activity_control = state.activity_control_lock.lock().await;
-                    state.activity.expire_trace_if_due().await
+                    state.activity.expire_trace_if_due().await.map(drop)
+                } else {
+                    Ok(())
                 };
                 if expiry.is_ok() {
                     let _ = ratspeak_tauri::commands::system::set_foreground_state_if_current(

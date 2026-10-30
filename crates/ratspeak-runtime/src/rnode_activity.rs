@@ -461,7 +461,7 @@ async fn await_identity_lifecycle_release(
         let guard = tokio::select! {
             biased;
             _ = shutdown.wait() => return false,
-            guard = state.identity_switch_lock.lock() => guard,
+            guard = state.identity_switch_lock.lock_routine() => guard,
         };
         let current = state.current_identity_session_generation() == identity_generation;
         drop(guard);

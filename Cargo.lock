@@ -17,6 +17,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -762,6 +763,7 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+ "zeroize",
 ]
 
 [[package]]
@@ -4175,7 +4177,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "ratspeak-core"
-version = "1.0.34"
+version = "1.0.36"
 dependencies = [
  "serde",
  "serde_json",
@@ -4185,7 +4187,7 @@ dependencies = [
 
 [[package]]
 name = "ratspeak-db"
-version = "1.0.34"
+version = "1.0.36"
 dependencies = [
  "hex",
  "lrgp",
@@ -4203,7 +4205,7 @@ dependencies = [
 
 [[package]]
 name = "ratspeak-runtime"
-version = "1.0.34"
+version = "1.0.36"
 dependencies = [
  "argon2",
  "bytes",
@@ -4215,6 +4217,7 @@ dependencies = [
  "indexmap 2.14.0",
  "jni 0.19.0",
  "keyring",
+ "libc",
  "lrgp",
  "lxmf-core",
  "lxst-codec2",
@@ -4252,7 +4255,7 @@ dependencies = [
 
 [[package]]
 name = "ratspeak-tauri"
-version = "1.0.34"
+version = "1.0.36"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4505,6 +4508,7 @@ name = "rns-link"
 version = "1.4.0"
 dependencies = [
  "hex",
+ "libc",
  "rand 0.8.7",
  "rmpv",
  "rns-crypto",
@@ -4512,6 +4516,7 @@ dependencies = [
  "rns-wire",
  "thiserror 2.0.21",
  "tracing",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

@@ -98,8 +98,9 @@ function checkSetupStatus() {
             }
             document.body.classList.remove('checking-setup');
         })
-        .catch(function() {
-            document.body.classList.remove('checking-setup');
+        .catch(function(err) {
+            // A failed start keeps the app hidden behind its startup screen.
+            if (!err || err.code !== 'startup_error') document.body.classList.remove('checking-setup');
         });
 }
 
@@ -414,6 +415,8 @@ function completeSetupAfterHardwareIdentity(result, pin) {
         window.RS.diag('error', '[setup] Hardware identity unlock failed:', detail);
     }
 
+    // A failed activation also ends with the switch's closing event. It carries
+    // this reply's message, so in either order the toast shows it once.
     RS.invoke('hw_activate_and_unlock', { hash: hash, pin: pin }).then(function(res) {
         if (res && res.ok) {
             requestSetupNotificationPermissionIfEnabled();
@@ -497,10 +500,10 @@ document.addEventListener('DOMContentLoaded', function() {
     if (setupMnemonicCopy) {
         setupMnemonicCopy.addEventListener('click', function() {
             if (!setupRecoveryMnemonic) return;
-            RS.copyText(setupRecoveryMnemonic).then(function(ok) {
+            RS.copySecret(setupRecoveryMnemonic).then(function(ok) {
                 if (ok) {
-                    if (typeof showCopyConfirmationToast === 'function') {
-                        showCopyConfirmationToast('Recovery phrase');
+                    if (typeof showSecretCopiedToast === 'function') {
+                        showSecretCopiedToast('Recovery phrase');
                     }
                 } else if (typeof showToast === 'function') {
                     showToast('Could not copy the recovery phrase', 'toast-error', 2000);

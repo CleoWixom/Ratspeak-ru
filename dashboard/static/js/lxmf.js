@@ -4,6 +4,8 @@ var lxmfConversations = [];
 var lxmfActiveContact = null;
 var _conversationEpoch = 0;
 var _conversationIdentityGeneration = 0;
+// Advanced by a bulk messages delete; a read from before it is dropped.
+var _messagesClearedCount = 0;
 var lxmfConversation = [];
 var lxmfPendingFile = null;
 var _ghostConversationHash = null;
@@ -1666,26 +1668,60 @@ function _splitTrailingUrlPunctuation(raw) {
     return { url: url, trailing: trailing };
 }
 
+function _messageLinkRanges(text) {
+    var value = String(text || '');
+    var ranges = [];
+    value.replace(RS_LINK_RE, function(match, schemeUrl, bareUrl, offset) {
+        var prev = offset > 0 ? value.charAt(offset - 1) : '';
+        if (prev === '@') return match;
+        var label = _splitTrailingUrlPunctuation(match).url;
+        if (!label) return match;
+        ranges.push({
+            start: offset,
+            end: offset + label.length,
+            href: /^https?:\/\//i.test(label) ? label : 'https://' + label,
+        });
+        return match;
+    });
+    return ranges;
+}
+
 function linkifyMessageText(text) {
     var value = String(text || '');
     if (!value) return '';
     var out = '';
     var last = 0;
-    value.replace(RS_LINK_RE, function(match, schemeUrl, bareUrl, offset) {
-        var prev = offset > 0 ? value.charAt(offset - 1) : '';
-        if (prev === '@') return match;
-        out += escapeHtml(value.slice(last, offset));
-        var split = _splitTrailingUrlPunctuation(match);
-        var label = split.url;
-        var href = /^https?:\/\//i.test(label) ? label : 'https://' + label;
-        out += '<a class="rs-message-link" href="' + escapeHtml(href) +
-            '" data-url="' + escapeHtml(href) + '" rel="noopener noreferrer">' +
-            escapeHtml(label) + '</a>' + escapeHtml(split.trailing);
-        last = offset + match.length;
-        return match;
+    _messageLinkRanges(value).forEach(function(range) {
+        var label = value.slice(range.start, range.end);
+        out += escapeHtml(value.slice(last, range.start));
+        out += '<a class="rs-message-link" href="' + escapeHtml(range.href) +
+            '" data-url="' + escapeHtml(range.href) + '" rel="noopener noreferrer">' +
+            escapeHtml(label) + '</a>';
+        last = range.end;
     });
     out += escapeHtml(value.slice(last));
     return out.replace(/\n/g, '<br>');
+}
+
+function _messageIsMarkdown(msg) {
+    return !!(msg && Number(msg.renderer) === 2 && window.RS && RS.markdown);
+}
+
+function _stripMessageMarkdown(text) {
+    return window.RS && RS.markdown ? RS.markdown.strip(text) : String(text || '');
+}
+
+function _messageBodyHtml(msg, hasRenderedAudio) {
+    var body = _messageBodyContent(msg, hasRenderedAudio);
+    var title = ((msg && msg.title) || '').trim();
+    if (_messageIsMarkdown(msg) && body.trim()) {
+        var rendered = RS.markdown.render(body, { links: _messageLinkRanges });
+        if (rendered != null) {
+            return { html: (title ? '<p class="md-p">' + escapeHtml(title) + '</p>' : '') + rendered, markdown: true };
+        }
+    }
+    var text = _messageDisplayContent(msg, hasRenderedAudio);
+    return { html: text ? linkifyMessageText(text) : '', markdown: false };
 }
 
 // Check color reflects the observable delivery state, independent of transport
@@ -2371,9 +2407,11 @@ function _onChatDetailExit() {
 function _loadConversation(hash) {
     hash = _canonicalConversationHash(hash);
     var loadOwner = _conversationOwnerSnapshot();
+    var loadClears = _messagesClearedCount;
     // Reactions are keyed per message; drop the previous conversation's
     // entries so the map doesn't accumulate across switches.
     _msgReactions = {};
+    _clearMessageSelection();
     var cached = cacheGet(hash);
     if (cached && cached.length > 0) {
         lxmfConversation = cached;
@@ -2383,7 +2421,7 @@ function _loadConversation(hash) {
     renderConversation({ forceScrollBottom: true });
     // get_conversation fetches messages AND marks-read; broadcasts unread_total.
     RS.invoke('get_conversation', { hash: hash }).then(function(result) {
-        if (!_conversationOwnerIsCurrent(loadOwner)) return;
+        if (!_conversationOwnerIsCurrent(loadOwner) || loadClears !== _messagesClearedCount) return;
         var messages = _mergeConversationMessages(hash, (result && result.messages) || []);
         cacheSet(hash, messages);
         if (hash === lxmfActiveContact) {
@@ -2514,16 +2552,21 @@ function _updateConversationPreview(hash, previewText, timestamp) {
 function _conversationPreviewForMessage(message) {
     if (!message) return '';
     var title = (message.title || '').trim();
-    if (title) return _messageDisplayContent(message, !!message.audio).trim();
+    if (title) return _messagePlainContent(message, !!message.audio).trim();
     if (message.audio && (Number(message.audio.mode) === 0x10 || Number(message.audio.mode) === 0x03)) return 'Voice message';
     if (message.audio) return 'Unsupported audio';
-    var content = (message.content || '').trim();
+    var content = (_messageIsMarkdown(message) ? _stripMessageMarkdown(message.content) : (message.content || '')).trim();
     if (content) return content;
     if (message.image) return 'Photo';
     if (Array.isArray(message.attachments) && message.attachments.length > 0) {
         return message.attachments[0].filename || 'Attachment';
     }
     return '';
+}
+
+function _conversationListPreview(c) {
+    var text = c.last_message || '';
+    return Number(c.preview_renderer) === 2 ? _stripMessageMarkdown(text) : text;
 }
 
 function _lastVisibleConversationMessage() {
@@ -2585,7 +2628,7 @@ function renderDashboardRecentMessages() {
 
     container.innerHTML = convos.slice(0, 5).map(function(c) {
         var nameInfo = _conversationNameInfo(c.hash, c.display_name, c.is_contact);
-        var rawPreview = c.last_message || '';
+        var rawPreview = _conversationListPreview(c);
         var dirPrefix = c.last_direction === 'outbound' ? 'You: ' : '';
         var preview = dirPrefix + rawPreview;
         var time = c.timestamp ? formatConvTime(c.timestamp) : '';
@@ -2759,7 +2802,7 @@ function _renderConversationsFromCache(convos) {
     var html = '';
     convos.forEach(function(c) {
             var nameInfo = _conversationNameInfo(c.hash, c.display_name, c.is_contact);
-            var rawPreview = c.last_message || '';
+            var rawPreview = _conversationListPreview(c);
             var dirPrefix = c.last_direction === 'outbound' ? 'You: ' : '';
             var preview = dirPrefix + rawPreview;
             var time = c.timestamp ? formatConvTime(c.timestamp) : '';
@@ -3280,15 +3323,41 @@ document.addEventListener('DOMContentLoaded', function() {
 
 window.renderConversation = renderConversation;
 
-function _messageDisplayContent(msg, hasRenderedAudio) {
+function _messageBodyContent(msg, hasRenderedAudio) {
     var displayContent = (msg && msg.content) || '';
     if (msg && (msg.image || (msg.attachments && msg.attachments.length > 0)) && displayContent) {
         displayContent = displayContent.replace(/\n?\[File:[^\]]*\]\s*$/, '');
     }
     if (hasRenderedAudio && displayContent.trim() === 'Voice message') displayContent = '';
+    return displayContent;
+}
+
+function _messageDisplayContent(msg, hasRenderedAudio) {
+    var displayContent = _messageBodyContent(msg, hasRenderedAudio);
     var title = ((msg && msg.title) || '').trim();
     if (title) return title + (displayContent.trim() ? '\n\n' + displayContent : '');
     return displayContent;
+}
+
+// Copy keeps Markdown source, but spoilers still covered in this bubble stay hidden.
+function _messageCopyText(msg, content) {
+    var text = _messageDisplayContent(msg, !!(msg && msg.audio));
+    var spoilers = content && content.querySelectorAll ? content.querySelectorAll('.md-spoiler') : [];
+    if (!_messageIsMarkdown(msg) || !spoilers.length) return text;
+    var body = RS.markdown.redactSpoilers(_messageBodyContent(msg, !!msg.audio), function(i) {
+        return !!(spoilers[i] && spoilers[i].classList.contains('is-revealed'));
+    });
+    var title = ((msg && msg.title) || '').trim();
+    return title ? title + (body.trim() ? '\n\n' + body : '') : body;
+}
+
+// Previews, reply quotes and search show Markdown messages without syntax.
+function _messagePlainContent(msg, hasRenderedAudio) {
+    if (!_messageIsMarkdown(msg)) return _messageDisplayContent(msg, hasRenderedAudio);
+    var body = _stripMessageMarkdown(_messageBodyContent(msg, hasRenderedAudio));
+    var title = ((msg && msg.title) || '').trim();
+    if (title) return title + (body.trim() ? '\n\n' + body : '');
+    return body;
 }
 
 function _mobileMessageActionsUseLongPress() {
@@ -3659,6 +3728,7 @@ function renderConversation(options) {
 
         // Strip the `[File: ...]` fallback suffix when we have structured payload.
         var displayContent = _messageDisplayContent(msg, !!audioHtml);
+        var body = _messageBodyHtml(msg, !!audioHtml);
 
         var hasReactions = reactionHtml ? ' has-reactions' : '';
         var hasImage = !!imageHtml;
@@ -3680,7 +3750,7 @@ function renderConversation(options) {
             '<div class="' + bubbleClass + '" data-msg-id="' + escapeHtml(msg.id || '') + '">' +
                 replyHtml +
                 imageHtml +
-                (displayContent ? '<div class="lxmf-msg-content">' + linkifyMessageText(displayContent) + '</div>' : '') +
+                (body.html ? '<div class="lxmf-msg-content' + (body.markdown ? ' md' : '') + '">' + body.html + '</div>' : '') +
                 audioHtml +
                 attachHtml +
                 '<div class="lxmf-msg-meta">' + metaHtml + '</div>' +
@@ -3752,18 +3822,43 @@ function renderConversation(options) {
         });
     });
 
+    _bindMessageSpoilers(container);
+    _bindMessageCodeBlocks(container);
+    var pointer = document.documentElement.dataset.inputModality !== 'touch';
+    container.querySelectorAll('.rs-message-link.md-link[data-url]').forEach(function(link) {
+        if (!pointer) return;
+        var target = rsLinkTarget(link.getAttribute('data-url'));
+        if (target) {
+            var p = target.parts;
+            link.title = p.scheme + p.www + p.host + p.port + p.rest;
+        }
+    });
+
     container.querySelectorAll('.rs-message-link[data-url]').forEach(function(link) {
+        // Middle-click must not bypass the warning or autoscroll.
+        link.addEventListener('mousedown', function(e) {
+            if (e.button === 1) e.preventDefault();
+        });
+        link.addEventListener('auxclick', function(e) {
+            if (e.button !== 1) return;
+            e.preventDefault();
+            e.stopPropagation();
+            if (_messageLinkActivationAllowed(this) && !this.closest('.md-spoiler:not(.is-revealed)')) {
+                _confirmExternalLink(this.getAttribute('data-url'), this);
+            }
+        });
         link.addEventListener('click', function(e) {
             e.preventDefault();
             e.stopPropagation();
             if (_consumePendingMessageHoldActivation(e, this)) return;
             if (!_messageLinkActivationAllowed(this)) return;
-            var url = this.getAttribute('data-url');
-            if (url && window.RS && typeof RS.openExternalUrl === 'function') {
-                RS.openExternalUrl(url).catch(function(err) {
-                    showToast('Could not open link: ' + ((err && err.message) || 'error'), 'toast-error', 3500);
-                });
+            var covered = this.closest('.md-spoiler:not(.is-revealed)');
+            if (covered) {
+                _revealMessageSpoiler(covered);
+                return;
             }
+            var url = this.getAttribute('data-url');
+            if (url) _confirmExternalLink(url, this);
         });
     });
 
@@ -3859,7 +3954,9 @@ function renderConversation(options) {
                     var msgData = lxmfConversation.find(function(m) { return m.id === msgId; });
                     if (!msgData) return;
                     _armPendingMessageHoldActivation(bubble, msgId, touch);
-                    _showMsgContextMenu(msgData, touch.clientX, touch.clientY, bubble);
+                    _showMsgContextMenu(msgData, touch.clientX, touch.clientY, bubble, null, {
+                        linkUrl: _messageLinkUrlAt(touch.target),
+                    });
                 }
             });
             if (typeof detachLongPress === 'function') _messageLongPressDetachFns.push(detachLongPress);
@@ -3874,9 +3971,6 @@ function renderConversation(options) {
         });
         bubble.addEventListener('contextmenu', function(e) {
             var target = e.target;
-            // Pointer users retain the browser's link menu. Touch links use the
-            // same message action sheet as the rest of the bubble; otherwise a
-            // link-only message would have no practical reaction/reply target.
             var selectionExistedBeforePointer = _consumeMessagePointerContextSelection(this);
             var disposition = _messageContextMenuDisposition(
                 target,
@@ -3896,11 +3990,13 @@ function renderConversation(options) {
                 var trigger = focusDialog ? this.querySelector('.msg-actions-trigger') : null;
                 _showMsgContextMenu(msgData, e.clientX, e.clientY, this, trigger, {
                     focusDialog: focusDialog,
+                    linkUrl: _messageLinkUrlAt(target),
                 });
             }
         });
     });
 
+    _applyMessageSelection();
 }
 
 // Must match backend out_<uuid> format so the round-trip preserves msg_id.
@@ -4000,6 +4096,29 @@ function _cancelStagedAttachmentToken(stageToken) {
     });
 }
 
+var COMPOSER_FORMAT_KEYS = { b: '**', i: '*', e: '`' };
+
+function _composerFormatMarker(e) {
+    if (!(window.RS && RS.markdown) || e.altKey || e.isComposing) return null;
+    var mod = /Mac|iPhone|iPad/.test(navigator.platform || '') ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+    if (!mod) return null;
+    var key = (e.key || '').toLowerCase();
+    if (e.shiftKey) return key === 'x' ? '~~' : null;
+    return COMPOSER_FORMAT_KEYS[key] || null;
+}
+
+// Formatting sets LXMF FIELD_RENDERER = Markdown; plain text goes out untouched.
+function _prepareComposedMessage(text) {
+    if (!text || !(window.RS && RS.markdown)) return { content: text, renderer: null, preview: text };
+    var prepared = RS.markdown.prepare(text, { links: _messageLinkRanges });
+    if (!prepared.markdown) return { content: text, renderer: null, preview: text };
+    return {
+        content: prepared.content,
+        renderer: RS.markdown.RENDERER,
+        preview: RS.markdown.strip(prepared.content),
+    };
+}
+
 function sendLxmfMessage(deliveryMethod, shareContext) {
     if (!lxmfActiveContact) return;
     if (!shareContext && RS.textShares && RS.textShares.interceptSend(deliveryMethod)) return;
@@ -4008,7 +4127,9 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
     var input = document.getElementById('lxmf-input');
     if (!input) return;
     var shouldRestoreComposerFocus = _consumeLxmfSendFocusState(input);
-    var text = input.value.trim();
+    var composed = _prepareComposedMessage(input.value.trim());
+    var text = composed.content;
+    var renderer = composed.renderer;
     var chosenDelivery = _deliveryPrefOrAuto(deliveryMethod);
     var maxMessageBytes = lxmfLimits.max_message_bytes || 134217727;
     if (text && _utf8ByteLength(text) > maxMessageBytes) {
@@ -4045,6 +4166,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
                     delivery_method: chosenDelivery,
                     client_msg_id: attachMsgId,
                     staging_token: stageToken,
+                    renderer: renderer,
                 }
             });
         }).then(function(resp) {
@@ -4070,6 +4192,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
             id: attachMsgId,
             direction: 'outbound',
             content: text,
+            renderer: renderer,
             timestamp: Date.now() / 1000,
             state: 'sending',
             delivery_method: _optimisticDeliveryMethod(chosenDelivery),
@@ -4083,7 +4206,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
         });
 
         // Capture before clearPendingFile() wipes pending state.
-        var attachPreview = text || (isImage ? 'Photo' : pendingAttachment.name);
+        var attachPreview = composed.preview || (isImage ? 'Photo' : pendingAttachment.name);
         pendingAttachment.preview_url = null;
         pendingAttachment.detached_for_send = true;
         clearPendingFile();
@@ -4108,6 +4231,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
                 reply_to_id: _replyTarget.id,
                 reply_to_preview: _replyTarget.content,
                 client_msg_id: msgId,
+                renderer: renderer,
             }
         }).then(function(resp) {
             _handleLxmfSendAccepted(resp, msgId, targetHash, sendOwner);
@@ -4116,6 +4240,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
             id: msgId,
             direction: 'outbound',
             content: text,
+            renderer: renderer,
             timestamp: Date.now() / 1000,
             state: 'sending',
             delivery_method: _optimisticDeliveryMethod(chosenDelivery),
@@ -4124,7 +4249,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
         });
         clearReplyTarget();
         if (replyWasActive) renderConversation({ forceScrollBottom: true });
-        _updateConversationPreview(targetHash, text, Date.now() / 1000);
+        _updateConversationPreview(targetHash, composed.preview, Date.now() / 1000);
         loadConversations();
         _finishLxmfComposerSend(input, shouldRestoreComposerFocus, targetHash);
         return;
@@ -4136,6 +4261,7 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
             content: text,
             delivery_method: chosenDelivery,
             client_msg_id: msgId,
+            renderer: renderer,
         }
     }).then(function(resp) {
         _handleLxmfSendAccepted(resp, msgId, targetHash, sendOwner);
@@ -4152,12 +4278,13 @@ function sendLxmfMessage(deliveryMethod, shareContext) {
         id: msgId,
         direction: 'outbound',
         content: text,
+        renderer: renderer,
         timestamp: Date.now() / 1000,
         state: 'sending',
         delivery_method: _optimisticDeliveryMethod(chosenDelivery),
     });
     if (messageWasActive) renderConversation({ forceScrollBottom: true });
-    _updateConversationPreview(targetHash, text, Date.now() / 1000);
+    _updateConversationPreview(targetHash, composed.preview, Date.now() / 1000);
     loadConversations();
     _finishLxmfComposerSend(input, shouldRestoreComposerFocus, targetHash);
 }
@@ -4693,7 +4820,7 @@ function clearPendingFile() {
 }
 
 function setReplyTarget(msgData) {
-    var replyContent = _messageDisplayContent(msgData, !!msgData.audio).substring(0, 100);
+    var replyContent = _messagePlainContent(msgData, !!msgData.audio).substring(0, 100);
     if (msgData.audio && !replyContent.trim()) {
         replyContent = (Number(msgData.audio.mode) === 0x10 || Number(msgData.audio.mode) === 0x03) ? 'Voice message' : 'Unsupported audio';
     }
@@ -4747,7 +4874,8 @@ var _messagePointerContextSelection = null;
 
 function _messageHoldActivationSurface(target, bubble) {
     if (!target || !target.closest || !bubble || !bubble.contains(target)) return null;
-    return target.closest('.lxmf-clickable-img, .rs-message-link, .rs-file-download, .msg-reply-quote');
+    return target.closest('.lxmf-clickable-img, .rs-message-link, .rs-file-download, .msg-reply-quote, ' +
+        '.md-spoiler:not(.is-revealed), .md-code-copy');
 }
 
 function _clearPendingMessageHoldActivation(expectedSequence) {
@@ -4904,6 +5032,14 @@ function _dismissContextMenu(opts) {
     if (_activeContextMenu.menu && _activeContextMenu.menu.parentNode) {
         _activeContextMenu.menu.parentNode.removeChild(_activeContextMenu.menu);
     }
+    if (_activeContextMenu.reposition) {
+        window.removeEventListener('resize', _activeContextMenu.reposition);
+        if (_activeContextMenu.container) _activeContextMenu.container.removeEventListener('scroll', _activeContextMenu.reposition);
+        if (window.visualViewport) {
+            window.visualViewport.removeEventListener('resize', _activeContextMenu.reposition);
+            window.visualViewport.removeEventListener('scroll', _activeContextMenu.reposition);
+        }
+    }
     if (_activeContextMenu.row) {
         _activeContextMenu.row.classList.remove('msg-action-selected');
     }
@@ -4923,6 +5059,240 @@ function _dismissContextMenu(opts) {
         _focusMessageControl(focusTarget);
     }
     return true;
+}
+
+// Bulk selection. The tray's Select row selects a message; while anything is
+// selected, taps on messages toggle them, a tap on empty transcript space or
+// Cancel ends it, and the bar under the header offers "Delete (N)".
+var _msgSelection = null;
+
+function _conversationMessageById(id) {
+    for (var i = 0; i < lxmfConversation.length; i++) {
+        if (lxmfConversation[i].id === id) return lxmfConversation[i];
+    }
+    return null;
+}
+
+function _messageSelectable(msg) {
+    // A message still sending would be delivered anyway; cancel it first.
+    return !!(msg && msg.id) && !_messageCanCancelSend(msg);
+}
+
+function _messageSelectionActive() {
+    return !!(_msgSelection && _msgSelection.ids.length &&
+        _msgSelection.ownerHash === _canonicalConversationHash(lxmfActiveContact));
+}
+
+function _selectMessage(msg) {
+    if (!_messageSelectable(msg)) return;
+    var owner = _canonicalConversationHash(lxmfActiveContact);
+    if (!_msgSelection || _msgSelection.ownerHash !== owner) {
+        _msgSelection = { ownerHash: owner, ids: [] };
+    }
+    if (_msgSelection.ids.indexOf(msg.id) === -1) _msgSelection.ids.push(msg.id);
+    _applyMessageSelection();
+}
+
+function _toggleMessageSelection(msg) {
+    if (!_messageSelectionActive() || !_messageSelectable(msg)) return;
+    var index = _msgSelection.ids.indexOf(msg.id);
+    if (index === -1) _msgSelection.ids.push(msg.id);
+    else _msgSelection.ids.splice(index, 1);
+    if (!_msgSelection.ids.length) _msgSelection = null;
+    _applyMessageSelection();
+    if (typeof haptic === 'function') haptic('selection');
+}
+
+function _clearMessageSelection() {
+    if (!_msgSelection) return false;
+    var wasActive = _messageSelectionActive();
+    _msgSelection = null;
+    _applyMessageSelection();
+    return wasActive;
+}
+
+function _messageSelectLabel(msg) {
+    var when = msg.timestamp ? new Date(msg.timestamp * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
+    var text = String(_messagePlainContent(msg, !!msg.audio) || '').trim().slice(0, 60) ||
+        (msg.image ? 'Photo' : msg.audio ? 'Voice message' : 'File');
+    return (msg.direction === 'outbound' ? 'You' : 'Them') + (when ? ', ' + when : '') + ': ' + text;
+}
+
+var _msgSelectAnnounceTimer = null;
+
+function _applyMessageSelection() {
+    var active = _messageSelectionActive();
+    if (active) {
+        _msgSelection.ids = _msgSelection.ids.filter(function(id) { return !!_conversationMessageById(id); });
+        if (!_msgSelection.ids.length) {
+            _msgSelection = null;
+            active = false;
+        }
+    }
+    var ids = active ? _msgSelection.ids : [];
+    var container = document.getElementById('lxmf-messages');
+    if (container) {
+        container.classList.toggle('msg-select-mode', active);
+        container.querySelectorAll('.msg-row').forEach(function(row) {
+            var bubble = row.querySelector('.lxmf-msg[data-msg-id]');
+            var check = row.querySelector('.msg-select-check');
+            var msg = bubble ? _conversationMessageById(bubble.getAttribute('data-msg-id')) : null;
+            // In-flight sends get no circle at all: they cannot be selected.
+            if (!active || !msg || !_messageSelectable(msg)) {
+                if (check) check.remove();
+                row.classList.remove('msg-selected');
+                return;
+            }
+            var selected = ids.indexOf(msg.id) !== -1;
+            if (!check) {
+                check = document.createElement('button');
+                check.type = 'button';
+                check.className = 'msg-select-check';
+                check.setAttribute('role', 'checkbox');
+                check.setAttribute('aria-label', _messageSelectLabel(msg));
+                bubble.appendChild(check);
+            }
+            check.setAttribute('aria-checked', selected ? 'true' : 'false');
+            row.classList.toggle('msg-selected', selected);
+        });
+    }
+    _applyMessageSelectBar(active, ids.length, container);
+}
+
+function _applyMessageSelectBar(active, count, container) {
+    var bar = document.getElementById('lxmf-select-bar');
+    if (!bar) return;
+    var wasShown = !bar.hidden;
+    if (active !== wasShown) {
+        // Keep the transcript visually still while the bar takes its height.
+        var before = bar.offsetHeight;
+        bar.hidden = !active;
+        var delta = active ? bar.offsetHeight : -before;
+        if (container && delta) container.scrollTop += delta;
+        if (active) {
+            var input = document.getElementById('lxmf-input');
+            if (input && document.activeElement === input) input.blur();
+        } else if (bar.contains(document.activeElement)) {
+            var composer = document.getElementById('lxmf-input');
+            if (composer && !isCompactLayout()) _focusMessageControl(composer);
+        }
+    }
+    var deleteBtn = document.getElementById('lxmf-select-delete-btn');
+    if (deleteBtn) {
+        deleteBtn.textContent = count > 1 ? 'Delete (' + count + ')' : 'Delete';
+        deleteBtn.setAttribute('aria-label', 'Delete ' + count + (count === 1 ? ' selected message' : ' selected messages'));
+    }
+    var status = document.getElementById('lxmf-select-status');
+    if (status && (active || wasShown)) {
+        clearTimeout(_msgSelectAnnounceTimer);
+        _msgSelectAnnounceTimer = setTimeout(function() {
+            status.textContent = active ? count + ' selected' : 'Selection cleared';
+        }, 250);
+    }
+}
+
+// Clicks that leave the conversation end selection: the chat header, the
+// conversation list, or app navigation. Cancel, Esc and Back do too.
+var MSG_SELECTION_EXIT_SURFACES = '#lxmf-chat-header, .lxmf-sidebar, #sidebar, #bottom-bar';
+
+function _handleMessageSelectionClick(e) {
+    if (!_messageSelectionActive()) return;
+    var target = e.target;
+    var container = document.getElementById('lxmf-messages');
+    if (!container || !target || !container.contains(target)) {
+        // The back arrow ends selection itself and must not also leave the chat.
+        if (!_msgSelection.pending && target && target.closest &&
+                target.closest(MSG_SELECTION_EXIT_SURFACES) && !target.closest('#lxmf-back-btn')) {
+            _clearMessageSelection();
+        }
+        return;
+    }
+    // Anywhere on a message's row toggles it, including the space beside
+    // the bubble; the gaps between messages do nothing.
+    var row = target.closest ? target.closest('.msg-row') : null;
+    if (!row) return;
+    // The click synthesized by the hold that selected this message is not a toggle.
+    if (_consumePendingMessageHoldActivation(e, e.target)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var bubble = row.querySelector('.lxmf-msg[data-msg-id]');
+    var msg = bubble ? _conversationMessageById(bubble.getAttribute('data-msg-id')) : null;
+    _dismissContextMenu({ restoreFocus: false });
+    if (msg) _toggleMessageSelection(msg);
+}
+
+function _removeConversationMessages(hash, ids) {
+    var owner = _canonicalConversationHash(hash);
+    var drop = function(list) {
+        return (list || []).filter(function(m) { return ids.indexOf(m.id) === -1; });
+    };
+    var cached = cacheGet(owner);
+    if (cached) cacheSet(owner, drop(cached));
+    ids.forEach(function(id) { delete _msgReactions[id]; });
+    if (owner === _canonicalConversationHash(lxmfActiveContact)) {
+        lxmfConversation = drop(lxmfConversation);
+        if (_msgSelection) {
+            _msgSelection.ids = _msgSelection.ids.filter(function(id) { return ids.indexOf(id) === -1; });
+        }
+        renderConversation();
+    }
+}
+
+function _deleteSelectedMessages() {
+    if (!_messageSelectionActive() || _msgSelection.pending) return;
+    var selection = _msgSelection;
+    var ids = selection.ids.slice();
+    var count = ids.length;
+    var hash = lxmfActiveContact;
+    var nameInfo = _conversationNameInfo(hash, null, false);
+    var who = nameInfo && !nameInfo.isHash && nameInfo.name ? nameInfo.name : 'The other person';
+    var hasMedia = ids.some(function(id) {
+        var m = _conversationMessageById(id);
+        return !!(m && (m.image || m.audio || (Array.isArray(m.attachments) && m.attachments.length)));
+    });
+    var message = (count === 1 ? 'It will' : 'They will') + ' be removed from this device only. ' +
+        who + ' still has their copy. This can’t be undone.' +
+        (hasMedia ? '\n\nPhotos and files in ' + (count === 1 ? 'this message' : 'these messages') +
+            ' will be deleted from this device too.' : '');
+    selection.pending = true;
+    if (typeof haptic === 'function') haptic('warning');
+    rsConfirm({
+        title: count === 1 ? 'Delete message?' : 'Delete ' + count + ' messages?',
+        message: message,
+        confirmText: count > 1 ? 'Delete ' + count : 'Delete',
+        cancelText: 'Cancel',
+        danger: true,
+    }).then(function(confirmed) {
+        if (!confirmed || _msgSelection !== selection) {
+            selection.pending = false;
+            return;
+        }
+        return RS.invoke('delete_messages', { hash: hash, ids: ids }).then(function() {
+            if (_msgSelection === selection) _msgSelection = null;
+            _removeConversationMessages(hash, ids);
+            _applyMessageSelection();
+            if (typeof showToast === 'function') {
+                showToast(count + (count === 1 ? ' message deleted.' : ' messages deleted.'), 'toast-success', 2000);
+            }
+            if (typeof haptic === 'function') haptic('success');
+        }).catch(function(err) {
+            if (err && err.code === 'files_not_removed') {
+                // The rows are gone; only some files are left for the cleanup sweep.
+                if (_msgSelection === selection) _msgSelection = null;
+                _removeConversationMessages(hash, ids);
+                _applyMessageSelection();
+                if (typeof showToast === 'function') {
+                    showToast('Messages deleted. Some files could not be removed.', 'toast-warning', 3500);
+                }
+                return;
+            }
+            selection.pending = false;
+            if (typeof showToast === 'function') {
+                showToast('Could not delete messages: ' + ((err && err.message) || 'unknown error'), 'toast-error', 3500);
+            }
+            if (typeof haptic === 'function') haptic('warning');
+        });
+    });
 }
 
 function _messageActionOwnsText(bubble, target) {
@@ -4959,6 +5329,9 @@ function _messageActionIcon(name) {
     if (name === 'more') {
         return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
     }
+    if (name === 'select') {
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="8 12.5 11 15.5 16 9.5"/></svg>';
+    }
     return '';
 }
 
@@ -4980,13 +5353,174 @@ function _messageTouchStartsDirectControl(touch, bubble) {
     if (!target || !target.closest || !bubble || !bubble.contains(target)) return false;
     return !!target.closest(
         '.msg-actions-trigger, .lxmf-send-cancel, .msg-send-cancel-inline, .msg-retry-btn, ' +
-        '.voice-memo-player-play, .voice-memo-player-waveform, .voice-memo-player-download'
+        '.voice-memo-player-play, .voice-memo-player-waveform, .voice-memo-player-download, .md-code-copy'
     );
 }
 
-function _messageLinkUsesNativeContext(target) {
-    var isMessageLink = target && target.closest && target.closest('.rs-message-link');
-    return !!isMessageLink && document.documentElement.dataset.inputModality !== 'touch';
+// The desktop link menu offers "Open Link", which would skip the leaving-app
+// warning; pointer right-clicks open the message actions (with Copy Link).
+function _messageLinkUrlAt(target) {
+    var link = target && target.closest ? target.closest('.rs-message-link[data-url]') : null;
+    return link ? link.getAttribute('data-url') : null;
+}
+
+function _openExternalMessageLink(url) {
+    if (!(window.RS && typeof RS.openExternalUrl === 'function')) return;
+    RS.openExternalUrl(url).catch(function(err) {
+        showToast('Could not open link: ' + ((err && err.message) || 'error'), 'toast-error', 3500);
+    });
+}
+
+// Hosts the user chose not to be asked about again (device-wide setting).
+RS.linkTrust = (function() {
+    var hosts = [];
+    var loading = null;
+    function apply(resp) {
+        hosts = resp && Array.isArray(resp.hosts) ? resp.hosts.slice() : hosts;
+        if (typeof updateTrustedLinksButton === 'function') updateTrustedLinksButton(hosts.slice());
+        return hosts.slice();
+    }
+    return {
+        load: function() {
+            if (!loading) {
+                loading = RS.invoke('api_trusted_link_hosts').then(apply).catch(function() {
+                    loading = null;
+                    return hosts.slice();
+                });
+            }
+            return loading;
+        },
+        list: function() { return hosts.slice(); },
+        has: function(host) { return hosts.indexOf(host) >= 0; },
+        add: function(host) { return RS.invoke('trust_link_host', { host: host }).then(apply); },
+        remove: function(host) { return RS.invoke('untrust_link_host', { host: host }).then(apply); },
+        clear: function() { return RS.invoke('clear_trusted_link_hosts').then(apply); },
+    };
+})();
+
+function _confirmExternalLink(url, link) {
+    var masked = link && link.hasAttribute('data-masked');
+    var linkText = masked ? link.textContent : null;
+    var target = rsLinkTarget(url, linkText);
+    if (!target) return;
+    RS.linkTrust.load().then(function() {
+        if (!target.warnings.length && RS.linkTrust.has(target.trustKey)) {
+            _openExternalMessageLink(target.href);
+            return;
+        }
+        rsLinkConfirm(url, { linkText: linkText }).then(function(result) {
+            if (!result.confirmed) return;
+            if (result.trust) {
+                RS.linkTrust.add(result.host).catch(function() {
+                    showToast('Could not save website', 'toast-error', 2500);
+                });
+            }
+            _openExternalMessageLink(target.href);
+        });
+    });
+}
+
+// Only code blocks that actually overflow become keyboard-scrollable stops.
+function _syncCodeBlockFocus(pre) {
+    if (pre.scrollWidth > pre.clientWidth) {
+        var lang = pre.getAttribute('data-lang');
+        pre.setAttribute('tabindex', '0');
+        pre.setAttribute('aria-label', lang ? 'Code, ' + lang : 'Code');
+    } else {
+        pre.removeAttribute('tabindex');
+        pre.removeAttribute('aria-label');
+    }
+}
+
+var _codeBlockObserver = typeof ResizeObserver === 'function'
+    ? new ResizeObserver(function(entries) {
+        entries.forEach(function(entry) { _syncCodeBlockFocus(entry.target); });
+    })
+    : null;
+
+function _bindMessageCodeBlocks(container) {
+    if (_codeBlockObserver) _codeBlockObserver.disconnect();
+    container.querySelectorAll('.md-codeblock').forEach(function(block) {
+        var pre = block.querySelector('.md-pre');
+        if (pre) {
+            _syncCodeBlockFocus(pre);
+            if (_codeBlockObserver) _codeBlockObserver.observe(pre);
+        }
+        var copy = block.querySelector('.md-code-copy');
+        if (!copy) return;
+        copy.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (_consumePendingMessageHoldActivation(e, copy) || _messageSelectionActive()) return;
+            if (copy.closest('.md-spoiler:not(.is-revealed)')) return;
+            var code = pre ? pre.textContent : '';
+            Promise.resolve(RS.copyText(code)).then(function() {
+                showToast('Code copied', 'toast-success', 1800);
+                if (typeof haptic === 'function') haptic('light');
+                copy.classList.add('is-copied');
+                clearTimeout(copy._copiedTimer);
+                copy._copiedTimer = setTimeout(function() { copy.classList.remove('is-copied'); }, 1200);
+            }).catch(function() {
+                showToast('Could not copy', 'toast-error', 1800);
+            });
+        });
+    });
+}
+
+// Revealed spoilers stay revealed across re-renders until the chat changes.
+var _revealedSpoilers = { hash: null, keys: {} };
+
+function _spoilerKey(spoiler) {
+    var bubble = spoiler.closest('.lxmf-msg[data-msg-id]');
+    if (!bubble) return null;
+    var all = bubble.querySelectorAll('.md-spoiler');
+    return bubble.getAttribute('data-msg-id') + ':' + Array.prototype.indexOf.call(all, spoiler);
+}
+
+function _revealMessageSpoiler(spoiler, restoring) {
+    var hadFocus = !restoring && document.activeElement === spoiler;
+    spoiler.classList.add('is-revealed');
+    spoiler.removeAttribute('role');
+    spoiler.removeAttribute('aria-label');
+    spoiler.removeAttribute('aria-expanded');
+    var content = spoiler.querySelector('.md-spoiler-content');
+    if (content) {
+        content.removeAttribute('aria-hidden');
+        content.removeAttribute('inert');
+    }
+    if (hadFocus) {
+        spoiler.setAttribute('tabindex', '-1');
+        spoiler.focus({ preventScroll: true });
+    } else {
+        spoiler.removeAttribute('tabindex');
+    }
+    if (restoring) return;
+    var key = _spoilerKey(spoiler);
+    if (key) _revealedSpoilers.keys[key] = true;
+}
+
+function _bindMessageSpoilers(container) {
+    var hash = _canonicalConversationHash(lxmfActiveContact);
+    if (_revealedSpoilers.hash !== hash) _revealedSpoilers = { hash: hash, keys: {} };
+    container.querySelectorAll('.md-spoiler').forEach(function(spoiler) {
+        if (_revealedSpoilers.keys[_spoilerKey(spoiler)]) {
+            _revealMessageSpoiler(spoiler, true);
+            return;
+        }
+        spoiler.addEventListener('click', function(e) {
+            if (spoiler.classList.contains('is-revealed') || _messageSelectionActive()) return;
+            e.preventDefault();
+            e.stopPropagation();
+            if (_consumePendingMessageHoldActivation(e, spoiler)) return;
+            _revealMessageSpoiler(spoiler);
+        });
+        spoiler.addEventListener('keydown', function(e) {
+            if (spoiler.classList.contains('is-revealed') || (e.key !== 'Enter' && e.key !== ' ')) return;
+            e.preventDefault();
+            e.stopPropagation();
+            _revealMessageSpoiler(spoiler);
+        });
+    });
 }
 
 function _messageLinkActivationAllowed(link) {
@@ -5011,11 +5545,11 @@ function _consumeMessagePointerContextSelection(bubble) {
 }
 
 function _messageContextMenuDisposition(target, bubble, now, selectionExistedBeforePointer) {
-    if (_messageLinkUsesNativeContext(target)) return 'native';
     // A contextmenu synthesized from the first action-opening hold belongs to
     // that exact gesture. Suppress it before considering the newly elevated
     // bubble; a real second hold has already cleared this pending record.
     if (_consumePendingMessageHoldContext(target, bubble, now)) return 'suppress';
+    if (_messageLinkUrlAt(target) && document.documentElement.dataset.inputModality !== 'touch') return 'actions';
     var selectableText = target && target.closest && target.closest('.lxmf-msg-content');
     var preserveSelection = selectionExistedBeforePointer === null ||
         typeof selectionExistedBeforePointer === 'undefined'
@@ -5218,25 +5752,155 @@ function _messageMediaContextAction(msgData) {
     return null;
 }
 
-function _positionMsgContextMenu(menu, x, y, bubble) {
-    var margin = 10;
-    var rect = bubble ? bubble.getBoundingClientRect() : null;
-    var menuRect = menu.getBoundingClientRect();
-    var isMobileWidth = isCompactLayout();
-    var left = x;
-    var top = y;
+var MSG_ACTION_GAP = 8;
+var MSG_ACTION_EDGE = 12;
 
-    if (rect) {
-        left = isMobileWidth ? (window.innerWidth - menuRect.width) / 2 : x;
-        var above = rect.top - menuRect.height - 8;
-        var below = rect.bottom + 8;
-        top = above >= margin ? above : below;
+// Visible transcript band in layout-viewport coordinates: below the header
+// (and call strip), above the composer and the on-screen keyboard.
+function _messageActionBand() {
+    var vv = window.visualViewport;
+    var top = vv ? vv.offsetTop : 0;
+    var bottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+    ['lxmf-chat-header', 'lxst-call-strip', 'lxmf-select-bar'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (!el || el.hidden) return;
+        var r = el.getBoundingClientRect();
+        if (r.height > 0) top = Math.max(top, r.bottom);
+    });
+    ['lxmf-compose-bar', 'lxmf-voice-recorder'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (!el || el.hidden) return;
+        var r = el.getBoundingClientRect();
+        if (r.height > 0) bottom = Math.min(bottom, r.top);
+    });
+    return { top: top + MSG_ACTION_GAP, bottom: bottom - MSG_ACTION_GAP };
+}
+
+// Smallest upward (+) or downward (-) transcript shift that lets the
+// message and its panels fit, preferring the split layout.
+function _messageActionScrollDelta(top, bottom, reactH, actionsH, band) {
+    var g = MSG_ACTION_GAP;
+    var ranges = [
+        [bottom + g + actionsH - band.bottom, top - g - reactH - band.top],
+        [bottom + g + reactH + g + actionsH - band.bottom, top - band.top],
+    ];
+    for (var i = 0; i < ranges.length; i++) {
+        var lo = ranges[i][0];
+        var hi = ranges[i][1];
+        if (lo <= hi) return lo > 0 ? lo : (hi < 0 ? hi : 0);
+    }
+    return null;
+}
+
+function _messageActionInsets() {
+    var style = window.getComputedStyle ? window.getComputedStyle(document.documentElement) : null;
+    var read = function(name) { return style ? parseFloat(style.getPropertyValue(name)) || 0 : 0; };
+    return { left: read('--sal'), right: read('--sar') };
+}
+
+// Arrow-key target within the tray. Groups are in on-screen order; the
+// reactions row moves with Left/Right (wrapping), the action rows with
+// Up/Down, and Up/Down at an edge crosses to the neighbouring group.
+function _messageActionKeyTarget(groups, current, key) {
+    var gi = -1;
+    var ii = -1;
+    groups.forEach(function(group, i) {
+        var j = group.items.indexOf(current);
+        if (j !== -1) { gi = i; ii = j; }
+    });
+    if (gi === -1) return null;
+    var items = groups[gi].items;
+    var horizontal = groups[gi].horizontal;
+    if (key === 'Home') return items[0];
+    if (key === 'End') return items[items.length - 1];
+    var enter = function(step) {
+        var next = groups[gi + step];
+        if (!next || !next.items.length) return null;
+        return next.horizontal || step > 0 ? next.items[0] : next.items[next.items.length - 1];
+    };
+    if (horizontal) {
+        if (key === 'ArrowLeft' || key === 'ArrowRight') {
+            return items[(ii + (key === 'ArrowRight' ? 1 : -1) + items.length) % items.length];
+        }
+        if (key === 'ArrowUp' || key === 'ArrowDown') return enter(key === 'ArrowDown' ? 1 : -1);
+        return null;
+    }
+    if (key !== 'ArrowUp' && key !== 'ArrowDown') return null;
+    var step = key === 'ArrowDown' ? 1 : -1;
+    return items[ii + step] || enter(step);
+}
+
+function _layoutMessageActionPanels(state, allowScroll) {
+    var bubble = state.bubble;
+    if (!bubble || !bubble.isConnected) return null;
+    var react = state.reactPanel;
+    var actions = state.actionsPanel;
+    var g = MSG_ACTION_GAP;
+    var band = _messageActionBand();
+    var b = bubble.getBoundingClientRect();
+    var rowRect = state.row && state.row.isConnected ? state.row.getBoundingClientRect() : b;
+    var top = b.top;
+    var bottom = Math.max(b.bottom, rowRect.bottom);
+    var reactH = react.offsetHeight;
+    var actionsH = actions.offsetHeight;
+    var fits = function(t, h) { return t >= band.top && t + h <= band.bottom; };
+    var placement = null;
+    var reactTop;
+    var actionsTop;
+
+    if (fits(top - g - reactH, reactH) && fits(bottom + g, actionsH)) {
+        placement = 'split';
+        reactTop = top - g - reactH;
+        actionsTop = bottom + g;
+    } else if (fits(bottom + g, reactH + g + actionsH)) {
+        placement = 'below';
+        reactTop = bottom + g;
+        actionsTop = reactTop + reactH + g;
+    } else if (fits(top - g - reactH - g - actionsH, reactH + g + actionsH)) {
+        // Above: the reactions stay nearest the message.
+        placement = 'above';
+        actionsTop = top - g - reactH - g - actionsH;
+        reactTop = actionsTop + actionsH + g;
     }
 
-    left = Math.max(margin, Math.min(left, window.innerWidth - menuRect.width - margin));
-    top = Math.max(margin, Math.min(top, window.innerHeight - menuRect.height - margin));
-    menu.style.left = left + 'px';
-    menu.style.top = top + 'px';
+    // Also reveal a message that is partly under the header or composer.
+    if (allowScroll && (!placement || top < band.top || bottom > band.bottom)) {
+        var scroller = document.getElementById('lxmf-messages');
+        var delta = _messageActionScrollDelta(top, bottom, reactH, actionsH, band);
+        if (scroller && delta) {
+            var before = scroller.scrollTop;
+            scroller.scrollTop = before + delta;
+            if (scroller.scrollTop !== before) return _layoutMessageActionPanels(state, false);
+        }
+    }
+
+    if (!placement) {
+        // Taller than the band: dock over the message, never over the chrome.
+        placement = 'dock';
+        actionsTop = band.bottom - actionsH;
+        reactTop = actionsTop - g - reactH;
+        if (reactTop < band.top) {
+            reactTop = band.top;
+            actionsTop = reactTop + reactH + g;
+        }
+    }
+
+    var insets = _messageActionInsets();
+    var place = function(panel, panelTop, below) {
+        var w = panel.offsetWidth;
+        var left = state.outbound ? b.right - w : b.left;
+        left = Math.max(MSG_ACTION_EDGE + insets.left,
+            Math.min(left, window.innerWidth - w - MSG_ACTION_EDGE - insets.right));
+        panel.style.left = Math.round(left) + 'px';
+        panel.style.top = Math.round(panelTop) + 'px';
+        panel.style.setProperty('--msg-panel-origin',
+            (below ? 'top ' : 'bottom ') + (state.outbound ? 'right' : 'left'));
+        panel.style.setProperty('--msg-panel-shift', (below ? -4 : 4) + 'px');
+    };
+    place(react, reactTop, placement === 'below');
+    place(actions, actionsTop, placement === 'split' || placement === 'below');
+    state.menu.setAttribute('data-placement', placement);
+    return placement;
 }
 
 function _prepareMessageActionTarget(msgData, bubble, trigger, x, y) {
@@ -5273,7 +5937,9 @@ function _showMsgContextMenu(msgData, x, y, bubble, trigger, opts) {
     menu.addEventListener('touchstart', _preventMessageActionFocusSteal, { passive: false });
 
     var reactBar = document.createElement('div');
-    reactBar.className = 'msg-quick-react';
+    reactBar.className = 'msg-action-panel msg-quick-react';
+    reactBar.setAttribute('role', 'group');
+    reactBar.setAttribute('aria-label', 'Reactions');
     var quickEmojis = ['\u2764\uFE0F', '\uD83D\uDC4D', '\uD83D\uDE02', '\uD83D\uDE2E', '\uD83D\uDE22', '\uD83D\uDD25'];
     quickEmojis.forEach(function(em) {
         var btn = document.createElement('button');
@@ -5295,9 +5961,9 @@ function _showMsgContextMenu(msgData, x, y, bubble, trigger, opts) {
     var plusBtn = document.createElement('button');
     plusBtn.type = 'button';
     plusBtn.className = 'quick-react-plus';
-    plusBtn.textContent = '+';
-    plusBtn.title = 'More emoji';
-    plusBtn.setAttribute('aria-label', 'More emoji');
+    plusBtn.innerHTML = _messageActionIcon('more');
+    plusBtn.title = 'More reactions';
+    plusBtn.setAttribute('aria-label', 'More reactions');
     plusBtn.setAttribute('data-message-action', 'reaction-more');
     _bindMessageFocusPreservingActivation(plusBtn, function() {
         var shouldRestoreComposer = _messageActionShouldPreserveComposer();
@@ -5333,7 +5999,7 @@ function _showMsgContextMenu(msgData, x, y, bubble, trigger, opts) {
     menu.appendChild(reactBar);
 
     var actions = document.createElement('div');
-    actions.className = 'msg-context-actions';
+    actions.className = 'msg-action-panel msg-context-actions';
 
     var replyBtn = document.createElement('button');
     replyBtn.className = 'msg-ctx-btn msg-ctx-reply';
@@ -5347,15 +6013,31 @@ function _showMsgContextMenu(msgData, x, y, bubble, trigger, opts) {
     });
     actions.appendChild(replyBtn);
 
+    if (_messageSelectable(msgData)) {
+        var isSelected = _messageSelectionActive() && _msgSelection.ids.indexOf(msgData.id) !== -1;
+        var selectBtn = document.createElement('button');
+        selectBtn.className = 'msg-ctx-btn msg-ctx-select';
+        selectBtn.type = 'button';
+        selectBtn.setAttribute('data-message-action', 'select');
+        selectBtn.innerHTML = _messageActionIcon('select') + '<span>' + (isSelected ? 'Deselect' : 'Select') + '</span>';
+        _bindMessageFocusPreservingActivation(selectBtn, function() {
+            _dismissContextMenu({ restoreFocus: false });
+            if (isSelected) _toggleMessageSelection(msgData);
+            else _selectMessage(msgData);
+            if (typeof haptic === 'function') haptic('light');
+        });
+        actions.appendChild(selectBtn);
+    }
+
     var content = bubble && bubble.querySelector ? bubble.querySelector('.lxmf-msg-content') : null;
-    var messageText = _messageDisplayContent(msgData, !!(msgData && msgData.audio));
+    var messageText = _messageCopyText(msgData, content);
     var hasText = !!(content && String(messageText || '').trim());
     if (hasText) {
         var copyBtn = document.createElement('button');
         copyBtn.className = 'msg-ctx-btn msg-ctx-copy';
         copyBtn.type = 'button';
         copyBtn.setAttribute('data-message-action', 'copy-message');
-        copyBtn.innerHTML = _messageActionIcon('copy') + '<span>Copy Message</span>';
+        copyBtn.innerHTML = _messageActionIcon('copy') + '<span>Copy</span>';
         _bindMessageFocusPreservingActivation(copyBtn, function() {
             var shouldRestoreComposer = _messageActionShouldPreserveComposer();
             _dismissContextMenu();
@@ -5374,6 +6056,28 @@ function _showMsgContextMenu(msgData, x, y, bubble, trigger, opts) {
             });
         });
         actions.appendChild(copyBtn);
+    }
+
+    if (opts.linkUrl) {
+        var linkUrl = opts.linkUrl;
+        var copyLinkBtn = document.createElement('button');
+        copyLinkBtn.className = 'msg-ctx-btn msg-ctx-copy-link';
+        copyLinkBtn.type = 'button';
+        copyLinkBtn.setAttribute('data-message-action', 'copy-link');
+        copyLinkBtn.innerHTML = _messageActionIcon('copy') + '<span>Copy Link</span>';
+        _bindMessageFocusPreservingActivation(copyLinkBtn, function() {
+            var shouldRestoreComposer = _messageActionShouldPreserveComposer();
+            _dismissContextMenu();
+            _copyToClipboard(linkUrl).then(function(ok) {
+                showToast(ok ? 'Link copied' : 'Could not copy', ok ? 'toast-success' : 'toast-error', 1600);
+                if (typeof haptic === 'function') haptic(ok ? 'success' : 'warning');
+                _restoreLxmfComposerKeyboard(shouldRestoreComposer);
+            }).catch(function() {
+                showToast('Could not copy', 'toast-error', 1800);
+                _restoreLxmfComposerKeyboard(shouldRestoreComposer);
+            });
+        });
+        actions.appendChild(copyLinkBtn);
     }
 
     var mediaAction = _messageMediaContextAction(msgData);
@@ -5402,21 +6106,60 @@ function _showMsgContextMenu(msgData, x, y, bubble, trigger, opts) {
     }
 
     menu.appendChild(actions);
+    menu.addEventListener('keydown', function(e) {
+        if (/^(Arrow(Up|Down|Left|Right)|Home|End|Tab)$/.test(e.key)) menu.classList.add('msg-action-keyboard');
+        if (!/^(Arrow(Up|Down|Left|Right)|Home|End)$/.test(e.key)) return;
+        var groups = [
+            { panel: reactBar, items: Array.from(reactBar.querySelectorAll('button')), horizontal: true },
+            { panel: actions, items: Array.from(actions.querySelectorAll('button')), horizontal: false },
+        ].sort(function(a, b) {
+            return a.panel.getBoundingClientRect().top - b.panel.getBoundingClientRect().top;
+        });
+        var target = _messageActionKeyTarget(groups, document.activeElement, e.key);
+        if (!target) return;
+        e.preventDefault();
+        _focusMessageControl(target);
+    });
 
     document.body.appendChild(menu);
     if (trigger) trigger.setAttribute('aria-expanded', 'true');
-    _activeContextMenu = {
+    var active = {
         menu: menu,
+        reactPanel: reactBar,
+        actionsPanel: actions,
         bubble: bubble,
         row: row,
         container: container,
         trigger: trigger,
         msgId: msgData.id,
+        outbound: msgData.direction === 'outbound',
         ownerHash: _canonicalConversationHash(lxmfActiveContact),
         restoreFocusExpected: !!opts.focusDialog,
         preserveComposerKeyboard: preserveComposerKeyboard,
     };
-    _positionMsgContextMenu(menu, x, y, bubble);
+    var repositionFrame = 0;
+    active.reposition = function() {
+        if (repositionFrame) return;
+        repositionFrame = requestAnimationFrame(function() {
+            repositionFrame = 0;
+            if (_activeContextMenu !== active) return;
+            var band = _messageActionBand();
+            var r = active.bubble && active.bubble.isConnected ? active.bubble.getBoundingClientRect() : null;
+            if (!r || r.bottom < band.top || r.top > band.bottom) {
+                _dismissContextMenu({ restoreFocus: false });
+                return;
+            }
+            _layoutMessageActionPanels(active, false);
+        });
+    };
+    _activeContextMenu = active;
+    window.addEventListener('resize', active.reposition);
+    if (container) container.addEventListener('scroll', active.reposition, { passive: true });
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', active.reposition);
+        window.visualViewport.addEventListener('scroll', active.reposition);
+    }
+    _layoutMessageActionPanels(active, true);
     if (opts.focusDialog) {
         _focusMessageControl(menu.querySelector('button'));
     }
@@ -5433,6 +6176,45 @@ function _handleMessageActionPointer(e) {
             _scheduleDeferredConversationRenderAfterPointer();
         }
     }
+}
+
+var COPY_BLOCK_TAGS = /^(P|DIV|LI|PRE|BLOCKQUOTE|H1|H2|H3|UL|OL)$/;
+
+function _copyTextOf(node, out) {
+    if (node.nodeType === 3) { out.push(node.nodeValue); return; }
+    if (node.nodeType !== 1 && node.nodeType !== 11) return;
+    if (node.nodeType === 1) {
+        if (node.tagName === 'BR') { out.push('\n'); return; }
+        if (node.classList.contains('md-code-head') || node.tagName === 'BUTTON') return;
+        if (node.classList.contains('md-spoiler') && !node.classList.contains('is-revealed')) {
+            out.push('[Spoiler]');
+            return;
+        }
+    }
+    var block = node.nodeType === 1 && COPY_BLOCK_TAGS.test(node.tagName);
+    if (block && out.length && !/\n$/.test(out[out.length - 1])) out.push('\n');
+    for (var child = node.firstChild; child; child = child.nextSibling) _copyTextOf(child, out);
+    if (block) out.push('\n');
+}
+
+// WebKit copies text under user-select:none and inert, so a selection that
+// touches a covered spoiler is rewritten with [Spoiler] in its place.
+function _handleSpoilerCopy(e) {
+    var selection = window.getSelection ? window.getSelection() : null;
+    if (!selection || selection.isCollapsed || !selection.rangeCount || !e.clipboardData) return;
+    var range = selection.getRangeAt(0);
+    var container = document.getElementById('lxmf-messages');
+    if (!container || !container.contains(range.commonAncestorContainer)) return;
+    var startEl = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
+    var fragment = range.cloneContents();
+    var startCovered = startEl && startEl.closest && startEl.closest('.md-spoiler:not(.is-revealed)');
+    if (!startCovered && !fragment.querySelector('.md-spoiler:not(.is-revealed)')) return;
+    var parts = [];
+    if (startCovered) parts.push('[Spoiler]');
+    _copyTextOf(fragment, parts);
+    var text = parts.join('').replace(/\u200B?(\[Spoiler\])(\[Spoiler\])*/g, '$1').replace(/\n{3,}/g, '\n\n').trim();
+    e.clipboardData.setData('text/plain', text);
+    e.preventDefault();
 }
 
 function _handleNativeMessageCopy() {
@@ -5453,12 +6235,22 @@ function _handleNativeMessageCopy() {
 document.addEventListener('pointerdown', _handleMessageActionPointer, true);
 document.addEventListener('mousedown', _handleMessageActionPointer, true);
 document.addEventListener('copy', _handleNativeMessageCopy, true);
+document.addEventListener('copy', _handleSpoilerCopy, true);
 document.addEventListener('keydown', function(e) {
     if (e.key !== 'Escape') return;
-    if (_dismissContextMenu()) {
+    if (_dismissContextMenu() ||
+            (!(_msgSelection && _msgSelection.pending) && _clearMessageSelection())) {
         e.preventDefault();
     }
 }, true);
+document.addEventListener('click', _handleMessageSelectionClick, true);
+document.addEventListener('keydown', function(e) {
+    if ((e.key !== 'Delete' && e.key !== 'Backspace') || !_messageSelectionActive()) return;
+    var target = e.target;
+    if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+    e.preventDefault();
+    _deleteSelectedMessages();
+});
 
 window.RS = window.RS || {};
 window.RS.closeMessageActionMenu = function() {
@@ -5466,8 +6258,12 @@ window.RS.closeMessageActionMenu = function() {
         _dismissContextMenu();
         return true;
     }
-    return false;
+    return _clearMessageSelection();
 };
+
+RS.listen('messages_deleted', function(data) {
+    if (data && data.hash && Array.isArray(data.ids)) _removeConversationMessages(data.hash, data.ids);
+});
 
 RS.listen('reaction_update', function(data) {
     if (data.message_id) {
@@ -5606,7 +6402,7 @@ RS.listen('lxmf_message', function(msg) {
     // for a background browser, where the last selected chat is not visible.
     if (!window.__TAURI_INTERNALS__ && !appForeground && typeof rsNotify !== 'undefined') {
         var notifFrom = _messageSourceName(msg);
-        var notifBody = _messageDisplayContent(msg, !!msg.audio).substring(0, 120) || 'New message';
+        var notifBody = _messagePlainContent(msg, !!msg.audio).substring(0, 120) || 'New message';
         rsNotify.send({
             title: 'Message from ' + notifFrom,
             body: notifBody,
@@ -6521,6 +7317,12 @@ document.addEventListener('DOMContentLoaded', function() {
         RS.composer.bindTypingPolicy(textarea);
         textarea.removeAttribute('maxlength');
         textarea.addEventListener('keydown', function(e) {
+            var wrap = _composerFormatMarker(e);
+            if (wrap) {
+                e.preventDefault();
+                RS.markdown.toggleWrap(this, wrap);
+                return;
+            }
             if (RS.composer.shouldSendOnEnter(e)) {
                 e.preventDefault();
                 sendLxmfMessage('auto');
@@ -6577,9 +7379,15 @@ document.addEventListener('DOMContentLoaded', function() {
     if (lxmfBackBtn) {
         lxmfBackBtn.addEventListener('click', function(e) {
             e.stopPropagation();
+            if (_clearMessageSelection()) return;
             RS.viewStack.pop();
         });
     }
+
+    var selectDeleteBtn = document.getElementById('lxmf-select-delete-btn');
+    if (selectDeleteBtn) selectDeleteBtn.addEventListener('click', _deleteSelectedMessages);
+    var selectCancelBtn = document.getElementById('lxmf-select-cancel-btn');
+    if (selectCancelBtn) selectCancelBtn.addEventListener('click', _clearMessageSelection);
 
     (function initChatSwipeBack() {
         var chatArea = document.getElementById('lxmf-chat-area');
@@ -6596,6 +7404,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 chatArea.style.opacity = Math.max(0.3, 1 - dx / chatArea.offsetWidth);
             },
             onCommit: function() {
+                _clearMessageSelection();
                 chatArea.style.transition = 'transform 0.25s ease, opacity 0.25s ease';
                 chatArea.style.transform = 'translateX(100%)';
                 chatArea.style.opacity = '0';
@@ -6937,6 +7746,17 @@ function _wireImageViewerSwipeDismiss(viewer, stage, img) {
     });
 }
 
+// The app UI never pinch-zooms; only the expanded image viewer may. Restoring
+// maximum-scale=1 on close also snaps any viewer zoom back to 1.
+function _setPageZoomAllowed(allowed) {
+    document.documentElement.classList.toggle('page-zoom-allowed', !!allowed);
+    var meta = document.querySelector('meta[name="viewport"]');
+    if (!meta) return;
+    var content = meta.getAttribute('content') || '';
+    var zoom = allowed ? 'maximum-scale=5.0, user-scalable=yes' : 'maximum-scale=1.0, user-scalable=no';
+    meta.setAttribute('content', content.replace(/maximum-scale=[^,]*,\s*user-scalable=[^,]*/, zoom));
+}
+
 function openImageViewer(img) {
     if (!img || !img.src) return;
     var viewer = _ensureImageViewer();
@@ -6958,6 +7778,7 @@ function openImageViewer(img) {
     viewer.offsetHeight;
     viewer.classList.add('open');
     document.body.classList.add('image-viewer-open');
+    _setPageZoomAllowed(true);
 }
 
 function closeImageViewer() {
@@ -6966,6 +7787,7 @@ function closeImageViewer() {
     viewer.classList.remove('open');
     viewer.classList.remove('is-zoomed');
     document.body.classList.remove('image-viewer-open');
+    _setPageZoomAllowed(false);
     setTimeout(function() {
         if (!viewer.classList.contains('open')) {
             viewer.setAttribute('hidden', '');

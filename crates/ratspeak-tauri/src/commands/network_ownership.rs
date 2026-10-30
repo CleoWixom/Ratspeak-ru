@@ -44,8 +44,20 @@ pub async fn set_network_ownership(
     .map_err(AppError::bad_request)
 }
 
+/// The shared instance's access file. Its control key is an admin credential,
+/// released with the active identity's passcode or a confirmation.
 #[tauri::command]
-pub async fn export_shared_access(state: State<'_, Arc<AppState>>) -> AppResult<String> {
+pub async fn export_shared_access(
+    state: State<'_, Arc<AppState>>,
+    passcode: Option<String>,
+    confirmed: Option<bool>,
+) -> AppResult<String> {
+    network_ownership::require_developer_mode(&state).map_err(AppError::bad_request)?;
+    let active = crate::helpers::active_identity_id(&state);
+    if let Some(passcode) = super::identity::release_passcode(&state, &active, passcode, confirmed)?
+    {
+        super::identity::verify_identity_passcode(&state, &active, passcode).await?;
+    }
     network_ownership::export_access(&state).map_err(AppError::bad_request)
 }
 

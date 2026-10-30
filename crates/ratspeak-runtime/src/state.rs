@@ -9,9 +9,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
-use ratspeak_core::{Emitter, NativeNotification, NativeNotifier};
+use ratspeak_core::{Emitter, NativeNotification, NativeNotifier, NotificationPreview};
+/// The suspend-counting clock an [`AutoLock`] deadline runs on.
+pub use rns_link::clock::ContinuousInstant;
 use rns_runtime::lifecycle::ShutdownSignal;
 use tokio::sync::watch;
+use zeroize::Zeroizing;
 
 use crate::activity::ActivityRecorder;
 use crate::activity::emitter::EmitterBatchSink;
@@ -424,10 +427,16 @@ impl ActivityRequestFence {
     }
 }
 
-/// Async identity/runtime transition lock with a span epoch. The epoch is odd
-/// while any holder owns the lock and advances again when that holder drops,
-/// allowing Activity commands to distinguish a request born during a
-/// transition from one that was merely queued before a point-in-time reset.
+/// Async identity/runtime lifecycle lock with a transition epoch.
+///
+/// A transition (`lock`, `lock_owned`) changes what a fenced request may rely
+/// on: the active identity's session, the identity set or its keys, the
+/// runtime, or Activity capture. The epoch is odd while a transition holds the
+/// lock and advances again when it drops, so a request born during a
+/// transition is told apart from one merely queued before it. Routine work
+/// (`lock_routine`, `lock_routine_owned`) publishes, reads, sends or edits the
+/// current identity's data: it still excludes transitions, but leaves the
+/// epoch alone, so fenced requests prepared meanwhile stay valid.
 pub struct IdentitySwitchLock {
     inner: Arc<tokio::sync::Mutex<()>>,
     epoch: Arc<AtomicU64>,
@@ -453,14 +462,18 @@ impl IdentitySwitchLock {
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
-    /// Publish a result for the current identity without announcing a new
-    /// identity/privacy transition. The same mutex still excludes real changes.
-    pub(crate) async fn lock_publication(&self) -> tokio::sync::MutexGuard<'_, ()> {
+    /// Routine work for the current identity; see the type's documentation.
+    pub async fn lock_routine(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.inner.lock().await
     }
 
-    /// Retain a short identity publication transition inside its actual blocking
-    /// closure, even when the awaiting command is cancelled.
+    /// As `lock_routine`, retained by a blocking worker or a moved guard.
+    pub async fn lock_routine_owned(&self) -> OwnedRoutineGuard {
+        self.inner.clone().lock_owned().await
+    }
+
+    /// As `lock`, retained by a blocking worker even when the awaiting command
+    /// is cancelled.
     pub async fn lock_owned(&self) -> OwnedIdentitySwitchGuard {
         let guard = self.inner.clone().lock_owned().await;
         self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -476,6 +489,9 @@ impl Default for IdentitySwitchLock {
         Self::new()
     }
 }
+
+/// A routine span of the identity lifecycle: it excludes transitions only.
+pub type OwnedRoutineGuard = tokio::sync::OwnedMutexGuard<()>;
 
 pub struct IdentitySwitchGuard<'a> {
     _guard: tokio::sync::MutexGuard<'a, ()>,
@@ -750,6 +766,9 @@ pub struct AppState {
     rnode_lifecycle_generation: AtomicU64,
     /// Coalesces conversation-list broadcasts; spawned task debounces 100ms.
     pub conversations_broadcast_pending: AtomicBool,
+    /// Advanced after a bulk delete commits: a conversation list built from
+    /// the rows before it must not be published after it.
+    conversation_list_revision: AtomicU64,
     /// 10s session-local throttle on Refresh button. `None` = never throttled.
     pub last_refresh_request_at: Mutex<Option<Instant>>,
     /// Low-rate background probing throttle for bundled Ratspeak relays.
@@ -761,6 +780,8 @@ pub struct AppState {
     /// Lifetime count of `lxmf.propagation` announces with unparseable app_data.
     pub pn_parse_failures: AtomicU64,
     pub native_notifications_enabled: AtomicBool,
+    /// What alerts show, as stored in `notification_preview`.
+    notification_preview: Mutex<NotificationPreview>,
     /// Sideband-compatible receive policy: enabled limits complete inbound
     /// Direct LXMF Resources to one decimal megabyte; disabled retains the
     /// 128 MB application maximum below Reticulum's structural ceiling.
@@ -772,16 +793,20 @@ pub struct AppState {
     pub auto_interface_lock: Arc<tokio::sync::Mutex<()>>,
     pub ble_peer_enable_lock: tokio::sync::Mutex<()>,
     pub identity_session_generation: AtomicU64,
-    /// Secret handed to the next protected-identity load (hardware PIN or
-    /// software passcode, consumed by `init_rns_lxmf`). Never persisted.
-    pub hw_pending_pin: Mutex<Option<String>>,
+    /// Secret handed to the next load of one protected identity (hardware PIN
+    /// or software passcode), with that identity's hash. Taken once by
+    /// `init_rns_lxmf`; never persisted.
+    pub hw_pending_pin: Mutex<Option<(String, Zeroizing<String>)>>,
     /// Hash of a protected identity that is active but locked (awaiting PIN).
     pub hw_locked: RwLock<Option<String>>,
     /// Last protected-identity unlock failure message.
     pub hw_last_error: Mutex<Option<String>>,
-    /// Bumped on every session teardown; an auto-lock timer no-ops if its captured
-    /// generation no longer matches (i.e. the session was switched/unlocked/quit).
+    /// Moves on with every auto-lock armed, so the watcher of an earlier one
+    /// stops.
     pub hw_lock_gen: AtomicU64,
+    /// The protected identity's auto-lock, which a watcher of its own carries
+    /// out. It outlives the identity's runtime and ends with its session.
+    pub auto_lock: Mutex<Option<AutoLock>>,
     /// Read-through cache for the active identity's (hash, lxmf_hash),
     /// stamped with `db::identity_generation()` so identity-table writes
     /// invalidate it. Keeps hot async paths off sync DB reads.
@@ -791,6 +816,35 @@ pub struct AppState {
 /// (identity-table generation, active identity (hash, lxmf_hash) at that
 /// generation — `None` when no identity is active).
 pub type CachedActiveIdentity = (u64, Option<(String, String)>);
+
+/// A protected identity's auto-lock. Its deadline runs from the unlock on the
+/// suspend-counting clock, so time the system slept counts; its watcher
+/// re-reads that clock, never arming a timer, which would count awake time
+/// only.
+#[derive(Clone, Debug)]
+pub struct AutoLock {
+    pub hash: String,
+    /// `hardware` or `passcode`.
+    pub kind: &'static str,
+    pub unlocked_at: ContinuousInstant,
+    /// Zero when auto-lock is off. Read at the unlock.
+    pub timeout: Duration,
+    /// The `hw_lock_gen` it was armed at.
+    pub generation: u64,
+}
+
+impl AutoLock {
+    /// Whether the identity is due to lock at `now`.
+    pub fn due_at(&self, now: ContinuousInstant) -> bool {
+        !self.timeout.is_zero() && self.remaining_at(now).is_zero()
+    }
+
+    /// How long until it falls due at `now`.
+    pub fn remaining_at(&self, now: ContinuousInstant) -> Duration {
+        self.timeout
+            .saturating_sub(now.saturating_duration_since(self.unlocked_at))
+    }
+}
 
 impl AppState {
     pub fn new(
@@ -861,6 +915,9 @@ impl AppState {
                 .and_then(|v| v.parse::<u8>().ok())
                 .map(|v| v != 0)
                 .unwrap_or(true);
+        let initial_notification_preview = crate::db::get_setting(&db, "notification_preview")
+            .and_then(|value| NotificationPreview::parse(&value))
+            .unwrap_or_default();
         let initial_lxmf_limit_1mb =
             crate::db::get_setting(&db, "lxmf_limit_1mb").is_none_or(|value| value != "false");
         let activity = ActivityRecorder::with_batch_sink(Arc::new(EmitterBatchSink::new(
@@ -969,12 +1026,14 @@ impl AppState {
             rnode_lifecycle_operations: Mutex::new(HashMap::new()),
             rnode_lifecycle_generation: AtomicU64::new(0),
             conversations_broadcast_pending: AtomicBool::new(false),
+            conversation_list_revision: AtomicU64::new(0),
             last_refresh_request_at: Mutex::new(None),
             last_static_probe_at: Mutex::new(None),
             auto_active_node: RwLock::new(None),
             auto_failure_counts: Mutex::new(HashMap::new()),
             pn_parse_failures: AtomicU64::new(0),
             native_notifications_enabled: AtomicBool::new(initial_notifications_enabled),
+            notification_preview: Mutex::new(initial_notification_preview),
             lxmf_limit_1mb: AtomicBool::new(initial_lxmf_limit_1mb),
             rns_config_lock: Mutex::new(()),
             identity_switch_lock: IdentitySwitchLock::new(),
@@ -985,18 +1044,68 @@ impl AppState {
             hw_locked: RwLock::new(None),
             hw_last_error: Mutex::new(None),
             hw_lock_gen: AtomicU64::new(0),
+            auto_lock: Mutex::new(None),
             active_identity_cache: Mutex::new(None),
         }
     }
 
-    /// Take the PIN staged for the next hardware-identity load (one-shot).
-    pub fn take_pending_hw_pin(&self) -> Option<String> {
+    /// Arm the auto-lock of protected identity `hash`, and return the
+    /// generation its watcher follows. A reload from its retained unlock is no
+    /// new unlock: the deadline runs on.
+    pub fn arm_auto_lock(
+        &self,
+        hash: &str,
+        kind: &'static str,
+        timeout: Duration,
+        from_retained_unlock: bool,
+    ) -> u64 {
+        let mut slot = self.auto_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = self.hw_lock_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let running = slot
+            .take()
+            .filter(|lock| from_retained_unlock && lock.hash == hash);
+        *slot = Some(match running {
+            Some(lock) => AutoLock { generation, ..lock },
+            None => AutoLock {
+                hash: hash.to_owned(),
+                kind,
+                unlocked_at: ContinuousInstant::now(),
+                timeout,
+                generation,
+            },
+        });
+        generation
+    }
+
+    pub fn disarm_auto_lock(&self) {
+        *self.auto_lock.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The armed auto-lock, while it is still the one armed at `generation`.
+    pub fn armed_auto_lock(&self, generation: u64) -> Option<AutoLock> {
+        self.auto_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|lock| lock.generation == generation)
+            .cloned()
+    }
+
+    /// Take the staged secret and the hash it was staged for (one-shot).
+    pub fn take_pending_hw_pin(&self) -> Option<(String, Zeroizing<String>)> {
         self.hw_pending_pin.lock().ok().and_then(|mut p| p.take())
     }
 
-    pub fn set_pending_hw_pin(&self, pin: Option<String>) {
+    /// Stage `secret` for the next load of `hash`, and of no other identity.
+    pub fn stage_pending_hw_pin(&self, hash: &str, secret: Zeroizing<String>) {
         if let Ok(mut p) = self.hw_pending_pin.lock() {
-            *p = pin;
+            *p = Some((hash.to_owned(), secret));
+        }
+    }
+
+    pub fn clear_pending_hw_pin(&self) {
+        if let Ok(mut p) = self.hw_pending_pin.lock() {
+            *p = None;
         }
     }
 
@@ -1094,6 +1203,27 @@ impl AppState {
             .store(enabled, Ordering::Relaxed);
     }
 
+    pub fn notification_preview(&self) -> NotificationPreview {
+        *self
+            .notification_preview
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_notification_preview(&self, preview: NotificationPreview) {
+        *self
+            .notification_preview
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = preview;
+    }
+
+    /// Withdraws the alerts of the identity session that is ending. Call in
+    /// its transition, after the generation bump: alerts are posted under
+    /// the routine lock against the generation, so none of it can follow.
+    pub fn withdraw_native_notifications(&self) {
+        self.notifier.withdraw_all();
+    }
+
     pub fn lxmf_limit_1mb_enabled(&self) -> bool {
         self.lxmf_limit_1mb.load(Ordering::Relaxed)
     }
@@ -1140,6 +1270,16 @@ impl AppState {
         self.identity_session_generation
             .fetch_add(1, Ordering::SeqCst)
             + 1
+    }
+
+    pub(crate) fn conversation_list_revision(&self) -> u64 {
+        self.conversation_list_revision.load(Ordering::SeqCst)
+    }
+
+    /// Call after a bulk delete commits, before re-sending the list.
+    pub fn invalidate_conversation_lists(&self) {
+        self.conversation_list_revision
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn set_propagation_host_readiness(
@@ -1198,6 +1338,7 @@ impl AppState {
 
     /// Install a validated software unlock only while the caller owns the identity
     /// transition lock. Startup consumes this instead of deriving the key twice.
+    /// A fresh unlock starts its auto-lock over, whatever was armed before.
     pub fn retain_unlocked_identity(
         &self,
         identity: rns_identity::identity::Identity,
@@ -1213,7 +1354,26 @@ impl AppState {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .retained_identity = Some((identity, false));
+        self.disarm_auto_lock();
         true
+    }
+
+    /// Drop a retained unlock that belongs to any identity other than `keep`, so
+    /// switching away and back costs the secret again. A hardware token is
+    /// relocked. Restarts of the same identity keep it.
+    pub fn release_retained_identity_except(&self, keep: &str) {
+        let mut session = self
+            .network_session
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let stale = session
+            .retained_identity
+            .as_ref()
+            .is_some_and(|(identity, _)| hex::encode(identity.hash) != keep);
+        // Taking it drops a software unlock; a hardware token is relocked.
+        if stale && let Some((identity, true)) = session.retained_identity.take() {
+            identity.lock();
+        }
     }
 
     pub fn announce_semantic_revision(&self) -> AnnounceSemanticRevision {
@@ -1961,10 +2121,11 @@ impl AppState {
         }
     }
 
-    /// Validate only while the caller owns `identity_switch_lock`. A request
-    /// born while another transition held the lock observes at least a release
-    /// plus this acquisition and therefore cannot match the single expected
-    /// epoch advance.
+    /// Validate only while the caller holds `identity_switch_lock` as a
+    /// transition. A request born while another transition held the lock
+    /// observes at least a release plus this acquisition and therefore cannot
+    /// match the single expected epoch advance. Routine holders use
+    /// `is_current_activity_origin_fence` instead.
     pub fn is_current_activity_request_fence_after_identity_lock(
         &self,
         fence: ActivityRequestFence,
@@ -1981,7 +2142,9 @@ impl AppState {
     /// fence before starting an operation and pass this validation through
     /// `ActivityRecorder::record_event_fenced`. The recorder invokes it only
     /// after acquiring an admission lease, so a transition either makes the
-    /// origin stale first or waits for/purges the already-admitted draft.
+    /// origin stale first or waits for/purges the already-admitted draft. It is
+    /// also the check for a request fence while holding `lock_routine`: no
+    /// transition began or ended since the fence was taken.
     pub fn is_current_activity_origin_fence(&self, fence: ActivityRequestFence) -> bool {
         let current_epoch = self.identity_switch_lock.epoch();
         fence.identity_lock_epoch.is_multiple_of(2)
@@ -2679,7 +2842,11 @@ impl AppState {
         // asynchronous work after their initial lifecycle check, so recheck
         // here to prevent a foreground transition from racing an OS alert.
         if self.should_surface_native_notification() {
-            self.notifier.notify(notification);
+            self.notifier
+                .notify(ratspeak_core::notification::with_preview(
+                    notification,
+                    self.notification_preview(),
+                ));
         }
     }
 
@@ -3360,6 +3527,96 @@ mod tests {
     }
 
     #[test]
+    fn switching_identity_releases_another_identitys_retained_unlock() {
+        let state = make_state();
+        let unlocked = rns_identity::identity::Identity::new();
+        let hash = hex::encode(unlocked.hash);
+        let generation = state.current_identity_session_generation();
+        assert!(state.retain_unlocked_identity(unlocked, &hash, generation));
+        let retained = |state: &AppState| {
+            state
+                .network_session
+                .read()
+                .unwrap()
+                .retained_identity
+                .is_some()
+        };
+
+        // Restarting the same identity keeps its unlock.
+        state.release_retained_identity_except(&hash);
+        assert!(retained(&state));
+
+        // Switching to another identity drops it.
+        state.release_retained_identity_except(&"ab".repeat(16));
+        assert!(!retained(&state));
+    }
+
+    #[test]
+    fn a_reload_from_the_retained_unlock_keeps_the_auto_lock_deadline() {
+        let state = make_state();
+        let hash = "ab".repeat(16);
+        let armed = |state: &AppState| state.auto_lock.lock().unwrap().clone().unwrap();
+        let first = state.arm_auto_lock(&hash, "passcode", Duration::from_secs(60), false);
+        let unlocked = armed(&state);
+
+        // A restart of the same identity from its retained unlock: the
+        // deadline runs on, and the earlier watcher hands over.
+        let restarted_generation =
+            state.arm_auto_lock(&hash, "passcode", Duration::from_secs(900), true);
+        let restarted = armed(&state);
+        assert_eq!(restarted.unlocked_at, unlocked.unlocked_at);
+        assert_eq!(restarted.timeout, Duration::from_secs(60));
+        assert!(restarted_generation > first);
+        assert!(state.armed_auto_lock(first).is_none());
+        assert!(state.armed_auto_lock(restarted_generation).is_some());
+
+        // An unlock with the secret starts it over.
+        let fresh_generation =
+            state.arm_auto_lock(&hash, "passcode", Duration::from_secs(900), false);
+        let fresh = armed(&state);
+        assert_eq!(fresh.timeout, Duration::from_secs(900));
+        let due = fresh.unlocked_at + fresh.timeout;
+        assert!(!fresh.due_at(due - Duration::from_secs(1)));
+        assert_eq!(
+            fresh.remaining_at(due - Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert!(fresh.due_at(due));
+
+        // Disarmed, no watcher has a lock left.
+        state.disarm_auto_lock();
+        assert!(state.armed_auto_lock(fresh_generation).is_none());
+    }
+
+    // A fresh unlock starts the deadline over, even while an earlier unlock
+    // of the same identity left one armed.
+    #[test]
+    fn a_fresh_unlock_starts_the_auto_lock_deadline_over() {
+        let state = make_state();
+        let identity = rns_identity::identity::Identity::new();
+        let hash = hex::encode(identity.hash);
+        state.arm_auto_lock(&hash, "passcode", Duration::from_secs(900), false);
+        let earlier = ContinuousInstant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap();
+        state
+            .auto_lock
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .unlocked_at = earlier;
+
+        let generation = state.current_identity_session_generation();
+        assert!(state.retain_unlocked_identity(identity, &hash, generation));
+        // The load that follows that unlock.
+        state.arm_auto_lock(&hash, "passcode", Duration::from_secs(900), true);
+
+        let armed = state.auto_lock.lock().unwrap().clone().unwrap();
+        assert!(armed.unlocked_at.saturating_duration_since(earlier) >= Duration::from_secs(590));
+    }
+
+    #[test]
     fn android_ble_rnode_auto_resume_defaults_on_and_updates_atomically() {
         let state = make_state();
         assert!(state.android_ble_rnode_auto_resume_enabled());
@@ -3418,33 +3675,14 @@ mod tests {
         rns_transport::messages::InterfaceStatRpcEntry {
             id,
             name: name.to_string(),
-            rx_bytes: 0,
-            tx_bytes: 0,
-            rx_rate: 0,
-            tx_rate: 0,
             online,
             bitrate: 115_200,
             mtu: 500,
             mode: "Full".to_string(),
             role: "normal".to_string(),
             announce_queue: Some(0),
-            held_announces: 0,
-            incoming_announce_frequency: 0.0,
-            outgoing_announce_frequency: 0.0,
-            incoming_pr_frequency: 0.0,
-            outgoing_pr_frequency: 0.0,
-            burst_active: false,
-            burst_activated: 0.0,
-            pr_burst_active: false,
-            pr_burst_activated: 0.0,
-            clients: None,
-            blocked_ips: None,
-            announce_rate_target: None,
-            announce_rate_grace: None,
-            announce_rate_penalty: None,
             announce_cap: 0.02,
-            ifac_size: 0,
-            tx_drops: 0,
+            ..Default::default()
         }
     }
 
@@ -4119,21 +4357,36 @@ mod tests {
         drop(next);
     }
     #[tokio::test]
-    async fn result_publication_excludes_switches_without_invalidating_activity() {
+    async fn routine_work_excludes_transitions_without_invalidating_fences() {
         let state = make_state();
-        let fence = state.activity_request_fence();
-        let publication = state.identity_switch_lock.lock_publication().await;
-        assert!(state.is_current_activity_origin_fence(fence));
+        let queued = state.activity_request_fence();
+        let routine = state.identity_switch_lock.lock_routine().await;
+        let born_during_routine = state.activity_request_fence();
         assert!(
             tokio::time::timeout(Duration::from_millis(20), state.identity_switch_lock.lock())
                 .await
                 .is_err()
         );
-        drop(publication);
-        assert!(state.is_current_activity_origin_fence(fence));
-        let transition = state.identity_switch_lock.lock().await;
-        drop(transition);
-        assert!(!state.is_current_activity_origin_fence(fence));
+        drop(routine);
+        let owned = state.identity_switch_lock.lock_routine_owned().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), state.identity_switch_lock.lock())
+                .await
+                .is_err()
+        );
+        drop(owned);
+        for fence in [queued, born_during_routine] {
+            assert!(state.is_current_activity_origin_fence(fence));
+        }
+        // A transition holder, such as an identity mutation, still accepts both.
+        let mutation = state.identity_switch_lock.lock().await;
+        assert!(state.is_current_activity_request_fence_after_identity_lock(queued));
+        assert!(state.is_current_activity_request_fence_after_identity_lock(born_during_routine));
+        drop(mutation);
+        // A transition, that mutation included, ends them for everyone else.
+        for fence in [queued, born_during_routine] {
+            assert!(!state.is_current_activity_origin_fence(fence));
+        }
     }
 
     #[tokio::test]

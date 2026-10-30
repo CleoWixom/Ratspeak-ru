@@ -255,6 +255,7 @@ test('all identity and batch listeners attach before the first status query', as
         'identity_switching',
         'identity_switched',
         'identity_error',
+        'identity_switch_failed',
         'activity_status_v1',
         'activity_boundary_v1',
         'activity_batch_v1'
@@ -541,6 +542,26 @@ test('identity transition invalidates stale replay, clears state, sends no Stop,
     await flush(60);
     var after = harness.invokeCalls.filter(function(call) { return call.name === 'activity_status'; }).length;
     assert(after > before, 'identity_error must rebootstrap');
+});
+
+test('a switch that does not finish ends the identity transition whatever its generation', async function() {
+    var harness = makeImmediateController(function(name) {
+        if (name === 'activity_status') return Promise.resolve(status(SESSION_A, 'capturing', '1', '1'));
+        return Promise.resolve(replayPage(SESSION_A, [event(SESSION_A, '1')], {
+            oldest: '1', latest: '1', nextAfter: '1'
+        }));
+    });
+    harness.controller.start();
+    await flush(30);
+    harness.handlers.identity_switching({ generation: '7' });
+    assert.strictEqual(harness.controller.snapshot().phase, 'identity_transition');
+    var before = harness.invokeCalls.filter(function(call) { return call.name === 'activity_status'; }).length;
+    // The restored session has a generation of its own, not the switch's.
+    harness.handlers.identity_switch_failed({ hash: SESSION_B, generation: '8', error: 'refused' });
+    await flush(60);
+    assert.notStrictEqual(harness.controller.snapshot().phase, 'identity_transition');
+    var after = harness.invokeCalls.filter(function(call) { return call.name === 'activity_status'; }).length;
+    assert(after > before, 'a failed switch must rebootstrap');
 });
 
 test('identity transition quarantines delayed status and events until its hard-reset fence', async function() {

@@ -101,6 +101,12 @@ function _rsWaitForInvoke() {
 }
 
 window.RS.invoke = function(name, args) {
+    // A core that could not start has no command state; its screen is static.
+    if (window.__RATSPEAK_STARTUP_ERROR__) {
+        var refused = new Error('Ratspeak could not start');
+        refused.code = 'startup_error';
+        return Promise.reject(refused);
+    }
     return _rsWaitForInvoke().then(function() {
         return window.__TAURI_INTERNALS__.invoke(name, args || {});
     }).catch(function(raw) {
@@ -160,6 +166,17 @@ window.RS.copyText = function(value) {
         );
     }
     return Promise.resolve(false);
+};
+
+// Keys and phrases. The native side keeps them out of clipboard history where
+// the platform allows and clears them after a minute unless something else
+// was copied since. A failed copy never falls back to one that stays.
+window.RS.copySecret = function(value) {
+    var text = String(value == null ? '' : value);
+    return RS.invoke('copy_secret', { text: text }).then(
+        function() { return true; },
+        function() { return false; }
+    );
 };
 
 var _rsAndroidMediaPermissionSeq = 0;

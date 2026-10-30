@@ -91,7 +91,10 @@ keyframes.forEach(function(owners, name) {
 assert.deepStrictEqual(duplicates, [], 'animation keyframes must have one owner');
 
 var tokens = sourceByName['00-tokens.css'];
-assert(/--text-base:\s*0\.9375rem/.test(tokens), 'text tokens must scale from rem units');
+assert(/--text-base:\s*1\.0625rem/.test(tokens) && /--text-base:\s*1rem/.test(tokens),
+    'text tokens must scale from rem units at the platform body sizes (17 mobile, 16 desktop)');
+assert(/--text-2xs:\s*0\.75rem/.test(tokens), 'no text token may fall below Caption 1 (12px)');
+assert(/--type-msg-meta-size:\s*var\(--text-xs\)/.test(tokens), 'message timestamps use Footnote (13px)');
 assert(/--text-3xl:\s*1\.75rem/.test(tokens), 'the complete text scale must be defined');
 assert(!/font-weight:\s*800\b/.test(allCss), 'CSS must not request an unloaded Outfit weight');
 assert(!/--font-sans\s*:/.test(sourceByName['09-channels.css']), 'Channels must inherit the app font contract');
@@ -102,10 +105,10 @@ assert(settingsFieldRule && /min-height:\s*34px/.test(settingsFieldRule[1]) && /
     'settings fields must grow with scaled text');
 assert(/data-text-scale-tier="xlarge"[\s\S]*?\.channels-layout/.test(sourceByName['13-responsive.css']),
     'the largest text tier must simplify the Channels layout');
-assert(/\.settings-type-presets\s*\{[\s\S]*?repeat\(5,/.test(sourceByName['10-views.css']),
-    'text sizing must expose five deliberate presets instead of a continuous slider');
-assert(/data-scale="100"[\s\S]*?--type-preview-size:\s*18px/.test(sourceByName['10-views.css']) &&
-    /data-scale="140"[\s\S]*?--type-preview-size:\s*34px/.test(sourceByName['10-views.css']),
+assert(/\.settings-type-presets\s*\{[\s\S]*?repeat\(7,/.test(sourceByName['10-views.css']),
+    'text sizing must expose seven deliberate presets (90-150%) instead of a continuous slider');
+assert(/data-scale="90"\][\s\S]*?--type-preview-size:\s*15px/.test(sourceByName['10-views.css']) &&
+    /data-scale="150"\][\s\S]*?--type-preview-size:\s*33px/.test(sourceByName['10-views.css']),
     'text-size specimens must make the preset progression visually distinct');
 assert(/data-text-scale-tier="large"\] \.settings-text-scale-row \.settings-row-info,\s*html\[data-text-scale-tier="xlarge"\] \.settings-text-scale-row \.settings-row-info\s*\{[^}]*flex:\s*0 0 auto/s.test(sourceByName['10-views.css']),
     'the 130% tier must not stretch the text-size introduction away from its presets');
@@ -154,6 +157,17 @@ assert(/\.four-token-a\s*\{[\s\S]*?background:\s*var\(--accent\)/.test(gamesCss)
     'Four in a Row sides must differ by solid-node versus ring geometry');
 assert(/prefers-reduced-motion:[^)]*reduce[\s\S]*?\.four-token[\s\S]*?animation:\s*none\s*!important/.test(gamesCss),
     'Four in a Row placement and win motion must honor reduced motion');
+assert(!/\.games-detail-board\s*\{[^}]*overflow:\s*hidden/.test(gamesCss) &&
+    !/100s?vh - 2\d\dpx/.test(gamesCss),
+    'game boards must never clip or guess the surrounding chrome from the viewport height');
+assert(/@supports \(width: 1cqmin\)\s*\{\s*\.games-detail-board\s*\{\s*container-type:\s*size;/.test(gamesCss) &&
+    /\.ttt-board-wrap\s*\{\s*width:\s*clamp\([^;]*100cqh - var\(--ttt-chrome\)/.test(gamesCss) &&
+    /\.chess-board-wrap\s*\{\s*width:\s*clamp\([^;]*100cqh - var\(--chess-chrome\)/.test(gamesCss) &&
+    /\.four-board-wrap\s*\{\s*width:\s*clamp\([^;]*\(100cqh - var\(--four-chrome\)\) \* 7 \/ 6/.test(gamesCss),
+    'game boards must fit the space between the status line and the controls');
+assert(/body\.view-game-detail \.bottom-bar,\s*body\.view-game-detail \.header\s*\{\s*display:\s*none;/
+    .test(sourceByName['13-responsive.css']),
+    'an open game must take the whole phone screen, as a conversation does');
 
 var paletteCss = sourceByName['00-palettes.css'];
 var themeSource = fs.readFileSync(path.join(dashboardRoot, 'static', 'js', 'theme.js'), 'utf8');

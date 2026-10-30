@@ -7,7 +7,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tauri::State;
 
-use crate::commands::shared::active_rns_config_dir;
+use crate::commands::messaging::broadcast_conversations;
+use crate::commands::shared::{active_rns_config_dir, format_contacts_list};
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::helpers::{active_identity_id, sanitize_announced_display_name};
@@ -46,6 +47,12 @@ fn storage_warning(data_dir: &std::path::Path) -> Option<&'static str> {
     }
 }
 
+fn profile_lock_warning(data_root: &std::path::Path) -> Option<&'static str> {
+    ratspeak_runtime::owner_lock::unenforced(data_root).then_some(
+        "This drive can't lock Ratspeak's data, so open it in only one app, on one device, at a time.",
+    )
+}
+
 #[tauri::command]
 pub async fn api_version() -> AppResult<Value> {
     Ok(json!({ "version": app_display_version(), "name": "Ratspeak" }))
@@ -80,6 +87,7 @@ pub async fn api_startup_progress(state: State<'_, Arc<AppState>>) -> AppResult<
         "hw_locked": locked,
         "hw_locked_kind": kind,
         "storage_warning": storage_warning(&state.config.data_dir),
+        "profile_lock_warning": profile_lock_warning(&state.config.data_root),
     }))
 }
 
@@ -106,6 +114,9 @@ pub async fn api_setup_complete(
     args: SetupCompleteArgs,
 ) -> AppResult<Value> {
     let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    if state.hw_locked_hash().is_some() {
+        return Err(AppError::new("locked", "Unlock this identity first."));
+    }
     let display_name = sanitize_announced_display_name(args.display_name.as_deref().unwrap_or(""))
         .map_err(AppError::bad_request)?;
 
@@ -114,10 +125,11 @@ pub async fn api_setup_complete(
     // the FIRST call; later calls load the existing one and just update the name.
     // The mnemonic is returned on the first call and persisted with the same
     // at-rest protection as the identity key for later re-display.
+    // A failed read is not "no identity": it would create a second one.
     let existing = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
         .await
-        .ok()
-        .flatten();
+        .map_err(|_| AppError::internal("setup identity read task failed"))?
+        .map_err(AppError::database_unavailable)?;
 
     let (identity_hash, lxmf_hash, mnemonic) = if let Some(identity) = existing {
         let hash = identity
@@ -132,6 +144,9 @@ pub async fn api_setup_complete(
             .to_string();
         (hash, lxmf_hash, None)
     } else {
+        // The phrase shown below is stored with the identity, or neither is.
+        let job = ratspeak_runtime::vault::try_acquire_job()
+            .map_err(|e| AppError::service_unavailable(e.to_string()))?;
         let (m, key) = match ratspeak_runtime::generate_recoverable_key() {
             Ok(v) => v,
             Err(e) => return Ok(json!({ "ok": false, "error": e })),
@@ -139,19 +154,23 @@ pub async fn api_setup_complete(
         let write_dir = state.config.data_dir.clone();
         let write_db = state.db.clone();
         let write_nick = display_name.clone();
+        let write_phrase = m.clone();
         let write = tokio::task::spawn_blocking(move || {
-            crate::lxmf::LxmfManager::import_identity_to_data_dir(
+            crate::lxmf::LxmfManager::import_identity_with_phrase(
                 &write_dir,
-                &key,
+                &key[..],
+                Some((write_phrase.as_str(), &job)),
                 &write_nick,
                 &write_db,
             )
-            .map_err(|e| e.to_string())
         })
         .await
         .map_err(|_| AppError::internal("setup write task panicked"))?;
         let (hash, lxmf_hash) = match write {
             Ok(t) => t,
+            Err(error @ crate::lxmf::IdentityImportError::Phrase(_)) => {
+                return Err(super::identity::identity_import_error(error));
+            }
             Err(e) => {
                 return Ok(
                     json!({ "ok": false, "error": format!("Failed to create identity: {e}") }),
@@ -160,23 +179,16 @@ pub async fn api_setup_complete(
         };
         // Persisting an identity is inactive. The acknowledged privacy/runtime
         // boundary must complete before this first identity becomes active.
-        let app_state = Arc::clone(state.inner());
-        crate::shutdown_rns_lxmf(&app_state)
+        let reset = crate::reset_activity_for_shutdown(&state)
             .await
             .map_err(|_| AppError::internal("identity activation boundary unavailable"))?;
+        state.bump_identity_session_generation();
+        crate::finish_shutdown(state.inner(), &reset).await;
         let ih = hash.clone();
         db::spawn_db(state.db.clone(), move |p| db::set_active_identity(&p, &ih))
             .await
             .map_err(|_| AppError::internal("identity activation task failed"))?
             .map_err(AppError::internal)?;
-        // Persist the phrase so the first identity can re-display it later too.
-        let seed_dir = state.config.data_dir.join("identities").join(&hash);
-        if ratspeak_runtime::vault::store_plaintext_seed(&seed_dir, &m).is_err() {
-            tracing::warn!(
-                reason = "write_failed",
-                "could not store recovery-phrase sidecar at setup"
-            );
-        }
         (hash, lxmf_hash, Some(m))
     };
 
@@ -201,7 +213,7 @@ pub async fn api_setup_complete(
         "identity_hash": identity_hash,
         "lxmf_hash": lxmf_hash,
         "display_name": display_name,
-        "mnemonic": mnemonic,
+        "mnemonic": mnemonic.as_deref().map(String::as_str),
     }))
 }
 
@@ -266,7 +278,8 @@ pub async fn apply_foreground_transition(
             "could not release voice memo capture while backgrounding"
         );
     }
-    if fg {
+    // Ending a Trace is a profile change; most foreground edges have none.
+    if fg && state.activity.trace_expiry_due() {
         let _identity_lifecycle = state.identity_switch_lock.lock().await;
         let _activity_control = state.activity_control_lock.lock().await;
         state
@@ -536,26 +549,98 @@ pub async fn api_clear_announces(state: State<'_, Arc<AppState>>) -> AppResult<V
     }))
 }
 
+type IdentityLists = (Vec<Value>, i64);
+
+/// Tells the window what a bulk delete removed before the lists it re-sends:
+/// events arrive in order, so the window drops only what it held from before.
+/// Call with the lifecycle guard still held, once the delete has committed.
+fn announce_identity_data_cleared(state: &AppState, messages: bool, contacts: bool) {
+    state.invalidate_conversation_lists();
+    state.emit_to_all(
+        "identity_data_cleared",
+        json!({ "messages": messages, "contacts": contacts }),
+    );
+}
+
+/// The identity's contacts and unread total, read after a bulk delete.
+async fn read_identity_lists(state: &AppState, identity_id: String) -> Option<IdentityLists> {
+    db::spawn_db(state.db.clone(), move |p| {
+        let contacts = format_contacts_list(&db::get_all_contacts(&p, &identity_id));
+        let unread = db::get_all_unread_counts(&p, &identity_id).values().sum();
+        (contacts, unread)
+    })
+    .await
+    .inspect_err(|_| tracing::error!(reason = "task_panicked", "bulk delete list read panicked"))
+    .ok()
+}
+
+/// Re-send what a bulk delete changed, unless the identity changed since
+/// `generation`. The caller has released its lifecycle guard: the spawned
+/// conversation broadcast takes the lock itself.
+async fn publish_identity_lists(
+    state: &Arc<AppState>,
+    generation: u64,
+    lists: Option<IdentityLists>,
+) {
+    let Some((contacts, unread)) = lists else {
+        return;
+    };
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
+    if state.current_identity_session_generation() != generation {
+        return;
+    }
+    state.emit_to_all("contacts_update", json!(contacts));
+    state.emit_to_all("unread_total", json!({ "count": unread }));
+    broadcast_conversations(Arc::clone(state));
+}
+
 #[tauri::command]
 pub async fn api_clear_messages(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    // Bound to the identity the user saw, not to one that took over meanwhile.
+    let generation = state.current_identity_session_generation();
     let deletion = Arc::new(
         ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await,
     );
+    if state.current_identity_session_generation() != generation {
+        return Err(AppError::conflict("Identity changed"));
+    }
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let id_for_db = identity_id.clone();
     let worker_state = Arc::clone(&state);
-    db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
-        ratspeak_runtime::propagation_recovery::delete_messages(&worker_state, &id_for_db, None)
+    let files = db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
+        let deleted = ratspeak_runtime::propagation_recovery::delete_messages(
+            &worker_state,
+            &id_for_db,
+            None,
+        )?;
+        announce_identity_data_cleared(&worker_state, true, false);
+        Ok::<_, db::admission::AdmissionDbError>(deleted.remove_files())
     })
     .await
     .map_err(|_| AppError::internal("message deletion worker failed"))?
     .map_err(|error| AppError::database_unavailable(error.to_string()))?;
+    let lists = read_identity_lists(&state, identity_id).await;
+    drop(deletion);
+    publish_identity_lists(state.inner(), generation, lists).await;
+    files.map_err(super::shared::files_not_removed)?;
     Ok(json!(null))
 }
 
 #[tauri::command]
 pub async fn api_clear_contacts(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    let generation = state.current_identity_session_generation();
+    let lifecycle = state.identity_switch_lock.lock_routine().await;
+    if state.current_identity_session_generation() != generation {
+        return Err(AppError::conflict("Identity changed"));
+    }
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
+    // Blocks stay: their network blocks can only be lifted through them.
     let id1 = identity_id.clone();
     db::spawn_db(state.db.clone(), move |p| db::clear_all_contacts(&p, &id1))
         .await
@@ -563,31 +648,36 @@ pub async fn api_clear_contacts(state: State<'_, Arc<AppState>>) -> AppResult<Va
             tracing::error!(reason = "task_panicked", "clear_contacts db task panicked");
             Default::default()
         });
-    let id2 = identity_id;
-    db::spawn_db(state.db.clone(), move |p| db::clear_all_blocked(&p, &id2))
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(reason = "task_panicked", "clear_blocked db task panicked");
-            Default::default()
-        });
+    announce_identity_data_cleared(&state, false, true);
+    let lists = read_identity_lists(&state, identity_id).await;
+    drop(lifecycle);
+    publish_identity_lists(state.inner(), generation, lists).await;
     Ok(json!(null))
 }
 
 #[tauri::command]
 #[tracing::instrument(level = "debug", name = "command.api_reset_database", skip_all)]
 pub async fn api_reset_database(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    let generation = state.current_identity_session_generation();
     let deletion = Arc::new(
         ratspeak_runtime::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await,
     );
+    if state.current_identity_session_generation() != generation {
+        return Err(AppError::conflict("Identity changed"));
+    }
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let id1 = identity_id.clone();
     let worker_state = Arc::clone(&state);
-    db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
+    let deleted = db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
         ratspeak_runtime::propagation_recovery::delete_messages(&worker_state, &id1, None)
     })
     .await
     .map_err(|_| AppError::internal("message deletion worker failed"))?
     .map_err(|error| AppError::database_unavailable(error.to_string()))?;
+    // Blocks stay, as in api_clear_contacts.
     let id2 = identity_id.clone();
     db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |p| {
         db::clear_all_contacts(&p, &id2)
@@ -600,106 +690,17 @@ pub async fn api_reset_database(state: State<'_, Arc<AppState>>) -> AppResult<Va
         );
         Default::default()
     });
-    let id3 = identity_id;
-    db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |p| {
-        db::clear_all_blocked(&p, &id3)
+    announce_identity_data_cleared(&state, true, true);
+    let files = db::spawn_db_with_lease(state.db.clone(), Arc::clone(&deletion), move |_p| {
+        deleted.remove_files()
     })
     .await
-    .unwrap_or_else(|_| {
-        tracing::error!(
-            reason = "task_panicked",
-            "reset_database clear_blocked panicked"
-        );
-        Default::default()
-    });
+    .map_err(|_| AppError::internal("message file removal worker failed"));
+    let lists = read_identity_lists(&state, identity_id).await;
+    drop(deletion);
+    publish_identity_lists(state.inner(), generation, lists).await;
+    files?.map_err(super::shared::files_not_removed)?;
     Ok(json!(null))
-}
-
-#[tauri::command]
-#[tracing::instrument(level = "debug", name = "command.api_identity_reset", skip_all)]
-pub async fn api_identity_reset(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
-    let identity_lifecycle = Arc::new(state.identity_switch_lock.lock_owned().await);
-    let identity_id = active_identity_id(&state);
-    if !identity_id.is_empty() {
-        super::shared::forget_shared_text_drafts(&state, Some(identity_id.clone())).await?;
-    }
-    let reset_data_dir = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|lxmf| lxmf.as_ref().map(|manager| manager.data_dir.clone()));
-    let app_state = Arc::clone(state.inner());
-    crate::shutdown_rns_lxmf(&app_state)
-        .await
-        .map_err(|_| AppError::internal("identity reset lifecycle boundary unavailable"))?;
-
-    if !identity_id.is_empty() {
-        let id1 = identity_id.clone();
-        let worker_state = Arc::clone(&state);
-        db::spawn_db_with_lease(
-            state.db.clone(),
-            Arc::clone(&identity_lifecycle),
-            move |_p| {
-                ratspeak_runtime::propagation_recovery::delete_messages(&worker_state, &id1, None)
-            },
-        )
-        .await
-        .map_err(|_| AppError::internal("message deletion worker failed"))?
-        .map_err(|error| AppError::database_unavailable(error.to_string()))?;
-        let id2 = identity_id.clone();
-        db::spawn_db_with_lease(
-            state.db.clone(),
-            Arc::clone(&identity_lifecycle),
-            move |p| db::clear_all_contacts(&p, &id2),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(
-                reason = "task_panicked",
-                "identity_reset clear_contacts panicked"
-            );
-            Default::default()
-        });
-        let id3 = identity_id.clone();
-        let del_res = db::spawn_db_with_lease(
-            state.db.clone(),
-            Arc::clone(&identity_lifecycle),
-            move |p| db::delete_identity(&p, &id3, true),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(reason = "task_panicked", "identity_reset delete panicked");
-            Err("db task panicked".to_string())
-        });
-        if del_res.is_err() {
-            tracing::error!(
-                reason = "delete_failed",
-                "Failed to delete identity during reset"
-            );
-        }
-    }
-
-    if let Some(data_dir) = reset_data_dir {
-        let lifecycle = Arc::clone(&identity_lifecycle);
-        tokio::task::spawn_blocking(move || {
-            let _lifecycle = lifecycle;
-            crate::lxmf::clear_identity_storage_namespace(&data_dir)?;
-            std::fs::remove_dir_all(data_dir.join("ratchets")).ok();
-            std::fs::remove_file(data_dir.join("identity")).ok();
-            // Hub keys are identity-scoped key material; a surviving keyfile
-            // would resurrect the hub on its old destination hash.
-            std::fs::remove_dir_all(data_dir.join("channel_hub")).ok();
-            Ok::<(), std::io::Error>(())
-        })
-        .await
-        .map_err(reset_identity_storage_error)?
-        .map_err(reset_identity_storage_error)?;
-    }
-
-    state.set_startup_stage("ready");
-    state.emit_to_all("identity_reset", json!({ "restarting": true }));
-
-    Ok(json!({ "message": "Identity deleted. Returning to setup..." }))
 }
 
 #[tauri::command]
@@ -731,17 +732,25 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
         .uses_app_private_rns_config_dir()
         .then(|| state.config.rns_config_dir.clone());
 
-    let app_state = Arc::clone(state.inner());
-    crate::shutdown_rns_lxmf(&app_state)
+    let reset = crate::reset_activity_for_shutdown(&state)
         .await
         .map_err(|_| AppError::internal("factory reset lifecycle boundary unavailable"))?;
+    state.bump_identity_session_generation();
+    state.withdraw_native_notifications();
+    crate::finish_shutdown(state.inner(), &reset).await;
+    // Every identity goes, and every unlock and auto-lock with it.
+    state.release_retained_identity_except("");
+    state.disarm_auto_lock();
+    state.clear_pending_hw_pin();
+    state.set_hw_locked(None);
+    state.set_hw_last_error(None);
 
     db::spawn_db_with_lease(state.db.clone(), Arc::clone(&identity_lifecycle), |pool| {
-        db::note_identity_tables_changed();
         if let Ok(conn) = pool.get() {
             for table in db::RESET_TABLES {
                 let _ = conn.execute(&format!("DELETE FROM {}", table), []);
             }
+            db::note_identity_tables_changed();
             let _ = conn.execute(
                 "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')",
                 [],
@@ -858,4 +867,233 @@ pub async fn api_factory_reset(state: State<'_, Arc<AppState>>) -> AppResult<Val
     state.emit_to_all("identity_reset", json!({ "restarting": true }));
 
     Ok(json!({ "message": "Factory reset complete. Returning to setup..." }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_refuses_a_locked_identity_without_renaming_it() {
+        use tauri::Manager;
+
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+        let pool = db::init_pool(root.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        db::save_identity(
+            &pool,
+            hash,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "Personal",
+            "Alice",
+        );
+        db::set_active_identity(&pool, hash).unwrap();
+        let state = Arc::new(AppState::new(
+            config,
+            pool,
+            Arc::new(ratspeak_core::NoopEmitter),
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        state.set_hw_locked(Some(hash.to_owned()));
+        let before = db::get_active_identity(&state.db).unwrap().unwrap();
+        let generation = state.current_identity_session_generation();
+        let app = tauri::test::mock_builder()
+            .manage(Arc::clone(&state))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        for display_name in [Some("Changed".to_owned()), None, Some("\0".to_owned())] {
+            let result = api_setup_complete(app.state(), SetupCompleteArgs { display_name }).await;
+            assert_eq!(db::get_active_identity(&state.db).unwrap().unwrap(), before);
+            assert_eq!(result.unwrap_err().code, "locked");
+            assert_eq!(state.hw_locked_hash().as_deref(), Some(hash));
+            assert_eq!(state.current_identity_session_generation(), generation);
+        }
+    }
+
+    #[test]
+    fn setup_returns_the_recoverable_phrase_once_with_the_same_json_shape() {
+        // Vault admission is process-wide, including calls made by import tests.
+        let _serial = super::super::identity::tests::VAULT_TEST_SERIAL
+            .lock()
+            .unwrap();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use tauri::Manager;
+
+                let root = tempfile::tempdir().unwrap();
+                crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+                let config =
+                    crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+                let pool = db::init_pool(root.path()).unwrap();
+                db::init_schema(&pool).unwrap();
+                let state = Arc::new(AppState::new(
+                    config,
+                    pool,
+                    Arc::new(ratspeak_core::NoopEmitter),
+                    Arc::new(ratspeak_core::NoopNotifier),
+                ));
+                let app = tauri::test::mock_builder()
+                    .manage(Arc::clone(&state))
+                    .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                    .unwrap();
+                let first =
+                    api_setup_complete(app.state(), SetupCompleteArgs { display_name: None })
+                        .await
+                        .unwrap();
+                let phrase = first["mnemonic"].as_str().unwrap();
+                let key = ratspeak_runtime::derive_identity_key_from_phrase(phrase).unwrap();
+                let identity =
+                    rns_identity::identity::Identity::from_private_key(&key[..]).unwrap();
+                let hash = hex::encode(identity.hash);
+                let directory = state.config.data_dir.join("identities").join(&hash);
+                let stored =
+                    ratspeak_runtime::vault::read_plain_identity_key(&directory.join("identity"))
+                        .unwrap();
+                assert_eq!(&key[..], &stored[..]);
+                assert_eq!(
+                    ratspeak_runtime::vault::reveal_mnemonic(&directory, None)
+                        .unwrap()
+                        .as_str(),
+                    phrase
+                );
+                let lxmf_hash = first["lxmf_hash"].as_str().unwrap();
+                assert_eq!(
+                    first,
+                    json!({
+                        "ok": true,
+                        "identity_hash": hash,
+                        "lxmf_hash": lxmf_hash,
+                        "display_name": format!("!Ratspeak.org-{}", &lxmf_hash[..6]),
+                        "mnemonic": phrase,
+                    })
+                );
+                let second = api_setup_complete(
+                    app.state(),
+                    SetupCompleteArgs {
+                        display_name: Some("Ann".into()),
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    second,
+                    json!({
+                        "ok": true,
+                        "identity_hash": hash,
+                        "lxmf_hash": lxmf_hash,
+                        "display_name": "Ann",
+                        "mnemonic": null,
+                    })
+                );
+            });
+    }
+
+    /// Identity key, vault or phrase files under `data_dir`'s identities.
+    fn identity_files(data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(data_dir.join("identities"))
+            .unwrap()
+            .flatten()
+            .flat_map(|entry| {
+                ["identity", "identity.enc", "identity.seed"].map(|name| entry.path().join(name))
+            })
+            .filter(|path| path.exists())
+            .collect()
+    }
+
+    // Setup succeeds only once the phrase it shows is stored: while another
+    // identity encryption holds the vault, it creates nothing.
+    #[test]
+    fn setup_creates_no_identity_until_its_recovery_phrase_can_be_stored() {
+        let _serial = super::super::identity::tests::VAULT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use tauri::Manager;
+
+                let root = tempfile::tempdir().unwrap();
+                crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+                let config =
+                    crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+                let pool = db::init_pool(root.path()).unwrap();
+                db::init_schema(&pool).unwrap();
+                let state = Arc::new(AppState::new(
+                    config,
+                    pool,
+                    Arc::new(ratspeak_core::NoopEmitter),
+                    Arc::new(ratspeak_core::NoopNotifier),
+                ));
+                let app = tauri::test::mock_builder()
+                    .manage(Arc::clone(&state))
+                    .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                    .unwrap();
+                let busy = ratspeak_runtime::vault::try_acquire_job().unwrap();
+                let refused =
+                    api_setup_complete(app.state(), SetupCompleteArgs { display_name: None }).await;
+                assert_eq!(refused.unwrap_err().code, "service_unavailable");
+                assert!(db::get_all_identities(&state.db).is_empty());
+                assert!(db::get_active_identity(&state.db).unwrap().is_none());
+                assert!(identity_files(&state.config.data_dir).is_empty());
+
+                drop(busy);
+                let created =
+                    api_setup_complete(app.state(), SetupCompleteArgs { display_name: None })
+                        .await
+                        .unwrap();
+                let hash = created["identity_hash"].as_str().unwrap();
+                let directory = state.config.data_dir.join("identities").join(hash);
+                assert_eq!(
+                    ratspeak_runtime::vault::reveal_mnemonic(&directory, None)
+                        .unwrap()
+                        .as_str(),
+                    created["mnemonic"].as_str().unwrap()
+                );
+            });
+    }
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<String>>);
+
+    impl ratspeak_core::Emitter for Recorder {
+        fn try_emit(&self, event: &str, _payload: Value) -> Result<(), ratspeak_core::EmitError> {
+            self.0.lock().unwrap().push(event.to_owned());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_lists_go_out_only_for_the_identity_they_were_read_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::init_pool(dir.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let state = Arc::new(AppState::new(
+            crate::config::DashboardConfig::from_env_and_defaults(dir.path().to_path_buf()),
+            pool,
+            Arc::clone(&recorder) as Arc<dyn ratspeak_core::Emitter>,
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        let read_for = state.current_identity_session_generation();
+        state.bump_identity_session_generation();
+        publish_identity_lists(&state, read_for, Some((Vec::new(), 0))).await;
+        assert!(recorder.0.lock().unwrap().is_empty());
+
+        let current = state.current_identity_session_generation();
+        publish_identity_lists(&state, current, Some((Vec::new(), 0))).await;
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            ["contacts_update", "unread_total"]
+        );
+    }
 }

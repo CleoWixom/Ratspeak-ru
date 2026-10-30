@@ -23,10 +23,12 @@ mod inbound_admission;
 mod link_accounting;
 pub mod lxmf;
 pub mod lxmf_persistence;
+mod markdown_plain;
 pub mod messaging;
 pub mod mobile_platform;
 pub mod network_ownership;
 mod network_secrets;
+pub mod owner_lock;
 mod path_response;
 pub mod propagation;
 pub mod propagation_recovery;
@@ -51,6 +53,8 @@ pub mod platform_ios;
 pub use ratspeak_core::config;
 pub use ratspeak_db as db;
 pub use ratspeak_db::static_nodes;
+/// The wrapper the staged unlock secret and other held secrets use.
+pub use zeroize::Zeroizing;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -637,6 +641,21 @@ async fn next_chat_observed_timestamp(
     .unwrap_or(observed_at)
 }
 
+/// The label `contact_label_from_db` gives, read off the lifecycle lock.
+pub(crate) async fn read_contact_label(
+    state: &AppState,
+    source_hash: &str,
+    identity_id: &str,
+) -> String {
+    let source = source_hash.to_string();
+    let identity = identity_id.to_string();
+    db::spawn_db(state.db.clone(), move |p| {
+        contact_label_from_db(&p, &source, &identity)
+    })
+    .await
+    .unwrap_or_else(|_| compact_hash_label(source_hash))
+}
+
 pub(crate) fn contact_label_from_db(
     pool: &db::DbPool,
     source_hash: &str,
@@ -665,7 +684,19 @@ pub(crate) fn contact_label_from_db(
         .unwrap_or_else(|| compact_hash_label(source_hash))
 }
 
-fn notification_body(content: &str, has_attachment: bool) -> String {
+fn notification_body(content: &str, renderer: Option<u8>, has_attachment: bool) -> String {
+    let plain;
+    let content = if renderer == Some(lxmf_core::constants::RENDERER_MARKDOWN) {
+        // The preview keeps 120 chars; bound the stripping work to a short head.
+        let head = (0..=content.len().min(4096))
+            .rev()
+            .find(|&end| content.is_char_boundary(end))
+            .map_or("", |end| &content[..end]);
+        plain = markdown_plain::markdown_to_plain_text(head);
+        plain.as_str()
+    } else {
+        content
+    };
     let trimmed = content.trim();
     let lower = trimmed.to_ascii_lowercase();
     if has_attachment && lower.starts_with("[file:") && trimmed.ends_with(']') {
@@ -686,32 +717,66 @@ fn notification_body(content: &str, has_attachment: bool) -> String {
     }
 }
 
-async fn notify_inbound_message_if_background(
+/// Call while the message's session is current and its row is stored.
+pub(crate) fn notify_inbound_message_if_background(
     state: &AppState,
     source_hash: &str,
-    identity_id: &str,
+    label: &str,
     content: &str,
+    renderer: Option<u8>,
     has_attachment: bool,
 ) {
     if !state.should_surface_native_notification() {
         return;
     }
 
-    let source_for_db = source_hash.to_string();
-    let identity_for_db = identity_id.to_string();
-    let pool = state.db.clone();
-    let label = db::spawn_db(pool, move |p| {
-        contact_label_from_db(&p, &source_for_db, &identity_for_db)
-    })
-    .await
-    .unwrap_or_else(|_| compact_hash_label(source_hash));
-
     state.emit_native_notification(ratspeak_core::NativeNotification::message(
         format!("Message from {label}"),
-        notification_body(content, has_attachment),
+        notification_body(content, renderer, has_attachment),
         format!("lxmf:{source_hash}"),
         stable_notification_id(source_hash, 1_000),
     ));
+}
+
+/// A game action's alert, raised once its session's publication is due.
+/// `label` names the sender from the receiver's contacts, read off the lock.
+pub(crate) struct GameAlert {
+    pub(crate) label: String,
+    pub(crate) sender_hash: String,
+    pub(crate) session_id: String,
+    pub(crate) app_id: String,
+    pub(crate) command: String,
+    pub(crate) is_new_session: bool,
+}
+
+/// What an inbound game action shows. Gathered under the game transaction
+/// and published after it, in identity-then-game lock order.
+#[derive(Default)]
+struct LrgpOutcome {
+    events: Vec<(&'static str, Value)>,
+    alert: Option<GameAlert>,
+}
+
+impl LrgpOutcome {
+    fn emit(&mut self, event: &'static str, payload: Value) {
+        self.events.push((event, payload));
+    }
+
+    /// Names the alert's sender, off the lifecycle lock.
+    async fn label_alert(&mut self, state: &AppState, identity_id: &str) {
+        if let Some(alert) = self.alert.as_mut() {
+            alert.label = read_contact_label(state, &alert.sender_hash, identity_id).await;
+        }
+    }
+
+    fn publish(self, state: &AppState) {
+        if let Some(alert) = &self.alert {
+            notify_game_if_background(state, alert);
+        }
+        for (event, payload) in self.events {
+            state.emit_to_all(event, payload);
+        }
+    }
 }
 
 fn game_name(state: &AppState, app_id: &str) -> String {
@@ -722,22 +787,16 @@ fn game_name(state: &AppState, app_id: &str) -> String {
         .unwrap_or_else(|| "a game".to_string())
 }
 
-fn notify_game_if_background(
-    state: &AppState,
-    sender_hash: &str,
-    session_id: &str,
-    app_id: &str,
-    command: &str,
-    is_new_session: bool,
-) {
+fn notify_game_if_background(state: &AppState, alert: &GameAlert) {
     if !state.should_surface_native_notification() {
         return;
     }
 
-    let identity_id = helpers::active_identity_id(state);
-    let label = contact_label_from_db(&state.db, sender_hash, &identity_id);
-    let game = game_name(state, app_id);
-    let is_challenge = is_new_session
+    let label = &alert.label;
+    let game = game_name(state, &alert.app_id);
+    let command = alert.command.as_str();
+    let session_id = alert.session_id.as_str();
+    let is_challenge = alert.is_new_session
         || command.eq_ignore_ascii_case("challenge")
         || command.eq_ignore_ascii_case("invite");
     let (title, body) = if is_challenge {
@@ -977,16 +1036,47 @@ pub(crate) async fn shutdown_rns_lxmf_inner(
     state: &Arc<AppState>,
     relock_identity: bool,
 ) -> Result<(), ActivityRecorderError> {
+    let reset = reset_activity_for_shutdown(state).await?;
+    finish_shutdown_inner(state, &reset, relock_identity).await;
+    Ok(())
+}
+
+/// An acknowledged Activity reset, which a shutdown begins with.
+#[must_use = "finish the shutdown it began"]
+pub struct ActivityReset {
+    status: activity::ActivityStatusV1,
+}
+
+/// The first step of a shutdown and the only one that can be refused, which
+/// leaves the runtime as it was. An activation resets before it starts its
+/// session, so a runtime never outlives the session it ran in.
+pub async fn reset_activity_for_shutdown(
+    state: &AppState,
+) -> Result<ActivityReset, ActivityRecorderError> {
+    let _activity_control = state.activity_control_lock.lock().await;
+    state.bump_activity_boundary_generation();
+    state
+        .network_log_enabled
+        .store(false, std::sync::atomic::Ordering::Release);
+    if let Ok(mut level) = state.network_log_level.write() {
+        *level = "standard".to_string();
+    }
+    let status = state.activity.hard_reset().await?;
+    Ok(ActivityReset { status })
+}
+
+/// The rest of the shutdown `reset` began. Nothing here is refused.
+pub async fn finish_shutdown(state: &Arc<AppState>, reset: &ActivityReset) {
+    finish_shutdown_inner(state, reset, true).await;
+}
+
+async fn finish_shutdown_inner(
+    state: &Arc<AppState>,
+    reset: &ActivityReset,
+    relock_identity: bool,
+) {
     {
         let _activity_control = state.activity_control_lock.lock().await;
-        state.bump_activity_boundary_generation();
-        state
-            .network_log_enabled
-            .store(false, std::sync::atomic::Ordering::Release);
-        if let Ok(mut level) = state.network_log_level.write() {
-            *level = "standard".to_string();
-        }
-        let status = state.activity.hard_reset().await?;
         // The worker's status notification makes recovery observable. This
         // second boundary gives frontend privacy teardown one acknowledged,
         // cross-runtime fence for the temporary one-shot legacy broadcasts.
@@ -996,16 +1086,12 @@ pub(crate) async fn shutdown_rns_lxmf_inner(
                 "version": 1,
                 "kind": "hard_reset",
                 "identity_generation": state.current_identity_session_generation().to_string(),
-                "capture_generation": status.ingress_generation().to_string(),
-                "status": status,
+                "capture_generation": reset.status.ingress_generation().to_string(),
+                "status": reset.status,
             }),
         );
     }
 
-    // Supersede any pending auto-lock timer for the session being torn down.
-    state
-        .hw_lock_gen
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.emit_to_all("system_status", json!({"status": "stopping"}));
     #[cfg(feature = "lxst-voice")]
     voice_memo::cancel_recording(state).await.ok();
@@ -1082,7 +1168,6 @@ pub(crate) async fn shutdown_rns_lxmf_inner(
     tokio::time::sleep(Duration::from_millis(300)).await;
     state.set_startup_stage("stopped");
     state.emit_to_all("system_status", json!({"status": "stopped"}));
-    Ok(())
 }
 
 async fn teardown_rns_runtime_interfaces(handle: &rns_runtime::reticulum::ReticulumHandle) {
@@ -1113,54 +1198,125 @@ async fn teardown_rns_runtime_interfaces(handle: &rns_runtime::reticulum::Reticu
     }
 }
 
-/// Initialize RNS runtime and LXMF manager.
-/// Arm the hardware auto-lock timer (no-op unless `hardware_session_timeout` > 0).
-/// The timer fires once; it locks the session only if its generation still matches
-/// (i.e. the session wasn't switched/unlocked/quit in the meantime).
-fn arm_hw_lock_timer(state: &Arc<AppState>) {
-    let secs = db::get_setting(&state.db, "hardware_session_timeout")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    if secs == 0 {
-        return;
-    }
-    let generation = state.hw_lock_gen.load(std::sync::atomic::Ordering::SeqCst);
-    let st = Arc::clone(state);
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(secs)).await;
-        lock_hardware_session(st, generation).await;
-    });
+/// The auto-lock setting, `hardware_session_timeout` in seconds; zero is off.
+fn auto_lock_timeout(state: &AppState) -> Duration {
+    Duration::from_secs(
+        db::get_setting(&state.db, "hardware_session_timeout")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0),
+    )
 }
 
-/// Auto-lock fired: tear down the session (which re-locks the token) and enter the
-/// locked state so the UI prompts for the PIN again.
-async fn lock_hardware_session(state: Arc<AppState>, generation: u64) {
+/// How long an armed auto-lock waits, at most, before it reads the boot clock
+/// again: a lock that fell due while the system slept happens within this
+/// long of waking.
+const AUTO_LOCK_RECHECK: Duration = Duration::from_secs(5);
+
+/// `hardware` or `passcode` for a protected identity in `data_dir`.
+fn protection_kind(data_dir: &std::path::Path, hash: &str) -> Option<&'static str> {
+    let dir = data_dir.join("identities").join(hash);
+    if dir.join("identity.hwid").exists() {
+        Some("hardware")
+    } else if dir.join("identity.enc").exists() {
+        Some("passcode")
+    } else {
+        None
+    }
+}
+
+/// Arm protected identity `hash`'s auto-lock, with the timeout set now, and
+/// watch it on a task of its own. A reload from its retained unlock keeps
+/// the deadline it had.
+pub fn arm_auto_lock(
+    state: &Arc<AppState>,
+    hash: &str,
+    kind: &'static str,
+    from_retained_unlock: bool,
+) {
+    let generation =
+        state.arm_auto_lock(hash, kind, auto_lock_timeout(state), from_retained_unlock);
+    tokio::spawn(watch_auto_lock(Arc::downgrade(state), generation));
+}
+
+/// Carries out the auto-lock armed at `generation` once it falls due. It
+/// waits for no network or tick: it sleeps at most `AUTO_LOCK_RECHECK` at a
+/// time and re-reads the boot clock, so time the system slept counts. It
+/// ends once another lock is armed or none is.
+async fn watch_auto_lock(state: std::sync::Weak<AppState>, generation: u64) {
+    loop {
+        let wait = {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let Some(lock) = state.armed_auto_lock(generation) else {
+                return;
+            };
+            if lock.timeout.is_zero() {
+                return;
+            }
+            let now = rns_link::clock::ContinuousInstant::now();
+            if lock.due_at(now) {
+                // One that cannot go ahead yet stays armed for the next check.
+                lock_protected_session(state, lock).await;
+                AUTO_LOCK_RECHECK
+            } else {
+                lock.remaining_at(now).min(AUTO_LOCK_RECHECK)
+            }
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Auto-lock fell due: refuse the identity's data at once, tear down its
+/// session (which re-locks a token), drop the unlock, and wait for its PIN
+/// or passcode again. An active identity whose network has stopped locks
+/// too. One that cannot lock yet keeps its lock armed.
+async fn lock_protected_session(state: Arc<AppState>, lock: state::AutoLock) {
     // Serialize with switch/unlock so two teardowns can't race on rns/lxmf.
     let _guard = state.identity_switch_lock.lock().await;
-    // Superseded while we waited on the lock (switch / unlock / quit)?
-    if state.hw_lock_gen.load(std::sync::atomic::Ordering::SeqCst) != generation {
+    // Re-armed or ended while we waited on the lock (switch, unlock, passcode)?
+    if state.armed_auto_lock(lock.generation).is_none() {
         return;
     }
-    let hash = state.lxmf.lock().ok().and_then(|l| {
-        l.as_ref()
-            .filter(|m| m.is_hardware)
-            .map(|m| m.identity_hash.clone())
-    });
-    let Some(hash) = hash else { return };
-    tracing::info!(identity = %short_id(&hash), "hardware session auto-lock timeout — locking");
-    if let Err(error) = shutdown_rns_lxmf(&state).await {
-        tracing::error!(
-            %error,
-            identity = %short_id(&hash),
-            "hardware session auto-lock aborted because Activity reset failed"
-        );
+    let hash = lock.hash;
+    let loaded = state
+        .lxmf
+        .lock()
+        .ok()
+        .and_then(|l| l.as_ref().map(|m| m.identity_hash.clone()));
+    let current = match loaded {
+        Some(loaded) => loaded == hash,
+        None => helpers::active_identity_id(&state) == hash,
+    };
+    let Some(kind) = protection_kind(&state.config.data_dir, &hash).filter(|_| current) else {
+        state.disarm_auto_lock();
         return;
-    }
+    };
+    tracing::info!(identity = %short_id(&hash), kind, "auto-lock timeout — locking");
+    let reset = match reset_activity_for_shutdown(&state).await {
+        Ok(reset) => reset,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                identity = %short_id(&hash),
+                "auto-lock deferred because Activity reset failed"
+            );
+            return;
+        }
+    };
+    // Nothing begun before the lock may land behind it, and none of the
+    // identity's data is answered from here on.
+    state.bump_identity_session_generation();
     state.set_hw_locked(Some(hash.clone()));
+    state.disarm_auto_lock();
+    state.withdraw_native_notifications();
+    finish_shutdown(&state, &reset).await;
+    state.release_retained_identity_except("");
+    state.clear_pending_hw_pin();
     state.set_startup_stage("hw_locked");
     state.emit_to_all(
         "hardware_locked",
-        serde_json::json!({ "hash": hash, "reason": "timeout" }),
+        serde_json::json!({ "hash": hash, "kind": kind, "reason": "timeout" }),
     );
 }
 
@@ -1169,13 +1325,13 @@ async fn lock_hardware_session(state: Arc<AppState>, generation: u64) {
 /// as recoverable hardware provisioning, so the restored identity matches the
 /// YubiKey-backed one. Hardware-independent — works on every platform.
 #[cfg(feature = "seed")]
-pub fn derive_identity_key_from_phrase(phrase: &str) -> Result<[u8; 64], String> {
+pub fn derive_identity_key_from_phrase(phrase: &str) -> Result<Zeroizing<[u8; 64]>, String> {
     if !rns_ratkey::seed::validate_mnemonic(phrase) {
         return Err("Invalid recovery phrase — expected 12 valid BIP-39 words".into());
     }
     let derived = rns_ratkey::seed::derive_identity(phrase)
         .map_err(|e| format!("Could not derive identity: {e}"))?;
-    let mut key = [0u8; 64];
+    let mut key = Zeroizing::new([0u8; 64]);
     key[..32].copy_from_slice(&derived.x25519_secret);
     key[32..].copy_from_slice(&derived.ed25519_seed);
     Ok(key)
@@ -1186,9 +1342,11 @@ pub fn derive_identity_key_from_phrase(phrase: &str) -> Result<[u8; 64], String>
 /// software identity and stores the mnemonic with the same at-rest protection as
 /// the identity key so it can be re-displayed after re-authentication.
 #[cfg(feature = "seed")]
-pub fn generate_recoverable_key() -> Result<(String, [u8; 64]), String> {
-    let mnemonic = rns_ratkey::seed::generate_mnemonic()
-        .map_err(|e| format!("Could not generate recovery phrase: {e}"))?;
+pub fn generate_recoverable_key() -> Result<(Zeroizing<String>, Zeroizing<[u8; 64]>), String> {
+    let mnemonic = Zeroizing::new(
+        rns_ratkey::seed::generate_mnemonic()
+            .map_err(|e| format!("Could not generate recovery phrase: {e}"))?,
+    );
     let key = derive_identity_key_from_phrase(&mnemonic)?;
     Ok((mnemonic, key))
 }
@@ -1209,6 +1367,59 @@ fn profile_has_identity_material(dir: &std::path::Path) -> bool {
     dir.join("identity").exists()
         || dir.join("identity.enc").exists()
         || dir.join("identity.hwid").exists()
+}
+
+/// The most recently used identity that can open.
+pub fn most_recent_identity(
+    pool: &db::DbPool,
+    data_dir: &std::path::Path,
+) -> Result<Option<String>, String> {
+    let identities = data_dir.join("identities");
+    Ok(db::identity_hashes_by_last_use(pool)?
+        .into_iter()
+        .find(|hash| {
+            helpers::is_protocol_hash_16(hash) && profile_opens(&identities.join(hash), hash)
+        }))
+}
+
+/// A protected identity opens to its lock sheet; a plain one only when its key
+/// loads as that identity.
+fn profile_opens(dir: &std::path::Path, hash: &str) -> bool {
+    if dir.join("identity.hwid").exists() || dir.join("identity.enc").exists() {
+        return true;
+    }
+    lxmf::bounded_plain_identity_from_file(&dir.join("identity"))
+        .is_ok_and(|identity| hex::encode(identity.hash) == hash)
+}
+
+/// No active row: the most recently used identity becomes active, as after a
+/// removal. A protected one then opens to its lock sheet.
+async fn activate_most_recent_identity(state: &Arc<AppState>) -> Result<Option<String>, ()> {
+    let data_dir = state.config.data_dir.clone();
+    let activated = db::spawn_db(state.db.clone(), move |pool| {
+        let Some(hash) = most_recent_identity(&pool, &data_dir)? else {
+            return Ok(None);
+        };
+        db::set_active_identity(&pool, &hash)?;
+        Ok::<_, String>(Some(hash))
+    })
+    .await;
+    match activated {
+        Ok(Ok(hash)) => {
+            if hash.is_some() {
+                state.bump_identity_session_generation();
+            }
+            Ok(hash)
+        }
+        Ok(Err(_)) | Err(_) => {
+            tracing::error!(
+                reason = "activate_failed",
+                "could not activate the most recently used identity"
+            );
+            state.set_startup_stage("error");
+            Err(())
+        }
+    }
 }
 
 fn has_plain_identity_material(ratspeak_dir: &std::path::Path) -> bool {
@@ -1264,15 +1475,19 @@ pub async fn start_channel_hub_service(state: &Arc<AppState>) -> bool {
         .read()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
-    let active_identity = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
+    let Ok(active_identity) = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
         .await
         .expect("db task panicked")
-        .and_then(|identity| {
-            identity
-                .get("hash")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        });
+    else {
+        tracing::error!(reason = "query_failed", "channel hub not started");
+        return false;
+    };
+    let active_identity = active_identity.and_then(|identity| {
+        identity
+            .get("hash")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    });
     let Some(identity_hash) =
         active_identity.filter(|hash| helpers::is_protocol_hash_16(hash.as_str()))
     else {
@@ -1325,6 +1540,21 @@ pub async fn start_channel_hub_service(state: &Arc<AppState>) -> bool {
     }
 }
 
+/// A failed read is not "no active identity": startup would then pick
+/// another identity. It ends startup in the error stage instead.
+async fn read_active_identity_for_startup(state: &AppState) -> Result<Option<Value>, ()> {
+    db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
+        .await
+        .expect("db task panicked")
+        .map_err(|_| {
+            tracing::error!(
+                reason = "query_failed",
+                "active identity unreadable at startup"
+            );
+            state.set_startup_stage("error");
+        })
+}
+
 pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
     // Keep the large startup state machine out of every caller's future and
     // debug poll frame. Tokio's normal worker stack should remain sufficient.
@@ -1341,6 +1571,9 @@ fn startup_future_keeps_callers_stack_small() {
 }
 
 async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf) {
+    // A staged secret serves this load only, and only the identity it was
+    // staged for.
+    let staged_secret = state.take_pending_hw_pin();
     state
         .network_session
         .write()
@@ -1358,15 +1591,21 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
     }
 
     state.set_startup_stage("lxmf");
-    let preferred_identity_hash = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
-        .await
-        .expect("db task panicked")
-        .and_then(|identity| {
-            identity
-                .get("hash")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        });
+    let Ok(preferred_identity) = read_active_identity_for_startup(&state).await else {
+        return;
+    };
+    let mut preferred_identity_hash = preferred_identity.and_then(|identity| {
+        identity
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
+    if preferred_identity_hash.is_none() {
+        let Ok(recent) = activate_most_recent_identity(&state).await else {
+            return;
+        };
+        preferred_identity_hash = recent;
+    }
     if preferred_identity_hash
         .as_deref()
         .is_some_and(|hash| !helpers::is_protocol_hash_16(hash))
@@ -1389,7 +1628,9 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
     // Protected identities need a secret to unlock. If the active identity is
     // hardware or passcode-encrypted and no secret is staged, enter the locked
     // state and wait for `unlock_identity` rather than coming up with no identity.
-    let hw_pin = state.take_pending_hw_pin();
+    let hw_pin = staged_secret.and_then(|(hash, secret)| {
+        (preferred_identity_hash.as_deref() == Some(hash.as_str())).then_some(secret)
+    });
     // Detect whether the active identity is protected (needs a secret to unlock):
     // hardware (.hwid → YubiKey PIN) or passcode-encrypted (.enc → passcode).
     let lock_kind = preferred_identity_hash.as_deref().and_then(|h| {
@@ -1416,6 +1657,7 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
         let hash = preferred_identity_hash.clone().unwrap_or_default();
         let kind = lock_kind.unwrap_or("hardware");
         tracing::info!(identity = %short_id(&hash), kind, "identity locked — awaiting unlock secret");
+        state.disarm_auto_lock();
         state.set_hw_locked(Some(hash.clone()));
         state.set_startup_stage("hw_locked");
         state.emit_to_all(
@@ -1430,6 +1672,7 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
         match vault::try_acquire_job() {
             Ok(job) => Some(job),
             Err(error) => {
+                state.disarm_auto_lock();
                 state.set_hw_last_error(Some(error.to_string()));
                 state.set_hw_locked(preferred_identity_hash.clone());
                 state.set_startup_stage("hw_locked");
@@ -1439,6 +1682,7 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
     } else {
         None
     };
+    let from_retained_unlock = retained_identity.is_some();
     let load_dir = data_dir.clone();
     let load_hash = preferred_identity_hash.clone();
     let loaded = tokio::task::spawn_blocking(move || match retained_identity {
@@ -1448,7 +1692,7 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
         None => lxmf::LxmfManager::load_or_create_with_vault_job(
             &load_dir,
             load_hash.as_deref(),
-            hw_pin,
+            hw_pin.as_deref().map(String::as_str),
             vault_job.as_ref(),
         ),
     })
@@ -1474,10 +1718,12 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 return;
             }
 
-            let active = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
-                .await
-                .expect("db task panicked");
+            let Ok(active) = read_active_identity_for_startup(&state).await else {
+                return;
+            };
             if active.is_none() {
+                // An activation: nothing begun before it may land in this identity.
+                state.bump_identity_session_generation();
                 let id_hash = mgr.identity_hash.clone();
                 let lxmf_hash = mgr.lxmf_hash.clone();
                 // Match the default used by setup + identity creation paths
@@ -1503,9 +1749,10 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 }
             }
 
-            if let Some(identity) = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
-                .await
-                .expect("db task panicked")
+            if let Ok(Some(identity)) =
+                db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
+                    .await
+                    .expect("db task panicked")
             {
                 mgr.display_name = identity
                     .get("display_name")
@@ -1521,14 +1768,6 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
 
             apply_lxmf_settings_from_state(&state, &mut mgr);
 
-            // Backfill identity_id on pre-multi-identity rows.
-            let id_hash_for_backfill = mgr.identity_hash.clone();
-            db::spawn_db(state.db.clone(), move |p| {
-                db::backfill_identity_id(&p, &id_hash_for_backfill);
-            })
-            .await
-            .expect("db task panicked");
-
             // Clear in-flight outbound from previous session.
             let id_hash_for_cleanup = mgr.identity_hash.clone();
             db::spawn_db(state.db.clone(), move |p| {
@@ -1541,6 +1780,8 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
                     .await
                     .expect("db task panicked")
+                    .ok()
+                    .flatten()
                     .map(|i| {
                         (
                             i.get("display_name")
@@ -1598,10 +1839,11 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 tracing::warn!("conversations pre-warm failed; tab will fetch on demand");
             }
             tracing::info!("LXMF manager initialized");
-            // Protected identities (hardware PIN or software passcode) can auto-lock
-            // after an idle timeout (off by default).
-            if active_is_protected {
-                arm_hw_lock_timer(&state);
+            // Protected identities (hardware PIN or software passcode) lock once
+            // the auto-lock timeout has passed since their unlock (off by default).
+            match lock_kind.zip(preferred_identity_hash.as_deref()) {
+                Some((kind, hash)) => arm_auto_lock(&state, hash, kind, from_retained_unlock),
+                None => state.disarm_auto_lock(),
             }
             state.request_poll_now();
         }
@@ -1614,6 +1856,7 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
             if active_is_protected {
                 let hash = preferred_identity_hash.clone().unwrap_or_default();
                 let kind = lock_kind.unwrap_or("hardware");
+                state.disarm_auto_lock();
                 state.set_hw_last_error(Some(msg.clone()));
                 state.set_hw_locked(Some(hash.clone()));
                 state.set_startup_stage("hw_locked");
@@ -1623,6 +1866,10 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 );
                 return;
             }
+            // Without its identity the network would run as a ready app
+            // that can't message.
+            state.set_startup_stage("error");
+            return;
         }
     }
 
@@ -2105,6 +2352,8 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                 let stored_pn = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
                     .await
                     .expect("db task panicked")
+                    .ok()
+                    .flatten()
                     .and_then(|i| {
                         i.get("propagation_node")
                             .and_then(|v| v.as_str())
@@ -2322,6 +2571,7 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
                                         .and_then(|identities| identities.get(&link_id).copied()),
                                 },
                                 activity_origin,
+                                link_inbound_shutdown.clone(),
                             )
                             .await;
                             // Keep completed attachment memory admitted through
@@ -3098,6 +3348,19 @@ async fn init_rns_lxmf_inner(state: Arc<AppState>, data_dir: std::path::PathBuf)
     state.emit_to_all("system_status", json!({"status": "ready"}));
     tracing::info!("Startup complete");
     schedule_startup_auto_announce(state.clone());
+    // Unblocks whose runtime stopped before they lifted their network block
+    // lift it through this one.
+    if let Some(identity) = state
+        .lxmf
+        .lock()
+        .ok()
+        .and_then(|lxmf| lxmf.as_ref().map(|mgr| mgr.identity_hash.clone()))
+    {
+        let lift_state = state.clone();
+        tokio::spawn(async move {
+            blackhole::apply_pending_network_lifts(&lift_state, &identity).await;
+        });
+    }
 
     // Schedule identity pruning after ready so it doesn't block cold-start.
     let prune_state = state.clone();
@@ -3664,25 +3927,7 @@ fn record_presence_lifecycle_activity(
     record_activity_if_current(state, activity_origin, || Ok(event));
 }
 
-/// Record while `identity_switch_lock` is held. This is the final wire-send
-/// ownership seam: the same fence that authorizes transport admission also
-/// authorizes the one correlated Activity result before the lock is released.
-fn record_presence_lifecycle_activity_after_identity_lock(
-    state: &AppState,
-    activity_origin: ActivityRequestFence,
-    leadership: &AnnounceLeadership,
-    report: &AnnounceSendReport,
-) {
-    let Some(event) = presence_lifecycle_activity_event(leadership, report) else {
-        return;
-    };
-    let _ = state.activity.record_event_fenced(
-        || state.is_current_activity_request_fence_after_identity_lock(activity_origin),
-        || Ok(event),
-    );
-}
-
-fn record_current_presence_lifecycle_activity_after_identity_lock(
+fn record_current_presence_lifecycle_activity(
     state: &AppState,
     activity_origin: ActivityRequestFence,
     leadership: &AnnounceLeadership,
@@ -3694,12 +3939,7 @@ fn record_current_presence_lifecycle_activity_after_identity_lock(
         .ok()
         .and_then(|coordinator| coordinator.leadership(leadership.correlation_id))
         .unwrap_or_else(|| leadership.clone());
-    record_presence_lifecycle_activity_after_identity_lock(
-        state,
-        activity_origin,
-        &completed_leadership,
-        report,
-    );
+    record_presence_lifecycle_activity(state, activity_origin, &completed_leadership, report);
 }
 
 fn presence_lifecycle_activity_event(
@@ -3810,6 +4050,25 @@ fn try_build_presence_announce_packets(
     }
 }
 
+/// Admit one presence component in a routine lifecycle span, unless a
+/// transition began or ended since `activity_origin`. Sending invalidates no
+/// other request, and callers await interface dispatch after the span, so
+/// inbound display, alerts and deletes never queue behind a slow interface.
+async fn admit_in_lifecycle<F, T>(
+    state: &AppState,
+    activity_origin: ActivityRequestFence,
+    admission: impl FnOnce() -> F,
+) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
+    if !state.is_current_activity_origin_fence(activity_origin) {
+        return None;
+    }
+    Some(admission().await)
+}
+
 async fn execute_announce_burst(
     state: &AppState,
     require_cached_online: bool,
@@ -3908,23 +4167,6 @@ async fn execute_announce_burst(
         };
     }
 
-    // Bind the prepared bytes and their final transport admission to the same
-    // exact identity/runtime lifecycle span. This covers same-identity RNS
-    // replacement as well as identity switches, and the guard remains held
-    // through the bounded channel admissions and correlated Activity record.
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
-    if !state.is_current_activity_request_fence_after_identity_lock(activity_origin) {
-        tracing::info!(
-            correlation_id = leadership.correlation_id,
-            "stale presence announce suppressed before transport admission"
-        );
-        report.failed = 1;
-        report.disposition = AnnounceSendDisposition::Failed;
-        return AnnounceBurstExecution {
-            report,
-            activity_recorded: false,
-        };
-    }
     if matches!(any_interface_online_cached(state), Some(false)) {
         tracing::warn!(
             correlation_id = leadership.correlation_id,
@@ -3932,12 +4174,7 @@ async fn execute_announce_burst(
         );
         report.failed = 1;
         report.disposition = AnnounceSendDisposition::Failed;
-        record_current_presence_lifecycle_activity_after_identity_lock(
-            state,
-            activity_origin,
-            leadership,
-            &report,
-        );
+        record_current_presence_lifecycle_activity(state, activity_origin, leadership, &report);
         return AnnounceBurstExecution {
             report,
             activity_recorded: true,
@@ -3951,12 +4188,7 @@ async fn execute_announce_burst(
     let Some(tx) = transport_tx else {
         report.failed = 1;
         report.disposition = AnnounceSendDisposition::Failed;
-        record_current_presence_lifecycle_activity_after_identity_lock(
-            state,
-            activity_origin,
-            leadership,
-            &report,
-        );
+        record_current_presence_lifecycle_activity(state, activity_origin, leadership, &report);
         return AnnounceBurstExecution {
             report,
             activity_recorded: true,
@@ -3967,19 +4199,31 @@ async fn execute_announce_burst(
         let packet_len = raw.len();
         let fingerprint = hex::encode(&rns_crypto::sha::sha256(&raw)[..6]);
         let (dispatch_tx, dispatch_rx) = tokio::sync::oneshot::channel();
-        let admitted = tokio::time::timeout(
-            ANNOUNCE_QUEUE_ADMISSION_WAIT,
-            tx.send(rns_transport::messages::TransportMessage::SendPacket {
-                request: rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash,
-                },
-                attached_interface: None,
-                receipt: None,
-                result_tx: dispatch_tx,
-            }),
-        )
-        .await;
+        let packet = rns_transport::messages::TransportMessage::SendPacket {
+            request: rns_transport::messages::OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash,
+            },
+            attached_interface: None,
+            receipt: None,
+            result_tx: dispatch_tx,
+        };
+        let Some(admitted) = admit_in_lifecycle(state, activity_origin, || {
+            tokio::time::timeout(ANNOUNCE_QUEUE_ADMISSION_WAIT, tx.send(packet))
+        })
+        .await
+        else {
+            tracing::info!(
+                correlation_id = leadership.correlation_id,
+                "stale presence announce suppressed before transport admission"
+            );
+            report.failed += 1;
+            report.disposition = AnnounceSendDisposition::Failed;
+            return AnnounceBurstExecution {
+                report,
+                activity_recorded: false,
+            };
+        };
         let dispatch = if matches!(admitted, Ok(Ok(()))) {
             tokio::time::timeout(ANNOUNCE_INTERFACE_DISPATCH_WAIT, dispatch_rx)
                 .await
@@ -4042,22 +4286,24 @@ async fn execute_announce_burst(
 
     #[cfg(feature = "lxst-voice")]
     if report.lxmf_delivery_queued {
-        match tokio::time::timeout(
-            ANNOUNCE_QUEUE_ADMISSION_WAIT,
-            voice::announce_if_running(state),
-        )
+        match admit_in_lifecycle(state, activity_origin, || {
+            tokio::time::timeout(
+                ANNOUNCE_QUEUE_ADMISSION_WAIT,
+                voice::announce_if_running(state),
+            )
+        })
         .await
         {
-            Ok(Ok(true)) => {
+            Some(Ok(Ok(true))) => {
                 report.packets += 1;
                 report.queued += 1;
                 report.lxst_queued = true;
                 tracing::info!("LXST telephony announce queued");
             }
-            Ok(Ok(false)) => {
+            Some(Ok(Ok(false))) => {
                 tracing::debug!("LXST telephony announce skipped: voice service is not running");
             }
-            Ok(Err(_)) | Err(_) => {
+            Some(Ok(Err(_)) | Err(_)) | None => {
                 report.packets += 1;
                 report.failed += 1;
                 tracing::warn!(
@@ -4086,12 +4332,7 @@ async fn execute_announce_burst(
         disposition = ?report.disposition,
         "presence announce burst completed"
     );
-    record_current_presence_lifecycle_activity_after_identity_lock(
-        state,
-        activity_origin,
-        leadership,
-        &report,
-    );
+    record_current_presence_lifecycle_activity(state, activity_origin, leadership, &report);
     AnnounceBurstExecution {
         report,
         activity_recorded: true,
@@ -4108,14 +4349,11 @@ struct ExtractedAttachment {
 }
 
 fn extract_and_save_attachment(
-    state: &AppState,
+    files_dir: &std::path::Path,
     msg: &lxmf_core::message_api::LxMessage,
 ) -> Option<ExtractedAttachment> {
-    if let Ok(Some((file_name, file_data))) = msg.first_file_attachment()
-        && let Ok(mut lxmf) = state.lxmf.lock()
-        && let Some(mgr) = lxmf.as_mut()
-    {
-        let stored = match mgr.save_attachment(&file_name, file_data) {
+    if let Ok(Some((file_name, file_data))) = msg.first_file_attachment() {
+        let stored = match lxmf::save_attachment_in(files_dir, &file_name, file_data) {
             Ok(stored) => stored,
             Err(error) => {
                 tracing::warn!(
@@ -4146,36 +4384,32 @@ fn extract_and_save_attachment(
     if let Ok(Some((mime_type, image_data))) = msg.image_attachment() {
         let ext = mime_type.rsplit('/').next().unwrap_or("png");
         let file_name = format!("image.{ext}");
-        if let Ok(mut lxmf) = state.lxmf.lock()
-            && let Some(mgr) = lxmf.as_mut()
-        {
-            let stored = match mgr.save_attachment(&file_name, image_data) {
-                Ok(stored) => stored,
-                Err(error) => {
-                    tracing::warn!(
-                        error_kind = ?error.kind(),
-                        size = image_data.len(),
-                        kind = "image",
-                        "failed to persist inbound attachment"
-                    );
-                    return Some(ExtractedAttachment {
-                        file_name,
-                        stored_name: db::ATTACHMENT_UNAVAILABLE_STORED_NAME.to_string(),
-                        is_image: true,
-                    });
-                }
-            };
-            tracing::info!(
-                size = image_data.len(),
-                kind = "image",
-                "extracted inbound attachment"
-            );
-            return Some(ExtractedAttachment {
-                file_name,
-                stored_name: stored,
-                is_image: true,
-            });
-        }
+        let stored = match lxmf::save_attachment_in(files_dir, &file_name, image_data) {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(
+                    error_kind = ?error.kind(),
+                    size = image_data.len(),
+                    kind = "image",
+                    "failed to persist inbound attachment"
+                );
+                return Some(ExtractedAttachment {
+                    file_name,
+                    stored_name: db::ATTACHMENT_UNAVAILABLE_STORED_NAME.to_string(),
+                    is_image: true,
+                });
+            }
+        };
+        tracing::info!(
+            size = image_data.len(),
+            kind = "image",
+            "extracted inbound attachment"
+        );
+        return Some(ExtractedAttachment {
+            file_name,
+            stored_name: stored,
+            is_image: true,
+        });
     }
 
     // A declared but malformed field is user media, not service traffic.
@@ -4227,7 +4461,7 @@ fn extracted_audio_json(audio: &ExtractedAudio) -> Value {
 /// authentication, policy and deduplication gates. Media errors are local to
 /// this optional field: they never reject the enclosing message or its proof.
 fn extract_and_save_audio(
-    state: &AppState,
+    files_dir: &std::path::Path,
     msg: &lxmf_core::message_api::LxMessage,
 ) -> Option<ExtractedAudio> {
     let audio = match msg.audio_field() {
@@ -4276,10 +4510,7 @@ fn extract_and_save_audio(
     } else {
         format!("Audio message {mode:02x}.bin")
     };
-    let stored_name = state.lxmf.lock().ok().and_then(|mut lxmf| {
-        lxmf.as_mut()
-            .and_then(|mgr| mgr.save_attachment(&file_name, audio.bytes).ok())
-    });
+    let stored_name = lxmf::save_attachment_in(files_dir, &file_name, audio.bytes).ok();
     match stored_name {
         Some(stored_name) => {
             tracing::info!(
@@ -4305,18 +4536,10 @@ fn extract_and_save_audio(
 }
 
 fn remove_inbound_media_after_persistence_failure(
-    state: &AppState,
+    files_dir: &std::path::Path,
     attachment: Option<&ExtractedAttachment>,
     audio: Option<&ExtractedAudio>,
 ) {
-    let files_dir = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|lxmf| lxmf.as_ref().map(lxmf::LxmfManager::files_dir));
-    let Some(files_dir) = files_dir else {
-        return;
-    };
     let stored_names = attachment
         .map(|attachment| attachment.stored_name.as_str())
         .into_iter()
@@ -4364,6 +4587,7 @@ fn inbound_reply_fields(ext: Option<&lxmf::RatspeakChatExtension>) -> (String, S
 
 async fn apply_inbound_ratspeak_reaction(
     state: &AppState,
+    fence: &InboundFence,
     source_hash: &str,
     identity_id: &str,
     target: &str,
@@ -4397,13 +4621,17 @@ async fn apply_inbound_ratspeak_reaction(
     .await
     .unwrap_or_default();
 
-    state.emit_to_all(
-        "reaction_update",
-        json!({
-            "message_id": target,
-            "reactions": reactions,
-        }),
-    );
+    fence
+        .publish(state, || {
+            state.emit_to_all(
+                "reaction_update",
+                json!({
+                    "message_id": target,
+                    "reactions": reactions,
+                }),
+            );
+        })
+        .await;
 }
 
 /// Build a signed response without erasing the durable ordering deferral.
@@ -4701,6 +4929,7 @@ async fn handle_inbound_lxmf(
             &lxmf_data,
             InboundLxmfSource::Opportunistic { raw },
             activity_origin,
+            shutdown.clone(),
         )
         .await;
     }
@@ -4776,7 +5005,11 @@ fn lrgp_sender_authenticated(
 /// Stamp PoW gate (T1-9): applies to every inbound source. Runs after
 /// signature validation and before the delivery-proof ACK; ticket-store
 /// entries bypass via `validate_stamp_with_tickets`.
-fn inbound_stamp_allowed(state: &AppState, msg: &lxmf_core::message_api::LxMessage) -> bool {
+fn inbound_stamp_allowed(
+    state: &AppState,
+    identity_id: &str,
+    msg: &lxmf_core::message_api::LxMessage,
+) -> bool {
     if !state
         .enforce_stamps
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -4793,21 +5026,26 @@ fn inbound_stamp_allowed(state: &AppState, msg: &lxmf_core::message_api::LxMessa
         msg.recipient_stamp().map(|stamp| stamp.as_bytes()),
         Some(msg.message_id()),
     ) {
-        (Some(stamp), Some(message_id)) => state
-            .lxmf
-            .lock()
-            .ok()
-            .and_then(|l| {
-                l.as_ref().map(|mgr| {
-                    mgr.router.validate_stamp_with_tickets(
-                        &message_id,
-                        stamp,
-                        required_cost,
-                        &msg.source_hash(),
-                    )
-                })
+        (Some(stamp), Some(message_id)) => with_receiver(state, identity_id, |mgr| {
+            mgr.router.validate_stamp_with_tickets(
+                &message_id,
+                stamp,
+                required_cost,
+                &msg.source_hash(),
+            )
+        })
+        // Once the receiver's manager is gone its tickets are too, but proof
+        // of work still counts: a switch alone never loses a message.
+        .unwrap_or_else(|| {
+            <&[u8; 32]>::try_from(stamp).is_ok_and(|stamp| {
+                lxmf_core::stamper::validate_stamp(
+                    &message_id,
+                    stamp,
+                    required_cost,
+                    lxmf_core::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS,
+                )
             })
-            .unwrap_or(false),
+        }),
         _ => false,
     };
     if !stamp_ok {
@@ -4874,6 +5112,7 @@ async fn handle_decrypted_lxmf_from_origin(
     data: Vec<u8>,
     source: InboundLxmfSource,
     activity_origin: ActivityRequestFence,
+    session: rns_runtime::lifecycle::ShutdownSignal,
 ) {
     if let InboundLxmfSource::Link { link_id, .. } = &source {
         let limit = state.lxmf_delivery_limit_bytes();
@@ -4911,12 +5150,18 @@ async fn handle_decrypted_lxmf_from_origin(
             return;
         }
     };
-    process_inbound_lxmf(state, msg, &data, source, activity_origin).await;
+    process_inbound_lxmf(state, msg, &data, source, activity_origin, session).await;
 }
 
 #[cfg(test)]
 async fn handle_decrypted_lxmf(state: &Arc<AppState>, data: Vec<u8>, source: InboundLxmfSource) {
-    handle_decrypted_lxmf_from_origin(state, data, source, state.activity_request_fence()).await;
+    let session = state
+        .session_shutdown
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    handle_decrypted_lxmf_from_origin(state, data, source, state.activity_request_fence(), session)
+        .await;
 }
 
 /// Presentation policy, not LXMF validity. Field presence preserves malformed
@@ -4935,6 +5180,157 @@ fn inbound_has_chat_content(
         || matches!(extension, Some(lxmf::RatspeakChatExtension::Reply { .. }))
 }
 
+/// The local identity a message is for: the live one when its processing
+/// began. What the message changes stays with it even when a switch replaces
+/// the live identity meanwhile, and its manager steps run only while it is
+/// still live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InboundReceiver {
+    identity_id: String,
+    lxmf_id: String,
+}
+
+/// What the receiver's manager knew of the sender when processing began.
+struct InboundSender {
+    identity: Option<[u8; 16]>,
+    public_key: Option<[u8; 64]>,
+    transport: Option<tokio::sync::mpsc::Sender<rns_transport::messages::TransportMessage>>,
+}
+
+impl InboundReceiver {
+    /// The live identity, when it owns `msg`'s destination and still runs in
+    /// `fence`'s sessions. A runtime session ends before its manager goes, so
+    /// the manager seen under its lock is that session's.
+    fn live(
+        state: &AppState,
+        msg: &lxmf_core::message_api::LxMessage,
+        fence: &InboundFence,
+    ) -> Option<(Self, InboundSender)> {
+        let lxmf = state.lxmf.lock().ok()?;
+        let mgr = lxmf.as_ref().filter(|mgr| {
+            mgr.lxmf_dest_hash == msg.destination_hash() && fence.is_current(state)
+        })?;
+        let source = msg.source_hash();
+        Some((
+            Self {
+                identity_id: mgr.identity_hash.clone(),
+                lxmf_id: mgr.lxmf_hash.clone(),
+            },
+            InboundSender {
+                identity: mgr.recall_identity_hash(&source),
+                public_key: mgr.inbound_source_public_key(&source),
+                transport: mgr.router.transport_tx.clone(),
+            },
+        ))
+    }
+}
+
+/// Runs `f` on the live manager only while it is `identity_id`'s.
+pub(crate) fn with_receiver<T>(
+    state: &AppState,
+    identity_id: &str,
+    f: impl FnOnce(&mut lxmf::LxmfManager) -> T,
+) -> Option<T> {
+    let mut lxmf = state.lxmf.lock().ok()?;
+    let mgr = lxmf
+        .as_mut()
+        .filter(|mgr| mgr.identity_hash == identity_id)?;
+    Some(f(mgr))
+}
+
+/// The identity session a message began in and the runtime session it came
+/// through. Nothing it shows reaches a window once either has ended.
+#[derive(Clone)]
+struct InboundFence {
+    generation: u64,
+    session: rns_runtime::lifecycle::ShutdownSignal,
+}
+
+impl InboundFence {
+    fn new(
+        activity_origin: ActivityRequestFence,
+        session: rns_runtime::lifecycle::ShutdownSignal,
+    ) -> Self {
+        Self {
+            generation: activity_origin.identity_session_generation(),
+            session,
+        }
+    }
+
+    fn is_current(&self, state: &AppState) -> bool {
+        !self.session.is_triggered()
+            && state.current_identity_session_generation() == self.generation
+    }
+
+    /// Runs `publish` under the routine lock while both sessions are current,
+    /// so no transition lands between the check and what it emits.
+    async fn publish(&self, state: &AppState, publish: impl FnOnce()) {
+        let _lifecycle = state.identity_switch_lock.lock_routine().await;
+        if self.is_current(state) {
+            publish();
+        }
+    }
+}
+
+/// A stored message's sender label, the lists it changed, and whether its row
+/// was still there. Read off the lifecycle lock, after the list revision was
+/// taken: only a bulk delete moves it, and only then is the row read again,
+/// under the lock (`inbound_message_stored`).
+pub(crate) struct InboundLists {
+    pub(crate) label: String,
+    pub(crate) contacts: Vec<Value>,
+    pub(crate) unread: i64,
+    pub(crate) stored: bool,
+}
+
+pub(crate) async fn read_inbound_lists(
+    state: &AppState,
+    source_hash: &str,
+    identity_id: &str,
+    msg_id: &str,
+) -> Option<InboundLists> {
+    let source = source_hash.to_string();
+    let identity = identity_id.to_string();
+    let msg_id = msg_id.to_string();
+    db::spawn_db(state.db.clone(), move |p| InboundLists {
+        label: contact_label_from_db(&p, &source, &identity),
+        contacts: contact_list_payload(db::get_all_contacts(&p, &identity)),
+        unread: db::get_all_unread_counts(&p, &identity).values().sum(),
+        stored: db::message_exists_for_identity(&p, &msg_id, &identity),
+    })
+    .await
+    .ok()
+}
+
+pub(crate) fn contact_list_payload(contacts: Vec<Value>) -> Vec<Value> {
+    contacts
+        .into_iter()
+        .map(|c| {
+            json!({
+                "hash": c.get("dest_hash"),
+                "display_name": c.get("display_name"),
+                "trust": c.get("trust"),
+                "notes": c.get("notes"),
+                "first_seen": c.get("first_seen"),
+                "last_seen": c.get("last_seen"),
+                "services": c.get("services"),
+            })
+        })
+        .collect()
+}
+
+/// Whether `msg_id` is still stored: a bulk delete that committed after the
+/// lists were read removed it, and it must not reach a window after that.
+async fn inbound_message_stored(state: &AppState, msg_id: &str, identity_id: &str) -> bool {
+    let msg_id = msg_id.to_string();
+    let identity_id = identity_id.to_string();
+    db::spawn_db(state.db.clone(), move |p| {
+        db::message_exists_for_identity(&p, &msg_id, &identity_id)
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// The one inbound LXMF pipeline. `fallback_id_material` is the unpacked
 /// wire material; its hash is the msg-id fallback when the message carries
 /// no hash — deterministic across sender retries so dedupe still works
@@ -4946,10 +5342,22 @@ async fn process_inbound_lxmf(
     fallback_id_material: &[u8],
     source: InboundLxmfSource,
     activity_origin: ActivityRequestFence,
+    session: rns_runtime::lifecycle::ShutdownSignal,
 ) {
     let source_hash = hex::encode(msg.source_hash());
     let dest_hash = hex::encode(msg.destination_hash());
     let inbound_method = source.activity_method();
+    let fence = InboundFence::new(activity_origin, session);
+    // Link and propagated deliveries name their destination only inside the
+    // message; one for no live local identity is dropped.
+    let Some((receiver, sender)) = InboundReceiver::live(state, &msg, &fence) else {
+        tracing::warn!(
+            reason = "not_for_us",
+            source = source.label(),
+            "inbound LXMF for no live local identity — dropping"
+        );
+        return;
+    };
 
     tracing::info!(
         from = %short_id(&source_hash),
@@ -4957,30 +5365,12 @@ async fn process_inbound_lxmf(
         source = source.label(),
         "inbound LXMF message received"
     );
-    let (source_identity, blackhole_tx) = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|l| {
-            l.as_ref().map(|mgr| {
-                (
-                    mgr.recall_identity_hash(&msg.source_hash()),
-                    mgr.router.transport_tx.clone(),
-                )
-            })
-        })
-        .unwrap_or((None, None));
-    if inbound_source_blackholed(source_identity, blackhole_tx).await {
+    if inbound_source_blackholed(sender.identity, sender.transport).await {
         tracing::debug!(from = %short_id(&source_hash), "Dropping LXM from blackholed identity");
         return;
     }
 
-    let source_key = state.lxmf.lock().ok().and_then(|manager| {
-        manager
-            .as_ref()
-            .and_then(|manager| manager.inbound_source_public_key(&msg.source_hash()))
-    });
-    let verification = source_key.as_ref().map(|key| msg.verify(key));
+    let verification = sender.public_key.as_ref().map(|key| msg.verify(key));
     let sig_valid = verification.as_ref().map(Result::is_ok);
     match sig_valid {
         Some(true) => tracing::debug!("inbound signature validated"),
@@ -4991,14 +5381,14 @@ async fn process_inbound_lxmf(
         None => tracing::debug!("sender unknown — signature not validated"),
     }
 
-    if !inbound_stamp_allowed(state, &msg) {
+    if !inbound_stamp_allowed(state, &receiver.identity_id, &msg) {
         return;
     }
 
     if let Some(Ok(verified)) = verification.as_ref()
-        && let Ok(mut lxmf) = state.lxmf.lock()
-        && let Some(mgr) = lxmf.as_mut()
-        && mgr.router.learn_ticket_from_inbound(verified)
+        && with_receiver(state, &receiver.identity_id, |mgr| {
+            mgr.router.learn_ticket_from_inbound(verified)
+        }) == Some(true)
     {
         tracing::debug!(
             from = %short_id(&hex::encode(msg.source_hash())),
@@ -5007,14 +5397,15 @@ async fn process_inbound_lxmf(
     }
 
     // Opportunistic ACK; runs before the blocked check on purpose so a
-    // blocked sender doesn't learn anything from a missing proof.
+    // blocked sender doesn't learn anything from a missing proof. Only the
+    // live receiver proves; a sender without a proof sends again.
     if let InboundLxmfSource::Opportunistic { ref raw } = source {
-        let proof_and_tx = state.lxmf.lock().ok().and_then(|l| {
-            let mgr = l.as_ref()?;
+        let proof_and_tx = with_receiver(state, &receiver.identity_id, |mgr| {
             let proof = mgr.create_delivery_proof(raw)?;
             let tx = mgr.router.transport_tx.clone()?;
             Some((proof, tx))
-        });
+        })
+        .flatten();
         if let Some((proof_raw, tx, proof_hdr)) = proof_and_tx.and_then(|(proof_raw, tx)| {
             rns_wire::header::PacketHeader::unpack(&proof_raw)
                 .ok()
@@ -5031,23 +5422,7 @@ async fn process_inbound_lxmf(
         }
     }
 
-    // Active identity comes from the running LXMF manager for every source
-    // (the old opportunistic path re-read the DB; the manager IS the active
-    // identity and inbound traffic only exists while it runs).
-    let (identity_id, lxmf_id) = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|l| {
-            l.as_ref()
-                .map(|m| (m.identity_hash.clone(), m.lxmf_hash.clone()))
-        })
-        .unwrap_or_default();
-    if identity_id.is_empty() {
-        tracing::warn!("No active LXMF identity — dropping inbound message");
-        return;
-    }
-
+    let identity_id = receiver.identity_id.clone();
     let msg_id = hex::encode(msg.message_id());
 
     // Senders retry on missing proofs; duplicates are scoped to the local
@@ -5083,26 +5458,18 @@ async fn process_inbound_lxmf(
         ..
     } = source
     {
-        let local_destination_matches = hex::decode(&lxmf_id)
-            .ok()
-            .and_then(|bytes| bytes.try_into().ok())
-            .is_some_and(|local_dest: [u8; 16]| local_dest == msg.destination_hash());
-        if local_destination_matches {
-            if let Ok(mut lxmf) = state.lxmf.lock()
-                && let Some(mgr) = lxmf.as_mut()
-            {
-                mgr.note_pending_direct_backchannel(msg.source_hash(), link_id);
-            }
-            tracing::debug!(
-                from = %short_id(&source_hash),
-                link_id = %short_id(&hex::encode(link_id)),
-                "Direct LXMF payload received; waiting for LINKIDENTIFY before backchannel reuse"
-            );
-        }
+        with_receiver(state, &identity_id, |mgr| {
+            mgr.note_pending_direct_backchannel(msg.source_hash(), link_id);
+        });
+        tracing::debug!(
+            from = %short_id(&source_hash),
+            link_id = %short_id(&hex::encode(link_id)),
+            "Direct LXMF payload received; waiting for LINKIDENTIFY before backchannel reuse"
+        );
     }
 
     if source.marks_sender_seen() {
-        touch_peer_last_heard(state, &source_hash).await;
+        touch_peer_last_heard(state, &fence, &identity_id, &source_hash).await;
     }
 
     let chat_extension = lxmf::decode_ratspeak_chat_extension(&msg);
@@ -5112,8 +5479,16 @@ async fn process_inbound_lxmf(
         action,
     }) = chat_extension.as_ref()
     {
-        apply_inbound_ratspeak_reaction(state, &source_hash, &identity_id, target, emoji, action)
-            .await;
+        apply_inbound_ratspeak_reaction(
+            state,
+            &fence,
+            &source_hash,
+            &identity_id,
+            target,
+            emoji,
+            action,
+        )
+        .await;
         return;
     }
 
@@ -5123,15 +5498,19 @@ async fn process_inbound_lxmf(
     if !matches!(
         chat_extension,
         Some(lxmf::RatspeakChatExtension::Reply { .. })
-    ) && try_handle_inbound_lrgp(
+    ) && let Some(mut outcome) = try_handle_inbound_lrgp(
         state,
         &msg,
         &source_hash,
-        &lxmf_id,
+        &receiver,
         lrgp_sender_authenticated,
     )
     .await
     {
+        // Published once its game transaction is released, in identity-then-
+        // game lock order.
+        outcome.label_alert(state, &identity_id).await;
+        fence.publish(state, || outcome.publish(state)).await;
         return;
     }
 
@@ -5150,82 +5529,81 @@ async fn process_inbound_lxmf(
     }
 
     let received_at = next_chat_observed_timestamp(state, &source_hash, &identity_id).await;
-    let attachment_file = extract_and_save_attachment(state, &msg);
-    let audio_file = extract_and_save_audio(state, &msg);
     let (reply_to_id, reply_to_preview) = inbound_reply_fields(chat_extension.as_ref());
-    {
-        let msg_id_for_save = msg_id.clone();
-        let source_hash_for_save = source_hash.clone();
-        let dest_hash_for_save = dest_hash.clone();
-        let content_for_save = msg.content_text().into_owned();
-        let title_for_save = msg.title_text().into_owned();
-        let timestamp_for_save = received_at;
-        let identity_id_for_save = identity_id.clone();
-        let reply_to_id_for_save = reply_to_id.clone();
-        let reply_to_preview_for_save = reply_to_preview.clone();
-        let audio_for_save = audio_file.clone();
-        let (att_name, att_stored, img_name, img_stored) = match attachment_file.as_ref() {
-            Some(a) if a.is_image => (
-                String::new(),
-                String::new(),
-                a.file_name.clone(),
-                a.stored_name.clone(),
-            ),
-            Some(a) => (
-                a.file_name.clone(),
-                a.stored_name.clone(),
-                String::new(),
-                String::new(),
-            ),
-            None => (String::new(), String::new(), String::new(), String::new()),
-        };
-        let save_result = db::spawn_db(state.db.clone(), move |p| {
-            db::try_save_message_with_audio(
+    let renderer = lxmf::message_renderer(&msg);
+    // The receiver's media is written to its own files with the row that
+    // names it, in one blocking task off the manager lock.
+    let saved = {
+        let config = state.config.clone();
+        let msg_id = msg_id.clone();
+        let source_hash = source_hash.clone();
+        let dest_hash = dest_hash.clone();
+        let identity_id = identity_id.clone();
+        let reply_to_id = reply_to_id.clone();
+        let reply_to_preview = reply_to_preview.clone();
+        db::spawn_db(state.db.clone(), move |p| {
+            let files_dir = config.identity_files_dir(&identity_id);
+            let attachment = extract_and_save_attachment(&files_dir, &msg);
+            let audio = extract_and_save_audio(&files_dir, &msg);
+            let (att_name, att_stored, img_name, img_stored) = match attachment.as_ref() {
+                Some(a) if a.is_image => (
+                    String::new(),
+                    String::new(),
+                    a.file_name.clone(),
+                    a.stored_name.clone(),
+                ),
+                Some(a) => (
+                    a.file_name.clone(),
+                    a.stored_name.clone(),
+                    String::new(),
+                    String::new(),
+                ),
+                None => (String::new(), String::new(), String::new(), String::new()),
+            };
+            let saved = db::try_save_message_with_audio(
                 &p,
-                &msg_id_for_save,
-                &source_hash_for_save,
-                &dest_hash_for_save,
-                &content_for_save,
-                &title_for_save,
-                timestamp_for_save,
+                &msg_id,
+                &source_hash,
+                &dest_hash,
+                &msg.content_text(),
+                &msg.title_text(),
+                received_at,
                 "received",
                 "inbound",
-                &identity_id_for_save,
+                &identity_id,
                 &att_name,
                 &att_stored,
                 &img_name,
                 &img_stored,
-                &reply_to_id_for_save,
-                &reply_to_preview_for_save,
+                &reply_to_id,
+                &reply_to_preview,
                 None,
-                audio_for_save.as_ref().map(|audio| audio.mode),
-                audio_for_save
+                audio.as_ref().map(|audio| audio.mode),
+                audio
                     .as_ref()
                     .map(|audio| audio.stored_name.as_str())
                     .unwrap_or(""),
-            )
-        })
-        .await
-        .expect("db task panicked");
-        if let Err(error) = save_result {
-            tracing::warn!(%error, "failed to persist inbound LXMF message");
-            remove_inbound_media_after_persistence_failure(
-                state,
-                attachment_file.as_ref(),
-                audio_file.as_ref(),
+                renderer,
             );
-            return;
-        }
-    }
-    {
-        // Inbound message un-hides the conversation.
-        let source_hash_for_unhide = source_hash.clone();
-        let identity_id_for_unhide = identity_id.clone();
-        db::spawn_db(state.db.clone(), move |p| {
-            db::unhide_conversation(&p, &source_hash_for_unhide, &identity_id_for_unhide);
+            if saved.is_err() {
+                remove_inbound_media_after_persistence_failure(
+                    &files_dir,
+                    attachment.as_ref(),
+                    audio.as_ref(),
+                );
+            } else {
+                // Inbound message un-hides the conversation.
+                db::unhide_conversation(&p, &source_hash, &identity_id);
+            }
+            (msg, attachment, audio, saved)
         })
         .await
-        .expect("db task panicked");
+        .expect("db task panicked")
+    };
+    let (msg, attachment_file, audio_file, save_result) = saved;
+    if let Err(error) = save_result {
+        tracing::warn!(%error, "failed to persist inbound LXMF message");
+        return;
     }
     // "Accepted" is intentionally recorded only after every authentication,
     // policy, duplicate, extension-routing, and persistence gate succeeds.
@@ -5240,16 +5618,14 @@ async fn process_inbound_lxmf(
             },
         ))
     });
-    notify_inbound_message_if_background(
-        state,
-        &source_hash,
-        &identity_id,
-        &messaging::message_display_text(&msg.title_text(), &msg.content_text()),
-        attachment_file.is_some() || audio_file.is_some(),
-    )
-    .await;
 
-    let source_display_name = contact_label_from_db(&state.db, &source_hash, &identity_id);
+    let revision = state.conversation_list_revision();
+    let lists = read_inbound_lists(state, &source_hash, &identity_id, &msg_id).await;
+
+    let source_display_name = lists.as_ref().map_or_else(
+        || compact_hash_label(&source_hash),
+        |lists| lists.label.clone(),
+    );
 
     // Frontend expects nested `image` / `attachments` matching history rows.
     let mut event_data = json!({
@@ -5264,6 +5640,7 @@ async fn process_inbound_lxmf(
         "direction": "inbound",
         "reply_to_id": reply_to_id,
         "reply_to_preview": reply_to_preview,
+        "renderer": renderer,
     });
     if let Some(ref att) = attachment_file {
         let obj = event_data.as_object_mut().unwrap();
@@ -5282,55 +5659,40 @@ async fn process_inbound_lxmf(
             .unwrap()
             .insert("audio".to_string(), extracted_audio_json(audio));
     }
+
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
+    if !fence.is_current(state) {
+        return;
+    }
+    let current = state.conversation_list_revision() == revision;
+    let stored = match &lists {
+        Some(lists) if current => lists.stored,
+        _ => inbound_message_stored(state, &msg_id, &identity_id).await,
+    };
+    if !stored {
+        return;
+    }
+    notify_inbound_message_if_background(
+        state,
+        &source_hash,
+        &source_display_name,
+        &messaging::message_display_text(&msg.title_text(), &msg.content_text()),
+        renderer,
+        attachment_file.is_some() || audio_file.is_some(),
+    );
     state.emit_to_all("lxmf_message", event_data);
     messaging::broadcast_conversations(Arc::clone(state));
-
-    // Post-emit UI refresh failures only mean stale sidebar counts.
-    let identity_id_for_contacts = identity_id.clone();
-    match db::spawn_db(state.db.clone(), move |p| {
-        db::get_all_contacts(&p, &identity_id_for_contacts)
-    })
-    .await
-    {
-        Ok(contacts) => {
-            let contacts_list: Vec<serde_json::Value> = contacts
-                .into_iter()
-                .map(|c| {
-                    json!({
-                        "hash": c.get("dest_hash"),
-                        "display_name": c.get("display_name"),
-                        "trust": c.get("trust"),
-                        "notes": c.get("notes"),
-                        "first_seen": c.get("first_seen"),
-                        "last_seen": c.get("last_seen"),
-                        "services": c.get("services"),
-                    })
-                })
-                .collect();
-            state.emit_to_all("contacts_update", contacts_list.into());
+    match lists {
+        Some(lists) if current => {
+            state.emit_to_all("contacts_update", lists.contacts.into());
+            state.emit_to_all("unread_total", json!({"count": lists.unread}));
         }
-        Err(_) => tracing::error!(
+        Some(_) => {}
+        // Post-emit UI refresh failures only mean stale sidebar counts.
+        None => tracing::error!(
             reason = "refresh_failed",
-            "contacts refresh after inbound message failed"
+            "list refresh after inbound message failed"
         ),
-    }
-
-    let identity_id_for_counts = identity_id.clone();
-    match db::spawn_db(state.db.clone(), move |p| {
-        db::get_all_unread_counts(&p, &identity_id_for_counts)
-    })
-    .await
-    {
-        Ok(counts) => {
-            let total: i64 = counts.values().sum();
-            state.emit_to_all("unread_total", json!({"count": total}));
-        }
-        Err(_) => {
-            tracing::error!(
-                reason = "refresh_failed",
-                "unread-total refresh after inbound message failed"
-            )
-        }
     }
 }
 
@@ -5565,6 +5927,16 @@ fn record_poll_activity(
             }),
         ),
     });
+}
+
+/// Runs `publish` under the lifecycle lock while `generation` is still the
+/// identity session: what a poll read under one never reaches the next, even
+/// when the next comes up locked and sends no lists of its own.
+async fn publish_in_session(state: &AppState, generation: u64, publish: impl FnOnce()) {
+    let _lifecycle = state.identity_switch_lock.lock_routine().await;
+    if state.current_identity_session_generation() == generation {
+        publish();
+    }
 }
 
 // Always emits, including backgrounded — first paint on resume.
@@ -6058,7 +6430,8 @@ async fn poll_stats_loop(
                     })
                     .await
                     .unwrap_or_default();
-                    emit_peers_batch(&state, &rows);
+                    publish_in_session(&state, poll_generation, || emit_peers_batch(&state, &rows))
+                        .await;
                 }
 
                 // Peers who messaged us before they announced have no real
@@ -6067,6 +6440,8 @@ async fn poll_stats_loop(
                     db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
                         .await
                         .expect("db task panicked")
+                        .ok()
+                        .flatten()
                         .and_then(|id| id.get("hash").and_then(|h| h.as_str()).map(String::from))
                         .unwrap_or_default();
                 if !announce_identity_id.is_empty() {
@@ -6117,7 +6492,10 @@ async fn poll_stats_loop(
                                 })
                             })
                             .collect();
-                        state.emit_to_all("contacts_update", serde_json::json!(contacts_list));
+                        publish_in_session(&state, poll_generation, || {
+                            state.emit_to_all("contacts_update", serde_json::json!(contacts_list))
+                        })
+                        .await;
                     }
                 }
             }
@@ -6761,20 +7139,27 @@ pub(crate) fn emit_peers_batch(state: &AppState, rows: &[db::PeerRow]) {
     state.emit_to_all("peers_updated", json!({ "peers": arr }));
 }
 
-async fn touch_peer_last_heard(state: &AppState, source_hash: &str) {
+async fn touch_peer_last_heard(
+    state: &AppState,
+    fence: &InboundFence,
+    identity_id: &str,
+    source_hash: &str,
+) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
     let hash = source_hash.to_string();
-    let identity_id = helpers::active_identity_id(state);
+    let identity_id = identity_id.to_string();
     let rows = db::spawn_db(state.db.clone(), move |p| {
         db::touch_identity_last_heard(&p, &hash, now);
         db::get_peers_by_hashes(&p, &[hash], &identity_id)
     })
     .await
     .unwrap_or_default();
-    emit_peers_batch(state, &rows);
+    fence
+        .publish(state, || emit_peers_batch(state, &rows))
+        .await;
 }
 
 // Three wire shapes: UTF-8 string, msgpack BIN/STR (NomadNet),
@@ -6803,6 +7188,8 @@ fn extract_name_from_msgpack(value: &rmpv::Value) -> Option<String> {
 }
 
 struct LrgpErrorReply<'a> {
+    /// The receiving identity: only its live manager answers.
+    receiver: &'a str,
     destination: &'a str,
     identity_id: &'a str,
     app_id: &'a str,
@@ -6815,6 +7202,7 @@ struct LrgpErrorReply<'a> {
 
 fn send_lrgp_error_best_effort(state: &AppState, reply: LrgpErrorReply<'_>) {
     let LrgpErrorReply {
+        receiver,
         destination,
         identity_id,
         app_id,
@@ -6859,42 +7247,40 @@ fn send_lrgp_error_best_effort(state: &AppState, reply: LrgpErrorReply<'_>) {
         return;
     };
     let fallback = format!("[LRGP] Action rejected: {message}");
-    let queued = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|mut manager| {
-            manager.as_mut().and_then(|manager| {
-                manager.send_message_with_lrgp_fields_preference(
-                    destination,
-                    &fallback,
-                    &fields,
-                    &state.db,
-                    identity_id,
-                    lxmf::DeliveryPreference::Opportunistic,
-                )
-            })
-        })
-        .is_some();
+    let queued = with_receiver(state, receiver, |manager| {
+        manager.send_message_with_lrgp_fields_preference(
+            destination,
+            &fallback,
+            &fields,
+            &state.db,
+            identity_id,
+            lxmf::DeliveryPreference::Opportunistic,
+        )
+    })
+    .flatten()
+    .is_some();
     if queued {
         state.lxmf_notify.notify_one();
     }
 }
 
-// Returns true if the envelope was LRGP (dispatched); false → fall through.
+// What an LRGP envelope shows once handled; `None` → not LRGP, fall through.
 async fn try_handle_inbound_lrgp(
     state: &AppState,
     msg: &lxmf_core::message_api::LxMessage,
     sender_hash: &str,
-    identity_id: &str,
+    receiver: &InboundReceiver,
     sender_authenticated: bool,
-) -> bool {
+) -> Option<LrgpOutcome> {
+    // Game sessions belong to the receiver's LXMF destination.
+    let identity_id = receiver.lxmf_id.as_str();
+    let mut outcome = LrgpOutcome::default();
     let envelope = match inbound_admission::decode_game(msg, sender_authenticated) {
         Ok(Some(envelope)) => envelope,
-        Ok(None) => return false,
+        Ok(None) => return None,
         Err(reason) => {
             tracing::warn!(?reason, from = %short_id(sender_hash), "Dropping invalid LRGP envelope");
-            return true;
+            return Some(outcome);
         }
     };
     let _game_transaction = Arc::new(state.lrgp_transaction.clone().lock_owned().await);
@@ -6929,7 +7315,7 @@ async fn try_handle_inbound_lrgp(
                 reason = "reencode_failed",
                 "Dropping LRGP envelope that cannot be encoded"
             );
-            return true;
+            return Some(outcome);
         }
     };
     let durable_nonce: [u8; lrgp::protocol::NONCE_BYTES] = envelope
@@ -6951,7 +7337,7 @@ async fn try_handle_inbound_lrgp(
     .unwrap_or(false);
     if replayed_after_restart {
         tracing::debug!(session_id, command, "Dropping durable LRGP replay");
-        return true;
+        return Some(outcome);
     }
 
     // Keep a router snapshot until durable storage commits. The LRGP app
@@ -6969,7 +7355,7 @@ async fn try_handle_inbound_lrgp(
         Ok(lrgp::app_base::IncomingDispatch::Applied(result)) => result,
         Ok(lrgp::app_base::IncomingDispatch::Replay) => {
             tracing::debug!(session_id, command, "Dropping in-process LRGP replay");
-            return true;
+            return Some(outcome);
         }
         Ok(lrgp::app_base::IncomingDispatch::RemoteError(error)) => {
             // Remote protocol errors are accepted LRGP actions even though
@@ -7026,7 +7412,7 @@ async fn try_handle_inbound_lrgp(
                     session = %short_id(&error.session_id),
                     "Remote LRGP error was not surfaced because durable replay state failed"
                 );
-                state.emit_to_all(
+                outcome.emit(
                     "game_action_received",
                     json!({
                         "session_id": error.session_id,
@@ -7037,7 +7423,7 @@ async fn try_handle_inbound_lrgp(
                         "reason": "storage_failed",
                     }),
                 );
-                return true;
+                return Some(outcome);
             } else {
                 let iid = identity_id.to_string();
                 let all = db::spawn_db_with_lease(
@@ -7047,7 +7433,7 @@ async fn try_handle_inbound_lrgp(
                 )
                 .await
                 .unwrap_or_default();
-                state.emit_to_all("all_game_sessions", all.into());
+                outcome.emit("all_game_sessions", all.into());
             }
             tracing::warn!(
                 session = %short_id(&error.session_id),
@@ -7055,7 +7441,7 @@ async fn try_handle_inbound_lrgp(
                 action_kind = %error_payload["ref"].as_str().unwrap_or("action"),
                 "Remote LRGP peer reported a protocol error"
             );
-            state.emit_to_all(
+            outcome.emit(
                 "game_protocol_error",
                 json!({
                     "session_id": error.session_id,
@@ -7066,7 +7452,7 @@ async fn try_handle_inbound_lrgp(
                     "ref": error_payload["ref"],
                 }),
             );
-            state.emit_to_all(
+            outcome.emit(
                 "game_action_received",
                 json!({
                     "session_id": session_id,
@@ -7077,7 +7463,7 @@ async fn try_handle_inbound_lrgp(
                     "remote_error": true,
                 }),
             );
-            return true;
+            return Some(outcome);
         }
         Err(error) => {
             tracing::warn!(
@@ -7115,6 +7501,7 @@ async fn try_handle_inbound_lrgp(
             send_lrgp_error_best_effort(
                 state,
                 LrgpErrorReply {
+                    receiver: &receiver.identity_id,
                     destination: sender_hash,
                     identity_id,
                     app_id: &app_id,
@@ -7126,7 +7513,7 @@ async fn try_handle_inbound_lrgp(
                 },
             );
             // Envelope parsed as LRGP; do not fall through to chat.
-            return true;
+            return Some(outcome);
         }
     };
 
@@ -7140,7 +7527,7 @@ async fn try_handle_inbound_lrgp(
             reason = "empty_session_id",
             "dropping inbound LRGP envelope with empty session_id"
         );
-        return true;
+        return Some(outcome);
     }
 
     tracing::info!(
@@ -7173,6 +7560,7 @@ async fn try_handle_inbound_lrgp(
         send_lrgp_error_best_effort(
             state,
             LrgpErrorReply {
+                receiver: &receiver.identity_id,
                 destination: sender_hash,
                 identity_id,
                 app_id: &app_id,
@@ -7183,7 +7571,7 @@ async fn try_handle_inbound_lrgp(
                 message,
             },
         );
-        state.emit_to_all(
+        outcome.emit(
             "game_action_received",
             json!({
                 "session_id": session_id,
@@ -7194,7 +7582,7 @@ async fn try_handle_inbound_lrgp(
                 "error": error,
             }),
         );
-        return true;
+        return Some(outcome);
     }
 
     let payload_json = result
@@ -7263,7 +7651,7 @@ async fn try_handle_inbound_lrgp(
             command,
             "Rejected LRGP action because durable persistence did not commit"
         );
-        state.emit_to_all(
+        outcome.emit(
             "game_action_received",
             json!({
                 "session_id": session_id,
@@ -7274,19 +7662,19 @@ async fn try_handle_inbound_lrgp(
                 "reason": "storage_failed",
             }),
         );
-        return true;
+        return Some(outcome);
     };
 
-    notify_game_if_background(
-        state,
-        sender_hash,
-        &session_id,
-        &app_id,
-        &command,
-        !had_session,
-    );
+    outcome.alert = Some(GameAlert {
+        label: String::new(),
+        sender_hash: sender_hash.to_string(),
+        session_id: session_id.clone(),
+        app_id: app_id.clone(),
+        command: command.clone(),
+        is_new_session: !had_session,
+    });
 
-    state.emit_to_all(
+    outcome.emit(
         "active_games",
         json!({"hash": sender_hash, "games": sessions}),
     );
@@ -7297,11 +7685,11 @@ async fn try_handle_inbound_lrgp(
         total_sessions = all.len(),
         "emitting all_game_sessions + active_games after inbound"
     );
-    state.emit_to_all("all_game_sessions", all.into());
+    outcome.emit("all_game_sessions", all.into());
 
     // Positive per-action signal so the frontend can force-redraw the active
     // board even if the bulk `all_game_sessions` payload looks identical.
-    state.emit_to_all(
+    outcome.emit(
         "game_action_received",
         json!({
             "session_id": session_id,
@@ -7312,7 +7700,7 @@ async fn try_handle_inbound_lrgp(
         }),
     );
 
-    true
+    Some(outcome)
 }
 
 #[cfg(test)]
@@ -8526,12 +8914,14 @@ mod inbound_pipeline_tests {
 
         let opp_data = packed_inbound(dest, [0xE3; 16], "via opportunistic");
         let msg = lxmf_core::message_api::LxMessage::unpack(&opp_data).unwrap();
+        let session = state.session_shutdown.read().unwrap().clone();
         process_inbound_lxmf(
             &state,
             msg,
             &opp_data,
             InboundLxmfSource::Opportunistic { raw: Bytes::new() },
             state.activity_request_fence(),
+            session,
         )
         .await;
 
@@ -8809,6 +9199,276 @@ mod identity_material_tests {
 }
 
 #[cfg(test)]
+mod identity_session_tests {
+    use super::*;
+    use rns_link::clock::ContinuousInstant;
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<(String, Value)>>);
+
+    impl ratspeak_core::Emitter for Recorder {
+        fn try_emit(&self, event: &str, payload: Value) -> Result<(), ratspeak_core::EmitError> {
+            self.0.lock().unwrap().push((event.to_owned(), payload));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct Withdrawals(std::sync::atomic::AtomicUsize);
+
+    impl ratspeak_core::NativeNotifier for Withdrawals {
+        fn notify(&self, _notification: ratspeak_core::NativeNotification) {}
+        fn withdraw_all(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct Session {
+        _root: tempfile::TempDir,
+        state: Arc<AppState>,
+        hash: String,
+    }
+
+    /// An active identity loaded as `kind`, with that protection on disk
+    /// unless it is `plain`, and its auto-lock armed.
+    fn armed_session(
+        kind: &'static str,
+        emitter: Arc<dyn ratspeak_core::Emitter>,
+        notifier: Arc<dyn ratspeak_core::NativeNotifier>,
+    ) -> (Session, state::AutoLock) {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = root.path().to_path_buf();
+        lxmf::initialize_storage_namespace(&data_root).unwrap();
+        let config = crate::config::DashboardConfig {
+            data_root: data_root.clone(),
+            data_dir: data_root.join(".ratspeak"),
+            rns_config_dir: data_root.join("rns"),
+            rns_config_dir_overridden: true,
+            max_log_entries: 20,
+        };
+        let pool = db::init_pool(&data_root).unwrap();
+        db::init_schema(&pool).unwrap();
+        let state = Arc::new(AppState::new(config, pool, emitter, notifier));
+        let identity = rns_identity::identity::Identity::new();
+        let hash = hex::encode(identity.hash);
+        if kind == "passcode" {
+            let generation = state.current_identity_session_generation();
+            assert!(state.retain_unlocked_identity(identity.clone(), &hash, generation));
+        }
+        let manager =
+            lxmf::LxmfManager::from_loaded_identity(&data_root, identity, kind == "hardware")
+                .unwrap();
+        let profile = state.config.data_dir.join("identities").join(&hash);
+        match kind {
+            "hardware" => std::fs::write(profile.join("identity.hwid"), b"{}").unwrap(),
+            "passcode" => std::fs::write(profile.join("identity.enc"), b"{}").unwrap(),
+            _ => {}
+        }
+        db::save_identity(&state.db, &hash, &manager.lxmf_hash, "A", "A");
+        db::set_active_identity(&state.db, &hash).unwrap();
+        state.set_lxmf(manager);
+        let lock_kind = if kind == "hardware" {
+            "hardware"
+        } else {
+            "passcode"
+        };
+        state.arm_auto_lock(&hash, lock_kind, Duration::from_secs(60), false);
+        let lock = state.auto_lock.lock().unwrap().clone().unwrap();
+        (
+            Session {
+                _root: root,
+                state,
+                hash,
+            },
+            lock,
+        )
+    }
+
+    fn last_lock_event(recorder: &Recorder) -> Value {
+        let events = recorder.0.lock().unwrap();
+        events
+            .iter()
+            .rev()
+            .find(|(event, _)| event == "hardware_locked")
+            .map(|(_, payload)| payload.clone())
+            .expect("no lock event")
+    }
+
+    // Locking ends the session: nothing begun under it may land behind the
+    // lock, and its alerts go. A passcode identity locks as a hardware one
+    // does, and its unlock goes with the session. The lock is private, so
+    // this stays in the library's tests.
+    #[tokio::test]
+    async fn auto_lock_locks_either_kind_and_starts_a_new_identity_session() {
+        let _hosts = crate::hosted_propagation::get_tests::GET_TEST_LOCK
+            .lock()
+            .await;
+        for kind in ["hardware", "passcode"] {
+            let recorder = Arc::new(Recorder::default());
+            let withdrawals = Arc::new(Withdrawals::default());
+            let (session, lock) = armed_session(kind, recorder.clone(), withdrawals.clone());
+            let (state, hash) = (&session.state, &session.hash);
+            let generation = state.current_identity_session_generation();
+
+            lock_protected_session(Arc::clone(state), lock).await;
+
+            assert_eq!(
+                state.hw_locked_hash().as_deref(),
+                Some(hash.as_str()),
+                "{kind}"
+            );
+            assert!(
+                state.current_identity_session_generation() > generation,
+                "{kind}"
+            );
+            assert!(
+                state
+                    .network_session
+                    .read()
+                    .unwrap()
+                    .retained_identity
+                    .is_none(),
+                "{kind}: the unlock outlived the lock"
+            );
+            assert!(state.auto_lock.lock().unwrap().is_none(), "{kind}");
+            assert_eq!(
+                withdrawals.0.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{kind}: the locked identity's alerts stayed"
+            );
+            let locked = last_lock_event(&recorder);
+            assert_eq!(locked["kind"], kind);
+            assert_eq!(locked["reason"], "timeout");
+        }
+    }
+
+    /// Records, with each event, which identity the state held locked then.
+    #[derive(Default)]
+    struct LockWitness {
+        state: std::sync::OnceLock<std::sync::Weak<AppState>>,
+        seen: std::sync::Mutex<Vec<(String, Value, Option<String>)>>,
+    }
+
+    impl ratspeak_core::Emitter for LockWitness {
+        fn try_emit(&self, event: &str, payload: Value) -> Result<(), ratspeak_core::EmitError> {
+            let locked = self
+                .state
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .and_then(|state| state.hw_locked_hash());
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).push((
+                event.to_owned(),
+                payload,
+                locked,
+            ));
+            Ok(())
+        }
+    }
+
+    // A lock refuses the identity's data from its start: the teardown, which
+    // waits on the network, never runs with the identity still open.
+    #[tokio::test]
+    async fn an_auto_lock_refuses_the_identitys_data_before_its_teardown() {
+        let _hosts = crate::hosted_propagation::get_tests::GET_TEST_LOCK
+            .lock()
+            .await;
+        let witness = Arc::new(LockWitness::default());
+        let (session, lock) = armed_session(
+            "passcode",
+            witness.clone(),
+            Arc::new(Withdrawals::default()),
+        );
+        witness.state.set(Arc::downgrade(&session.state)).unwrap();
+
+        lock_protected_session(Arc::clone(&session.state), lock).await;
+
+        let seen = witness.seen.lock().unwrap();
+        let (_, _, locked) = seen
+            .iter()
+            .find(|(event, payload, _)| event == "system_status" && payload["status"] == "stopping")
+            .expect("no teardown");
+        assert_eq!(locked.as_deref(), Some(session.hash.as_str()));
+    }
+
+    // The network stopping leaves the identity active, and it still locks.
+    #[tokio::test]
+    async fn an_auto_lock_locks_an_active_identity_whose_network_stopped() {
+        let _hosts = crate::hosted_propagation::get_tests::GET_TEST_LOCK
+            .lock()
+            .await;
+        let recorder = Arc::new(Recorder::default());
+        let (session, lock) = armed_session(
+            "passcode",
+            recorder.clone(),
+            Arc::new(Withdrawals::default()),
+        );
+        let state = &session.state;
+        shutdown_rns_lxmf(state).await.unwrap();
+        assert!(state.lxmf.lock().unwrap().is_none());
+
+        lock_protected_session(Arc::clone(state), lock).await;
+
+        assert_eq!(
+            state.hw_locked_hash().as_deref(),
+            Some(session.hash.as_str())
+        );
+        assert!(
+            state
+                .network_session
+                .read()
+                .unwrap()
+                .retained_identity
+                .is_none(),
+            "the unlock outlived the lock"
+        );
+        assert_eq!(last_lock_event(&recorder)["reason"], "timeout");
+    }
+
+    // An identity that lost its passcode before its lock fell due stays open,
+    // and its lock goes.
+    #[tokio::test]
+    async fn an_auto_lock_never_locks_an_identity_without_a_passcode_or_key() {
+        let (session, lock) = armed_session(
+            "plain",
+            Arc::new(Recorder::default()),
+            Arc::new(Withdrawals::default()),
+        );
+        let state = &session.state;
+
+        lock_protected_session(Arc::clone(state), lock).await;
+
+        assert!(state.hw_locked_hash().is_none());
+        assert!(state.lxmf.lock().unwrap().is_some(), "its session ended");
+        assert!(
+            state.auto_lock.lock().unwrap().is_none(),
+            "its lock stayed armed"
+        );
+    }
+
+    // The deadline runs from the unlock on the suspend-counting clock, so time
+    // the system slept counts toward it.
+    #[test]
+    fn an_auto_lock_falls_due_once_its_timeout_has_passed_since_the_unlock() {
+        let unlocked_at = ContinuousInstant::now();
+        let lock = |timeout: u64| state::AutoLock {
+            hash: "ab".repeat(16),
+            kind: "passcode",
+            unlocked_at,
+            timeout: Duration::from_secs(timeout),
+            generation: 0,
+        };
+        let quarter_hour = lock(15 * 60);
+        assert!(!quarter_hour.due_at(unlocked_at + Duration::from_secs(15 * 60 - 1)));
+        assert!(quarter_hour.due_at(unlocked_at + Duration::from_secs(15 * 60)));
+        // A lid closed for eight hours.
+        assert!(quarter_hour.due_at(unlocked_at + Duration::from_secs(8 * 3600)));
+        assert!(!quarter_hour.due_at(unlocked_at.checked_sub(Duration::from_secs(1)).unwrap()));
+        // Off.
+        assert!(!lock(0).due_at(unlocked_at + Duration::from_secs(8 * 3600)));
+    }
+}
+
+#[cfg(test)]
 mod transport_startup_tests {
     use super::*;
     use crate::config::DashboardConfig;
@@ -8956,6 +9616,7 @@ mod notification_tests {
         fn notify(&self, notification: NativeNotification) {
             self.notifications.lock().unwrap().push(notification);
         }
+        fn withdraw_all(&self) {}
     }
 
     fn make_state(notifier: Arc<RecordingNotifier>) -> AppState {
@@ -8975,20 +9636,155 @@ mod notification_tests {
         AppState::new(config, pool, Arc::new(ratspeak_core::NoopEmitter), notifier)
     }
 
+    fn announce_state() -> Arc<AppState> {
+        let state = Arc::new(make_state(Arc::new(RecordingNotifier::default())));
+        let unique = TEMP_NOTIFICATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!(
+            "ratspeak-announce-fence-test-{}-{unique}",
+            std::process::id()
+        ));
+        crate::lxmf::initialize_storage_namespace(&tmp).unwrap();
+        *state.lxmf.lock().unwrap() =
+            Some(crate::lxmf::LxmfManager::load_or_create(&tmp, None, None).unwrap());
+        state
+    }
+
+    fn manual_leadership(state: &AppState) -> crate::announce::AnnounceLeadership {
+        crate::announce::AnnounceLeadership {
+            correlation_id: 1,
+            activity_correlation_id: crate::activity::CorrelationId::random(),
+            revisions: state.announce_semantic_revision(),
+            origins: vec![crate::announce::AnnounceOrigin::Manual],
+        }
+    }
+
+    // A burst past its fence fails later here for want of a transport, and
+    // records its result; a stale one is suppressed without a record.
+    #[tokio::test]
+    async fn only_a_transition_suppresses_an_announce_and_sending_suppresses_none() {
+        let state = announce_state();
+        let origin = state.activity_request_fence();
+        drop(crate::propagation_recovery::begin_download_deletion(Arc::clone(&state)).await);
+        let bystander = state.activity_request_fence();
+        let burst = execute_announce_burst(&state, false, origin, &manual_leadership(&state)).await;
+        assert!(
+            burst.activity_recorded,
+            "routine work suppressed the announce"
+        );
+        assert!(
+            state.is_current_activity_origin_fence(bystander),
+            "sending the announce invalidated another request"
+        );
+
+        let state = announce_state();
+        let origin = state.activity_request_fence();
+        drop(state.identity_switch_lock.lock().await);
+        let burst = execute_announce_burst(&state, false, origin, &manual_leadership(&state)).await;
+        assert!(
+            !burst.activity_recorded,
+            "a transition must suppress the announce"
+        );
+    }
+
+    // A burst that really sends: its dispatch waits outside the lifecycle
+    // lock, so routine work goes on meanwhile, and it invalidates no request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sending_burst_waits_for_dispatch_outside_the_lock_and_invalidates_nothing() {
+        use rns_transport::messages::{OutboundDispatchResult, TransportMessage};
+        let state = announce_state();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("config"),
+            "[reticulum]\nshare_instance = No\nenable_transport = No\n[interfaces]\n",
+        )
+        .unwrap();
+        let mut network = crate::rns::RnsManager::init(
+            root.path().to_str().unwrap(),
+            Some(root.path().join("cache")),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .await
+        .unwrap();
+        let (tx, mut packets) = tokio::sync::mpsc::channel(4);
+        network.handle.transport_tx = tx;
+        let network_shutdown = network.handle.shutdown.clone();
+        *state.rns.write().unwrap() = Some(network);
+
+        let origin = state.activity_request_fence();
+        let bystander = state.activity_request_fence();
+        let burst = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                execute_announce_burst(&state, false, origin, &manual_leadership(&state)).await
+            }
+        });
+        let Some(TransportMessage::SendPacket { result_tx, .. }) = packets.recv().await else {
+            panic!("the burst sent nothing");
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                state.identity_switch_lock.lock_routine()
+            )
+            .await
+            .is_ok(),
+            "the burst held the lifecycle lock across a pending dispatch"
+        );
+        let _ = result_tx.send(OutboundDispatchResult::Sent);
+        let answer = tokio::spawn(async move {
+            while let Some(message) = packets.recv().await {
+                if let TransportMessage::SendPacket { result_tx, .. } = message {
+                    let _ = result_tx.send(OutboundDispatchResult::Sent);
+                }
+            }
+        });
+        let burst = burst.await.unwrap();
+        assert!(burst.report.lxmf_delivery_queued, "the burst did not send");
+        assert!(
+            state.is_current_activity_origin_fence(bystander),
+            "sending the announce invalidated another request"
+        );
+        network_shutdown.trigger();
+        state.rns.write().unwrap().take();
+        answer.abort();
+    }
+
     #[test]
     fn attachment_notifications_hide_wire_fallback_without_legacy_media_inference() {
         assert_eq!(
-            notification_body("[File: field-notes.pdf]", true),
+            notification_body("[File: field-notes.pdf]", None, true),
             "New attachment"
         );
         assert_eq!(
-            notification_body("Please review\n[File: field-notes.pdf]", true),
+            notification_body("Please review\n[File: field-notes.pdf]", None, true),
             "Please review"
         );
     }
 
-    #[tokio::test]
-    async fn inbound_message_notifies_only_when_backgrounded_and_enabled() {
+    #[test]
+    fn markdown_notifications_are_plain_text_only_for_the_markdown_renderer() {
+        let body = "## Plan\n**ship** it, see [notes](https://x.org) ||twist||";
+        assert_eq!(
+            notification_body(body, Some(lxmf_core::constants::RENDERER_MARKDOWN), false),
+            "Plan\nship it, see notes [Spoiler]"
+        );
+        assert_eq!(notification_body(body, None, false), body);
+        assert_eq!(
+            notification_body(body, Some(lxmf_core::constants::RENDERER_MICRON), false),
+            body
+        );
+        assert_eq!(
+            notification_body(
+                "```\n```",
+                Some(lxmf_core::constants::RENDERER_MARKDOWN),
+                true
+            ),
+            "New attachment"
+        );
+    }
+
+    #[test]
+    fn inbound_message_notifies_only_when_backgrounded_and_enabled() {
         let notifier = Arc::new(RecordingNotifier::default());
         let state = make_state(notifier.clone());
         state
@@ -9006,11 +9802,11 @@ mod notification_tests {
         notify_inbound_message_if_background(
             &state,
             "abcd1234abcd1234",
-            "identity-a",
+            &contact_label_from_db(&state.db, "abcd1234abcd1234", "identity-a"),
             "hello from mesh",
+            None,
             false,
-        )
-        .await;
+        );
 
         let seen = notifier.notifications.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
@@ -9024,11 +9820,11 @@ mod notification_tests {
         notify_inbound_message_if_background(
             &state,
             "abcd1234abcd1234",
-            "identity-a",
+            &contact_label_from_db(&state.db, "abcd1234abcd1234", "identity-a"),
             "foreground",
+            None,
             false,
-        )
-        .await;
+        );
         assert_eq!(notifier.notifications.lock().unwrap().len(), 1);
 
         state
@@ -9039,11 +9835,11 @@ mod notification_tests {
         notify_inbound_message_if_background(
             &state,
             "abcd1234abcd1234",
-            "identity-a",
+            &contact_label_from_db(&state.db, "abcd1234abcd1234", "identity-a"),
             "disabled",
+            None,
             false,
-        )
-        .await;
+        );
         assert_eq!(notifier.notifications.lock().unwrap().len(), 1);
     }
 
@@ -9073,6 +9869,50 @@ mod notification_tests {
         state.set_notification_foreground(true);
         state.emit_native_notification(notification);
         assert_eq!(notifier.notifications.lock().unwrap().len(), 1);
+    }
+
+    // What alerts show is one stored setting, applied where every alert
+    // passes; the route stays.
+    #[test]
+    fn every_alert_shows_what_the_stored_preview_allows() {
+        for (preview, title, body) in [
+            ("name_only", "Message from Alice", "New message"),
+            ("neither", "Ratspeak", "New message"),
+        ] {
+            let notifier = Arc::new(RecordingNotifier::default());
+            let unique = TEMP_NOTIFICATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let config = DashboardConfig::from_env_and_defaults(std::env::temp_dir().join(
+                format!("ratspeak-preview-test-{}-{unique}", std::process::id()),
+            ));
+            let pool = r2d2::Pool::builder()
+                .max_size(2)
+                .build(SqliteConnectionManager::memory())
+                .unwrap();
+            db::init_schema(&pool).unwrap();
+            db::set_setting(&pool, "notification_preview", preview);
+            let state = AppState::new(
+                config,
+                pool,
+                Arc::new(ratspeak_core::NoopEmitter),
+                notifier.clone(),
+            );
+            state.set_notification_foreground(false);
+
+            state.emit_native_notification(ratspeak_core::NativeNotification::message(
+                "Message from Alice",
+                "meet at noon",
+                "lxmf:abcd1234abcd1234",
+                42,
+            ));
+
+            let shown = notifier.notifications.lock().unwrap().pop().expect(preview);
+            assert_eq!(
+                (shown.title.as_str(), shown.body.as_str()),
+                (title, body),
+                "{preview}"
+            );
+            assert_eq!(shown.thread_id.as_deref(), Some("lxmf:abcd1234abcd1234"));
+        }
     }
 
     #[test]
@@ -9113,22 +9953,16 @@ mod notification_tests {
             "identity-a",
         );
 
-        notify_game_if_background(
-            &state,
-            "feedfacefeedface",
-            "session-1",
-            "chess",
-            "move",
-            false,
-        );
-        notify_game_if_background(
-            &state,
-            "feedfacefeedface",
-            "session-1",
-            "chess",
-            "move",
-            false,
-        );
+        let alert = GameAlert {
+            label: contact_label_from_db(&state.db, "feedfacefeedface", "identity-a"),
+            sender_hash: "feedfacefeedface".into(),
+            session_id: "session-1".into(),
+            app_id: "chess".into(),
+            command: "move".into(),
+            is_new_session: false,
+        };
+        notify_game_if_background(&state, &alert);
+        notify_game_if_background(&state, &alert);
 
         let seen = notifier.notifications.lock().unwrap().clone();
         assert_eq!(seen.len(), 2);

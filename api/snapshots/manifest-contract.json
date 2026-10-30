@@ -4,7 +4,7 @@
   "packages": [
     {
       "name": "ratspeak",
-      "version": "1.0.34",
+      "version": "1.0.36",
       "rustVersion": "1.89",
       "edition": "2021",
       "features": {
@@ -149,11 +149,22 @@
           "sourceKind": "registry"
         },
         {
+          "name": "zeroize",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
           "name": "ratspeak-tauri",
           "rename": null,
           "kind": null,
           "target": "cfg(any(target_os = \"android\", target_os = \"ios\"))",
-          "requirement": "^1.0.34",
+          "requirement": "^1.0.36",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -176,6 +187,17 @@
           "sourceKind": "registry"
         },
         {
+          "name": "arboard",
+          "rename": null,
+          "kind": null,
+          "target": "cfg(not(any(target_os = \"android\", target_os = \"ios\")))",
+          "requirement": "^3.7",
+          "optional": false,
+          "defaultFeatures": false,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
           "name": "dirs",
           "rename": null,
           "kind": null,
@@ -191,7 +213,7 @@
           "rename": null,
           "kind": null,
           "target": "cfg(not(any(target_os = \"android\", target_os = \"ios\")))",
-          "requirement": "^1.0.34",
+          "requirement": "^1.0.36",
           "optional": false,
           "defaultFeatures": true,
           "features": [
@@ -381,7 +403,7 @@
     },
     {
       "name": "ratspeak-core",
-      "version": "1.0.34",
+      "version": "1.0.36",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {},
@@ -448,7 +470,7 @@
     },
     {
       "name": "ratspeak-db",
-      "version": "1.0.34",
+      "version": "1.0.36",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {},
@@ -514,7 +536,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "^1.0.34",
+          "requirement": "^1.0.36",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -607,7 +629,7 @@
     },
     {
       "name": "ratspeak-runtime",
-      "version": "1.0.34",
+      "version": "1.0.36",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {
@@ -860,7 +882,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "^1.0.34",
+          "requirement": "^1.0.36",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -871,7 +893,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "^1.0.34",
+          "requirement": "^1.0.36",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1167,12 +1189,23 @@
             "windows-native"
           ],
           "sourceKind": "registry"
+        },
+        {
+          "name": "libc",
+          "rename": null,
+          "kind": null,
+          "target": "cfg(unix)",
+          "requirement": "^0.2",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
         }
       ]
     },
     {
       "name": "ratspeak-tauri",
-      "version": "1.0.34",
+      "version": "1.0.36",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {
@@ -1329,7 +1362,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "^1.0.34",
+          "requirement": "^1.0.36",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1340,7 +1373,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "^1.0.34",
+          "requirement": "^1.0.36",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1351,7 +1384,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "^1.0.34",
+          "requirement": "^1.0.36",
           "optional": false,
           "defaultFeatures": true,
           "features": [],

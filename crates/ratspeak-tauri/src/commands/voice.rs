@@ -9,12 +9,13 @@ use serde_json::{Value, json};
 use tauri::State;
 use tokio::io::AsyncReadExt as _;
 
-use crate::commands::shared::{hex_to_array16, resolve_identity_hash};
+use crate::commands::shared::{hex_to_array16, transport_sender};
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::helpers::{active_identity_id, sanitize_text, validate_hex};
 use crate::state::{AppState, AttachmentTransferAdmissionError};
 use crate::voice_memo::MemoFormat;
+use ratspeak_runtime::blackhole::resolve_identity_hash;
 
 const VOICE_MEMO_START_UNAVAILABLE: &str = "Ratspeak couldn't start recording. Check microphone access and the selected input device, then try again.";
 const VOICE_MEMO_AUDIO_BUSY: &str =
@@ -113,8 +114,8 @@ pub async fn voice_memo_format(
         return Err(AppError::bad_request("Voice message format is automatic"));
     }
     let fence = state.activity_request_fence();
-    let _identity = state.identity_switch_lock.lock().await;
-    if !state.is_current_activity_request_fence_after_identity_lock(fence) {
+    let _identity = state.identity_switch_lock.lock_routine().await;
+    if !state.is_current_activity_origin_fence(fence) {
         return Err(AppError::conflict("Identity changed"));
     }
     let identity = active_identity_id(&state);
@@ -238,7 +239,9 @@ pub async fn voice_call(state: State<'_, Arc<AppState>>, args: VoiceCallArgs) ->
 
     let input = hex_to_array16(&hash)
         .ok_or_else(|| AppError::bad_request("Voice calls require a 16-byte hash"))?;
-    let remote_identity = resolve_identity_hash(&state, input).await.unwrap_or(input);
+    let remote_identity = resolve_identity_hash(transport_sender(&state).as_ref(), input)
+        .await
+        .unwrap_or(input);
     // TODO: Warn or block when the contact has not advertised `lxst.telephony`.
 
     let app_state = state.inner().clone();
@@ -333,8 +336,8 @@ pub async fn voice_memo_start(
     args: Option<VoiceMemoStartArgs>,
 ) -> AppResult<Value> {
     let fence = state.activity_request_fence();
-    let _identity = state.identity_switch_lock.lock().await;
-    if !state.is_current_activity_request_fence_after_identity_lock(fence) {
+    let _identity = state.identity_switch_lock.lock_routine().await;
+    if !state.is_current_activity_origin_fence(fence) {
         return Err(AppError::conflict("Identity changed"));
     }
     let format = if let Some(args) = args {
@@ -544,7 +547,7 @@ pub async fn send_lxmf_voice_message(
     if let Err(error) = &result
         && let Some(clip) = staged.take()
     {
-        let _identity = state.identity_switch_lock.lock().await;
+        let _identity = state.identity_switch_lock.lock_routine().await;
         if state.current_identity_session_generation() == fence.identity_session_generation()
             && active_identity_id(&state) == identity_id
             && !matches!(error.code.as_str(), "bad_request" | "invalid_destination")
@@ -702,8 +705,8 @@ async fn load_stored_voice(
     stored_name: &str,
 ) -> AppResult<(Vec<u8>, MemoFormat)> {
     let fence = state.activity_request_fence();
-    let _identity = state.identity_switch_lock.lock().await;
-    if !state.is_current_activity_request_fence_after_identity_lock(fence) {
+    let _identity = state.identity_switch_lock.lock_routine().await;
+    if !state.is_current_activity_origin_fence(fence) {
         return Err(AppError::conflict("Identity changed"));
     }
     let identity = active_identity_id(state);

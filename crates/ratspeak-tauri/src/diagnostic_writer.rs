@@ -343,6 +343,9 @@ impl BoundedLogWriter {
         for index in 0..=limits.archive_count {
             let path = log_path(log_dir, index);
             repair_oversized_regular_file(&path, limits.max_file_bytes)?;
+            if validate_regular_target(&path)?.is_some() {
+                make_private(&path, 0o600)?;
+            }
         }
 
         let active_path = log_path(log_dir, 0);
@@ -516,14 +519,33 @@ fn log_path(log_dir: &Path, index: usize) -> PathBuf {
 
 fn prepare_log_directory(log_dir: &Path) -> io::Result<()> {
     match fs::symlink_metadata(log_dir) {
-        Ok(metadata) => validate_directory_metadata(&metadata),
+        Ok(metadata) => validate_directory_metadata(&metadata)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(log_dir)?;
-            let metadata = fs::symlink_metadata(log_dir)?;
-            validate_directory_metadata(&metadata)
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(log_dir)?;
+            validate_directory_metadata(&fs::symlink_metadata(log_dir)?)?;
         }
-        Err(error) => Err(error),
+        Err(error) => return Err(error),
     }
+    make_private(log_dir, 0o700)
+}
+
+/// Logs can quote what the app was doing; older builds left them readable by
+/// every local user. Call on a path already checked not to be a link.
+fn make_private(path: &Path, mode: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::symlink_metadata(path)?.permissions().mode() & 0o077 != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
 }
 
 fn validate_directory_metadata(metadata: &Metadata) -> io::Result<()> {
@@ -648,7 +670,7 @@ fn open_regular_no_follow(path: &Path, append: bool, create_new: bool) -> io::Re
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
     }
     #[cfg(target_os = "windows")]
     {
@@ -743,6 +765,36 @@ mod tests {
         assert!(bytes.len() <= 16);
         assert!(bytes.ends_with(TRUNCATION_MARKER));
         assert!(std::str::from_utf8(&bytes).is_ok());
+    }
+
+    // Logs can quote what the app was doing: only their user reads them, also
+    // when an older build left them readable.
+    #[cfg(unix)]
+    #[test]
+    fn logs_are_readable_only_by_their_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let root = tempdir().unwrap();
+        let older = root.path().join("older");
+        fs::create_dir(&older).unwrap();
+        fs::set_permissions(&older, fs::Permissions::from_mode(0o755)).unwrap();
+        for index in [0, 1] {
+            fs::write(log_path(&older, index), b"older\n").unwrap();
+            fs::set_permissions(log_path(&older, index), fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+        let fresh = root.path().join("fresh").join("logs");
+
+        for dir in [&older, &fresh] {
+            DiagnosticFileRuntime::start(dir)
+                .unwrap()
+                .shutdown()
+                .unwrap();
+            assert_eq!(mode(dir), 0o700, "{}", dir.display());
+            assert_eq!(mode(&log_path(dir, 0)), 0o600, "{}", dir.display());
+        }
+        assert_eq!(mode(&root.path().join("fresh")), 0o700);
+        assert_eq!(mode(&log_path(&older, 1)), 0o600);
     }
 
     #[test]

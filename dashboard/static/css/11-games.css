@@ -332,13 +332,15 @@
 }
 .games-detail-status.status-muted { color: var(--text-muted); }
 .games-detail-board {
+    --game-board-min: 140px;
     flex: 1;
     display: flex;
-    align-items: center;
-    justify-content: center;
     padding: var(--space-10) var(--space-8);
     min-height: 0;
+    overflow: auto;
 }
+/* Auto margins centre the board without pushing an oversized one out of reach. */
+.games-detail-board > * { margin: auto; }
 .games-detail-controls {
     display: flex;
     align-items: center;
@@ -656,6 +658,8 @@
     cursor: not-allowed;
 }
 .ttt-board-wrap {
+    --ttt-label-height: 1.75rem;
+    --ttt-chrome: calc(2 * var(--ttt-label-height) + 2 * var(--space-6));
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -664,9 +668,12 @@
     width: min(100%, 330px);
 }
 .ttt-player-label {
+    flex: none;
+    height: var(--ttt-label-height);
+    line-height: var(--ttt-label-height);
     font-size: var(--text-sm);
     color: var(--text-muted);
-    padding: var(--space-2) var(--space-6);
+    padding: 0 var(--space-6);
     border-radius: var(--radius-md);
     transition: all var(--transition-base);
     max-width: 100%;
@@ -680,6 +687,7 @@
     font-weight: 600;
 }
 .ttt-grid {
+    position: relative;
     display: grid;
     grid-template-columns: repeat(3, 1fr);
     grid-template-rows: repeat(3, 1fr);
@@ -763,7 +771,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: var(--surface-scrim);
+    background: rgba(var(--theme-page-rgb), 0.85);
     backdrop-filter: blur(3px);
     -webkit-backdrop-filter: blur(3px);
     border-radius: var(--radius-lg);
@@ -866,7 +874,7 @@
 .ttt-game-over-overlay {
     position: absolute; inset: 0;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
-    background: var(--surface-scrim);
+    background: rgba(var(--theme-page-rgb), 0.85);
     backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
     border-radius: var(--radius-xl); z-index: 2; gap: 6px;
     pointer-events: none;
@@ -885,14 +893,19 @@
    metaphor. Its two sides remain distinguishable without relying on color:
    A is a solid network node; B is a patterned ring. */
 .four-board-wrap {
+    --four-gap: var(--space-4);
+    --four-key-height: 2.25rem;
+    --four-result-height: 1.75rem;
+    --four-chrome: calc(2 * var(--four-key-height) + 2 * var(--four-gap));
     position: relative;
     display: flex;
     flex-direction: column;
     align-items: stretch;
-    gap: var(--space-4);
+    gap: var(--four-gap);
     width: min(100%, 520px);
-    max-width: 100%;
-    margin: 0 auto;
+}
+.four-board-wrap.has-result {
+    --four-chrome: calc(2 * var(--four-key-height) + var(--four-result-height) + 3 * var(--four-gap));
 }
 
 .four-player-key {
@@ -900,7 +913,8 @@
     grid-template-columns: 24px minmax(0, 1fr) auto;
     align-items: center;
     gap: var(--space-3);
-    min-height: 36px;
+    flex: none;
+    height: var(--four-key-height);
     padding: var(--space-2) var(--space-4);
     border: 1px solid transparent;
     border-radius: var(--radius-md);
@@ -1114,7 +1128,7 @@
     justify-content: center;
     padding: var(--space-6);
     border-radius: var(--radius-xl);
-    background: var(--surface-scrim);
+    background: rgba(var(--theme-page-rgb), 0.85);
     backdrop-filter: blur(4px);
     -webkit-backdrop-filter: blur(4px);
     color: var(--text-primary);
@@ -1124,7 +1138,10 @@
 }
 .four-result {
     align-self: center;
-    padding: var(--space-2) var(--space-5);
+    flex: none;
+    height: var(--four-result-height);
+    line-height: var(--four-result-height);
+    padding: 0 var(--space-5);
     border-radius: var(--radius-full);
     background: rgba(var(--status-online-rgb), 0.10);
     color: var(--status-online-fg);
@@ -1141,22 +1158,34 @@
 }
 
 .chess-board-wrap {
+    --chess-gap: 4px;
+    --chess-row-height: 1.75rem;
+    --chess-tray-height: 26px;
+    --chess-chrome: calc(2 * var(--chess-row-height) + 2 * var(--chess-tray-height) + 4 * var(--chess-gap));
+    /* Tray inks follow the well, not the page. */
+    --chess-tray-ink-dark: var(--text-primary);
+    --chess-tray-ink-light: var(--bg-primary);
+    --chess-tray-shade: var(--bg-dark);
     position: relative;
     display: flex;
     flex-direction: column;
     align-items: stretch;
-    gap: 4px;
-    width: 100%;
-    max-width: min(92vw, 450px);
-    margin: 0 auto;
+    gap: var(--chess-gap);
+    width: min(100%, 450px);
+}
+[data-theme="dark"] .chess-board-wrap {
+    --chess-tray-ink-dark: var(--bg-primary);
+    --chess-tray-ink-light: var(--text-primary);
+    --chess-tray-shade: var(--bg-primary);
 }
 
 .chess-player-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    min-height: 28px;
-    padding: 4px 8px;
+    flex: none;
+    height: var(--chess-row-height);
+    padding: 0 8px;
     border-radius: var(--radius-md);
     background: rgba(255,255,255,0.025);
     color: var(--text-primary);
@@ -1175,6 +1204,7 @@
     background: currentColor;
     box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.14);
     flex-shrink: 0;
+    margin-left: 3px;
 }
 .chess-player-name {
     display: inline-flex;
@@ -1185,25 +1215,50 @@
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+/* Plain names truncate; Ratspeak names already do via .ratspeak-name-text. */
+.chess-player-name > bdi { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .chess-material-pill {
     display: inline-block;
-    padding: 1px 6px;
+    padding: 0 5px;
     border-radius: var(--radius-sm);
-    background: rgba(var(--accent-rgb), 0.14);
-    color: var(--accent);
-    font-size: 0.75em;
+    background: var(--accent-bg);
+    color: var(--text-primary);
+    font-size: var(--text-2xs);
     font-weight: 700;
-    line-height: 1.2;
+    line-height: 1.45;
+    font-variant-numeric: tabular-nums;
 }
 
+/* Wells contrast with the pieces they hold: light tone for black pieces, deep tone for white. */
 .chess-captured-tray {
     display: flex;
-    flex-wrap: wrap;
-    gap: 1px;
-    min-height: 18px;
-    padding: 0 8px;
+    flex: none;
+    align-self: flex-start;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    height: var(--chess-tray-height);
+    padding: 0 6px;
+    border: 1px solid var(--border-control);
+    border-radius: var(--radius-md);
+    background: var(--chess-light);
+    color: var(--chess-tray-ink-dark);
+    overflow: hidden;
 }
-.chess-captured-piece { width: 18px; height: 18px; opacity: 0.72; }
+.chess-captured-tray[data-side="b"] {
+    background: color-mix(in oklab, var(--chess-dark) 40%, var(--chess-tray-shade));
+    color: var(--chess-tray-ink-light);
+}
+.chess-captured-tray:empty { visibility: hidden; }
+.chess-captured-group { display: inline-flex; flex: none; align-items: center; }
+.chess-captured-piece { flex: none; width: 22px; height: 22px; }
+.chess-captured-count {
+    margin-left: 1px;
+    font-size: var(--text-2xs);
+    font-weight: var(--type-weight-bold);
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+}
 
 .chess-board {
     display: grid;
@@ -1218,7 +1273,7 @@
     background:
         linear-gradient(135deg, rgba(var(--ble-accent-rgb), 0.24), rgba(var(--accent-rgb), 0.18)),
         var(--chess-border);
-    box-shadow: 0 18px 38px rgba(0,0,0,0.22), 0 0 0 1px rgba(255,255,255,0.06);
+    box-shadow: var(--shadow-md), 0 0 0 1px rgba(255,255,255,0.06);
     user-select: none;
     -webkit-user-select: none;
     touch-action: manipulation;
@@ -1344,7 +1399,7 @@
 .chess-board-overlay {
     position: absolute; inset: 0;
     display: flex; align-items: center; justify-content: center;
-    background: var(--surface-overlay);
+    background: rgba(var(--theme-page-rgb), 0.85);
     backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
     border-radius: var(--radius-md); z-index: 2;
     font-weight: 600; color: var(--text-primary); text-align: center;
@@ -1355,8 +1410,8 @@
     position: absolute; inset: 0;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     background:
-        linear-gradient(135deg, rgba(var(--accent-rgb), 0.18), rgba(var(--ble-accent-rgb), 0.12)),
-        var(--surface-overlay);
+        linear-gradient(135deg, rgba(var(--accent-rgb), 0.12), rgba(var(--ble-accent-rgb), 0.08)),
+        rgba(var(--theme-page-rgb), 0.85);
     backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
     border-radius: var(--radius-md); z-index: 2; gap: 6px;
     pointer-events: none;
@@ -1378,84 +1433,61 @@
 .game-over-overlay.draw .chess-game-over-text { color: var(--status-warning-fg); }
 
 @media (max-width: 480px) {
-    .chess-captured-piece { width: 15px; height: 15px; }
     .chess-player-row { font-size: var(--text-xs); }
     .chess-coord { font-size: 0.6em; }
-    .four-board-wrap { gap: var(--space-3); }
-    .four-player-key {
-        min-height: 32px;
-        padding: var(--space-1) var(--space-3);
+    .four-board-wrap {
+        --four-gap: var(--space-3);
+        --four-key-height: 2rem;
     }
+    .four-player-key { padding: var(--space-1) var(--space-3); }
     .four-player-marker { display: none; }
 }
 
 @media (max-width: 768px) {
+    /* Full-screen detail: the header carries the back button and the top inset. */
     .games-detail-header {
-        align-items: flex-start;
-        flex-wrap: wrap;
-        padding: var(--space-4) var(--space-5);
+        gap: var(--space-4);
+        min-height: calc(56px + var(--sat));
+        padding: calc(var(--space-3) + var(--sat)) calc(var(--space-5) + var(--sar))
+            var(--space-3) calc(var(--space-5) + var(--sal));
     }
+    .games-detail-heading { flex: 1 1 auto; }
     .games-detail-meta {
-        justify-content: flex-start;
-        width: 100%;
+        flex: 0 1 auto;
+        max-width: 45%;
     }
     .games-detail-status { padding: var(--space-3) var(--space-5); }
-    .games-detail-board {
-        align-items: flex-start;
-        padding: var(--space-4);
-        overflow: hidden;
-    }
+    .games-detail-board { padding: var(--space-4); }
     .games-detail-controls { padding: var(--space-4) var(--space-5); }
-    .ttt-board-wrap {
-        width: min(calc(100vw - 32px), calc(100vh - 226px), 310px);
-    }
     .ttt-grid {
         width: 100%;
-    }
-    .chess-board-wrap {
-        width: min(calc(100vw - 32px), calc(100vh - 236px), 420px);
-        max-width: 100%;
-    }
-    .four-board-wrap {
-        width: min(calc(100vw - 32px), 500px);
-    }
-    @supports (height: 100svh) {
-        .ttt-board-wrap {
-            width: min(calc(100vw - 32px), calc(100svh - 226px), 310px);
-        }
-        .chess-board-wrap {
-            width: min(calc(100vw - 32px), calc(100svh - 236px), 420px);
-        }
-        .four-board-wrap {
-            width: min(calc(100vw - 32px), 500px);
-        }
     }
 }
 
 @media (max-height: 620px) and (orientation: landscape) {
     .games-detail-board { padding: var(--space-3); }
     .chess-captured-tray { display: none; }
-    .chess-player-row { min-height: 22px; font-size: var(--text-xs); }
+    .chess-board-wrap {
+        --chess-row-height: 1.375rem;
+        --chess-chrome: calc(2 * var(--chess-row-height) + 2 * var(--chess-gap));
+    }
+    .chess-player-row { font-size: var(--text-xs); }
     .ttt-player-label { display: none; }
+    .ttt-board-wrap { --ttt-chrome: 0px; }
+}
+
+/* Each board takes the space between the status line and the controls; the
+   --*-chrome terms are the fixed-height rows stacked with it. */
+@supports (width: 1cqmin) {
+    .games-detail-board { container-type: size; }
     .ttt-board-wrap {
-        width: min(calc(100vh - 150px), 300px, 58vw);
+        width: clamp(var(--game-board-min), min(100cqw, 100cqh - var(--ttt-chrome)), 330px);
     }
     .chess-board-wrap {
-        width: min(calc(100vh - 154px), 360px, 58vw);
+        width: clamp(var(--game-board-min), min(100cqw, 100cqh - var(--chess-chrome)), 450px);
     }
     .four-board-wrap {
-        width: min(calc(100vh - 154px), 470px, 68vw);
-    }
-    @supports (height: 100svh) {
-        .ttt-board-wrap {
-            width: min(calc(100svh - 150px), 300px, 58vw);
-        }
-        .chess-board-wrap {
-            width: min(calc(100svh - 154px), 360px, 58vw);
-        }
-        .four-board-wrap {
-            width: min(calc(100svh - 154px), 470px, 68vw);
-        }
+        width: clamp(var(--game-board-min), min(100cqw, (100cqh - var(--four-chrome)) * 7 / 6), 520px);
     }
 }
 

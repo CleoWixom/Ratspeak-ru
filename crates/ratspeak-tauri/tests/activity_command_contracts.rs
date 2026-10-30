@@ -79,15 +79,21 @@ fn activity_lifecycle_commands_follow_identity_then_activity_lock_order() {
     ] {
         let body = command_body(&activity, command);
         let identity = body
-            .find("identity_switch_lock.lock().await")
+            .find("identity_switch_lock.lock")
             .expect("identity lifecycle lock");
         let control = body
             .find("activity_control_lock.lock().await")
             .expect("activity control lock");
         assert!(identity < control, "wrong lock order in {command}");
         if command == "activity_status" {
+            // An observation is routine work: it invalidates no request.
+            assert!(body.contains("identity_switch_lock.lock_routine().await"));
             continue;
         }
+        assert!(
+            body.contains("identity_switch_lock.lock().await"),
+            "{command} changes Activity capture, a transition"
+        );
         let snapshot = body
             .find("activity_request_fence()")
             .expect("Activity request-fence snapshot");
@@ -105,6 +111,8 @@ fn activity_lifecycle_commands_follow_identity_then_activity_lock_order() {
     }
 
     let foreground = command_body(&system, "api_set_foreground");
+    // Only a Trace that is due makes a foreground edge a transition.
+    assert!(foreground.contains("if fg && state.activity.trace_expiry_due() {"));
     let identity = foreground
         .find("identity_switch_lock.lock().await")
         .expect("identity lifecycle lock");

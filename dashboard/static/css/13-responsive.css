@@ -514,7 +514,9 @@
     .lxmf-msg {
         max-width: 90%;
         padding: var(--space-4) var(--space-6);
-        font-size: var(--text-sm);
+    }
+    .lxmf-messages.msg-select-mode .lxmf-msg:not(.msg-has-image) {
+        max-width: calc(100% - 52px);
     }
     .lxmf-msg.msg-has-image {
         max-width: 75%;
@@ -617,7 +619,7 @@
     .nr-input-sm,
     .nr-select,
     .modal-input {
-        font-size: max(16px, 1rem);
+        font-size: max(16px, var(--text-base));
     }
 
     :root {
@@ -670,7 +672,7 @@
     input[type="text"], input[type="number"], textarea, select, .modal-input {
         min-height: 44px;
         padding: var(--space-4) var(--space-7);
-        font-size: max(16px, 1rem);
+        font-size: max(16px, var(--text-base));
         border: 1.5px solid var(--border-light);
     }
 
@@ -679,7 +681,7 @@
     input.list-search-input {
         min-height: var(--touch-target);
         padding: var(--space-3) var(--space-6);
-        font-size: max(16px, 1rem);
+        font-size: max(16px, var(--text-base));
         border: 1px solid var(--input-border);
     }
 
@@ -688,7 +690,7 @@
     .conn-sort-select {
         min-height: 40px;
         padding: var(--space-3) var(--space-6);
-        font-size: max(16px, 1rem);
+        font-size: max(16px, var(--text-base));
     }
 
     .log-filter {
@@ -705,17 +707,12 @@
     }
     .log-filters::-webkit-scrollbar { display: none; }
 
-    .conv-name { font-size: var(--text-base); }
-    .conv-preview { font-size: var(--text-sm); }
-    .conv-time { font-size: var(--text-xs); }
     .header-right { font-size: var(--text-base); }
     .contacts-row-name { font-size: var(--text-base); }
     .contacts-row-status { font-size: var(--type-row-detail-size); }
     .contacts-row-hash { font-size: var(--text-sm); }
-    .lxmf-msg { font-size: var(--text-lg); }
     .lxmf-chat-header-name { font-size: var(--text-lg); }
     .lxmf-chat-header-hash { font-size: var(--text-xs); }
-    .lxmf-msg-meta { font-size: var(--text-2xs); }
     .eventlog-full { font-size: var(--text-sm); }
     .log-badge { font-size: var(--text-2xs); }
 
@@ -943,7 +940,7 @@
     }
 
     .lxmf-compose textarea {
-        font-size: max(16px, 1rem);
+        font-size: max(16px, var(--text-base));
     }
 
     .lxmf-char-count { display: none !important; }
@@ -1072,7 +1069,23 @@
         position: relative;
     }
 
-    .games-detail-board { justify-content: center; }
+    /* A game takes the whole screen, as a conversation does. */
+    body.view-game-detail {
+        overflow: hidden;
+        overscroll-behavior: none;
+    }
+    body.view-game-detail .bottom-bar,
+    body.view-game-detail .header {
+        display: none;
+    }
+    body.view-game-detail .app-layout {
+        height: var(--app-height, 100vh);
+        height: var(--app-height, 100dvh);
+        padding-bottom: 0;
+    }
+    body.view-game-detail .main-content {
+        padding-bottom: 0;
+    }
 
     #panel-interfaces { display: none; }
 
@@ -1237,7 +1250,7 @@
     }
     .network-ownership-settings .modal-input {
         min-height: var(--touch-target);
-        font-size: max(16px, 1rem);
+        font-size: max(16px, var(--text-base));
     }
     .network-ownership-settings select.modal-input { height: var(--touch-target); }
     .network-ownership-settings .nr-btn,
@@ -1250,7 +1263,7 @@
     }
     .settings-type-presets {
         width: 100%;
-        grid-template-columns: repeat(5, minmax(0, 1fr));
+        grid-template-columns: repeat(4, minmax(0, 1fr));
         gap: var(--space-2);
     }
     .settings-type-preset-card {
@@ -1258,7 +1271,7 @@
         padding-inline: var(--space-2);
     }
     .settings-row-label {
-        font-size: 1rem;
+        font-size: var(--text-base);
         line-height: 1.25;
     }
     .settings-row-desc {
@@ -1933,9 +1946,6 @@
         padding-inline: var(--space-3);
     }
 
-    .conv-name { font-size: var(--text-base); }
-    .conv-time { font-size: var(--text-2xs); }
-
     .health-card { min-width: 48px; padding: 4px 8px; }
     .health-card-value { font-size: var(--text-base); }
     .health-card-label { font-size: var(--text-2xs); }
@@ -2207,11 +2217,6 @@
         background: var(--surface-page);
         border-top: 1px solid var(--border-row);
         padding: var(--space-6);
-    }
-
-    .chess-board-grid, .ttt-grid {
-        width: min(320px, 85vw);
-        height: min(320px, 85vw);
     }
 
     .games-detail-controls {
@@ -3092,9 +3097,9 @@
         --mobile-list-avatar-size: 44px;
         --mobile-list-icon-size: 40px;
         --mobile-list-min-height: 58px;
-        --mobile-list-title-size: 1rem;
-        --mobile-list-detail-size: 0.875rem;
-        --mobile-list-meta-size: 0.8125rem;
+        --mobile-list-title-size: var(--text-base);
+        --mobile-list-detail-size: var(--text-sm);
+        --mobile-list-meta-size: var(--text-xs);
     }
 
     .peers-list-scroll,
@@ -3985,7 +3990,7 @@ html[data-text-scale-tier="xlarge"] .activity-event-details > div {
 
     .channel-event-text {
         color: var(--text-primary);
-        font-size: 1rem;
+        font-size: var(--text-base);
         line-height: 1.45;
     }
 
@@ -4008,7 +4013,7 @@ html[data-text-scale-tier="xlarge"] .activity-event-details > div {
     }
 
     .channel-compose .nr-input {
-        font-size: max(16px, 1rem);
+        font-size: max(16px, var(--text-base));
     }
 
     .channel-send-btn {

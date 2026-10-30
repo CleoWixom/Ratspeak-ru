@@ -24,7 +24,7 @@ function toastErrorCopy(error, fallback) {
 
     // Validation/auth/conflict messages are deliberately written for users.
     // Uncoded client errors are likewise authored at the interaction site.
-    var safeCodes = ['bad_request', 'unauthorized', 'forbidden', 'not_found', 'conflict'];
+    var safeCodes = ['bad_request', 'unauthorized', 'forbidden', 'not_found', 'conflict', 'locked'];
     var code = error && error.code ? String(error.code) : '';
     if (!code || safeCodes.indexOf(code) !== -1) return detail;
 
@@ -179,6 +179,11 @@ function showToast(message, colorClass, duration, onClick) {
 
 function showCopyConfirmationToast(noun) {
     showToast(noun + ' copied', 'toast-success', 1500);
+}
+
+// Matches RS.copySecret: a copied key or phrase leaves the clipboard after a minute.
+function showSecretCopiedToast(noun) {
+    showToast(noun + ' copied. It clears from the clipboard in a minute.', 'toast-success', 3000);
 }
 
 function showRateLimitedToast() {

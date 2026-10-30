@@ -86,7 +86,8 @@ pub async fn activity_status(state: State<'_, Arc<AppState>>) -> AppResult<Activ
     // it shares the identity/activity lock order with mutating commands. It is
     // an observation, not queued work: waiting across a transition and reading
     // the resulting current status is safe and keeps initial bootstrap robust.
-    let _identity_lifecycle = state.identity_switch_lock.lock().await;
+    // As routine work it invalidates no request.
+    let _identity_lifecycle = state.identity_switch_lock.lock_routine().await;
     let _activity_control = state.activity_control_lock.lock().await;
     Ok(state.activity.status())
 }

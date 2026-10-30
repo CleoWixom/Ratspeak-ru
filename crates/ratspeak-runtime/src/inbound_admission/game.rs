@@ -191,6 +191,14 @@ pub(super) struct PreparedGame {
     _memory: ProcessingMemoryLease,
     _transaction: Option<OwnedMutexGuard<()>>,
 }
+
+/// What a committed game action shows, read before the lifecycle lock.
+pub(super) struct GamePublication {
+    all: Vec<serde_json::Value>,
+    sender_sessions: Option<Vec<serde_json::Value>>,
+    label: String,
+}
+
 impl PreparedGame {
     /// `identity` is the LXMF delivery destination, not the enclosing Reticulum
     /// identity used by the download receipt scope.
@@ -422,27 +430,65 @@ impl PreparedGame {
         self._transaction.take();
         Ok(())
     }
+    /// Reads what `emit` shows, off the lifecycle lock: the session lists and
+    /// the alert's sender, named from the receiving identity's contacts.
+    /// `None` when there is nothing to show.
+    pub(super) async fn read_publication(
+        &self,
+        state: &AppState,
+        receiver: &str,
+    ) -> Option<GamePublication> {
+        if !self.published || self.replay {
+            return None;
+        }
+        let identity = self.identity.clone();
+        let sender = self.sender.clone();
+        let alerts = self.remote_error.is_none();
+        let (all, sender_sessions) = db::spawn_db(state.db.clone(), move |p| {
+            (
+                db::list_game_sessions(&p, &identity, None, None),
+                alerts.then(|| db::list_game_sessions(&p, &identity, Some(&sender), None)),
+            )
+        })
+        .await
+        .ok()?;
+        let label = if alerts {
+            crate::read_contact_label(state, &self.sender, receiver).await
+        } else {
+            String::new()
+        };
+        Some(GamePublication {
+            all,
+            sender_sessions,
+            label,
+        })
+    }
     /// The caller has already checked the current identity generation and
     /// accepted the matching durable download token before emitting effects.
-    pub(super) fn emit(&self, state: &AppState) {
-        if !self.published || self.replay {
-            return;
-        }
-        let all = db::list_game_sessions(&state.db, &self.identity, None, None);
+    pub(super) fn emit(&self, state: &AppState, publication: GamePublication) {
+        let GamePublication {
+            all,
+            sender_sessions,
+            label,
+        } = publication;
         if let Some(error) = &self.remote_error {
             state.emit_to_all("game_protocol_error",json!({"session_id":self.sid,"app_id":self.app,"from":self.sender,"code":error["code"],"message":error["msg"],"ref":error["ref"]}));
         } else {
-            let sessions =
-                db::list_game_sessions(&state.db, &self.identity, Some(&self.sender), None);
             crate::notify_game_if_background(
                 state,
-                &self.sender,
-                &self.sid,
-                &self.app,
-                &self.command,
-                !self.had_session,
+                &crate::GameAlert {
+                    label,
+                    sender_hash: self.sender.clone(),
+                    session_id: self.sid.clone(),
+                    app_id: self.app.clone(),
+                    command: self.command.clone(),
+                    is_new_session: !self.had_session,
+                },
             );
-            state.emit_to_all("active_games", json!({"hash":self.sender,"games":sessions}));
+            state.emit_to_all(
+                "active_games",
+                json!({"hash":self.sender,"games":sender_sessions.unwrap_or_default()}),
+            );
         }
         state.emit_to_all("all_game_sessions", all.into());
         state.emit_to_all("game_action_received",json!({"session_id":self.sid,"app_id":self.app,"command":self.command,"from":self.sender,"applied":self.remote_error.is_none(),"remote_error":self.remote_error.is_some()}));

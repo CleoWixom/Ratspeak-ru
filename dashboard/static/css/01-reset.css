@@ -5,6 +5,12 @@ html, body {
     overflow: hidden;
 }
 
+/* No page pinch or double-tap zoom; the expanded image viewer re-enables pinch. */
+html:not(.page-zoom-allowed),
+html:not(.page-zoom-allowed) body {
+    touch-action: pan-x pan-y;
+}
+
 *:focus-visible {
     outline: 2px solid var(--focus-ring);
     outline-offset: 2px;

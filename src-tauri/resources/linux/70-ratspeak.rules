@@ -1,0 +1,42 @@
+# udev rule for USB-Serial radios used by Ratspeak (RNode and friends).
+#
+# VID list mirrors `KNOWN_VIDS` in
+# `rsReticulum/crates/rns-interface/src/android_usb.rs` — keep in sync.
+#
+# TAG+="uaccess" gives the user signed in at the seat access to these ports.
+# systemd applies it in 73-seat-late.rules, so this file must sort before it.
+# Without logind, add your user to the group that owns serial ports (dialout,
+# or uucp on Arch).
+#
+# The .deb and .rpm packages install this file as
+# /usr/lib/udev/rules.d/70-ratspeak.rules. With the AppImage:
+#   sudo cp 70-ratspeak.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+# Delete an older /etc/udev/rules.d/99-ratspeak.rules if you copied one there.
+#
+# Uninstall:
+#   sudo rm /etc/udev/rules.d/70-ratspeak.rules && sudo udevadm control --reload
+
+# FTDI (FT232 / FT2232 / FT4232 etc.)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", TAG+="uaccess"
+
+# Silicon Labs CP210x (CP2102 / CP2104) — most RNode hardware
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", TAG+="uaccess"
+
+# WCH CH340 / CH341
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", TAG+="uaccess"
+
+# CDC-ACM (Netchip and other generic CDC-ACM devices)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0525", TAG+="uaccess"
+
+# Raspberry Pi Pico / RP2040
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", TAG+="uaccess"
+
+# Espressif ESP32-S3 (native USB)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", TAG+="uaccess"
+
+# Adafruit boards
+SUBSYSTEM=="tty", ATTRS{idVendor}=="239a", TAG+="uaccess"
+
+# Nordic Semiconductor nRF52840
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1915", TAG+="uaccess"

@@ -1931,7 +1931,7 @@
     align-self: flex-start;
     flex: 0 0 auto;
     display: grid;
-    grid-template-columns: repeat(5, minmax(64px, 112px));
+    grid-template-columns: repeat(7, minmax(56px, 96px));
     gap: var(--space-4);
 }
 .settings-type-preset {
@@ -1942,11 +1942,13 @@
 }
 /* The specimen is a choice cue, not a literal rendering sample. Use a wider
    progression than the applied percentages so adjacent presets scan clearly. */
+.settings-type-preset[data-scale="90"]  { --type-preview-size: 15px; }
 .settings-type-preset[data-scale="100"] { --type-preview-size: 18px; }
-.settings-type-preset[data-scale="110"] { --type-preview-size: 22px; }
-.settings-type-preset[data-scale="120"] { --type-preview-size: 26px; }
-.settings-type-preset[data-scale="130"] { --type-preview-size: 30px; }
-.settings-type-preset[data-scale="140"] { --type-preview-size: 34px; }
+.settings-type-preset[data-scale="110"] { --type-preview-size: 21px; }
+.settings-type-preset[data-scale="120"] { --type-preview-size: 24px; }
+.settings-type-preset[data-scale="130"] { --type-preview-size: 27px; }
+.settings-type-preset[data-scale="140"] { --type-preview-size: 30px; }
+.settings-type-preset[data-scale="150"] { --type-preview-size: 33px; }
 .settings-type-preset input {
     position: absolute;
     width: 1px;

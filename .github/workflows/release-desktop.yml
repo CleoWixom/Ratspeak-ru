@@ -177,7 +177,7 @@ jobs:
       - name: Run tests
         timeout-minutes: 20
         working-directory: Ratspeak
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --features ratspeak-tauri/hardware --locked
 
       - name: Build CSS
         shell: bash

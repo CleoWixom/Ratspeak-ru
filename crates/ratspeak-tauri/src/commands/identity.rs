@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use ratspeak_runtime::Zeroizing;
 use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ use crate::helpers::{
     active_identity_id, sanitize_announced_display_name, sanitize_announced_status, sanitize_text,
     validate_hex,
 };
-use crate::state::{ActivityRequestFence, AppState, OwnedIdentitySwitchGuard};
+use crate::state::{ActivityRequestFence, AppState, OwnedIdentitySwitchGuard, OwnedRoutineGuard};
 
 use ratspeak_core::LXMF_DELIVERY_APP_NAME as LXMF_APP_NAME;
 use ratspeak_runtime::activity::ActivityRecorderError;
@@ -50,6 +51,34 @@ pub(super) async fn acquire_identity_mutation(
         ));
     }
     Ok(lease)
+}
+
+/// As `acquire_identity_mutation`, for routine work on the active identity's
+/// data: it waits out transitions and is refused if one ran since the request,
+/// but invalidates no other request.
+pub(super) async fn acquire_identity_routine(
+    state: &AppState,
+    fence: ActivityRequestFence,
+) -> AppResult<OwnedRoutineGuard> {
+    let lease = state.identity_switch_lock.lock_routine_owned().await;
+    if !state.is_current_activity_origin_fence(fence) {
+        return Err(AppError::conflict(
+            "Identity changed while preparing this operation; retry",
+        ));
+    }
+    Ok(lease)
+}
+
+/// The active identity, refused unless it is the one the caller shows.
+fn callers_identity(state: &AppState, caller: Option<&str>) -> AppResult<String> {
+    let active = active_identity_id(state);
+    if active.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
+    if caller.is_some_and(|caller| caller != active) {
+        return Err(AppError::conflict("Identity changed; retry"));
+    }
+    Ok(active)
 }
 
 /// The actual blocking operation retains its lifecycle owner even if the
@@ -86,11 +115,15 @@ struct EncryptedIdentityBackupV2 {
     exported_at: f64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 struct LegacyIdentityBackupV1 {
     format: String,
     kind: String,
-    private_key: String,
+    #[serde(
+        serialize_with = "serialize_private_key",
+        deserialize_with = "deserialize_private_key"
+    )]
+    private_key: Zeroizing<String>,
     identity_hash: String,
     lxmf_hash: String,
     #[serde(default)]
@@ -102,11 +135,24 @@ struct LegacyIdentityBackupV1 {
     exported_at: f64,
 }
 
-#[derive(Debug)]
 struct ParsedIdentityImport {
-    key_bytes: Vec<u8>,
+    key_bytes: Zeroizing<Vec<u8>>,
     format: &'static str,
-    mnemonic: Option<String>,
+    mnemonic: Option<Zeroizing<String>>,
+}
+
+fn serialize_private_key<S>(key: &Zeroizing<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(key.as_str())
+}
+
+fn deserialize_private_key<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Zeroizing::new)
 }
 
 fn now_ts() -> f64 {
@@ -200,7 +246,7 @@ fn parse_private_identity_bytes_with_job(
     }
     if bytes.len() == 64 {
         return Ok(ParsedIdentityImport {
-            key_bytes: bytes.to_vec(),
+            key_bytes: Zeroizing::new(bytes.to_vec()),
             format: "raw-private-key",
             mnemonic: None,
         });
@@ -235,8 +281,8 @@ fn parse_private_identity_bytes_with_job(
                     }
                     _ => e.to_string(),
                 })?;
-            let mnemonic = unlocked.mnemonic().map(str::to_string);
-            let key_bytes = unlocked.key().to_vec();
+            let mnemonic = unlocked.mnemonic().map(|m| Zeroizing::new(m.to_owned()));
+            let key_bytes = Zeroizing::new(unlocked.key().to_vec());
             let identity = Identity::from_private_key(&key_bytes)
                 .map_err(|e| format!("Invalid identity backup key: {e}"))?;
             let hash_hex = hex::encode(identity.hash);
@@ -256,9 +302,10 @@ fn parse_private_identity_bytes_with_job(
             if backup.kind != "private" {
                 return Err("Public identity backups are not activatable identities".into());
             }
-            let key_bytes = B64
-                .decode(backup.private_key.trim())
-                .map_err(|_| "Invalid identity backup key data")?;
+            let key_bytes = Zeroizing::new(
+                B64.decode(backup.private_key.trim())
+                    .map_err(|_| "Invalid identity backup key data")?,
+            );
             if key_bytes.len() != 64 {
                 return Err("Identity backup key must be exactly 64 bytes".into());
             }
@@ -284,7 +331,7 @@ fn parse_private_identity_bytes_with_job(
             .filter(|key_bytes| key_bytes.len() == 64)
     {
         return Ok(ParsedIdentityImport {
-            key_bytes,
+            key_bytes: Zeroizing::new(key_bytes),
             format: "hex-private-key",
             mnemonic: None,
         });
@@ -297,7 +344,7 @@ fn parse_private_identity_bytes_with_job(
             .filter(|key_bytes| key_bytes.len() == 64)
     {
         return Ok(ParsedIdentityImport {
-            key_bytes,
+            key_bytes: Zeroizing::new(key_bytes),
             format: "base64-private-key",
             mnemonic: None,
         });
@@ -309,7 +356,7 @@ fn parse_private_identity_bytes_with_job(
             .filter(|key_bytes| key_bytes.len() == 64)
     {
         return Ok(ParsedIdentityImport {
-            key_bytes,
+            key_bytes: Zeroizing::new(key_bytes),
             format: "base32-private-key",
             mnemonic: None,
         });
@@ -337,10 +384,11 @@ fn bounded_encoded_input(text: &str, encoded_limit: usize) -> AppResult<&str> {
     }
     Ok(text)
 }
-fn decode_identity_base64(text: &str) -> AppResult<Vec<u8>> {
-    let bytes = B64
-        .decode(bounded_encoded_input(text, vault::MAX_BASE64_IMPORT_BYTES)?)
-        .map_err(|_| AppError::bad_request("Invalid base64 identity data"))?;
+fn decode_identity_base64(text: &str) -> AppResult<Zeroizing<Vec<u8>>> {
+    let bytes = Zeroizing::new(
+        B64.decode(bounded_encoded_input(text, vault::MAX_BASE64_IMPORT_BYTES)?)
+            .map_err(|_| AppError::bad_request("Invalid base64 identity data"))?,
+    );
     if bytes.len() > vault::MAX_IDENTITY_IMPORT_BYTES {
         return Err(AppError::bad_request(
             "Identity import exceeds the 1 MiB limit",
@@ -349,8 +397,8 @@ fn decode_identity_base64(text: &str) -> AppResult<Vec<u8>> {
     Ok(bytes)
 }
 async fn parse_identity_import_async(
-    bytes: Vec<u8>,
-    passcode: Option<String>,
+    bytes: Zeroizing<Vec<u8>>,
+    passcode: Option<Zeroizing<String>>,
 ) -> AppResult<ParsedIdentityImport> {
     if bytes.len() > vault::MAX_IDENTITY_IMPORT_BYTES {
         return Err(AppError::bad_request(
@@ -362,7 +410,7 @@ async fn parse_identity_import_async(
     }
     let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     tokio::task::spawn_blocking(move || {
-        parse_private_identity_bytes_with_job(&bytes, passcode.as_deref(), &job)
+        parse_private_identity_bytes_with_job(&bytes, passcode.as_deref().map(String::as_str), &job)
     })
     .await
     .map_err(|_| AppError::internal("identity parsing task panicked"))?
@@ -394,8 +442,10 @@ pub async fn api_identity(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
         .await
         .unwrap_or_else(|_| {
             tracing::error!(reason = "task_panicked", "db task panicked");
-            Default::default()
-        });
+            Ok(None)
+        })
+        .ok()
+        .flatten();
     let is_hardware = state
         .lxmf
         .lock()
@@ -492,7 +542,7 @@ pub async fn api_create_identity(
         ratspeak_runtime::generate_recoverable_key().map_err(AppError::internal)?;
     let mut resp = import_identity_request(
         Arc::clone(&state),
-        key.to_vec(),
+        Zeroizing::new(key.to_vec()),
         Some(nickname),
         None,
         Some(mnemonic.clone()),
@@ -500,7 +550,7 @@ pub async fn api_create_identity(
     )
     .await?;
     if let Some(obj) = resp.as_object_mut() {
-        obj.insert("mnemonic".to_string(), json!(mnemonic));
+        obj.insert("mnemonic".to_string(), json!(mnemonic.as_str()));
     }
     Ok(resp)
 }
@@ -519,11 +569,11 @@ pub async fn api_import_identity(
     state: State<'_, Arc<AppState>>,
     args: ImportIdentityArgs,
 ) -> AppResult<Value> {
-    let key_bytes = hex::decode(bounded_encoded_input(
-        &args.key,
-        vault::MAX_HEX_IMPORT_BYTES,
-    )?)
-    .map_err(|_| AppError::bad_request("Invalid hex key data"))?;
+    let key = Zeroizing::new(args.key);
+    let key_bytes = Zeroizing::new(
+        hex::decode(bounded_encoded_input(&key, vault::MAX_HEX_IMPORT_BYTES)?)
+            .map_err(|_| AppError::bad_request("Invalid hex key data"))?,
+    );
     import_identity_shared(state, key_bytes, args.nickname).await
 }
 
@@ -532,8 +582,14 @@ pub async fn api_import_identity_base64(
     state: State<'_, Arc<AppState>>,
     args: ImportIdentityArgs,
 ) -> AppResult<Value> {
-    let key_bytes = decode_identity_base64(&args.key)?;
-    import_identity_shared_with_passcode(state, key_bytes, args.nickname, args.passcode).await
+    let key_bytes = decode_identity_base64(&Zeroizing::new(args.key))?;
+    import_identity_shared_with_passcode(
+        state,
+        key_bytes,
+        args.nickname,
+        args.passcode.map(Zeroizing::new),
+    )
+    .await
 }
 
 #[cfg(feature = "seed")]
@@ -555,12 +611,13 @@ pub async fn restore_seed_identity(
     args: RestoreSeedArgs,
 ) -> AppResult<Value> {
     let request_fence = state.activity_request_fence();
-    let phrase = args.phrase.trim().to_string();
+    let phrase = Zeroizing::new(args.phrase);
+    let phrase = Zeroizing::new(phrase.trim().to_owned());
     let key = ratspeak_runtime::derive_identity_key_from_phrase(&phrase)
         .map_err(AppError::bad_request)?;
     import_identity_request(
         Arc::clone(&state),
-        key.to_vec(),
+        Zeroizing::new(key.to_vec()),
         args.nickname,
         None,
         Some(phrase),
@@ -588,15 +645,18 @@ pub async fn set_identity_passcode(
     if !validate_hex(&args.hash, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
-    if args.passcode.len() < 6 || args.passcode.len() > vault::MAX_PASSCODE_BYTES {
+    let (passcode, current) = (
+        Zeroizing::new(args.passcode),
+        args.current.map(Zeroizing::new),
+    );
+    if passcode.len() < 6 || passcode.len() > vault::MAX_PASSCODE_BYTES {
         return Err(AppError::bad_request("PIN must be at least 6 characters"));
     }
     let generation = state.current_identity_session_generation();
     let id_dir = state.config.data_dir.join("identities").join(&args.hash);
-    let (passcode, current) = (args.passcode, args.current);
     let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     let (job, prepared) = tokio::task::spawn_blocking(move || {
-        job.prepare_protection(&id_dir, &passcode, current.as_deref())
+        job.prepare_protection(&id_dir, &passcode, current.as_deref().map(String::as_str))
             .map(|prepared| (job, prepared))
             .map_err(|e| e.to_string())
     })
@@ -609,13 +669,20 @@ pub async fn set_identity_passcode(
             "Identity changed while preparing protection; retry",
         ));
     }
+    let worker_state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         let _identity_lifecycle = identity_lifecycle;
-        job.commit_protection(prepared)
+        job.commit_protection(prepared)?;
+        // The open active identity locks once the set time has passed from now.
+        if args.hash == active_identity_id(&worker_state) && worker_state.hw_locked_hash().is_none()
+        {
+            ratspeak_runtime::arm_auto_lock(&worker_state, &args.hash, "passcode", false);
+        }
+        Ok(())
     })
     .await
     .map_err(|_| AppError::internal("vault commit task panicked"))?
-    .map_err(|e| AppError::bad_request(e.to_string()))?;
+    .map_err(|e: vault::VaultError| AppError::bad_request(e.to_string()))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -636,7 +703,7 @@ pub async fn remove_identity_passcode(
     }
     let generation = state.current_identity_session_generation();
     let id_dir = state.config.data_dir.join("identities").join(&args.hash);
-    let passcode = args.passcode;
+    let passcode = Zeroizing::new(args.passcode);
     let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     let (job, prepared) = tokio::task::spawn_blocking(move || {
         job.prepare_unprotection(&id_dir, &passcode)
@@ -652,27 +719,37 @@ pub async fn remove_identity_passcode(
             "Identity changed while preparing unprotection; retry",
         ));
     }
+    let worker_state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         let _identity_lifecycle = identity_lifecycle;
-        job.commit_unprotection(prepared)
+        job.commit_unprotection(prepared)?;
+        // Without a passcode the active identity no longer locks.
+        if args.hash == active_identity_id(&worker_state) {
+            worker_state.disarm_auto_lock();
+        }
+        Ok(())
     })
     .await
     .map_err(|_| AppError::internal("vault commit task panicked"))?
-    .map_err(|e| AppError::bad_request(e.to_string()))?;
+    .map_err(|e: vault::VaultError| AppError::bad_request(e.to_string()))?;
     Ok(json!({ "ok": true }))
 }
 
 #[derive(Deserialize)]
 pub struct RevealMnemonicArgs {
     pub hash: String,
-    /// Required only when the identity is passcode-protected (phrase in the vault).
+    /// Required when the identity is passcode-protected (phrase in the vault).
     #[serde(default)]
     pub passcode: Option<String>,
+    /// Required when it is not.
+    #[serde(default)]
+    pub confirmed: Option<bool>,
 }
 
-/// Re-display a software identity's 12-word recovery phrase. Reads the plaintext
-/// sidecar, or decrypts it from the vault (Argon2 → spawn_blocking) when the
-/// identity is passcode-protected. Hardware identities have no stored phrase.
+/// Re-display the active software identity's 12-word recovery phrase: from
+/// its vault with its passcode (Argon2 → spawn_blocking), or from the
+/// plaintext sidecar after a confirmation. Hardware identities have no stored
+/// phrase.
 #[tauri::command]
 pub async fn reveal_identity_mnemonic(
     state: State<'_, Arc<AppState>>,
@@ -681,18 +758,21 @@ pub async fn reveal_identity_mnemonic(
     if !validate_hex(&args.hash, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
+    if args.hash != active_identity_id(&state) {
+        return Err(AppError::forbidden(
+            "Only the active identity's recovery phrase can be shown",
+        ));
+    }
+    let passcode = release_passcode(&state, &args.hash, args.passcode, args.confirmed)?;
     let id_dir = state.config.data_dir.join("identities").join(&args.hash);
-    let passcode = args.passcode;
     let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
     let phrase = tokio::task::spawn_blocking(move || {
-        job.reveal_mnemonic(&id_dir, passcode.as_deref())
-            .map(|z| z.as_str().to_string())
-            .map_err(|e| e.to_string())
+        job.reveal_mnemonic(&id_dir, passcode.as_deref().map(String::as_str))
     })
     .await
     .map_err(|_| AppError::internal("reveal_mnemonic task panicked"))?
-    .map_err(AppError::bad_request)?;
-    Ok(json!({ "mnemonic": phrase }))
+    .map_err(key_release_error)?;
+    Ok(json!({ "mnemonic": phrase.as_str() }))
 }
 
 fn protected_identity_kind(state: &AppState, hash: &str) -> Option<&'static str> {
@@ -704,6 +784,73 @@ fn protected_identity_kind(state: &AppState, hash: &str) -> Option<&'static str>
     } else {
         None
     }
+}
+
+/// A key, phrase or access file of `hash`'s is released with the identity's
+/// passcode when it has one, otherwise only after an explicit confirmation: a
+/// hardware PIN would need the token. Returns the passcode to open its vault.
+pub(crate) fn release_passcode(
+    state: &AppState,
+    hash: &str,
+    passcode: Option<String>,
+    confirmed: Option<bool>,
+) -> AppResult<Option<Zeroizing<String>>> {
+    let passcode = passcode.map(Zeroizing::new);
+    if protected_identity_kind(state, hash) == Some("passcode") {
+        return match passcode.filter(|passcode| !passcode.is_empty()) {
+            Some(passcode) => Ok(Some(passcode)),
+            None => Err(AppError::unauthorized("Enter this identity's PIN")),
+        };
+    }
+    if confirmed == Some(true) {
+        Ok(None)
+    } else {
+        Err(AppError::bad_request(
+            "Confirm before releasing this identity's keys",
+        ))
+    }
+}
+
+/// `hash`'s key and stored phrase, opened as an unlock opens them.
+fn open_identity_files(
+    job: &VaultJob,
+    id_dir: &std::path::Path,
+    hash: &str,
+    passcode: Option<&str>,
+) -> Result<(vault::UnlockedVault, Identity), vault::VaultError> {
+    let unlocked = job.open_identity(id_dir, passcode)?;
+    let identity = Identity::from_private_key(unlocked.key())
+        .map_err(|_| vault::VaultError::InvalidFormat("private identity".into()))?;
+    if hex::encode(identity.hash) != hash {
+        return Err(vault::VaultError::InvalidFormat(
+            "vault identity does not match selected profile".into(),
+        ));
+    }
+    Ok((unlocked, identity))
+}
+
+fn key_release_error(error: vault::VaultError) -> AppError {
+    match error {
+        vault::VaultError::Auth => AppError::unauthorized("Incorrect PIN"),
+        error => AppError::bad_request(error.to_string()),
+    }
+}
+
+/// Checks `passcode` against `hash`'s vault.
+pub(crate) async fn verify_identity_passcode(
+    state: &AppState,
+    hash: &str,
+    passcode: Zeroizing<String>,
+) -> AppResult<()> {
+    let id_dir = state.config.data_dir.join("identities").join(hash);
+    let hash = hash.to_owned();
+    let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        open_identity_files(&job, &id_dir, &hash, Some(&passcode)).map(drop)
+    })
+    .await
+    .map_err(|_| AppError::internal("passcode check task panicked"))?
+    .map_err(key_release_error)
 }
 
 fn check_unlock_secret(kind: Option<&str>, secret: &str) -> AppResult<()> {
@@ -737,38 +884,25 @@ pub(crate) async fn unlock_protected_identity(
     state: Arc<AppState>,
     secret: String,
 ) -> AppResult<Value> {
+    let secret = Zeroizing::new(secret);
     let generation = state.current_identity_session_generation();
-    let expected_hash = state.hw_locked_hash();
-    let kind = expected_hash
-        .as_deref()
-        .and_then(|hash| protected_identity_kind(&state, hash));
+    // The secret is staged for the locked identity alone.
+    let expected_hash = state
+        .hw_locked_hash()
+        .ok_or_else(|| AppError::bad_request("No locked identity"))?;
+    let kind = protected_identity_kind(&state, &expected_hash);
     check_unlock_secret(kind, &secret)?;
 
     // Validate the candidate before stopping a usable runtime. The job permit
     // lives in the actual worker if this awaiting command is cancelled.
     let unlocked = if kind == Some("passcode") {
-        let hash = expected_hash
-            .clone()
-            .ok_or_else(|| AppError::bad_request("No locked identity"))?;
-        let path = state
-            .config
-            .data_dir
-            .join("identities")
-            .join(&hash)
-            .join("identity.enc");
+        let hash = expected_hash.clone();
+        let id_dir = state.config.data_dir.join("identities").join(&hash);
         let passcode = secret.clone();
         let job =
             vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
         let unlocked = tokio::task::spawn_blocking(move || {
-            let decoded = job.decrypt_identity(&passcode, &vault::read_vault(&path)?)?;
-            let identity = Identity::from_private_key(decoded.key())
-                .map_err(|_| vault::VaultError::InvalidFormat("private identity".into()))?;
-            if hex::encode(identity.hash) != hash {
-                return Err(vault::VaultError::InvalidFormat(
-                    "vault identity does not match selected profile".into(),
-                ));
-            }
-            Ok::<_, vault::VaultError>(identity)
+            open_identity_files(&job, &id_dir, &hash, Some(&passcode)).map(|(_, identity)| identity)
         })
         .await
         .map_err(|_| AppError::internal("identity unlock task panicked"))?;
@@ -786,7 +920,7 @@ pub(crate) async fn unlock_protected_identity(
     };
     let _guard = state.identity_switch_lock.lock().await;
     if generation != state.current_identity_session_generation()
-        || expected_hash != state.hw_locked_hash()
+        || state.hw_locked_hash().as_deref() != Some(expected_hash.as_str())
     {
         return Err(AppError::conflict(
             "Selected identity changed during unlock; retry",
@@ -799,18 +933,14 @@ pub(crate) async fn unlock_protected_identity(
     state.clear_identity_scoped_runtime_state();
     state.set_hw_last_error(None);
     if let Some(identity) = unlocked {
-        if !state.retain_unlocked_identity(
-            identity,
-            expected_hash.as_deref().unwrap_or(""),
-            generation,
-        ) {
+        if !state.retain_unlocked_identity(identity, &expected_hash, generation) {
             return Err(AppError::conflict(
                 "Selected identity changed during unlock",
             ));
         }
-        state.set_pending_hw_pin(None);
+        state.clear_pending_hw_pin();
     } else {
-        state.set_pending_hw_pin(Some(secret));
+        state.stage_pending_hw_pin(&expected_hash, secret);
     }
     if let Ok(mut sig) = state.session_shutdown.write() {
         *sig = rns_runtime::lifecycle::ShutdownSignal::new();
@@ -824,10 +954,7 @@ pub(crate) async fn unlock_protected_identity(
         .lock()
         .ok()
         .and_then(|lxmf| lxmf.as_ref().map(|mgr| mgr.identity_hash.clone()));
-    let unlocked = loaded_identity.is_some()
-        && expected_hash
-            .as_deref()
-            .is_none_or(|expected| loaded_identity.as_deref() == Some(expected));
+    let unlocked = loaded_identity.as_deref() == Some(expected_hash.as_str());
     if unlocked {
         state.set_hw_locked(None);
         state.set_hw_last_error(None);
@@ -841,10 +968,8 @@ pub(crate) async fn unlock_protected_identity(
         Some("passcode") => "Could not unlock the identity.".to_string(),
         _ => "Could not unlock the hardware identity.".to_string(),
     });
-    if let Some(expected) = expected_hash {
-        state.set_hw_locked(Some(expected));
-        state.set_startup_stage("hw_locked");
-    }
+    state.set_hw_locked(Some(expected_hash));
+    state.set_startup_stage("hw_locked");
     let locked = kind == Some("hardware") && msg.contains("PIN locked");
     Ok(json!({
         "ok": false,
@@ -864,7 +989,7 @@ pub async fn unlock_identity(state: State<'_, Arc<AppState>>, secret: String) ->
 
 async fn import_identity_shared(
     state: State<'_, Arc<AppState>>,
-    key_bytes: Vec<u8>,
+    key_bytes: Zeroizing<Vec<u8>>,
     nickname: Option<String>,
 ) -> AppResult<Value> {
     import_identity_shared_with_passcode(state, key_bytes, nickname, None).await
@@ -872,9 +997,9 @@ async fn import_identity_shared(
 
 async fn import_identity_shared_with_passcode(
     state: State<'_, Arc<AppState>>,
-    key_bytes: Vec<u8>,
+    key_bytes: Zeroizing<Vec<u8>>,
     nickname: Option<String>,
-    passcode: Option<String>,
+    passcode: Option<Zeroizing<String>>,
 ) -> AppResult<Value> {
     let request_fence = state.activity_request_fence();
     import_identity_request(
@@ -890,10 +1015,10 @@ async fn import_identity_shared_with_passcode(
 
 async fn import_identity_request(
     state: Arc<AppState>,
-    key_bytes: Vec<u8>,
+    key_bytes: Zeroizing<Vec<u8>>,
     nickname: Option<String>,
-    passcode: Option<String>,
-    explicit_mnemonic: Option<String>,
+    passcode: Option<Zeroizing<String>>,
+    explicit_mnemonic: Option<Zeroizing<String>>,
     request_fence: ActivityRequestFence,
 ) -> AppResult<Value> {
     import_identity_after_parse(
@@ -907,36 +1032,42 @@ async fn import_identity_request(
     .await
 }
 
+/// A failed identity creation, as the window shows it. A phrase that could
+/// not be stored has a code of its own: no identity was created without it.
+pub(crate) fn identity_import_error(error: crate::lxmf::IdentityImportError) -> AppError {
+    match error {
+        crate::lxmf::IdentityImportError::Phrase(error) => {
+            tracing::error!(%error, "identity not created: its recovery phrase was not stored");
+            AppError::new(
+                "phrase_not_saved",
+                "Ratspeak couldn't save the recovery phrase, so it didn't create the identity. \
+                 Make sure this device has free storage, then try again.",
+            )
+        }
+        error => AppError::bad_request(error.to_string()),
+    }
+}
+
 fn persist_parsed_identity_import(
     state: Arc<AppState>,
     parsed: ParsedIdentityImport,
     nickname: String,
-    mnemonic: Option<String>,
-) -> Result<(String, String), String> {
-    let result = {
-        let lxmf = state.lxmf.lock().map_err(|_| "Lock error".to_string())?;
-        if let Some(manager) = lxmf.as_ref() {
-            manager.import_identity(&parsed.key_bytes, &nickname, &state.db)
-        } else {
-            crate::lxmf::LxmfManager::import_identity_to_data_dir(
-                &state.config.data_dir,
-                &parsed.key_bytes,
-                &nickname,
-                &state.db,
-            )
-        }
-        .map_err(|error| error.to_string())?
-    };
-    if let Some(phrase) = mnemonic.as_deref() {
-        let seed_dir = state.config.data_dir.join("identities").join(&result.0);
-        if ratspeak_runtime::vault::store_plaintext_seed(&seed_dir, phrase).is_err() {
-            tracing::warn!(
-                reason = "write_failed",
-                "could not store recovery-phrase sidecar"
-            );
-        }
-    }
-    Ok(result)
+    mnemonic: Option<Zeroizing<String>>,
+) -> AppResult<(String, String)> {
+    // A recoverable identity is created with its stored phrase or not at all.
+    let job = mnemonic
+        .as_ref()
+        .map(|_| vault::try_acquire_job())
+        .transpose()
+        .map_err(|e| AppError::service_unavailable(e.to_string()))?;
+    crate::lxmf::LxmfManager::import_identity_with_phrase(
+        &state.config.data_dir,
+        &parsed.key_bytes,
+        mnemonic.as_deref().map(String::as_str).zip(job.as_ref()),
+        &nickname,
+        &state.db,
+    )
+    .map_err(identity_import_error)
 }
 
 // The production-used seam lets regression tests pause preparation or the
@@ -944,7 +1075,7 @@ fn persist_parsed_identity_import(
 async fn import_identity_after_parse<P, W>(
     state: Arc<AppState>,
     nickname: Option<String>,
-    explicit_mnemonic: Option<String>,
+    explicit_mnemonic: Option<Zeroizing<String>>,
     request_fence: ActivityRequestFence,
     parse: P,
     persist: W,
@@ -955,8 +1086,8 @@ where
             Arc<AppState>,
             ParsedIdentityImport,
             String,
-            Option<String>,
-        ) -> Result<(String, String), String>
+            Option<Zeroizing<String>>,
+        ) -> AppResult<(String, String)>
         + Send
         + 'static,
 {
@@ -970,13 +1101,21 @@ where
     let parsed_identity = Identity::from_private_key(&parsed.key_bytes)
         .map_err(|error| AppError::bad_request(format!("Invalid identity key: {error}")))?;
     let import_hash = hex::encode(parsed_identity.hash);
-    let already_exists = db::spawn_db_with_lease(
+    let (already_exists, active) = db::spawn_db_with_lease(
         state.db.clone(),
         Arc::clone(&identity_lifecycle),
-        move |pool| db::get_identity(&pool, &import_hash).is_some(),
+        move |pool| {
+            (
+                db::get_identity(&pool, &import_hash).is_some(),
+                db::get_active_identity(&pool),
+            )
+        },
     )
     .await
     .map_err(|_| AppError::internal("identity duplicate check db task panicked"))?;
+    // Read before anything is written: a failed read is not "none active", and
+    // activating the import on it would switch identity.
+    let active_missing = active.map_err(AppError::database_unavailable)?.is_none();
     if already_exists {
         return Err(AppError::conflict("Identity already exists"));
     }
@@ -985,21 +1124,17 @@ where
         persist(worker_state, parsed, nickname, mnemonic)
     })
     .await
-    .map_err(|_| AppError::internal("import_identity task panicked"))?
-    .map_err(AppError::bad_request)?;
+    .map_err(|_| AppError::internal("import_identity task panicked"))??;
 
     // Reuse this exact lifecycle owner. A nested acquisition would deadlock,
     // while releasing it here would allow reset to erase the just-imported row.
-    let active_missing =
-        db::spawn_db_with_lease(state.db.clone(), Arc::clone(&identity_lifecycle), |pool| {
-            db::get_active_identity(&pool).is_none()
-        })
-        .await
-        .map_err(|_| AppError::internal("active identity db task panicked"))?;
     if active_missing {
-        crate::shutdown_rns_lxmf(&state)
+        let reset = crate::reset_activity_for_shutdown(&state)
             .await
             .map_err(identity_activity_reset_error)?;
+        // An activation: nothing begun before it may land in this identity.
+        state.bump_identity_session_generation();
+        crate::finish_shutdown(&state, &reset).await;
         let hash_for_active = hash.clone();
         db::spawn_db_with_lease(
             state.db.clone(),
@@ -1020,8 +1155,8 @@ where
 
 #[tauri::command]
 pub async fn api_preview_identity_import_base64(args: ImportIdentityArgs) -> AppResult<Value> {
-    let bytes = decode_identity_base64(&args.key)?;
-    let parsed = parse_identity_import_async(bytes, args.passcode).await?;
+    let bytes = decode_identity_base64(&Zeroizing::new(args.key))?;
+    let parsed = parse_identity_import_async(bytes, args.passcode.map(Zeroizing::new)).await?;
     identity_preview_payload(&parsed.key_bytes, parsed.format).map_err(AppError::bad_request)
 }
 
@@ -1034,52 +1169,6 @@ pub async fn api_activate_identity(
         return Err(AppError::bad_request("Invalid hash"));
     }
     switch_identity_session(Arc::clone(&state), hash_hex).await
-}
-
-/// Existence check; the actual bytes ship via `api_export_identity_base64`.
-#[tauri::command]
-pub async fn api_export_identity(
-    state: State<'_, Arc<AppState>>,
-    hash_hex: String,
-) -> AppResult<Value> {
-    if !validate_hex(&hash_hex, 16, 128) {
-        return Err(AppError::bad_request("Invalid hash"));
-    }
-    let exists = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|l| l.as_ref().and_then(|mgr| mgr.export_identity(&hash_hex)))
-        .is_some();
-    if exists {
-        Ok(json!({ "message": "Use export-base64 endpoint for key data" }))
-    } else {
-        Err(AppError::not_found("Identity file not found"))
-    }
-}
-
-#[tauri::command]
-pub async fn api_export_identity_base64(
-    state: State<'_, Arc<AppState>>,
-    hash_hex: String,
-) -> AppResult<Value> {
-    if !validate_hex(&hash_hex, 16, 128) {
-        return Err(AppError::bad_request("Invalid hash"));
-    }
-    if is_hardware_identity(&state, &hash_hex) {
-        return Err(AppError::bad_request(
-            "Hardware-backed identity: the private key lives on the token and cannot be exported",
-        ));
-    }
-    let key_bytes = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|l| l.as_ref().and_then(|mgr| mgr.export_identity(&hash_hex)));
-    match key_bytes {
-        Some(bytes) => Ok(json!({ "key": B64.encode(&bytes) })),
-        None => Err(AppError::not_found("Identity file not found")),
-    }
 }
 
 /// Pull the PIV `serial` out of a `.hwid` (TOML) without a ratkey dependency,
@@ -1097,40 +1186,44 @@ fn read_hwid_serial(path: &std::path::Path) -> Option<u64> {
     None
 }
 
-/// A hardware-backed identity stores a `.hwid` instead of a private-key file.
-fn is_hardware_identity(state: &AppState, hash_hex: &str) -> bool {
-    state
-        .config
-        .data_dir
-        .join("identities")
-        .join(hash_hex)
-        .join("identity.hwid")
-        .exists()
-}
-
-pub(crate) fn export_identity_key_bytes(state: &AppState, hash_hex: &str) -> AppResult<Vec<u8>> {
-    if !validate_hex(hash_hex, 16, 128) {
+/// Runs `export` on `hash`'s private key and stored recovery phrase, under the
+/// one vault job, opened as an unlock opens them: a passcode identity's from
+/// its vault with its passcode, so a locked one exports too; any other's from
+/// its files once confirmed. A hardware key never leaves its token.
+async fn export_identity<T: Send + 'static>(
+    state: &AppState,
+    hash: &str,
+    passcode: Option<String>,
+    confirmed: Option<bool>,
+    export: impl FnOnce(&VaultJob, &vault::UnlockedVault) -> AppResult<T> + Send + 'static,
+) -> AppResult<T> {
+    if !validate_hex(hash, 16, 128) {
         return Err(AppError::bad_request("Invalid hash"));
     }
-    if is_hardware_identity(state, hash_hex) {
+    let id_dir = state.config.data_dir.join("identities").join(hash);
+    if id_dir.join("identity.hwid").exists() {
         return Err(AppError::bad_request(
             "Hardware-backed identity: the private key lives on the token and cannot be exported",
         ));
     }
-    let key_bytes = state
-        .lxmf
-        .lock()
-        .ok()
-        .and_then(|l| l.as_ref().and_then(|mgr| mgr.export_identity(hash_hex)))
-        .ok_or_else(|| AppError::not_found("Identity file not found"))?;
-
-    let identity =
-        Identity::from_private_key(&key_bytes).map_err(|_| AppError::bad_request("Invalid key"))?;
-    let identity_hash = hex::encode(identity.hash);
-    if identity_hash != hash_hex {
-        return Err(AppError::conflict("Identity file hash mismatch"));
+    if !identity_material_exists(&id_dir) {
+        return Err(AppError::not_found("Identity file not found"));
     }
-    Ok(key_bytes)
+    let passcode = release_passcode(state, hash, passcode, confirmed)?;
+    let hash = hash.to_owned();
+    let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let (unlocked, _) = open_identity_files(
+            &job,
+            &id_dir,
+            &hash,
+            passcode.as_deref().map(String::as_str),
+        )
+        .map_err(key_release_error)?;
+        export(&job, &unlocked)
+    })
+    .await
+    .map_err(|_| AppError::internal("identity export task panicked"))?
 }
 
 fn identity_export_hashes(key_bytes: &[u8]) -> AppResult<(String, String)> {
@@ -1141,58 +1234,73 @@ fn identity_export_hashes(key_bytes: &[u8]) -> AppResult<(String, String)> {
     Ok((identity_hash, hex::encode(lxmf_dest)))
 }
 
+/// The raw private key. Takes the identity's passcode when it has one,
+/// otherwise `confirmed`.
 #[tauri::command]
 pub async fn api_export_identity_reticulum_base64(
     state: State<'_, Arc<AppState>>,
     hash_hex: String,
+    passcode: Option<String>,
+    confirmed: Option<bool>,
 ) -> AppResult<Value> {
-    let key_bytes = export_identity_key_bytes(&state, &hash_hex)?;
-    let (identity_hash, lxmf_hash) = identity_export_hashes(&key_bytes)?;
-    Ok(json!({
-        "data_base64": B64.encode(&key_bytes),
-        "file_name": format!("{}-reticulum-identity.identity", &identity_hash[..16]),
-        "identity_hash": identity_hash,
-        "lxmf_hash": lxmf_hash,
-        "format": "reticulum.raw-private-key",
-    }))
+    export_identity(&state, &hash_hex, passcode, confirmed, |_, identity| {
+        let (identity_hash, lxmf_hash) = identity_export_hashes(identity.key())?;
+        Ok(json!({
+            "data_base64": B64.encode(identity.key()),
+            "file_name": format!("{}-reticulum-identity.identity", &identity_hash[..16]),
+            "identity_hash": identity_hash,
+            "lxmf_hash": lxmf_hash,
+            "format": "reticulum.raw-private-key",
+        }))
+    })
+    .await
 }
 
+/// The private key as base32 text. Takes the identity's passcode when it has
+/// one, otherwise `confirmed`.
 #[tauri::command]
 pub async fn api_export_identity_reticulum_base32(
     state: State<'_, Arc<AppState>>,
     hash_hex: String,
+    passcode: Option<String>,
+    confirmed: Option<bool>,
 ) -> AppResult<Value> {
-    let key_bytes = export_identity_key_bytes(&state, &hash_hex)?;
-    let (identity_hash, lxmf_hash) = identity_export_hashes(&key_bytes)?;
-    let text = base32_encode_padded(&key_bytes);
-    Ok(json!({
-        "data_base64": B64.encode(text.as_bytes()),
-        "text": text,
-        "file_name": format!("{}-reticulum-identity-key-base32.txt", &identity_hash[..16]),
-        "identity_hash": identity_hash,
-        "lxmf_hash": lxmf_hash,
-        "format": "reticulum.base32-private-key",
-    }))
+    export_identity(&state, &hash_hex, passcode, confirmed, |_, identity| {
+        let (identity_hash, lxmf_hash) = identity_export_hashes(identity.key())?;
+        let text = Zeroizing::new(base32_encode_padded(identity.key()));
+        Ok(json!({
+            "data_base64": B64.encode(text.as_bytes()),
+            "text": text.as_str(),
+            "file_name": format!("{}-reticulum-identity-key-base32.txt", &identity_hash[..16]),
+            "identity_hash": identity_hash,
+            "lxmf_hash": lxmf_hash,
+            "format": "reticulum.base32-private-key",
+        }))
+    })
+    .await
 }
 
+/// A backup sealed with `passcode`, the backup PIN. Like the raw exports it
+/// takes the identity's own passcode (`identity_passcode`) when it has one,
+/// otherwise `confirmed`.
 #[tauri::command]
 pub async fn api_export_identity_backup_base64(
     state: State<'_, Arc<AppState>>,
     hash_hex: String,
     passcode: String,
+    identity_passcode: Option<String>,
+    confirmed: Option<bool>,
 ) -> AppResult<Value> {
-    let passcode = passcode.trim().to_string();
+    let passcode = Zeroizing::new(passcode);
+    let passcode = Zeroizing::new(passcode.trim().to_owned());
     if passcode.len() < 6 || passcode.len() > vault::MAX_PASSCODE_BYTES {
         return Err(AppError::bad_request(
             "Backup PIN must be at least 6 characters",
         ));
     }
-    let key_bytes = export_identity_key_bytes(&state, &hash_hex)?;
-    let (identity_hash, lxmf_hash) = identity_export_hashes(&key_bytes)?;
-    let key_array: [u8; 64] = key_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| AppError::internal("identity key length mismatch"))?;
+    if !validate_hex(&hash_hex, 16, 128) {
+        return Err(AppError::bad_request("Invalid hash"));
+    }
 
     let row_hash = hash_hex.clone();
     let identity_row = db::spawn_db(state.db.clone(), move |p| db::get_identity(&p, &row_hash))
@@ -1216,19 +1324,22 @@ pub async fn api_export_identity_backup_base64(
         .to_string();
 
     // Argon2id KDF — off the async worker like the other vault paths.
-    let identity_dir = state.config.data_dir.join("identities").join(&hash_hex);
-    let passcode_for_kdf = passcode.clone();
-    let job = vault::try_acquire_job().map_err(|e| AppError::service_unavailable(e.to_string()))?;
-    let vault = tokio::task::spawn_blocking(move || {
-        let mnemonic = job
-            .reveal_mnemonic(&identity_dir, None)
-            .ok()
-            .map(|m| m.as_str().to_string());
-        job.encrypt_identity(&passcode_for_kdf, &key_array, mnemonic.as_deref())
-    })
-    .await
-    .map_err(|_| AppError::internal("identity backup task panicked"))?
-    .map_err(|e| AppError::internal(format!("failed to encrypt identity backup: {e}")))?;
+    let (vault, identity_hash, lxmf_hash) = export_identity(
+        &state,
+        &hash_hex,
+        identity_passcode,
+        confirmed,
+        move |job, identity| {
+            let (identity_hash, lxmf_hash) = identity_export_hashes(identity.key())?;
+            let vault = job
+                .encrypt_identity(&passcode, identity.key(), identity.mnemonic())
+                .map_err(|e| {
+                    AppError::internal(format!("failed to encrypt identity backup: {e}"))
+                })?;
+            Ok((vault, identity_hash, lxmf_hash))
+        },
+    )
+    .await?;
 
     let backup = EncryptedIdentityBackupV2 {
         format: IDENTITY_BACKUP_FORMAT.to_string(),
@@ -1352,6 +1463,7 @@ pub async fn api_delete_identity(
     }
     crate::lxmf::LxmfManager::purge_identity_profile(&state.config.data_root, &hash_hex, cascade)
         .map_err(|e| AppError::internal(format!("Failed to remove identity files: {e}")))?;
+    state.release_retained_identity_except(&active);
     state.forget_local_identity_public_key(&hash_hex);
     ratspeak_runtime::network_ownership::forget_deleted_profile(&state, &hash_hex)
         .await
@@ -1363,10 +1475,139 @@ pub async fn api_delete_identity(
 pub struct DisplayNameArgs {
     #[serde(default)]
     pub display_name: Option<String>,
+    /// The identity the caller shows; the rename is refused if another is active.
+    #[serde(default)]
+    pub identity_id: Option<String>,
+}
+
+/// A switch under way. One that does not finish closes with
+/// `identity_switch_failed`, so no window is left showing it.
+struct SwitchUnderWay {
+    state: Arc<AppState>,
+    target: String,
+    error: Option<String>,
+    finished: bool,
+}
+
+impl SwitchUnderWay {
+    fn begin(state: &Arc<AppState>, target: &str, generation: u64) -> Self {
+        state.emit_to_all(
+            "identity_switching",
+            json!({
+                "hash": target,
+                "generation": generation.to_string(),
+            }),
+        );
+        Self {
+            state: Arc::clone(state),
+            target: target.to_owned(),
+            error: None,
+            finished: false,
+        }
+    }
+
+    /// Call just before announcing the new identity.
+    fn finish(mut self) {
+        self.finished = true;
+    }
+
+    /// End the switch with `error`, which its closing event carries.
+    fn fail(mut self, error: AppError) -> AppError {
+        self.error = Some(error.message.clone());
+        error
+    }
+}
+
+impl Drop for SwitchUnderWay {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let error = self
+            .error
+            .take()
+            .unwrap_or_else(|| "The identity switch was interrupted.".to_string());
+        emit_switch_failed(&self.state, &self.target, &error);
+    }
+}
+
+/// A switch to `target` that did not finish, in the session that followed it.
+pub(super) fn emit_switch_failed(state: &AppState, target: &str, error: &str) {
+    state.emit_to_all(
+        "identity_switch_failed",
+        json!({
+            "hash": target,
+            "generation": state.current_identity_session_generation().to_string(),
+            "error": error,
+        }),
+    );
+}
+
+/// Bring the previous identity back up after a failed switch to `target`.
+/// With none before it, no identity is left active without a runtime.
+pub(super) async fn resume_previous(state: &Arc<AppState>, previous: Option<String>, target: &str) {
+    let Some(old_hash) = previous else {
+        let target = target.to_owned();
+        let deactivated = db::spawn_db(state.db.clone(), move |p| {
+            db::deactivate_identity(&p, &target)
+        })
+        .await;
+        // Still active, it would come back at the next start without a runtime.
+        if !matches!(deactivated, Ok(Ok(()))) {
+            tracing::error!(
+                reason = "deactivate_failed",
+                "could not leave the failed identity inactive"
+            );
+            state.set_startup_stage("error");
+            return;
+        }
+        state.set_startup_stage("ready");
+        return;
+    };
+    let reactivated = db::spawn_db(state.db.clone(), move |p| {
+        db::set_active_identity(&p, &old_hash)
+    })
+    .await;
+    // With the failed identity still active, a start would only open it again.
+    if !matches!(reactivated, Ok(Ok(()))) {
+        tracing::error!(
+            reason = "reactivate_failed",
+            "could not bring the previous identity back"
+        );
+        state.set_startup_stage("error");
+        return;
+    }
+    if let Ok(mut sig) = state.session_shutdown.write() {
+        *sig = rns_runtime::lifecycle::ShutdownSignal::new();
+    }
+    state.set_startup_stage("checking");
+    crate::init_rns_lxmf(Arc::clone(state), state.config.data_root.clone()).await;
+    crate::commands::ble::restore_ble_peer_if_requested(Arc::clone(state)).await;
+}
+
+async fn mark_identity_used(state: &AppState, hash: &str) {
+    let hash = hash.to_owned();
+    let marked = db::spawn_db(state.db.clone(), move |p| db::mark_identity_used(&p, &hash)).await;
+    if !matches!(marked, Ok(Ok(()))) {
+        tracing::warn!(
+            reason = "mark_used_failed",
+            "could not count the identity's use"
+        );
+    }
 }
 
 async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppResult<Value> {
-    let _switch_guard = state.identity_switch_lock.lock().await;
+    let lifecycle = state.identity_switch_lock.lock_owned().await;
+    switch_identity_session_held(state, hash_hex, &lifecycle).await
+}
+
+/// The switch, inside a transition its caller holds: a removal re-activates
+/// through it without taking the lock again.
+async fn switch_identity_session_held(
+    state: Arc<AppState>,
+    hash_hex: String,
+    _lifecycle: &OwnedIdentitySwitchGuard,
+) -> AppResult<Value> {
     let _auto_ownership = state.auto_interface_lock.lock().await;
 
     let hash_for_lookup = hash_hex.clone();
@@ -1387,9 +1628,11 @@ async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppR
         return Err(AppError::not_found("Identity file not found"));
     }
 
+    // Without the previous identity a failed switch could not restore it.
     let previous_active = db::spawn_db(state.db.clone(), |p| db::get_active_identity(&p))
         .await
         .map_err(|_| AppError::internal("db task panicked"))?
+        .map_err(AppError::database_unavailable)?
         .and_then(|identity| {
             identity
                 .get("hash")
@@ -1415,37 +1658,37 @@ async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppR
         return Ok(payload);
     }
 
-    let generation = state.bump_identity_session_generation();
-    state.emit_to_all(
-        "identity_switching",
-        json!({
-            "hash": hash_hex,
-            "generation": generation.to_string(),
-        }),
-    );
-
-    crate::shutdown_rns_lxmf(&state)
+    // Only the reset can refuse, and it comes first: a refused one changes
+    // nothing, and once it is acknowledged the previous runtime always stops.
+    let reset = crate::reset_activity_for_shutdown(&state)
         .await
         .map_err(identity_activity_reset_error)?;
+    let generation = state.bump_identity_session_generation();
+    state.withdraw_native_notifications();
+    let switching = SwitchUnderWay::begin(&state, &hash_hex, generation);
+    crate::finish_shutdown(&state, &reset).await;
     state.clear_identity_scoped_runtime_state();
 
+    // Counted as its use only once the identity opens.
     let hash_for_db = hash_hex.clone();
-    let set_result = db::spawn_db(state.db.clone(), move |p| {
-        db::set_active_identity(&p, &hash_for_db)
+    let activation = match db::spawn_db(state.db.clone(), move |p| {
+        db::activate_identity(&p, &hash_for_db)
     })
     .await
-    .map_err(|_| {
-        tracing::error!(reason = "task_panicked", "activate db task panicked");
-        AppError::internal("db task panicked")
-    })?;
-    if let Err(e) = set_result {
-        if let Some(old_hash) = previous_active {
-            let _ = db::spawn_db(state.db.clone(), move |p| {
-                db::set_active_identity(&p, &old_hash)
-            })
-            .await;
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(AppError::internal(format!("Failed to activate: {e}"))),
+        Err(_) => {
+            tracing::error!(reason = "task_panicked", "activate db task panicked");
+            Err(AppError::internal("db task panicked"))
         }
-        return Err(AppError::internal(format!("Failed to activate: {e}")));
+    };
+    if let Err(error) = activation {
+        // The runtime is down: bring the previous identity back, in a session
+        // of its own.
+        state.bump_identity_session_generation();
+        resume_previous(&state, previous_active, &hash_hex).await;
+        return Err(switching.fail(error));
     }
 
     if let Ok(mut sig) = state.session_shutdown.write() {
@@ -1459,19 +1702,16 @@ async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppR
     // intermediate state, not a failed switch. Keep it active and let the unlock
     // prompt (driven by the hardware_locked event) take over; do not roll back.
     if state.hw_locked_hash().as_deref() == Some(hash_hex.as_str()) {
-        state.emit_to_all(
-            "identity_switched",
-            json!({
-                "hash": hash_hex,
-                "locked": true,
-                "generation": generation.to_string(),
-            }),
-        );
-        return Ok(json!({
+        mark_identity_used(&state, &hash_hex).await;
+        state.release_retained_identity_except(&hash_hex);
+        let payload = json!({
             "hash": hash_hex,
             "locked": true,
             "generation": generation.to_string(),
-        }));
+        });
+        switching.finish();
+        state.emit_to_all("identity_switched", payload.clone());
+        return Ok(payload);
     }
 
     let (loaded_identity, loaded_lxmf, loaded_display, loaded_status) = {
@@ -1499,32 +1739,23 @@ async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppR
         );
         // Target failed to load (e.g. a hardware key that was re-provisioned or
         // unplugged). Restore the previous identity + its runtime so the session
-        // is not left with a dead active row and no LXMF.
-        crate::shutdown_rns_lxmf(&state)
-            .await
-            .map_err(identity_activity_reset_error)?;
+        // is not left with a dead active row and no LXMF. The restored session
+        // gets its own generation; it never reuses the failed target's. The
+        // switch's reset still covers this teardown.
+        state.bump_identity_session_generation();
+        crate::finish_shutdown(&state, &reset).await;
         state.clear_identity_scoped_runtime_state();
-        if let Some(old_hash) = previous_active.clone() {
-            let old_for_db = old_hash.clone();
-            let _ = db::spawn_db(state.db.clone(), move |p| {
-                db::set_active_identity(&p, &old_for_db)
-            })
-            .await;
-            if let Ok(mut sig) = state.session_shutdown.write() {
-                *sig = rns_runtime::lifecycle::ShutdownSignal::new();
-            }
-            state.set_startup_stage("checking");
-            crate::init_rns_lxmf(Arc::clone(&state), state.config.data_root.clone()).await;
-            crate::commands::ble::restore_ble_peer_if_requested(Arc::clone(&state)).await;
-        } else {
-            state.set_startup_stage("ready");
-        }
-        return Err(AppError::bad_request(
+        resume_previous(&state, previous_active, &hash_hex).await;
+        return Err(switching.fail(AppError::bad_request(
             "Couldn't load this identity's key. If it's a hardware (YubiKey) identity, \
              the key may be unplugged or was re-provisioned.",
-        ));
+        )));
     }
 
+    mark_identity_used(&state, &hash_hex).await;
+    // Switched away for good: the previous identity's unlock goes. A failed
+    // switch kept it to bring that identity back as it was.
+    state.release_retained_identity_except(&hash_hex);
     let payload = json!({
         "hash": hash_hex,
         "lxmf_hash": loaded_lxmf,
@@ -1534,9 +1765,44 @@ async fn switch_identity_session(state: Arc<AppState>, hash_hex: String) -> AppR
     });
     let ifaces = crate::rns_config::get_all_interfaces(&active_rns_config_dir(&state));
     emit_hub_interfaces(&state, ifaces);
+    switching.finish();
     state.emit_to_all("identity_switched", payload.clone());
     state.request_poll_now();
     Ok(payload)
+}
+
+/// After the live identity is removed the most recently used one takes over,
+/// as at a cold start. The caller holds the lifecycle lock as a transition.
+#[cfg(feature = "hardware")]
+pub(super) async fn activate_most_recent_identity(
+    state: &Arc<AppState>,
+    lifecycle: &OwnedIdentitySwitchGuard,
+) {
+    let data_dir = state.config.data_dir.clone();
+    let next = db::spawn_db(state.db.clone(), move |p| {
+        ratspeak_runtime::most_recent_identity(&p, &data_dir)
+    })
+    .await;
+    match next {
+        Ok(Ok(Some(hash))) => {
+            if let Err(error) =
+                switch_identity_session_held(Arc::clone(state), hash, lifecycle).await
+            {
+                tracing::warn!(
+                    code = %error.code,
+                    "the most recently used identity could not take over"
+                );
+            }
+        }
+        Ok(Ok(None)) => state.set_startup_stage("ready"),
+        Ok(Err(_)) | Err(_) => {
+            tracing::error!(
+                reason = "identity_read_failed",
+                "could not choose an identity to take over"
+            );
+            state.set_startup_stage("error");
+        }
+    }
 }
 
 #[tauri::command]
@@ -1559,23 +1825,24 @@ pub async fn api_set_display_name(
     if display_name.is_empty() {
         return Err(AppError::bad_request("display_name required"));
     }
-    let identity_id = active_identity_id(&state);
-    if identity_id.is_empty() {
-        return Err(AppError::conflict("no active identity"));
-    }
-
-    // Memory update under a short lock; the DB write happens after it drops
-    // (the mgr may be absent on a startup race — DB-only then).
+    // A switch lands before or after the check, the rename and its write,
+    // never between: the name stays with the identity the caller showed.
+    let lifecycle = acquire_identity_routine(&state, activity_origin).await?;
+    let identity_id = callers_identity(&state, args.identity_id.as_deref())?;
+    // The mgr may be absent on a startup race: DB-only then.
     let updated_in_memory = {
         let mut guard = state
             .lxmf
             .lock()
             .map_err(|_| AppError::internal("lxmf state lock poisoned"))?;
         match guard.as_mut() {
-            Some(mgr) => {
+            Some(mgr) if mgr.identity_hash == identity_id => {
                 mgr.set_display_name(&display_name);
+                // With the rename, so nothing built under the old name is sent.
+                state.bump_announce_content_revision();
                 true
             }
+            Some(_) => return Err(AppError::conflict("Identity changed; retry")),
             None => false,
         }
     };
@@ -1593,13 +1860,15 @@ pub async fn api_set_display_name(
         tracing::error!(reason = "update_failed", "display_name: rename failed");
         AppError::internal("failed to save display name")
     })?;
+    let channels = state.channels_handle();
+    drop(lifecycle);
 
     // A live channels session snapshots its nickname at connect, so without
     // this it would keep stamping the superseded name on every outbound
     // envelope for the rest of the session.
     if !rename.previous_name.is_empty()
         && rename.previous_name != display_name
-        && let Some(channels) = state.channels_handle()
+        && let Some(channels) = channels
     {
         channels
             .identity_renamed(&rename.previous_name, &display_name)
@@ -1607,7 +1876,6 @@ pub async fn api_set_display_name(
     }
 
     if updated_in_memory {
-        state.bump_announce_content_revision();
         crate::send_typed_announce_from_origin(
             &state,
             crate::announce::AnnounceOrigin::IdentityChanged,
@@ -1623,31 +1891,34 @@ pub async fn api_set_display_name(
 pub async fn set_identity_status(
     state: State<'_, Arc<AppState>>,
     status: Option<String>,
+    identity_id: Option<String>,
 ) -> AppResult<Value> {
     let activity_origin = state.activity_request_fence();
     let status = sanitize_announced_status(status.as_deref().unwrap_or(""))
         .map_err(AppError::bad_request)?;
-    let identity_id = active_identity_id(&state);
-    if identity_id.is_empty() {
-        return Err(AppError::conflict("no active identity"));
-    }
-
-    // Memory update under a short lock; the DB write happens after it drops
-    // (the mgr may be absent on a startup race — DB-only then).
+    // As a rename: one routine span for the check, the change and its write.
+    let lifecycle = acquire_identity_routine(&state, activity_origin).await?;
+    let identity_id = callers_identity(&state, identity_id.as_deref())?;
+    // The mgr may be absent on a startup race: DB-only then.
     let identity_payload: Option<Value> = {
         let mut guard = state
             .lxmf
             .lock()
             .map_err(|_| AppError::internal("lxmf state lock poisoned"))?;
-        guard.as_mut().map(|mgr| {
-            mgr.set_status(&status);
-            json!({
-                "hash": mgr.lxmf_hash.clone(),
-                "identity_hash": mgr.identity_hash.clone(),
-                "display_name": mgr.display_name.clone(),
-                "status": status.clone(),
-            })
-        })
+        match guard.as_mut() {
+            Some(mgr) if mgr.identity_hash == identity_id => {
+                mgr.set_status(&status);
+                state.bump_announce_content_revision();
+                Some(json!({
+                    "hash": mgr.lxmf_hash.clone(),
+                    "identity_hash": mgr.identity_hash.clone(),
+                    "display_name": mgr.display_name.clone(),
+                    "status": status.clone(),
+                }))
+            }
+            Some(_) => return Err(AppError::conflict("Identity changed; retry")),
+            None => None,
+        }
     };
 
     let id = identity_id.clone();
@@ -1667,7 +1938,7 @@ pub async fn set_identity_status(
 
     if let Some(payload) = identity_payload {
         state.emit_to_all("lxmf_identity", payload);
-        state.bump_announce_content_revision();
+        drop(lifecycle);
         crate::send_typed_announce_from_origin(
             &state,
             crate::announce::AnnounceOrigin::IdentityChanged,
@@ -1680,11 +1951,12 @@ pub async fn set_identity_status(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static VAULT_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(in crate::commands) static VAULT_TEST_SERIAL: std::sync::Mutex<()> =
+        std::sync::Mutex::new(());
 
     static TEMP_IDENTITY_COMMAND_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1703,74 +1975,359 @@ mod tests {
         (root, state)
     }
 
-    fn parsed_key(key_bytes: Vec<u8>, mnemonic: Option<String>) -> ParsedIdentityImport {
+    const ACTIVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// ACTIVE and OTHER exist, ACTIVE is active. One pooled connection, so
+    /// holding it fails every read for 200 ms.
+    fn single_connection_state() -> (tempfile::TempDir, Arc<AppState>) {
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+        let manager = r2d2_sqlite::SqliteConnectionManager::file(config.db_path())
+            .with_init(|c| c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;"));
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_timeout(std::time::Duration::from_millis(200))
+            .build(manager)
+            .unwrap();
+        db::init_schema(&pool).unwrap();
+        for hash in [ACTIVE, OTHER] {
+            db::save_identity(&pool, hash, &hash[..16], "", "");
+        }
+        db::set_active_identity(&pool, ACTIVE).unwrap();
+        let state = Arc::new(AppState::new(
+            config,
+            pool,
+            Arc::new(ratspeak_core::NoopEmitter),
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        (root, state)
+    }
+
+    fn active_hash(state: &AppState) -> Option<String> {
+        state
+            .db
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT hash FROM identities WHERE is_active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    fn identity_dirs(state: &AppState) -> Vec<String> {
+        let mut dirs: Vec<String> = std::fs::read_dir(state.config.data_dir.join("identities"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        dirs.sort();
+        dirs
+    }
+
+    #[tokio::test]
+    async fn import_refuses_when_the_active_identity_cannot_be_read() {
+        let (_root, state) = single_connection_state();
+        let boundary = state.current_activity_boundary_generation();
+        let dirs = identity_dirs(&state);
+        let held = state.db.get().unwrap();
+        let result = import_identity_after_parse(
+            Arc::clone(&state),
+            None,
+            None,
+            state.activity_request_fence(),
+            std::future::ready(Ok(parsed_key(private_key_bytes(), None))),
+            persist_parsed_identity_import,
+        )
+        .await;
+        drop(held);
+        assert_eq!(result.unwrap_err().code, "database_unavailable");
+        assert_eq!(identity_dirs(&state), dirs, "no identity was created");
+        assert_eq!(db::get_all_identities(&state.db).len(), 2);
+        assert_eq!(active_hash(&state).as_deref(), Some(ACTIVE));
+        assert_eq!(
+            state.current_activity_boundary_generation(),
+            boundary,
+            "nothing was shut down"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_refuses_when_the_active_identity_cannot_be_read() {
+        let (_root, state) = single_connection_state();
+        let target = state.config.data_dir.join("identities").join(OTHER);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("identity.enc"), b"sealed").unwrap();
+        // The target lookup reads another row first, so the active row itself
+        // is made unreadable instead of holding the only connection.
+        state
+            .db
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE identities SET created_at = 'unreadable' WHERE hash = ?1",
+                [ACTIVE],
+            )
+            .unwrap();
+        assert!(db::get_active_identity(&state.db).is_err());
+        let boundary = state.current_activity_boundary_generation();
+        let generation = state.current_identity_session_generation();
+        let result = switch_identity_session(Arc::clone(&state), OTHER.to_string()).await;
+        assert_eq!(result.unwrap_err().code, "database_unavailable");
+        assert_eq!(active_hash(&state).as_deref(), Some(ACTIVE));
+        assert_eq!(state.current_activity_boundary_generation(), boundary);
+        assert_eq!(state.current_identity_session_generation(), generation);
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        events: std::sync::Mutex<Vec<(String, Value)>>,
+    }
+
+    impl ratspeak_core::Emitter for Recorder {
+        fn try_emit(&self, event: &str, payload: Value) -> Result<(), ratspeak_core::EmitError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push((event.to_owned(), payload));
+            Ok(())
+        }
+    }
+
+    impl Recorder {
+        fn last(&self, name: &str) -> Option<Value> {
+            let events = self.events.lock().unwrap();
+            events
+                .iter()
+                .rev()
+                .find(|(event, _)| event == name)
+                .map(|(_, payload)| payload.clone())
+        }
+
+        async fn wait_for(&self, name: &str) -> Value {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(payload) = self.last(name) {
+                    return payload;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "no {name}");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// No identity, with events recorded and a mock app holding the state, so
+    /// commands can take their `State`.
+    fn recorded_state() -> (
+        tempfile::TempDir,
+        Arc<AppState>,
+        Arc<Recorder>,
+        tauri::App<tauri::test::MockRuntime>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        crate::lxmf::initialize_storage_namespace(root.path()).unwrap();
+        let config = crate::config::DashboardConfig::from_env_and_defaults(root.path().into());
+        let pool = db::init_pool(root.path()).unwrap();
+        db::init_schema(&pool).unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let state = Arc::new(AppState::new(
+            config,
+            pool,
+            Arc::clone(&recorder) as Arc<dyn ratspeak_core::Emitter>,
+            Arc::new(ratspeak_core::NoopNotifier),
+        ));
+        let app = tauri::test::mock_builder()
+            .manage(Arc::clone(&state))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        (root, state, recorder, app)
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Start an import whose preparation pauses until `release` is sent.
+    fn paused_import(
+        state: &Arc<AppState>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<AppResult<Value>>,
+    ) {
+        let request_fence = state.activity_request_fence();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let import = tokio::spawn(import_identity_after_parse(
+            Arc::clone(state),
+            None,
+            None,
+            request_fence,
+            async move {
+                ready_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok(parsed_key(private_key_bytes(), None))
+            },
+            persist_parsed_identity_import,
+        ));
+        (ready_rx, release_tx, import)
+    }
+
+    // What the window does all the time must not fail an identity mutation.
+    #[test]
+    fn identity_mutation_survives_routine_work_during_preparation() {
+        use tauri::Manager;
+        let (_root, state, recorder, app) = recorded_state();
+        test_runtime().block_on(async {
+            let (ready, release, import) = paused_import(&state);
+            ready.await.unwrap();
+            super::super::activity::activity_status(app.state())
+                .await
+                .unwrap();
+            let _ = super::super::channels::api_channel_unread(app.state()).await;
+            let edge = state.begin_foreground_transition();
+            super::super::system::apply_foreground_transition(Arc::clone(&state), true, edge)
+                .await
+                .unwrap();
+            let unblock = super::super::contacts::UnblockContactArgs {
+                hash: "ab".repeat(16),
+                also_remove_blackhole: false,
+            };
+            super::super::contacts::unblock_contact(app.state(), unblock)
+                .await
+                .unwrap();
+            // The unblock re-sends the conversation list under the lifecycle lock.
+            recorder.wait_for("conversations_update").await;
+            release.send(()).unwrap();
+            let imported = import.await.unwrap().unwrap();
+            let hash = imported["hash"].as_str().unwrap();
+            assert!(db::get_identity(&state.db, hash).is_some());
+        });
+    }
+
+    // A guard, which passes even when every lifecycle holder is a transition:
+    // a privacy reset during preparation must still refuse.
+    #[test]
+    fn identity_mutation_refused_after_a_privacy_reset_during_preparation() {
+        use tauri::Manager;
+        let (_root, state, _recorder, app) = recorded_state();
+        test_runtime().block_on(async {
+            let (ready, release, import) = paused_import(&state);
+            ready.await.unwrap();
+            let _ = super::super::activity::activity_clear(app.state()).await;
+            release.send(()).unwrap();
+            assert_eq!(import.await.unwrap().unwrap_err().code, "conflict");
+            assert!(db::get_all_identities(&state.db).is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn import_with_none_active_starts_a_new_identity_session() {
+        let (_root, state) = mutation_state();
+        for activates in [true, false] {
+            let generation = state.current_identity_session_generation();
+            let imported = import_identity_after_parse(
+                Arc::clone(&state),
+                None,
+                None,
+                state.activity_request_fence(),
+                std::future::ready(Ok(parsed_key(private_key_bytes(), None))),
+                persist_parsed_identity_import,
+            )
+            .await
+            .unwrap();
+            assert_eq!(imported["activated"], activates);
+            assert_eq!(
+                state.current_identity_session_generation() > generation,
+                activates,
+                "only the import that activates starts a session"
+            );
+        }
+    }
+
+    fn parsed_key(key_bytes: Vec<u8>, mnemonic: Option<Zeroizing<String>>) -> ParsedIdentityImport {
         ParsedIdentityImport {
-            key_bytes,
+            key_bytes: Zeroizing::new(key_bytes),
             format: "test-private-key",
             mnemonic,
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Vault admission is process-wide, so the seed worker's tests hold the
+    // vault serial from the start, not from inside the timed wait.
+    #[test]
     #[cfg(feature = "seed")]
-    async fn identity_mutation_cancelled_import_keeps_reset_blocked_until_seed_worker_finishes() {
-        let (_root, state) = mutation_state();
-        let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
-        let identity = Identity::from_private_key(&key).unwrap();
-        let hash = hex::encode(identity.hash);
-        let request_fence = state.activity_request_fence();
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let worker_state = Arc::clone(&state);
-        let import = tokio::spawn(async move {
-            import_identity_after_parse(
-                worker_state,
-                None,
-                Some(phrase),
-                request_fence,
-                std::future::ready(Ok(parsed_key(key.to_vec(), None))),
-                move |state, parsed, nickname, mnemonic| {
-                    ready_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    let _serial = VAULT_TEST_SERIAL.lock().unwrap();
-                    persist_parsed_identity_import(state, parsed, nickname, mnemonic)
-                },
-            )
-            .await
-        });
-        ready_rx.await.unwrap();
-        import.abort();
-        assert!(import.await.unwrap_err().is_cancelled());
-        let reset_state = Arc::clone(&state);
-        let reset_hash = hash.clone();
-        let mut reset = tokio::spawn(async move {
-            let _lifecycle = reset_state.identity_switch_lock.lock_owned().await;
-            crate::lxmf::clear_identity_storage_namespace(&reset_state.config.data_dir).unwrap();
-            db::delete_identity(&reset_state.db, &reset_hash, true).unwrap();
-        });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(40), &mut reset)
+    fn identity_mutation_cancelled_import_keeps_reset_blocked_until_seed_worker_finishes() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        test_runtime().block_on(async {
+            let (_root, state) = mutation_state();
+            let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
+            let identity = Identity::from_private_key(&key[..]).unwrap();
+            let hash = hex::encode(identity.hash);
+            let request_fence = state.activity_request_fence();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let worker_state = Arc::clone(&state);
+            let import = tokio::spawn(async move {
+                import_identity_after_parse(
+                    worker_state,
+                    None,
+                    Some(phrase),
+                    request_fence,
+                    std::future::ready(Ok(parsed_key(key.to_vec(), None))),
+                    move |state, parsed, nickname, mnemonic| {
+                        ready_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        persist_parsed_identity_import(state, parsed, nickname, mnemonic)
+                    },
+                )
                 .await
-                .is_err()
-        );
-        release_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), reset)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            !state
-                .config
-                .data_dir
-                .join("identities")
-                .join(&hash)
-                .exists()
-        );
-        assert!(db::get_identity(&state.db, &hash).is_none());
-        assert!(
-            db::get_active_identity(&state.db).is_none(),
-            "cancelled import must not later activate or resurrect its row"
-        );
+            });
+            ready_rx.await.unwrap();
+            import.abort();
+            assert!(import.await.unwrap_err().is_cancelled());
+            let reset_state = Arc::clone(&state);
+            let reset_hash = hash.clone();
+            let mut reset = tokio::spawn(async move {
+                let _lifecycle = reset_state.identity_switch_lock.lock_owned().await;
+                crate::lxmf::clear_identity_storage_namespace(&reset_state.config.data_dir)
+                    .unwrap();
+                db::delete_identity(&reset_state.db, &reset_hash, true).unwrap();
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(40), &mut reset)
+                    .await
+                    .is_err()
+            );
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), reset)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !state
+                    .config
+                    .data_dir
+                    .join("identities")
+                    .join(&hash)
+                    .exists()
+            );
+            assert!(db::get_identity(&state.db, &hash).is_none());
+            assert!(
+                db::get_active_identity(&state.db).unwrap().is_none(),
+                "cancelled import must not later activate or resurrect its row"
+            );
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1810,7 +2367,7 @@ mod tests {
             0
         );
         assert!(db::get_all_identities(&state.db).is_empty());
-        assert!(db::get_active_identity(&state.db).is_none());
+        assert!(db::get_active_identity(&state.db).unwrap().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1847,46 +2404,135 @@ mod tests {
         assert!(db::get_all_identities(&state.db).is_empty());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[test]
     #[cfg(feature = "seed")]
-    async fn identity_mutation_explicit_and_backup_seeds_commit_with_first_activation() {
-        for explicit in [true, false] {
+    fn identity_mutation_explicit_and_backup_seeds_commit_with_first_activation() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        test_runtime().block_on(async {
+            for explicit in [true, false] {
+                let (_root, state) = mutation_state();
+                let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
+                let identity = Identity::from_private_key(&key[..]).unwrap();
+                let hash = hex::encode(identity.hash);
+                let parsed = parsed_key(key.to_vec(), (!explicit).then_some(phrase.clone()));
+                let value = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    import_identity_after_parse(
+                        Arc::clone(&state),
+                        None,
+                        explicit.then_some(phrase),
+                        state.activity_request_fence(),
+                        std::future::ready(Ok(parsed)),
+                        persist_parsed_identity_import,
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(value["hash"], hash);
+                assert_eq!(value["activated"], true);
+                assert!(
+                    state
+                        .config
+                        .data_dir
+                        .join("identities")
+                        .join(&hash)
+                        .join("identity.seed")
+                        .is_file()
+                );
+                assert!(db::get_identity(&state.db, &hash).is_some());
+                assert_eq!(
+                    db::get_active_identity(&state.db).unwrap().unwrap()["hash"],
+                    hash
+                );
+            }
+        });
+    }
+
+    /// Asserts that no part of `hash` was created: no row, no activation and
+    /// no key, vault or phrase file.
+    fn assert_no_identity(state: &AppState, hash: &str) {
+        assert!(db::get_identity(&state.db, hash).is_none(), "listed");
+        assert!(
+            db::get_active_identity(&state.db).unwrap().is_none(),
+            "active"
+        );
+        let profile = state.config.data_dir.join("identities").join(hash);
+        assert!(!identity_material_exists(&profile), "key left behind");
+        assert!(
+            !profile.join("identity.seed").is_file(),
+            "phrase left behind"
+        );
+    }
+
+    async fn import_recoverable(
+        state: &Arc<AppState>,
+        key: &[u8],
+        phrase: &Zeroizing<String>,
+    ) -> AppResult<Value> {
+        import_identity_after_parse(
+            Arc::clone(state),
+            None,
+            Some(phrase.clone()),
+            state.activity_request_fence(),
+            std::future::ready(Ok(parsed_key(key.to_vec(), None))),
+            persist_parsed_identity_import,
+        )
+        .await
+    }
+
+    // A recoverable identity is created with its stored phrase or not at
+    // all: while another identity encryption holds the vault, nothing is.
+    #[test]
+    #[cfg(feature = "seed")]
+    fn a_recoverable_identity_is_not_created_while_the_vault_is_busy() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        test_runtime().block_on(async {
             let (_root, state) = mutation_state();
             let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
-            let identity = Identity::from_private_key(&key).unwrap();
-            let hash = hex::encode(identity.hash);
-            let parsed = parsed_key(key.to_vec(), (!explicit).then_some(phrase.clone()));
-            let value = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                import_identity_after_parse(
-                    Arc::clone(&state),
-                    None,
-                    explicit.then_some(phrase),
-                    state.activity_request_fence(),
-                    std::future::ready(Ok(parsed)),
-                    |state, parsed, nickname, mnemonic| {
-                        let _serial = VAULT_TEST_SERIAL.lock().unwrap();
-                        persist_parsed_identity_import(state, parsed, nickname, mnemonic)
-                    },
-                ),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(value["hash"], hash);
-            assert_eq!(value["activated"], true);
-            assert!(
-                state
-                    .config
-                    .data_dir
-                    .join("identities")
-                    .join(&hash)
-                    .join("identity.seed")
-                    .is_file()
+            let hash = hex::encode(Identity::from_private_key(&key[..]).unwrap().hash);
+            let busy = vault::try_acquire_job().unwrap();
+            let refused = import_recoverable(&state, &key[..], &phrase).await;
+            assert_eq!(refused.unwrap_err().code, "service_unavailable");
+            assert_no_identity(&state, &hash);
+
+            drop(busy);
+            let created = import_recoverable(&state, &key[..], &phrase).await.unwrap();
+            assert_eq!(
+                (&created["hash"], &created["activated"]),
+                (&json!(hash), &json!(true))
             );
-            assert!(db::get_identity(&state.db, &hash).is_some());
-            assert_eq!(db::get_active_identity(&state.db).unwrap()["hash"], hash);
-        }
+            let profile = state.config.data_dir.join("identities").join(&hash);
+            assert_eq!(vault::reveal_mnemonic(&profile, None).unwrap(), phrase);
+        });
+    }
+
+    // A phrase that cannot be written leaves no identity behind, and the same
+    // identity is created with its phrase once it can be.
+    #[test]
+    #[cfg(feature = "seed")]
+    fn a_recoverable_identity_is_not_created_when_its_phrase_cannot_be_written() {
+        let _serial = VAULT_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        test_runtime().block_on(async {
+            let (_root, state) = mutation_state();
+            let (phrase, key) = ratspeak_runtime::generate_recoverable_key().unwrap();
+            let hash = hex::encode(Identity::from_private_key(&key[..]).unwrap().hash);
+            let profile = state.config.data_dir.join("identities").join(&hash);
+            let blocked = profile.join("identity.seed");
+            std::fs::create_dir_all(blocked.join("occupied")).unwrap();
+            let failed = import_recoverable(&state, &key[..], &phrase).await;
+            assert_eq!(failed.unwrap_err().code, "phrase_not_saved");
+            assert_no_identity(&state, &hash);
+            assert!(
+                blocked.join("occupied").is_dir(),
+                "only its own files are removed"
+            );
+
+            std::fs::remove_dir_all(&blocked).unwrap();
+            let created = import_recoverable(&state, &key[..], &phrase).await.unwrap();
+            assert_eq!(created["activated"], true);
+            assert_eq!(vault::reveal_mnemonic(&profile, None).unwrap(), phrase);
+        });
     }
 
     fn private_key_bytes() -> Vec<u8> {
@@ -1918,7 +2564,7 @@ mod tests {
         let key = private_key_bytes();
         let parsed = parse_private_identity_bytes(&key, None).unwrap();
         assert_eq!(parsed.format, "raw-private-key");
-        assert_eq!(parsed.key_bytes, key);
+        assert_eq!(*parsed.key_bytes, key);
     }
 
     #[test]
@@ -1952,7 +2598,7 @@ mod tests {
 
         let parsed = parse_private_identity_bytes(&encoded, Some("123456")).unwrap();
         assert_eq!(parsed.format, IDENTITY_BACKUP_FORMAT);
-        assert_eq!(parsed.key_bytes, key);
+        assert_eq!(*parsed.key_bytes, key);
         assert!(parsed.mnemonic.is_some());
     }
 
@@ -1984,8 +2630,32 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&backup).unwrap();
 
-        let err = parse_private_identity_bytes(&encoded, None).unwrap_err();
+        let err = parse_private_identity_bytes(&encoded, None)
+            .err()
+            .expect("refused");
         assert!(err.contains("Backup PIN required"));
+    }
+
+    #[test]
+    fn legacy_backup_private_key_keeps_its_json_string_shape() {
+        let value = json!({
+            "format": LEGACY_IDENTITY_BACKUP_FORMAT,
+            "kind": "private",
+            "private_key": "cHJpdmF0ZSBrZXk=",
+            "identity_hash": "identity",
+            "lxmf_hash": "destination",
+            "display_name": "Name",
+            "status": "Away",
+            "nickname": "Alias",
+            "exported_at": 1.0,
+        });
+        let backup: LegacyIdentityBackupV1 = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(backup.private_key.as_str(), "cHJpdmF0ZSBrZXk=");
+        assert_eq!(serde_json::to_value(&backup).unwrap(), value);
+
+        let mut invalid = value;
+        invalid["private_key"] = json!([1, 2, 3]);
+        assert!(serde_json::from_value::<LegacyIdentityBackupV1>(invalid).is_err());
     }
 
     #[test]
@@ -1996,7 +2666,7 @@ mod tests {
         let backup = LegacyIdentityBackupV1 {
             format: LEGACY_IDENTITY_BACKUP_FORMAT.to_string(),
             kind: "private".to_string(),
-            private_key: B64.encode(&key),
+            private_key: Zeroizing::new(B64.encode(&key)),
             identity_hash: preview
                 .get("identity_hash")
                 .and_then(|v| v.as_str())
@@ -2016,7 +2686,7 @@ mod tests {
 
         let parsed = parse_private_identity_bytes(&encoded, None).unwrap();
         assert_eq!(parsed.format, LEGACY_IDENTITY_BACKUP_FORMAT);
-        assert_eq!(parsed.key_bytes, key);
+        assert_eq!(*parsed.key_bytes, key);
     }
 
     #[test]
@@ -2027,7 +2697,7 @@ mod tests {
 
         let parsed = parse_private_identity_bytes(encoded.as_bytes(), None).unwrap();
         assert_eq!(parsed.format, "base32-private-key");
-        assert_eq!(parsed.key_bytes, key);
+        assert_eq!(*parsed.key_bytes, key);
     }
 
     #[test]
@@ -2044,7 +2714,7 @@ mod tests {
 
         let parsed = parse_private_identity_bytes(wrapped.as_bytes(), None).unwrap();
         assert_eq!(parsed.format, "base32-private-key");
-        assert_eq!(parsed.key_bytes, key);
+        assert_eq!(*parsed.key_bytes, key);
     }
 
     #[test]
@@ -2054,7 +2724,7 @@ mod tests {
         let backup = LegacyIdentityBackupV1 {
             format: LEGACY_IDENTITY_BACKUP_FORMAT.to_string(),
             kind: "public".to_string(),
-            private_key: B64.encode(&key),
+            private_key: Zeroizing::new(B64.encode(&key)),
             identity_hash: String::new(),
             lxmf_hash: String::new(),
             display_name: String::new(),
@@ -2064,7 +2734,9 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&backup).unwrap();
 
-        let err = parse_private_identity_bytes(&encoded, None).unwrap_err();
+        let err = parse_private_identity_bytes(&encoded, None)
+            .err()
+            .expect("refused");
         assert!(err.contains("Public identity backups are not activatable"));
     }
 
@@ -2075,7 +2747,7 @@ mod tests {
         let backup = LegacyIdentityBackupV1 {
             format: LEGACY_IDENTITY_BACKUP_FORMAT.to_string(),
             kind: "private".to_string(),
-            private_key: B64.encode(&key),
+            private_key: Zeroizing::new(B64.encode(&key)),
             identity_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             lxmf_hash: String::new(),
             display_name: String::new(),
@@ -2085,7 +2757,9 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&backup).unwrap();
 
-        let err = parse_private_identity_bytes(&encoded, None).unwrap_err();
+        let err = parse_private_identity_bytes(&encoded, None)
+            .err()
+            .expect("refused");
         assert!(err.contains("hash does not match"));
     }
 }

@@ -200,6 +200,9 @@ pub async fn import_contact_card(
 ) -> AppResult<Value> {
     let card = parse_contact_card_payload(&payload).map_err(AppError::bad_request)?;
     let identity_id = active_identity_id(&state);
+    if identity_id.is_empty() {
+        return Err(AppError::conflict("no active identity"));
+    }
     let dest_hash = card.lxmf_hash.to_ascii_lowercase();
     let display_name = card.display_name.clone();
     let identity_hash = card.identity_hash.clone();
