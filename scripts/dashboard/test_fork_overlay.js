@@ -222,6 +222,16 @@ async function runLoader(anchors) {
     var byContacts = v.planGroups(items, 'contacts');
     assert.strictEqual(byContacts.map(function(g) { return g.key + ':' + g.hashes.join(''); }).join('|'), 'contact:ac|other:bd');
     assert.strictEqual(v.planGroups([], 'status').length, 0);
+    // The Recent Peers spoiler is closed unless the user explicitly opened it.
+    assert.strictEqual(v.isOpen(), false);
+    var opened = { window: { renderDashboardPeersList: undefined }, document: { readyState: 'complete' }, localStorage: { getItem: function(k) { return k === 'ratspeak-ru-peers-open' ? '1' : null; } }, navigator: { language: 'en' } };
+    vm.createContext(opened);
+    vm.runInContext(read('dashboard/static/js/ru_peer_views.js'), opened);
+    assert.strictEqual(opened.window.RuPeerViews.isOpen(), true);
+    var broken = { window: { renderDashboardPeersList: undefined }, document: { readyState: 'complete' }, localStorage: { getItem: function() { throw new Error('blocked'); } }, navigator: { language: 'en' } };
+    vm.createContext(broken);
+    vm.runInContext(read('dashboard/static/js/ru_peer_views.js'), broken);
+    assert.strictEqual(broken.window.RuPeerViews.isOpen(), false);
     console.log('ru_peer_views ok');
 })();
 
@@ -255,6 +265,42 @@ async function runLoader(anchors) {
         assert.strictEqual(invoked[0][1].args.hash, h);
         console.log('ru_lxma ok');
     });
+})();
+
+// ---- ru_lxma.js: message text links and known contacts ----
+(function() {
+    var opened = [], prompts = [];
+    var h = '0123456789abcdef0123456789abcdef', k = 'cd'.repeat(64);
+    var ctx = {
+        window: {
+            RS: { invokeOrToast: function() {} },
+            PeersCache: { enriched: function() { return [{ hash: h, is_contact: true }, { hash: 'f'.repeat(32), is_contact: false }]; } },
+            openConversationWith: function(hash) { opened.push(hash); },
+            linkifyMessageText: function(text) { return String(text); }
+        },
+        document: { addEventListener: function() {} }, Event: function() {},
+        rsPromptContact: function(opts) { prompts.push(opts); return new Promise(function() {}); }
+    };
+    vm.createContext(ctx);
+    vm.runInContext(read('dashboard/static/js/ru_lxma.js'), ctx);
+    var linkify = ctx.window.linkifyMessageText;
+    // Whole addresses become links; the address is the only thing that reaches the markup.
+    var out = linkify('hi lxma://' + h + ' and lxma://' + h + '.' + k + '.');
+    assert(out.indexOf('<a class="rs-message-link ru-lxma-link" href="lxma://' + h + '"') !== -1);
+    assert(out.indexOf('href="lxma://' + h + '.' + k + '"') !== -1);
+    assert(out.endsWith('</a>.'), 'trailing punctuation stays outside the link');
+    // Incomplete, oversized or already-linked addresses are left alone.
+    assert.strictEqual(linkify('lxma://' + h.slice(1)), 'lxma://' + h.slice(1));
+    assert.strictEqual(linkify('lxma://' + h + '00'), 'lxma://' + h + '00');
+    assert.strictEqual(ctx.window.RuLxma.linkify('<a href="x">lxma://' + h + '</a>'), '<a href="x">lxma://' + h + '</a>');
+    assert.strictEqual(ctx.window.RuLxma.linkify('plain text'), 'plain text');
+    // A known contact opens the conversation; an unknown address opens the form.
+    assert.strictEqual(ctx.window.openNativeConnectionLink({ kind: 'lxma', hash: h, public_key: null }), true);
+    assert.strictEqual(opened[0], h);
+    assert.strictEqual(prompts.length, 0);
+    assert.strictEqual(ctx.window.openNativeConnectionLink({ kind: 'lxma', hash: 'f'.repeat(32), public_key: null }), true);
+    assert.strictEqual(prompts.length, 1);
+    console.log('ru_lxma links ok');
 })();
 
 // ---- ru_geo.js: fix validation, throttling, config ----

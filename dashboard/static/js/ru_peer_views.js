@@ -2,10 +2,12 @@
 // Wraps upstream renderDashboardPeersList (health.js) and post-processes the rows it
 // renders, so no upstream file is edited. Modes: default, grouped by status, grouped by
 // contacts, compact list, tiles. The choice is stored in localStorage.
+// The panel itself is a spoiler that is closed by default; only an explicit "open" is stored.
 (function() {
     'use strict';
 
     var KEY = 'ratspeak-ru-peers-view';
+    var OPEN_KEY = 'ratspeak-ru-peers-open';
     var MODES = ['default', 'status', 'contacts', 'list', 'tiles'];
     var LABELS = {
         en: { default: 'Default', status: 'Group by status', contacts: 'Group by contacts', list: 'Compact list', tiles: 'Tiles', view: 'Peer view',
@@ -31,6 +33,17 @@
         try {
             if (mode === 'default') localStorage.removeItem(KEY);
             else localStorage.setItem(KEY, mode);
+        } catch (_) {}
+    }
+
+    // The Recent Peers spoiler is closed unless the user opened it (stored as '1').
+    function readOpen() {
+        try { return localStorage.getItem(OPEN_KEY) === '1'; } catch (_) { return false; }
+    }
+    function writeOpen(open) {
+        try {
+            if (open) localStorage.setItem(OPEN_KEY, '1');
+            else localStorage.removeItem(OPEN_KEY);
         } catch (_) {}
     }
 
@@ -145,20 +158,76 @@
         actions.insertBefore(select, actions.firstChild);
     }
 
-    window.RuPeerViews = { MODES: MODES, planGroups: planGroups, statusBucket: statusBucket, readMode: readMode };
+    window.RuPeerViews = { MODES: MODES, planGroups: planGroups, statusBucket: statusBucket, readMode: readMode,
+        isOpen: readOpen };
 
     var original = window.renderDashboardPeersList;
     if (typeof original !== 'function' || original.__ruWrapped) return;
+    function updateCount() {
+        var el = document.getElementById('ru-peers-count');
+        var listEl = document.getElementById('dashboard-peers-list');
+        if (!el || !listEl) return;
+        var n = listEl.querySelectorAll('.dashboard-peers-row').length;
+        el.textContent = n > 0 ? '· ' + n : '';
+    }
+
     var wrapper = function() {
         var result = original.apply(this, arguments);
         var listEl = document.getElementById('dashboard-peers-list');
         if (listEl) applyMode(listEl, readMode());
+        updateCount();
         return result;
     };
     wrapper.__ruWrapped = true;
     window.renderDashboardPeersList = wrapper;
 
-    function init() { buildSwitcher(); refresh(true); }
+    // Turns the panel header into a toggle for the list. Closed by default.
+    function buildSpoiler() {
+        var panel = document.getElementById('panel-dashboard-peers');
+        var header = panel && panel.querySelector('.panel-header');
+        var info = header && header.querySelector('.dashboard-peers-header-info');
+        if (!panel || !info || panel.getAttribute('data-ru-spoiler')) return;
+        panel.setAttribute('data-ru-spoiler', '1');
+
+        var chevron = document.createElement('span');
+        chevron.className = 'ru-peers-chevron';
+        chevron.setAttribute('aria-hidden', 'true');
+        info.insertBefore(chevron, info.firstChild);
+        var count = document.createElement('span');
+        count.id = 'ru-peers-count';
+        count.className = 'ru-peers-count';
+        info.appendChild(count);
+
+        header.classList.add('ru-peers-spoiler-head');
+        header.setAttribute('role', 'button');
+        header.setAttribute('tabindex', '0');
+
+        function apply(open) {
+            panel.classList.toggle('ru-peers-collapsed', !open);
+            header.setAttribute('aria-expanded', open ? 'true' : 'false');
+        }
+        function toggle() {
+            var open = panel.classList.contains('ru-peers-collapsed');
+            writeOpen(open);
+            apply(open);
+        }
+        header.addEventListener('click', function(event) {
+            // The view switcher and "View all" keep their own behavior.
+            if (event.target.closest && event.target.closest('.panel-header-actions')) return;
+            toggle();
+        });
+        header.addEventListener('keydown', function(event) {
+            if (event.target !== header) return;
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                toggle();
+            }
+        });
+        apply(readOpen());
+        updateCount();
+    }
+
+    function init() { buildSpoiler(); buildSwitcher(); refresh(true); }
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
     else init();
 })();

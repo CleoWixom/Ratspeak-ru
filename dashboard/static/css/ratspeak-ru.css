@@ -348,3 +348,13 @@ button.bs-cell { cursor: pointer; }
 .games-sheet-game-grid:has(> .games-sheet-game-card:nth-child(4)) {
     grid-template-columns: repeat(2, minmax(0, 1fr));
 }
+
+/* Recent Peers spoiler (ru_peer_views.js): closed by default. */
+.ru-peers-spoiler-head { cursor: pointer; }
+.ru-peers-spoiler-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.ru-peers-chevron { display: inline-block; width: 1em; margin-right: var(--space-1); color: var(--text-muted); }
+.ru-peers-chevron::before { content: '▾'; }
+.ru-peers-collapsed .ru-peers-chevron::before { content: '▸'; }
+.ru-peers-count { margin-left: var(--space-2); color: var(--text-muted); font-weight: var(--type-weight-semibold); }
+.ru-peers-collapsed > .panel-body,
+.ru-peers-collapsed .ru-peers-view-select { display: none; }

@@ -29,10 +29,48 @@
         return key ? { hash: hash, publicKey: key } : null;
     }
 
+    // Message text: upstream only turns http(s) and domain names into links, so a plain
+    // lxma:// address stays dead text. Wrap the already-escaped HTML it returns and link
+    // every complete address outside existing anchors. Matches are hex only, so nothing
+    // from the message can reach the markup.
+    var TEXT_RE = /(<a\b[\s\S]*?<\/a>)|(lxma:\/\/[0-9a-fA-F]{32}(?:\.[0-9a-fA-F]{128})?)(?![0-9a-zA-Z])/gi;
+
+    function linkifyHtml(html) {
+        if (typeof html !== 'string' || html.toLowerCase().indexOf('lxma://') === -1) return html;
+        return html.replace(TEXT_RE, function(match, anchor, link) {
+            if (anchor) return anchor;
+            if (!parse(link)) return match;
+            return '<a class="rs-message-link ru-lxma-link" href="' + link + '" data-url="' + link +
+                '" rel="noopener noreferrer">' + link + '</a>';
+        });
+    }
+
+    var upstreamLinkify = window.linkifyMessageText;
+    if (typeof upstreamLinkify === 'function' && !upstreamLinkify.__ruLxma) {
+        var wrappedLinkify = function() {
+            return linkifyHtml(upstreamLinkify.apply(this, arguments));
+        };
+        wrappedLinkify.__ruLxma = true;
+        window.linkifyMessageText = wrappedLinkify;
+    }
+
+    function isContact(hash) {
+        try {
+            var cache = window.PeersCache;
+            var list = (cache && typeof cache.enriched === 'function' && cache.enriched()) || [];
+            return list.some(function(peer) { return peer.hash === hash && peer.is_contact; });
+        } catch (_) { return false; }
+    }
+
     var presenting = false;
 
     function present(link) {
         if (!link || presenting) return true;
+        // An address that is already a contact opens its conversation instead of the form.
+        if (isContact(link.hash) && typeof window.openConversationWith === 'function') {
+            window.openConversationWith(link.hash);
+            return true;
+        }
         var rs = window.RS;
         if (typeof rsPromptContact !== 'function' || !rs || typeof rs.invokeOrToast !== 'function') {
             return false;
@@ -79,5 +117,5 @@
         field.dispatchEvent(new Event('input', { bubbles: true }));
     }, true);
 
-    window.RuLxma = { parse: parse };
+    window.RuLxma = { parse: parse, linkify: linkifyHtml };
 })();

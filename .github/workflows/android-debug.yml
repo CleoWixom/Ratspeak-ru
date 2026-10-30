@@ -5,6 +5,25 @@ name: Android debug APK
 # Не для распространения: любой, у кого есть этот ключ, может подписать «обновление».
 
 on:
+  # Reused by fork-release.yml, which publishes the APKs as GitHub Release assets.
+  workflow_call:
+    inputs:
+      source_ref:
+        required: false
+        type: string
+      app_id_suffix:
+        required: false
+        default: ".ru"
+        type: string
+      targets:
+        required: false
+        default: "aarch64"
+        type: string
+      apk_version:
+        description: "Fork version used in APK file names (empty = keep Gradle's names)."
+        required: false
+        default: ""
+        type: string
   workflow_dispatch:
     inputs:
       source_ref:
@@ -21,13 +40,18 @@ on:
         required: true
         default: "aarch64"
         type: string
+      apk_version:
+        description: "Fork version used in APK file names (empty = keep Gradle's names)."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: android-debug-${{ github.ref }}
-  cancel-in-progress: true
+  group: android-debug-${{ github.ref }}-${{ inputs.apk_version || 'manual' }}
+  cancel-in-progress: ${{ inputs.apk_version == '' }}
 
 jobs:
   build:
@@ -180,10 +204,24 @@ jobs:
       - name: Collect APKs
         shell: bash
         working-directory: Ratspeak
+        env:
+          APK_VERSION: ${{ inputs.apk_version }}
         run: |
           set -euo pipefail
           mkdir -p dist/android
-          find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -exec cp {} dist/android/ \;
+          if [ -n "$APK_VERSION" ] && ! [[ "$APK_VERSION" =~ ^[0-9A-Za-z._-]+$ ]]; then
+            echo "error: apk_version contains unexpected characters" >&2
+            exit 1
+          fi
+          while IFS= read -r apk; do
+            name="$(basename "$apk")"
+            if [ -n "$APK_VERSION" ]; then
+              abi="$(echo "$name" | sed -E 's/^app-//; s/-(release|debug)(-.*)?\.apk$//')"
+              cp "$apk" "dist/android/Ratspeak-ru-${APK_VERSION}-${abi}.apk"
+            else
+              cp "$apk" dist/android/
+            fi
+          done < <(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk')
           test -n "$(ls dist/android)"
           (cd dist/android && sha256sum *.apk | tee checksums.txt)
 
